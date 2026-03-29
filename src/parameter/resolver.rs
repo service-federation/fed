@@ -244,6 +244,15 @@ impl Resolver {
         template: &str,
         parameters: &HashMap<String, String>,
     ) -> Result<String> {
+        Self::resolve_template_static(template, parameters)
+    }
+
+    /// Resolve `{{PARAM}}` placeholders in a template string.
+    /// Static version for use outside the resolver (e.g., generate commands).
+    pub fn resolve_template_static(
+        template: &str,
+        parameters: &HashMap<String, String>,
+    ) -> Result<String> {
         if template.is_empty() {
             return Ok(String::new());
         }
@@ -385,8 +394,35 @@ impl Resolver {
             }
         }
 
-        // Nothing to generate? We're done.
-        if analysis.needs_generation.is_empty() {
+        // Run DAG-based resolution for all secrets with `generate` commands.
+        // This handles invalidation cascading even for secrets that have existing values.
+        let effective_params = config.get_effective_parameters().clone();
+        let generate_results = super::generate::resolve_generate_params(
+            &effective_params,
+            &analysis.existing_values,
+            &HashMap::new(),
+        )?;
+
+        let dag_generated: HashSet<String> = generate_results
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+
+        let mut generated: Vec<(String, String)> = generate_results
+            .into_iter()
+            .filter(|r| r.was_generated)
+            .map(|r| (r.name, r.value))
+            .collect();
+
+        // Simple secrets (no generate command) — use random alphanumeric.
+        for name in &analysis.needs_generation {
+            if !dag_generated.contains(name) {
+                generated.push((name.clone(), super::secret::generate_secret()));
+            }
+        }
+
+        // Nothing to write? We're done.
+        if generated.is_empty() {
             return Ok(());
         }
 
@@ -418,13 +454,6 @@ impl Resolver {
         } else {
             tracing::info!("Generating secret values → {}", analysis.env_path.display());
         }
-
-        // Generate values
-        let generated: Vec<(String, String)> = analysis
-            .needs_generation
-            .iter()
-            .map(|name| (name.clone(), super::secret::generate_secret()))
-            .collect();
 
         super::secret::write_env_file(&analysis.env_path, &generated)?;
 
@@ -629,6 +658,29 @@ impl Resolver {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // Resolve non-secret `generate` parameters (recompute every start).
+        // Secret generate params were already handled in resolve_secrets.
+        let non_secret_generate: HashMap<String, crate::config::Parameter> = effective_params
+            .iter()
+            .filter(|(_, p)| p.has_generate() && !p.is_secret_type())
+            .map(|(name, p)| (name.clone(), p.clone()))
+            .collect();
+
+        if !non_secret_generate.is_empty() {
+            let generate_results = super::generate::resolve_generate_params(
+                &non_secret_generate,
+                &HashMap::new(), // Non-secrets have no persisted values.
+                &parameters,     // Already-resolved params (ports, secrets, defaults).
+            )?;
+            for result in generate_results {
+                if result.was_generated {
+                    parameters.insert(result.name.clone(), result.value.clone());
+                    self.resolved_parameters
+                        .insert(result.name, result.value);
                 }
             }
         }
@@ -1121,7 +1173,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("API_PORT".to_string(), param);
@@ -1168,7 +1220,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("API_PORT".to_string(), param);
@@ -1205,7 +1257,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("API_PORT".to_string(), param);
@@ -1241,7 +1293,7 @@ mod tests {
                 source: None,
                 description: None,
                 optional: None,
-                value: None,
+                ..Default::default()
             },
         );
         config.parameters.insert(
@@ -1257,7 +1309,7 @@ mod tests {
                 source: None,
                 description: None,
                 optional: None,
-                value: None,
+                ..Default::default()
             },
         );
 
@@ -1290,7 +1342,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("API_PORT".to_string(), param);
@@ -1333,7 +1385,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         let param2 = Parameter {
@@ -1347,7 +1399,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("API_PORT".to_string(), param1);
@@ -1384,7 +1436,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
         param.value = Some("8080".to_string());
 
@@ -1415,7 +1467,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
         param.value = Some("invalid".to_string());
 
@@ -1448,7 +1500,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
         param.value = Some("0".to_string());
 
@@ -1481,7 +1533,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
         param.value = Some("99999".to_string());
 
@@ -1514,7 +1566,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
         param.value = Some("invalid".to_string());
 
@@ -1545,7 +1597,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         let param_b = Parameter {
@@ -1559,7 +1611,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("A".to_string(), param_a);
@@ -1593,7 +1645,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         let param_b = Parameter {
@@ -1607,7 +1659,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         let param_c = Parameter {
@@ -1621,7 +1673,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("A".to_string(), param_a);
@@ -1656,7 +1708,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         let param_b = Parameter {
@@ -1670,7 +1722,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         let param_a = Parameter {
@@ -1684,7 +1736,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("A".to_string(), param_a);
@@ -1718,7 +1770,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("A".to_string(), param_a);
@@ -1748,7 +1800,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("ENV".to_string(), param);
@@ -1778,7 +1830,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("ENV".to_string(), param);
@@ -1809,7 +1861,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
         param.value = Some("prod".to_string());
 
@@ -1840,7 +1892,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
         param.value = Some("test".to_string());
 
@@ -1872,7 +1924,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         // Create parameter with either constraint that references base
@@ -1887,7 +1939,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("BASE".to_string(), base_param);
@@ -1970,7 +2022,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
         param.value = Some("; rm -rf /".to_string());
 
@@ -2024,7 +2076,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("MY_PARAM".to_string(), param);
@@ -2064,6 +2116,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
+            generate: None,
             value: Some("explicit_value".to_string()), // Explicit value takes precedence
         };
 
@@ -2129,7 +2182,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("API_KEY".to_string(), param);
@@ -2207,7 +2260,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         };
 
         config.parameters.insert("MY_PARAM".to_string(), param);

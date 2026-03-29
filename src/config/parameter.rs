@@ -49,6 +49,19 @@ pub struct Parameter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
 
+    /// Shell command to generate the parameter value.
+    ///
+    /// Command is run via `sh -c`, stdout is captured as the value.
+    /// May reference other parameters with `{{PARAM}}` syntax — Fed
+    /// resolves these in dependency order (DAG).
+    ///
+    /// For `type: secret`: value is persisted to the secrets file.
+    /// Generated once, not regenerated unless an input dependency changes.
+    ///
+    /// Without `type: secret`: value is recomputed on every `fed start`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generate: Option<String>,
+
     #[serde(skip)]
     pub value: Option<String>,
 }
@@ -72,6 +85,24 @@ impl Parameter {
     /// Check if this parameter is marked as optional.
     pub fn is_optional(&self) -> bool {
         self.optional.unwrap_or(false)
+    }
+
+    /// Check if this parameter has a custom generate command.
+    pub fn has_generate(&self) -> bool {
+        self.generate.is_some()
+    }
+
+    /// Extract parameter names referenced in the generate command via `{{PARAM}}`.
+    pub fn generate_dependencies(&self) -> Vec<String> {
+        match &self.generate {
+            Some(cmd) => {
+                let re = regex::Regex::new(r"\{\{([^}]+)\}\}").unwrap();
+                re.captures_iter(cmd)
+                    .map(|cap| cap[1].trim().to_string())
+                    .collect()
+            }
+            None => Vec::new(),
+        }
     }
 
     /// Get the value for a specific environment.
@@ -120,7 +151,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         }
     }
 
@@ -137,7 +168,7 @@ mod tests {
             source: None,
             description: None,
             optional: None,
-            value: None,
+            ..Default::default()
         }
     }
 

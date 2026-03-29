@@ -271,6 +271,37 @@ Secret parameters cannot have `default`, environment-specific values (`developme
 
 `generated_secrets_file` is prepended to the `env_file` list at runtime, giving it the lowest priority. This means your `.env` or `.env.local` files can override generated values when needed.
 
+### Custom Generation
+
+Use `generate` to run a shell command that produces the parameter value:
+
+```yaml
+parameters:
+  # Generate an Ed25519 keypair for JWT signing.
+  JWT_PRIVATE_KEY:
+    type: secret
+    generate: openssl genpkey -algorithm ed25519 -outform PEM 2>/dev/null | base64 -w0
+
+  JWT_PUBLIC_KEY:
+    type: secret
+    generate: echo '{{JWT_PRIVATE_KEY}}' | base64 -d | openssl pkey -pubout -outform PEM 2>/dev/null | base64 -w0
+
+  # Computed parameter (not a secret — recomputed every start).
+  DB_URL:
+    generate: echo "postgres://app:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/mydb"
+```
+
+The command runs via `sh -c`. Stdout is captured as the value (trimmed). Stderr is discarded on success, shown on failure.
+
+**`{{PARAM}}` references** create dependencies. Fed resolves parameters in topological order (DAG). Circular dependencies are detected and rejected.
+
+**Invalidation:** When a secret with `generate` is missing and gets generated, all secrets that depend on it (via `{{PARAM}}` references) are regenerated — even if they already have values. This ensures derived secrets stay in sync with their sources.
+
+**Persistence rules:**
+- `type: secret` with `generate`: generated once, persisted to secrets file. Not regenerated unless an input dependency changes.
+- `generate` without `type: secret`: recomputed on every `fed start`. Not persisted.
+- `type: secret` without `generate`: random 32-char alphanumeric (default behavior).
+
 ## Dependencies & Health Checks
 
 Services declare dependencies with `depends_on`. A service waits for its dependencies to become healthy before starting.
