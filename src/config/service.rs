@@ -80,6 +80,11 @@ pub struct Service {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
 
+    /// Override the Docker CMD for image-based services.
+    /// Accepts a string (split on whitespace) or an array of strings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<DockerCommand>,
+
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<String>,
 
@@ -160,6 +165,33 @@ pub struct Service {
 
 fn is_false(b: &bool) -> bool {
     !b
+}
+
+/// Docker CMD override. Accepts either a string (split on whitespace)
+/// or an array of strings for exact argument control.
+///
+/// ```yaml
+/// # String form (split on whitespace):
+/// command: "--jetstream --store_dir /data"
+///
+/// # Array form (exact arguments):
+/// command: ["--jetstream", "--store_dir", "/data"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DockerCommand {
+    String(String),
+    List(Vec<String>),
+}
+
+impl DockerCommand {
+    /// Convert to a list of arguments for `docker run`.
+    pub fn to_args(&self) -> Vec<String> {
+        match self {
+            DockerCommand::String(s) => s.split_whitespace().map(String::from).collect(),
+            DockerCommand::List(v) => v.clone(),
+        }
+    }
 }
 
 /// Types of services supported by the federation.
@@ -448,5 +480,36 @@ migrate: ./migrate.sh
         let serialized = serde_yaml::to_string(&svc).unwrap();
         let deserialized: Service = serde_yaml::from_str(&serialized).unwrap();
         assert_eq!(deserialized.migrate.as_deref(), Some("./migrate.sh"));
+    }
+
+    #[test]
+    fn test_docker_command_string() {
+        let yaml = r#"
+image: nats:2.10
+command: "--jetstream --store_dir /data"
+"#;
+        let svc: Service = serde_yaml::from_str(yaml).unwrap();
+        let cmd = svc.command.unwrap();
+        assert_eq!(cmd.to_args(), vec!["--jetstream", "--store_dir", "/data"]);
+    }
+
+    #[test]
+    fn test_docker_command_list() {
+        let yaml = r#"
+image: nats:2.10
+command: ["--jetstream", "--store_dir", "/data"]
+"#;
+        let svc: Service = serde_yaml::from_str(yaml).unwrap();
+        let cmd = svc.command.unwrap();
+        assert_eq!(cmd.to_args(), vec!["--jetstream", "--store_dir", "/data"]);
+    }
+
+    #[test]
+    fn test_docker_command_omitted() {
+        let yaml = r#"
+image: redis:7
+"#;
+        let svc: Service = serde_yaml::from_str(yaml).unwrap();
+        assert!(svc.command.is_none());
     }
 }

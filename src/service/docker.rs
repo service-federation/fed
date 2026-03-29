@@ -543,6 +543,11 @@ impl ServiceManager for DockerService {
         // Add image name
         args.push(image.clone());
 
+        // Add command override (appended after image, replaces Docker CMD)
+        if let Some(ref command) = self.config.command {
+            args.extend(command.to_args());
+        }
+
         // PERFORMANCE: Check if image exists locally before pulling (avoid 5min timeout on cached images)
         let needs_pull = !self.client.image_exists(image).await;
 
