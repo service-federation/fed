@@ -165,6 +165,7 @@ fn test_circular_template_references() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -179,6 +180,7 @@ fn test_circular_template_references() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -872,6 +874,7 @@ fn test_parameter_with_value_override() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: Some("override".to_string()),
     };
 

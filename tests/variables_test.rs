@@ -19,6 +19,7 @@ fn test_environment_specific_values() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -47,6 +48,7 @@ fn test_environment_fallback_to_default() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -75,6 +77,7 @@ fn test_development_alias() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -103,6 +106,7 @@ fn test_development_precedence() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -131,6 +135,7 @@ fn test_variables_take_precedence_over_parameters() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -145,6 +150,7 @@ fn test_variables_take_precedence_over_parameters() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -177,6 +183,7 @@ fn test_backward_compatibility_with_parameters() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -210,6 +217,7 @@ fn test_port_type_with_environment() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -241,6 +249,7 @@ fn test_template_resolution_with_environment() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -256,6 +265,7 @@ fn test_template_resolution_with_environment() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -286,6 +296,7 @@ fn test_complex_multi_environment_config() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -301,6 +312,7 @@ fn test_complex_multi_environment_config() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -316,6 +328,7 @@ fn test_complex_multi_environment_config() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
 
@@ -356,6 +369,7 @@ fn test_get_effective_parameters() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
     config.parameters.insert("PARAM1".to_string(), param1);
@@ -372,6 +386,7 @@ fn test_get_effective_parameters() {
         source: None,
         description: None,
         optional: None,
+        generate: None,
         value: None,
     };
     config.variables.insert("VAR1".to_string(), var1);

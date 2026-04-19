@@ -150,6 +150,7 @@ pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Res
 
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)
@@ -226,7 +227,8 @@ pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Res
 
         // Seek to end for append.
         use std::io::Seek;
-        writer.seek(std::io::SeekFrom::End(0))
+        writer
+            .seek(std::io::SeekFrom::End(0))
             .map_err(|e| Error::Filesystem(format!("Seek error: {}", e)))?;
 
         for (key, value) in &new_keys {
