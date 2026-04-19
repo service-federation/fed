@@ -403,10 +403,8 @@ impl Resolver {
             &HashMap::new(),
         )?;
 
-        let dag_generated: HashSet<String> = generate_results
-            .iter()
-            .map(|r| r.name.clone())
-            .collect();
+        let dag_generated: HashSet<String> =
+            generate_results.iter().map(|r| r.name.clone()).collect();
 
         let mut generated: Vec<(String, String)> = generate_results
             .into_iter()
@@ -679,8 +677,7 @@ impl Resolver {
             for result in generate_results {
                 if result.was_generated {
                     parameters.insert(result.name.clone(), result.value.clone());
-                    self.resolved_parameters
-                        .insert(result.name, result.value);
+                    self.resolved_parameters.insert(result.name, result.value);
                 }
             }
         }

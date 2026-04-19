@@ -25,9 +25,7 @@ pub struct GenerateResult {
 ///
 /// Returns parameter names in dependency order (roots first).
 /// Errors on cycles.
-pub fn topological_sort(
-    params: &HashMap<String, Parameter>,
-) -> Result<Vec<String>> {
+pub fn topological_sort(params: &HashMap<String, Parameter>) -> Result<Vec<String>> {
     // Only consider params with generate commands.
     let generate_params: HashMap<&str, Vec<String>> = params
         .iter()
@@ -95,23 +93,16 @@ pub fn topological_sort(
 
 /// Execute a generate command, interpolating `{{PARAM}}` references
 /// from already-resolved values.
-pub fn run_generate_command(
-    command: &str,
-    resolved: &HashMap<String, String>,
-) -> Result<String> {
+pub fn run_generate_command(command: &str, resolved: &HashMap<String, String>) -> Result<String> {
     // Interpolate {{PARAM}} references.
-    let interpolated = crate::parameter::Resolver::resolve_template_static(
-        command, resolved,
-    )?;
+    let interpolated = crate::parameter::Resolver::resolve_template_static(command, resolved)?;
 
     // Run via sh -c, capture stdout.
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(&interpolated)
         .output()
-        .map_err(|e| Error::TemplateResolution(format!(
-            "Failed to run generate command: {e}"
-        )))?;
+        .map_err(|e| Error::TemplateResolution(format!("Failed to run generate command: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
