@@ -737,29 +737,41 @@ impl Orchestrator {
 
     /// Force run install command for a service (clears install state first).
     pub async fn run_install(&self, service_name: &str) -> Result<()> {
-        let lifecycle =
-            crate::orchestrator::ServiceLifecycleCommands::new(&self.config, &self.work_dir);
+        let lifecycle = crate::orchestrator::ServiceLifecycleCommands::new(
+            &self.config,
+            &self.work_dir,
+            self.isolation_id.clone(),
+        );
         lifecycle.run_install(service_name).await
     }
 
     /// Run install command for a service if needed.
     async fn run_install_if_needed(&self, service_name: &str) -> Result<()> {
-        let lifecycle =
-            crate::orchestrator::ServiceLifecycleCommands::new(&self.config, &self.work_dir);
+        let lifecycle = crate::orchestrator::ServiceLifecycleCommands::new(
+            &self.config,
+            &self.work_dir,
+            self.isolation_id.clone(),
+        );
         lifecycle.run_install_if_needed(service_name).await
     }
 
     /// Force run migrate command for a service (clears migrate state first).
     pub async fn run_migrate(&self, service_name: &str) -> Result<()> {
-        let lifecycle =
-            crate::orchestrator::ServiceLifecycleCommands::new(&self.config, &self.work_dir);
+        let lifecycle = crate::orchestrator::ServiceLifecycleCommands::new(
+            &self.config,
+            &self.work_dir,
+            self.isolation_id.clone(),
+        );
         lifecycle.run_migrate(service_name).await
     }
 
     /// Run migrate command for a service if needed.
     async fn run_migrate_if_needed(&self, service_name: &str) -> Result<()> {
-        let lifecycle =
-            crate::orchestrator::ServiceLifecycleCommands::new(&self.config, &self.work_dir);
+        let lifecycle = crate::orchestrator::ServiceLifecycleCommands::new(
+            &self.config,
+            &self.work_dir,
+            self.isolation_id.clone(),
+        );
         lifecycle.run_migrate_if_needed(service_name).await
     }
 
@@ -769,8 +781,11 @@ impl Orchestrator {
     /// 1. Run the user-defined clean command (if present)
     /// 2. Remove any Docker volumes associated with the service
     pub async fn run_clean(&self, service_name: &str) -> Result<()> {
-        let lifecycle =
-            crate::orchestrator::ServiceLifecycleCommands::new(&self.config, &self.work_dir);
+        let lifecycle = crate::orchestrator::ServiceLifecycleCommands::new(
+            &self.config,
+            &self.work_dir,
+            self.isolation_id.clone(),
+        );
         lifecycle.run_clean(service_name).await
     }
 
@@ -781,8 +796,11 @@ impl Orchestrator {
         tag: Option<&str>,
         cli_build_args: &[String],
     ) -> Result<Option<crate::config::DockerBuildResult>> {
-        let lifecycle =
-            crate::orchestrator::ServiceLifecycleCommands::new(&self.config, &self.work_dir);
+        let lifecycle = crate::orchestrator::ServiceLifecycleCommands::new(
+            &self.config,
+            &self.work_dir,
+            self.isolation_id.clone(),
+        );
         lifecycle.run_build(service_name, tag, cli_build_args).await
     }
 

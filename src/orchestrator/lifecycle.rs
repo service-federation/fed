@@ -26,7 +26,7 @@ use std::process::Stdio;
 /// # async fn example() -> Result<(), fed::Error> {
 /// let config = Config::default();
 /// let work_dir = Path::new(".");
-/// let lifecycle = ServiceLifecycleCommands::new(&config, work_dir);
+/// let lifecycle = ServiceLifecycleCommands::new(&config, work_dir, None);
 ///
 /// // Run install for a service
 /// lifecycle.run_install("my-service").await?;
@@ -39,17 +39,34 @@ use std::process::Stdio;
 pub struct ServiceLifecycleCommands<'a> {
     config: &'a Config,
     work_dir: &'a Path,
+    isolation_id: Option<String>,
 }
 
 impl<'a> ServiceLifecycleCommands<'a> {
     /// Create a new lifecycle commands handler.
     ///
+    /// Install/migrate marker lookups are scoped by `(work_dir, isolation_id)`
+    /// so isolated child orchestrators never read or mutate the parent's
+    /// shared marker state.
+    ///
     /// # Arguments
     ///
     /// * `config` - Reference to the service configuration
     /// * `work_dir` - Working directory for resolving relative paths
-    pub fn new(config: &'a Config, work_dir: &'a Path) -> Self {
-        Self { config, work_dir }
+    /// * `isolation_id` - Isolation session id, or `None` for the shared scope
+    pub fn new(config: &'a Config, work_dir: &'a Path, isolation_id: Option<String>) -> Self {
+        Self {
+            config,
+            work_dir,
+            isolation_id,
+        }
+    }
+
+    fn markers(&self) -> crate::markers::LifecycleMarkers {
+        crate::markers::LifecycleMarkers::new(
+            self.work_dir.to_path_buf(),
+            self.isolation_id.clone(),
+        )
     }
 
     /// Force run install command for a service (clears install state first).
@@ -70,7 +87,7 @@ impl<'a> ServiceLifecycleCommands<'a> {
     /// - Marker directory is inaccessible
     pub async fn run_install(&self, service_name: &str) -> Result<()> {
         // Clear install state first
-        let ctx = crate::markers::LifecycleMarkers::new(self.work_dir.to_path_buf());
+        let ctx = self.markers();
         ctx.clear_installed(service_name)?;
 
         // Run install
@@ -111,7 +128,7 @@ impl<'a> ServiceLifecycleCommands<'a> {
         };
 
         // Check if already installed
-        let ctx = crate::markers::LifecycleMarkers::new(self.work_dir.to_path_buf());
+        let ctx = self.markers();
         let is_installed = ctx.is_installed(service_name)?;
 
         if is_installed {
@@ -173,7 +190,7 @@ impl<'a> ServiceLifecycleCommands<'a> {
         }
 
         // Mark as installed
-        let ctx = crate::markers::LifecycleMarkers::new(self.work_dir.to_path_buf());
+        let ctx = self.markers();
         ctx.mark_installed(service_name)?;
 
         tracing::info!(
@@ -189,7 +206,7 @@ impl<'a> ServiceLifecycleCommands<'a> {
     /// 1. Clear any existing migrate state
     /// 2. Run the migrate command unconditionally
     pub async fn run_migrate(&self, service_name: &str) -> Result<()> {
-        let ctx = crate::markers::LifecycleMarkers::new(self.work_dir.to_path_buf());
+        let ctx = self.markers();
         ctx.clear_migrated(service_name)?;
         self.run_migrate_if_needed(service_name).await
     }
@@ -214,7 +231,7 @@ impl<'a> ServiceLifecycleCommands<'a> {
             None => return Ok(()),
         };
 
-        let ctx = crate::markers::LifecycleMarkers::new(self.work_dir.to_path_buf());
+        let ctx = self.markers();
         let is_migrated = ctx.is_migrated(service_name)?;
 
         if is_migrated {
@@ -271,7 +288,7 @@ impl<'a> ServiceLifecycleCommands<'a> {
             )));
         }
 
-        let ctx = crate::markers::LifecycleMarkers::new(self.work_dir.to_path_buf());
+        let ctx = self.markers();
         ctx.mark_migrated(service_name)?;
 
         tracing::info!(
@@ -562,7 +579,7 @@ impl<'a> ServiceLifecycleCommands<'a> {
         }
 
         // Clear install and migrate state since we cleaned up
-        let ctx = crate::markers::LifecycleMarkers::new(self.work_dir.to_path_buf());
+        let ctx = self.markers();
         ctx.clear_installed(service_name)?;
         ctx.clear_migrated(service_name)?;
 
