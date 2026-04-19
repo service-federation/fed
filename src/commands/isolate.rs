@@ -64,10 +64,9 @@ async fn enable(
         .set_isolation_mode(true, Some(isolation_id.clone()))
         .await?;
 
-    // Clear lifecycle markers so install/migrate re-run against the isolated containers
-    let markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf());
-    markers.clear_all_installed()?;
-    markers.clear_all_migrated()?;
+    // Markers are scoped by isolation_id, so the new session's namespace is
+    // empty by construction — no clearing needed. The shared-scope markers
+    // stay intact and will be reused when the user runs `fed isolate disable`.
 
     // Display allocated ports
     let ports = tracker.get_global_port_allocations().await;
@@ -95,14 +94,15 @@ async fn disable(
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
     // Check if isolation is currently enabled
-    {
+    let previous_isolation_id = {
         let tracker = StateTracker::new(work_dir.to_path_buf()).await?;
-        let (enabled, _) = tracker.get_isolation_mode().await;
+        let (enabled, id) = tracker.get_isolation_mode().await;
         if !enabled {
             out.status("Isolation mode is already disabled.\n");
             return Ok(());
         }
-    }
+        id
+    };
 
     super::ports::ensure_services_stopped(work_dir, force, out).await?;
 
@@ -114,10 +114,20 @@ async fn disable(
     // Clear isolation mode
     tracker.clear_isolation_mode().await?;
 
-    // Clear lifecycle markers so install/migrate re-run against the now-active containers
-    let markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf());
-    markers.clear_all_installed()?;
-    markers.clear_all_migrated()?;
+    // Clear shared-scope lifecycle markers so install/migrate re-run against
+    // the now-active shared containers. (The shared containers may have been
+    // torn down or diverged while the user was in isolation mode.)
+    let shared_markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf(), None);
+    shared_markers.clear_all_installed()?;
+    shared_markers.clear_all_migrated()?;
+
+    // Also clean up the abandoned isolation scope's marker directory so it
+    // doesn't linger in `~/.fed/isolated/`.
+    if let Some(id) = previous_isolation_id {
+        let iso_markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf(), Some(id));
+        let _ = iso_markers.clear_all_installed();
+        let _ = iso_markers.clear_all_migrated();
+    }
 
     out.success(
         "Isolation mode disabled. Next `fed start` will use default ports and shared containers.\n",
@@ -169,7 +179,7 @@ async fn rotate(
 ) -> anyhow::Result<()> {
     // Check isolation is currently enabled
     let tracker = StateTracker::new(work_dir.to_path_buf()).await?;
-    let (enabled, _) = tracker.get_isolation_mode().await;
+    let (enabled, previous_id) = tracker.get_isolation_mode().await;
     if !enabled {
         anyhow::bail!("Isolation mode is not enabled. Run `fed isolate enable` first.");
     }
@@ -200,10 +210,15 @@ async fn rotate(
         .set_isolation_mode(true, Some(isolation_id.clone()))
         .await?;
 
-    // Clear lifecycle markers so install/migrate re-run against the rotated containers
-    let markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf());
-    markers.clear_all_installed()?;
-    markers.clear_all_migrated()?;
+    // Clean up the previous isolation session's marker directory. The new
+    // session's namespace is empty by construction (scoped by isolation_id),
+    // so `install/migrate` will re-run against the rotated containers without
+    // us having to clear anything — we just tidy up the abandoned dir.
+    if let Some(id) = previous_id {
+        let old_markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf(), Some(id));
+        let _ = old_markers.clear_all_installed();
+        let _ = old_markers.clear_all_migrated();
+    }
 
     // Display new ports
     let ports = tracker.get_global_port_allocations().await;
