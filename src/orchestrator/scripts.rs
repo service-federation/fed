@@ -263,10 +263,16 @@ impl<'a> ScriptRunner<'a> {
         // Give the child its own container namespace so Docker containers don't
         // collide with (or kill) the parent's running containers.
         let isolation_id = format!("iso-{:08x}", rand::random::<u32>());
-        child_orchestrator.set_isolation_id(isolation_id);
+        child_orchestrator.set_isolation_id(isolation_id.clone());
 
         // Enable randomize mode for port isolation — NoopPortStore forces fresh allocation
         child_orchestrator.set_randomize_ports(true);
+
+        // Install/migrate markers are scoped by `(work_dir, isolation_id)`, so the
+        // child's isolation_id gives it a fresh, empty marker namespace automatically.
+        // No clearing is needed: the parent's shared-scope markers stay intact, and
+        // `run_migrate_if_needed` against the child sees an empty scope and correctly
+        // runs migrations against the fresh isolated containers.
 
         // Initialize child orchestrator (allocates fresh ports due to isolated mode)
         child_orchestrator.initialize().await?;
@@ -340,6 +346,17 @@ impl<'a> ScriptRunner<'a> {
         // Cleanup child orchestrator (stops all services started in isolation)
         tracing::debug!("Cleaning up isolated context for script '{}'", script_name);
         child_orchestrator.cleanup().await;
+
+        // Remove the ephemeral marker namespace we created under this
+        // isolation_id. Each isolated run gets a fresh random id, so without
+        // this cleanup `~/.fed/isolated/` would accumulate one orphan
+        // directory per run.
+        let child_markers = crate::markers::LifecycleMarkers::new(
+            self.orchestrator.work_dir.to_path_buf(),
+            Some(isolation_id),
+        );
+        let _ = child_markers.clear_all_installed();
+        let _ = child_markers.clear_all_migrated();
 
         // Log which ports were used (helpful for debugging)
         if !child_params.is_empty() {

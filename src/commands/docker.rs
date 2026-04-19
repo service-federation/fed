@@ -107,7 +107,9 @@ pub async fn run_docker_build(
         ));
     }
 
-    let lifecycle = ServiceLifecycleCommands::new(config, work_dir);
+    // Docker build does not read or mutate lifecycle markers, so the
+    // isolation scope passed here is irrelevant; use the shared scope.
+    let lifecycle = ServiceLifecycleCommands::new(config, work_dir, None);
     let mut results: Vec<DockerBuildResult> = Vec::new();
 
     for service in &services_to_build {
