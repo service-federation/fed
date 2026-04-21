@@ -1,10 +1,11 @@
 //! Tests for the --dry-run flag on the start command.
 //!
 //! These tests verify that:
-//! 1. Dry run shows expected output (services, start order, parameters, etc.)
+//! 1. Dry run shows expected output (services, start order, etc.)
 //! 2. Dry run does NOT actually start any services
 //! 3. Dry run detects port conflicts
 //! 4. Dry run masks sensitive environment variables
+//! 5. Dry run does NOT print resolved parameters (they can contain secrets)
 
 use std::fs;
 use std::net::TcpListener;
@@ -86,14 +87,10 @@ entrypoint: frontend
     // Check start order - dependencies should come before dependents
     assert!(stdout.contains("Start order:"), "Should show start order");
 
-    // Check resolved parameters
+    // Resolved parameter values must not leak to stdout — they can contain secrets.
     assert!(
-        stdout.contains("Resolved parameters:"),
-        "Should show resolved parameters"
-    );
-    assert!(
-        stdout.contains("API_PORT"),
-        "Should show API_PORT parameter"
+        !stdout.contains("Resolved parameters:"),
+        "Must not print resolved parameters (can contain secrets)"
     );
 
     // Check validation summary

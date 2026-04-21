@@ -155,31 +155,13 @@ fn test_circular_template_references() {
 
     // A depends on B, B depends on A
     let param_a = Parameter {
-        development: None,
-        develop: None,
-        staging: None,
-        production: None,
-        param_type: None,
         default: Some(serde_yaml::Value::String("{{B}}".to_string())),
-        either: vec![],
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     let param_b = Parameter {
-        development: None,
-        develop: None,
-        staging: None,
-        production: None,
-        param_type: None,
         default: Some(serde_yaml::Value::String("{{A}}".to_string())),
-        either: vec![],
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     config.parameters.insert("A".to_string(), param_a);
@@ -862,17 +844,9 @@ fn test_parameter_with_value_override() {
 
     // Parameter with both default and value - value should win
     let param = Parameter {
-        development: None,
-        develop: None,
-        staging: None,
-        production: None,
-        param_type: None,
         default: Some(serde_yaml::Value::String("default".to_string())),
-        either: vec![],
-        source: None,
-        description: None,
-        optional: None,
         value: Some("override".to_string()),
+        ..Default::default()
     };
 
     config.parameters.insert("TEST".to_string(), param);

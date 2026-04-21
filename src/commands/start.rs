@@ -243,15 +243,6 @@ pub async fn run_start(
     // Mark startup complete - enables monitoring to clean up dead services
     orchestrator.mark_startup_complete();
 
-    // Print resolved parameters
-    let params = orchestrator.get_resolved_parameters();
-    if !params.is_empty() {
-        out.status("\nResolved parameters:");
-        for (key, value) in params {
-            out.status(&format!("  {}: {}", key, value));
-        }
-    }
-
     // Brief delay to let processes bind ports and potentially fail with EADDRINUSE.
     // Then use active status check to detect processes that crashed after spawn.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -663,11 +654,10 @@ async fn run_watch_mode(
 /// This displays:
 /// 1. Services to start (with their dependencies)
 /// 2. Start order (topological sort)
-/// 3. Resolved parameters
-/// 4. Port conflict detection
-/// 5. Environment variables per service (with secrets masked)
-/// 6. Resource limits
-/// 7. Validation summary
+/// 3. Port conflict detection
+/// 4. Environment variables per service (with secrets masked)
+/// 5. Resource limits
+/// 6. Validation summary
 async fn run_dry_run(
     orchestrator: &Orchestrator,
     config: &Config,
@@ -717,19 +707,7 @@ async fn run_dry_run(
         out.status(&format!("  {}. {} ({:?})", i + 1, service, service_type));
     }
 
-    // 3. Show resolved parameters
-    let params = orchestrator.get_resolved_parameters();
-    if !params.is_empty() {
-        out.status("\nResolved parameters:");
-        // Sort parameters for consistent output
-        let mut sorted_params: Vec<_> = params.iter().collect();
-        sorted_params.sort_by_key(|(k, _)| *k);
-        for (key, value) in sorted_params {
-            out.status(&format!("  {}: {}", key, value));
-        }
-    }
-
-    // 4. Check for port conflicts using resolution tracking
+    // 3. Check for port conflicts using resolution tracking
     // Release port listeners first so our own listeners don't appear as conflicts.
     // Safe in dry-run since we never start services.
     orchestrator.release_port_listeners();
@@ -799,7 +777,7 @@ async fn run_dry_run(
         }
     }
 
-    // 5. Show environment variables per service (mask sensitive values)
+    // 4. Show environment variables per service (mask sensitive values)
     out.status("\nService configuration:");
     for service_name in &all_services {
         if let Some(service_config) = config.services.get(service_name) {
@@ -864,7 +842,7 @@ async fn run_dry_run(
         }
     }
 
-    // 6. Show resource limits
+    // 5. Show resource limits
     out.status("\nResource limits:");
     let mut any_limits = false;
     for service_name in &all_services {
@@ -891,7 +869,7 @@ async fn run_dry_run(
         out.status("  No resource limits configured");
     }
 
-    // 7. Validation summary
+    // 6. Validation summary
     out.status("\n=== Validation Summary ===");
     out.status("  Configuration: OK (parsed successfully)");
     out.status(&format!("  Services to start: {}", all_services.len()));

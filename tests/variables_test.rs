@@ -9,17 +9,10 @@ fn test_environment_specific_values() {
 
     // Create a variable with environment-specific values
     let param = Parameter {
-        param_type: None,
         default: Some(Value::String("dev-value".to_string())),
-        either: vec![],
-        development: None,
-        develop: None,
         staging: Some(Value::String("staging-value".to_string())),
         production: Some(Value::String("prod-value".to_string())),
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     config.variables.insert("TEST_VAR".to_string(), param);
@@ -37,17 +30,9 @@ fn test_environment_fallback_to_default() {
 
     // Variable with default but no staging-specific value
     let param = Parameter {
-        param_type: None,
         default: Some(Value::String("default-value".to_string())),
-        either: vec![],
-        development: None,
-        develop: None,
-        staging: None,
         production: Some(Value::String("prod-value".to_string())),
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     config.variables.insert("TEST_VAR".to_string(), param);
@@ -65,17 +50,9 @@ fn test_development_alias() {
 
     // Variable with "develop" (alias) instead of "development"
     let param = Parameter {
-        param_type: None,
         default: Some(Value::String("default-value".to_string())),
-        either: vec![],
-        development: None,
         develop: Some(Value::String("develop-value".to_string())),
-        staging: None,
-        production: None,
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     config.variables.insert("TEST_VAR".to_string(), param);
@@ -93,17 +70,10 @@ fn test_development_precedence() {
 
     // Variable with both "development" and "develop" - "development" takes precedence
     let param = Parameter {
-        param_type: None,
         default: Some(Value::String("default-value".to_string())),
-        either: vec![],
         development: Some(Value::String("development-value".to_string())),
         develop: Some(Value::String("develop-value".to_string())),
-        staging: None,
-        production: None,
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     config.variables.insert("TEST_VAR".to_string(), param);
@@ -121,31 +91,14 @@ fn test_variables_take_precedence_over_parameters() {
 
     // Add both parameters and variables
     let param_param = Parameter {
-        param_type: None,
         default: Some(Value::String("param-value".to_string())),
-        either: vec![],
-        development: None,
-        develop: None,
-        staging: None,
-        production: None,
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     let var_param = Parameter {
-        param_type: None,
         default: Some(Value::String("var-value".to_string())),
-        either: vec![],
-        development: None,
-        develop: None,
-        staging: None,
         production: Some(Value::String("var-prod-value".to_string())),
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     config
@@ -167,17 +120,8 @@ fn test_backward_compatibility_with_parameters() {
 
     // Only parameters field is used (backward compatibility)
     let param = Parameter {
-        param_type: None,
         default: Some(Value::String("param-value".to_string())),
-        either: vec![],
-        development: None,
-        develop: None,
-        staging: None,
-        production: None,
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     config.parameters.insert("TEST_VAR".to_string(), param);
@@ -202,15 +146,8 @@ fn test_port_type_with_environment() {
     let param = Parameter {
         param_type: Some("port".to_string()),
         default: Some(Value::Number(8000.into())),
-        either: vec![],
-        development: None,
-        develop: None,
-        staging: None,
         production: Some(Value::Number(available_port.into())),
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     config.variables.insert("API_PORT".to_string(), param);
@@ -231,32 +168,16 @@ fn test_template_resolution_with_environment() {
 
     // Base variable
     let base_param = Parameter {
-        param_type: None,
         default: Some(Value::String("dev-db".to_string())),
-        either: vec![],
-        development: None,
-        develop: None,
         staging: Some(Value::String("staging-db".to_string())),
         production: Some(Value::String("prod-db".to_string())),
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     // Variable that references base
     let url_param = Parameter {
-        param_type: None,
         default: Some(Value::String("postgres://{{DB_NAME}}".to_string())),
-        either: vec![],
-        development: None,
-        develop: None,
-        staging: None,
-        production: None,
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     config.variables.insert("DB_NAME".to_string(), base_param);
@@ -276,47 +197,24 @@ fn test_complex_multi_environment_config() {
 
     // DEBUG_MODE: true in dev, false in production
     let debug_param = Parameter {
-        param_type: None,
         default: Some(Value::String("true".to_string())),
-        either: vec![],
-        development: None,
-        develop: None,
-        staging: None,
         production: Some(Value::String("false".to_string())),
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     // REPLICA_COUNT: 1 in dev, 2 in staging, 5 in production
     let replica_param = Parameter {
-        param_type: None,
         default: Some(Value::Number(1.into())),
-        either: vec![],
-        development: None,
-        develop: None,
         staging: Some(Value::Number(2.into())),
         production: Some(Value::Number(5.into())),
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     // JWT_SECRET: static in dev, different secret in production
     let secret_param = Parameter {
-        param_type: None,
         default: Some(Value::String("dev-secret".to_string())),
-        either: vec![],
-        development: None,
-        develop: None,
-        staging: None,
         production: Some(Value::String("prod-secret-from-vault".to_string())),
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
 
     config
@@ -346,33 +244,15 @@ fn test_get_effective_parameters() {
 
     // Add parameters
     let param1 = Parameter {
-        param_type: None,
         default: Some(Value::String("param-value".to_string())),
-        either: vec![],
-        development: None,
-        develop: None,
-        staging: None,
-        production: None,
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
     config.parameters.insert("PARAM1".to_string(), param1);
 
     // Add variables
     let var1 = Parameter {
-        param_type: None,
         default: Some(Value::String("var-value".to_string())),
-        either: vec![],
-        development: None,
-        develop: None,
-        staging: None,
-        production: None,
-        source: None,
-        description: None,
-        optional: None,
-        value: None,
+        ..Default::default()
     };
     config.variables.insert("VAR1".to_string(), var1);
 
