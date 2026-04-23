@@ -514,15 +514,11 @@ impl App {
 
         match key.code {
             // Navigation
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.graph_selected > 0 {
-                    self.graph_selected -= 1;
-                }
+            KeyCode::Up | KeyCode::Char('k') if self.graph_selected > 0 => {
+                self.graph_selected -= 1;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.graph_selected + 1 < node_count {
-                    self.graph_selected += 1;
-                }
+            KeyCode::Down | KeyCode::Char('j') if self.graph_selected + 1 < node_count => {
+                self.graph_selected += 1;
             }
             KeyCode::Home | KeyCode::Char('g') => {
                 self.graph_selected = 0;
@@ -603,15 +599,13 @@ impl App {
 
         match key.code {
             // Navigation
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.params_selected > 0 {
-                    self.params_selected -= 1;
-                }
+            KeyCode::Up | KeyCode::Char('k') if self.params_selected > 0 => {
+                self.params_selected -= 1;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if param_count > 0 && self.params_selected + 1 < param_count {
-                    self.params_selected += 1;
-                }
+            KeyCode::Down | KeyCode::Char('j')
+                if param_count > 0 && self.params_selected + 1 < param_count =>
+            {
+                self.params_selected += 1;
             }
             KeyCode::Home | KeyCode::Char('g') => {
                 self.params_selected = 0;
@@ -622,10 +616,8 @@ impl App {
             KeyCode::PageUp => {
                 self.params_selected = self.params_selected.saturating_sub(10);
             }
-            KeyCode::PageDown => {
-                if param_count > 0 {
-                    self.params_selected = (self.params_selected + 10).min(param_count - 1);
-                }
+            KeyCode::PageDown if param_count > 0 => {
+                self.params_selected = (self.params_selected + 10).min(param_count - 1);
             }
 
             // Filter
