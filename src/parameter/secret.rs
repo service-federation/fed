@@ -150,6 +150,7 @@ pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Res
 
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)

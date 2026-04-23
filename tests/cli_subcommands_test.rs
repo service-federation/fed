@@ -1192,16 +1192,31 @@ entrypoint: api
 }
 
 fn parse_resolved_param(stdout: &str, param_name: &str) -> u16 {
+    // Parses the resolved port for a parameter from dry-run's "Port availability:" section.
+    // Handles all four shapes emitted by src/commands/start.rs::run_dry_run:
+    //   [OK] Port N (NAME) is available
+    //   [OK] Port N (NAME) randomly allocated
+    //   [CONFLICT] Port N (NAME): ...
+    //   [CONFLICT] Default port D (NAME) occupied by ... - resolved to N
+    // In the last case the resolved value is after "resolved to"; in the others it's the
+    // numeric token immediately before "(NAME)".
+    let marker = format!("({})", param_name);
     for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with(&format!("{}:", param_name)) {
-            let value = trimmed
-                .strip_prefix(&format!("{}:", param_name))
-                .unwrap()
-                .trim();
-            return value.parse::<u16>().unwrap_or_else(|_| {
-                panic!("Failed to parse '{}' as u16 for {}", value, param_name)
-            });
+        let Some(marker_idx) = line.find(&marker) else {
+            continue;
+        };
+        if let Some(idx) = line.find("resolved to ") {
+            let rest = &line[idx + "resolved to ".len()..];
+            if let Some(word) = rest.split_whitespace().next() {
+                if let Ok(port) = word.parse::<u16>() {
+                    return port;
+                }
+            }
+        }
+        for word in line[..marker_idx].split_whitespace().rev() {
+            if let Ok(port) = word.parse::<u16>() {
+                return port;
+            }
         }
     }
     panic!("Parameter {} not found in stdout:\n{}", param_name, stdout);
