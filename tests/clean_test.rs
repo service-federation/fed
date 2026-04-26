@@ -328,6 +328,75 @@ services:
     );
 }
 
+/// Regression: `fed clean` (no args) must clear migrate markers for ALL
+/// services in the workspace, not just services that appear in
+/// `services_to_clean` (those with `clean:` or `volumes:`).
+///
+/// The bug this catches: a Rust service whose `migrate:` step creates a
+/// database in a sibling postgres has its marker stranded when postgres's
+/// volumes are wiped — Fed thinks "already migrated" on next start but
+/// the database is gone, so the service crashes with "database does not
+/// exist". Full `fed clean` is the "wipe everything" operation; migrate
+/// markers must follow.
+#[test]
+fn test_clean_clears_migrate_markers_for_unlisted_services() {
+    let config_content = r#"
+services:
+  cleanable:
+    process: "echo running"
+    clean: "true"
+  migrate-only:
+    process: "echo running"
+    migrate: "true"
+"#;
+
+    let (temp_dir, config_path) = create_clean_test_config(config_content);
+    let workdir = temp_dir.path().to_path_buf();
+
+    // Simulate prior migration of both services. Only `cleanable` would
+    // get its marker cleared by per-service clean (it's in the loop).
+    // `migrate-only` has neither `clean:` nor `volumes:`, so it would
+    // never be touched without the full-clean fix.
+    fed::markers::mark_migrated_global("cleanable", &workdir).expect("seed cleanable marker");
+    fed::markers::mark_migrated_global("migrate-only", &workdir).expect("seed migrate-only marker");
+
+    assert!(
+        fed::markers::is_migrated_global("cleanable", &workdir).unwrap(),
+        "precondition: cleanable should be marked migrated"
+    );
+    assert!(
+        fed::markers::is_migrated_global("migrate-only", &workdir).unwrap(),
+        "precondition: migrate-only should be marked migrated"
+    );
+
+    let clean_out = Command::new(fed_binary())
+        .args([
+            "-c",
+            config_path.to_str().unwrap(),
+            "-w",
+            workdir.to_str().unwrap(),
+            "clean",
+        ])
+        .output()
+        .expect("Failed to run clean");
+
+    assert!(
+        clean_out.status.success(),
+        "clean failed: {}",
+        String::from_utf8_lossy(&clean_out.stderr)
+    );
+
+    assert!(
+        !fed::markers::is_migrated_global("cleanable", &workdir).unwrap(),
+        "cleanable's migrate marker should be cleared (covered by per-service clean)"
+    );
+    assert!(
+        !fed::markers::is_migrated_global("migrate-only", &workdir).unwrap(),
+        "migrate-only's marker should be cleared by full `fed clean` even \
+         though it has no clean/volumes — this is the regression"
+    );
+}
+
 #[test]
 fn test_clean_idempotent() {
     let config_content = r#"
