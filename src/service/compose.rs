@@ -222,10 +222,12 @@ impl ServiceManager for DockerComposeService {
 
         // Add environment variables via command environment (not -e flag)
         let env_vars = self.get_environment_vars();
+        let workspace = self.base.read().work_dir.clone();
         command
             .envs(&env_vars)
-            // Set marker to detect circular dependency if this process invokes `fed`
-            .env("FED_SPAWNED_BY_SERVICE", &self.name);
+            // Markers for the recursion check in main.rs.
+            .env("FED_SPAWNED_BY_SERVICE", &self.name)
+            .env("FED_SPAWNED_FROM_WORKSPACE", &workspace);
 
         // Add service name
         command.arg(&self.compose_service);

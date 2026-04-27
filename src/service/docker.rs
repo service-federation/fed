@@ -420,9 +420,14 @@ impl ServiceManager for DockerService {
                 env_args.push("-e".to_string());
                 env_args.push(format!("{}={}", key, value));
             }
-            // Set marker to detect circular dependency if container invokes `fed`
+            // Markers for the recursion check in main.rs. Containers
+            // shelling out to fed against the host workspace would
+            // recurse — the workspace path lets fed distinguish that
+            // from a legitimate cross-workspace invocation.
             env_args.push("-e".to_string());
             env_args.push(format!("FED_SPAWNED_BY_SERVICE={}", base.name));
+            env_args.push("-e".to_string());
+            env_args.push(format!("FED_SPAWNED_FROM_WORKSPACE={}", base.work_dir));
             (base.name.clone(), env_args)
         };
 

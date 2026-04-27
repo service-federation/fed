@@ -126,8 +126,9 @@ impl GradleService {
         }
         cmd.current_dir(&work_dir)
             .envs(&base.environment)
-            // Set marker to detect circular dependency if this process invokes `fed`
+            // Markers for the recursion check in main.rs.
             .env("FED_SPAWNED_BY_SERVICE", &base.name)
+            .env("FED_SPAWNED_FROM_WORKSPACE", &work_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)

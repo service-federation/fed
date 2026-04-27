@@ -53,6 +53,116 @@ fn test_circular_dependency_detection() {
     );
 }
 
+/// Path to the built fed binary. Cargo sets CARGO_BIN_EXE_<name> for
+/// integration tests of binary crates; using it sidesteps the
+/// `cargo run` requirement of being inside a Cargo workspace, which
+/// matters for tests that change `current_dir` to a tempdir.
+fn fed_binary() -> String {
+    env!("CARGO_BIN_EXE_fed").to_string()
+}
+
+/// 3.6.3: When the spawning fed sets FED_SPAWNED_FROM_WORKSPACE and
+/// the child fed runs against a *different* workspace, the recursion
+/// check should NOT fire — that's a legitimate cross-config invocation.
+#[test]
+fn test_cross_workspace_invocation_allowed() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    // Two distinct workspaces.
+    let parent_ws = tempdir().expect("create parent workspace");
+    let child_ws = tempdir().expect("create child workspace");
+
+    // Minimal config in the child workspace so fed has something to validate.
+    fs::write(
+        child_ws.path().join("service-federation.yaml"),
+        "services:\n  noop:\n    process: 'true'\n",
+    )
+    .expect("write child config");
+
+    let output = Command::new(fed_binary())
+        .args(["validate"])
+        .env("FED_SPAWNED_BY_SERVICE", "test-service")
+        .env("FED_SPAWNED_FROM_WORKSPACE", parent_ws.path())
+        .current_dir(child_ws.path())
+        .output()
+        .expect("Failed to run fed");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Circular dependency detected"),
+        "cross-workspace invocation must not trip the recursion check, got stderr:\n{}",
+        stderr
+    );
+    assert!(
+        output.status.success(),
+        "validate against fresh workspace failed: {}",
+        stderr
+    );
+}
+
+/// 3.6.3: Same-workspace recursion must still be blocked when both
+/// markers are set and resolve to the same canonical path.
+#[test]
+fn test_same_workspace_invocation_blocked() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let ws = tempdir().expect("create workspace");
+    fs::write(
+        ws.path().join("service-federation.yaml"),
+        "services:\n  noop:\n    process: 'true'\n",
+    )
+    .expect("write config");
+
+    let output = Command::new(fed_binary())
+        .args(["validate"])
+        .env("FED_SPAWNED_BY_SERVICE", "test-service")
+        .env("FED_SPAWNED_FROM_WORKSPACE", ws.path())
+        .current_dir(ws.path())
+        .output()
+        .expect("Failed to run fed");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Circular dependency detected"),
+        "same-workspace recursion must trip the check, got:\n{}",
+        stderr
+    );
+    assert!(!output.status.success());
+}
+
+/// 3.6.3: FED_ALLOW_RECURSION=1 escapes the check entirely, even
+/// when same-workspace markers would otherwise block.
+#[test]
+fn test_allow_recursion_env_var_escapes_check() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let ws = tempdir().expect("create workspace");
+    fs::write(
+        ws.path().join("service-federation.yaml"),
+        "services:\n  noop:\n    process: 'true'\n",
+    )
+    .expect("write config");
+
+    let output = Command::new(fed_binary())
+        .args(["validate"])
+        .env("FED_SPAWNED_BY_SERVICE", "test-service")
+        .env("FED_SPAWNED_FROM_WORKSPACE", ws.path())
+        .env("FED_ALLOW_RECURSION", "1")
+        .current_dir(ws.path())
+        .output()
+        .expect("Failed to run fed");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Circular dependency detected"),
+        "FED_ALLOW_RECURSION=1 must skip the check, got:\n{}",
+        stderr
+    );
+}
+
 /// Test that `fed` runs normally when FED_SPAWNED_BY_SERVICE is not set
 #[test]
 fn test_normal_startup_without_circular_dependency_marker() {

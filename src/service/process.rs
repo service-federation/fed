@@ -211,8 +211,12 @@ impl ProcessService {
             .arg(&final_cmd)
             .current_dir(&work_dir)
             .envs(&environment)
-            // Set marker to detect circular dependency if this process invokes `fed`
-            .env("FED_SPAWNED_BY_SERVICE", &service_name);
+            // Markers for the recursion check in main.rs. Service name
+            // is identity for the error message; workspace path lets
+            // the child fed distinguish same-workspace recursion (real
+            // problem) from cross-workspace invocation (legitimate).
+            .env("FED_SPAWNED_BY_SERVICE", &service_name)
+            .env("FED_SPAWNED_FROM_WORKSPACE", &work_dir);
 
         // Configure stdio based on output mode
         match self.output_mode {

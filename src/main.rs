@@ -3,10 +3,47 @@ mod commands;
 mod output;
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser};
 use cli::{Cli, Commands};
 use fed::{Error as FedError, Orchestrator, OutputMode, Parser as ConfigParser};
+
+/// Best-effort discovery of the workspace directory for the current
+/// invocation. Used by the recursion check to compare the child's
+/// workspace with the parent's `FED_SPAWNED_FROM_WORKSPACE`.
+///
+/// Peeks at argv for `-w <path>` / `--workdir <path>` /
+/// `--workdir=<path>` *before* clap runs, then falls back to
+/// `current_dir()`. Returns None on any failure; the caller treats
+/// None as "can't tell, be conservative."
+fn detect_current_workspace() -> Option<PathBuf> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "-w" || arg == "--workdir" {
+            if let Some(path) = args.next() {
+                return Some(PathBuf::from(path));
+            }
+        } else if let Some(rest) = arg.strip_prefix("--workdir=") {
+            return Some(PathBuf::from(rest));
+        } else if let Some(rest) = arg.strip_prefix("-w=") {
+            return Some(PathBuf::from(rest));
+        }
+    }
+
+    std::env::current_dir().ok()
+}
+
+/// Compare two paths for canonical equality. Falls back to lexical
+/// equality if either side fails to canonicalize (file may not exist
+/// yet, etc.).
+fn canonicalize_eq(a: &str, b: &PathBuf) -> bool {
+    let a = std::path::Path::new(a);
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ac), Ok(bc)) => ac == bc,
+        _ => a == b.as_path(),
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -31,24 +68,60 @@ async fn main() {
 }
 
 async fn run() -> anyhow::Result<()> {
-    // CRITICAL: Detect circular dependency before doing anything else
-    if let Ok(parent_service) = std::env::var("FED_SPAWNED_BY_SERVICE") {
-        eprintln!("Error: Circular dependency detected!");
-        eprintln!();
-        eprintln!(
-            "  Service '{}' invoked 'fed', which would create an infinite loop.",
-            parent_service
-        );
-        eprintln!();
-        eprintln!("  Detected call chain:");
-        eprintln!("    fed start -> {} (process) -> fed", parent_service);
-        eprintln!();
-        eprintln!("  Fix: Change the process command in service-federation.yaml to run");
-        eprintln!("  the actual application directly instead of invoking 'fed'.");
-        eprintln!();
-        eprintln!("  Example: Instead of 'npm run dev' where dev runs 'fed start',");
-        eprintln!("  use 'npx next dev' or the direct command.");
-        std::process::exit(1);
+    // CRITICAL: Detect *same-workspace* circular dependency before
+    // doing anything else.
+    //
+    // The original check fired on every nested fed invocation regardless
+    // of workspace. That blocks legitimate cross-config patterns — e.g.
+    // an orchestrator service running under one fed config that shells
+    // out to fed for managed environments under a *different* config.
+    // The infinite loop only happens when the same workspace recurses;
+    // cross-config calls terminate naturally.
+    //
+    // Heuristic: the spawning fed sets FED_SPAWNED_FROM_WORKSPACE to
+    // its own canonical work_dir. The child compares against its own
+    // canonical work_dir (current_dir() or `--workdir`). Same dir →
+    // recursion; different dir → independent invocation, allow.
+    //
+    // FED_ALLOW_RECURSION=1 escapes the check entirely for unusual cases.
+    if std::env::var("FED_ALLOW_RECURSION").ok().as_deref() != Some("1") {
+        if let Ok(parent_service) = std::env::var("FED_SPAWNED_BY_SERVICE") {
+            let parent_workspace = std::env::var("FED_SPAWNED_FROM_WORKSPACE").ok();
+            let child_workspace = detect_current_workspace();
+
+            let same_workspace = match (&parent_workspace, &child_workspace) {
+                (Some(p), Some(c)) => canonicalize_eq(p, c),
+                // Older fed binaries (pre-3.6.3) didn't set
+                // FED_SPAWNED_FROM_WORKSPACE. Be conservative: treat as
+                // same-workspace and block, matching the old behavior.
+                _ => true,
+            };
+
+            if same_workspace {
+                eprintln!("Error: Circular dependency detected!");
+                eprintln!();
+                eprintln!(
+                    "  Service '{}' invoked 'fed' against the same workspace,",
+                    parent_service
+                );
+                eprintln!("  which would create an infinite loop.");
+                eprintln!();
+                eprintln!("  Detected call chain:");
+                eprintln!("    fed start -> {} (process) -> fed", parent_service);
+                eprintln!();
+                eprintln!("  Fix: Change the process command in service-federation.yaml to run");
+                eprintln!("  the actual application directly instead of invoking 'fed'.");
+                eprintln!();
+                eprintln!("  Example: Instead of 'npm run dev' where dev runs 'fed start',");
+                eprintln!("  use 'npx next dev' or the direct command.");
+                eprintln!();
+                eprintln!("  Cross-config use case (orchestrator service shelling out to fed");
+                eprintln!("  for a different workspace): set FED_ALLOW_RECURSION=1 in the");
+                eprintln!("  child's environment, or invoke fed against a different");
+                eprintln!("  --workdir / cwd.");
+                std::process::exit(1);
+            }
+        }
     }
 
     // Check if help is requested - we'll add scripts after standard help
