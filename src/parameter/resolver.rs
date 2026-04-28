@@ -491,14 +491,26 @@ impl Resolver {
             } else {
                 config_dir.join(full_path)
             };
-            let env_vars = crate::config::env_loader::load_env_file(&full_path).map_err(|e| {
-                Error::TemplateResolution(format!(
-                    "Failed to load environment file '{}' (resolved to '{}'): {}",
-                    env_file_path,
-                    full_path.display(),
-                    e
-                ))
-            })?;
+            let env_vars = match crate::config::env_loader::load_env_file_optional(&full_path)
+                .map_err(|e| {
+                    Error::TemplateResolution(format!(
+                        "Failed to load environment file '{}' (resolved to '{}'): {}",
+                        env_file_path,
+                        full_path.display(),
+                        e
+                    ))
+                })? {
+                Some(vars) => vars,
+                None => {
+                    tracing::warn!(
+                        "env_file '{}' (resolved to '{}') does not exist — continuing without it. \
+                         Parameters that depend on values from this file may be unset.",
+                        env_file_path,
+                        full_path.display()
+                    );
+                    continue;
+                }
+            };
 
             // Track value and source file (later files override earlier)
             for (key, value) in env_vars {
@@ -2592,5 +2604,56 @@ mod tests {
         result.unwrap();
         let resolved = resolver.get_resolved_parameters();
         assert_eq!(resolved.get("TILDE_VAR").unwrap(), "it_works");
+    }
+
+    #[test]
+    fn missing_env_file_warns_and_continues() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let work_dir = TempDir::new().unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(work_dir.path());
+
+        // Reference an env_file that doesn't exist on disk.
+        let mut config = Config::default();
+        config.env_file = vec!["does-not-exist.env".to_string()];
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                value: Some("from-default".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // Resolution should succeed; the parameter keeps its default value.
+        resolver.resolve_parameters(&mut config).unwrap();
+        let resolved = resolver.get_resolved_parameters();
+        assert_eq!(resolved.get("API_KEY").unwrap(), "from-default");
+    }
+
+    #[test]
+    fn missing_env_file_still_errors_on_parse_failure() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let work_dir = TempDir::new().unwrap();
+        let env_path = work_dir.path().join("bad.env");
+        // Invalid env name — file exists but parse/validate fails.
+        std::fs::write(&env_path, "INVALID-NAME=value\n").unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(work_dir.path());
+
+        let mut config = Config::default();
+        config.env_file = vec!["bad.env".to_string()];
+        config
+            .parameters
+            .insert("WHATEVER".to_string(), Parameter::default());
+
+        let err = resolver
+            .resolve_parameters(&mut config)
+            .expect_err("malformed env file should still error");
+        assert!(err.to_string().contains("bad.env"));
     }
 }

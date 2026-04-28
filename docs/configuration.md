@@ -375,6 +375,12 @@ env_file:
 
 All `.env` variables must be declared as parameters.
 
+A missing `env_file` is **not** a fatal error: fed logs a warning and continues
+without it. Parameters that depend on values from the missing file fall back to
+their defaults (or fail later with a clearer "missing parameter value" error if
+they have no default). Parse errors and other I/O failures (e.g. permission
+denied) still abort startup.
+
 See [`examples/env-file/`](../examples/env-file).
 
 ## Startup Messages

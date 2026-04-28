@@ -32,7 +32,27 @@ pub fn load_env_file<P: AsRef<Path>>(path: P) -> Result<HashMap<String, String>>
     }
 
     let mut env_vars = HashMap::new();
+    load_env_file_inner(path, &mut env_vars)?;
+    Ok(env_vars)
+}
 
+/// Load environment variables from a single .env file, treating a missing file
+/// as `Ok(None)` rather than an error.
+///
+/// Parse errors, permission errors, and other I/O failures still surface as
+/// `Err`. Use this when callers want to warn-and-continue on missing files
+/// without swallowing real failures.
+pub fn load_env_file_optional<P: AsRef<Path>>(path: P) -> Result<Option<HashMap<String, String>>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut env_vars = HashMap::new();
+    load_env_file_inner(path, &mut env_vars)?;
+    Ok(Some(env_vars))
+}
+
+fn load_env_file_inner(path: &Path, env_vars: &mut HashMap<String, String>) -> Result<()> {
     match dotenvy::from_path_iter(path) {
         Ok(iter) => {
             for item in iter {
@@ -59,10 +79,9 @@ pub fn load_env_file<P: AsRef<Path>>(path: P) -> Result<HashMap<String, String>>
         }
     }
 
-    // Validate environment variable names and check for suspicious patterns
-    validate_and_sanitize_env(&env_vars)?;
+    validate_and_sanitize_env(env_vars)?;
 
-    Ok(env_vars)
+    Ok(())
 }
 
 /// Load and merge multiple .env files.
@@ -286,6 +305,33 @@ mod tests {
         let result = load_env_file("/nonexistent/.env");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_load_env_file_optional_missing_returns_none() {
+        let result = load_env_file_optional("/nonexistent/.env").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_load_env_file_optional_present_returns_values() {
+        let temp_dir = TempDir::new().unwrap();
+        let env_path = temp_dir.path().join(".env");
+        fs::write(&env_path, "KEY=value\n").unwrap();
+
+        let result = load_env_file_optional(&env_path).unwrap().unwrap();
+        assert_eq!(result.get("KEY"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn test_load_env_file_optional_parse_error_still_errors() {
+        // Invalid env name should propagate as Err, not collapse to None.
+        let temp_dir = TempDir::new().unwrap();
+        let env_path = temp_dir.path().join(".env");
+        fs::write(&env_path, "INVALID-NAME=value\n").unwrap();
+
+        let result = load_env_file_optional(&env_path);
+        assert!(result.is_err());
     }
 
     #[test]

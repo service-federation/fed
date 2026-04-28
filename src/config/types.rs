@@ -55,6 +55,10 @@ pub struct Config {
     /// NOTE: Paths do NOT support template substitution (no `{{VAR}}`) to avoid
     /// circular dependencies. Use parameter environment fields (development/staging/production)
     /// for environment-specific defaults instead.
+    ///
+    /// Missing files are non-fatal: fed logs a warning and continues without
+    /// them. Parse errors and other I/O failures (e.g. permission denied) still
+    /// abort startup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_file: Vec<String>,
 
