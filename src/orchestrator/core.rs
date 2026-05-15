@@ -1061,8 +1061,9 @@ impl Orchestrator {
 
     /// Stop a service and its dependents.
     ///
-    /// Dependents are stopped first in reverse dependency order to ensure
-    /// services don't lose their dependencies while running.
+    /// Dependents are stopped first in deepest-first order so no service
+    /// loses a dependency while still running. `get_all_dependents` returns
+    /// in this order already; iterate forward, do not reverse.
     ///
     /// # Cancellation
     ///
@@ -1070,13 +1071,10 @@ impl Orchestrator {
     /// even if cancelled - a cancelled stop is less dangerous than a
     /// cancelled start. Returns `Error::Cancelled` after completing stops.
     pub async fn stop(&self, service_name: &str) -> Result<()> {
-        // Get all dependents
         let dependents = self.get_all_dependents(service_name);
-
         let was_cancelled = self.cancellation_token.is_cancelled();
 
-        // Stop dependents first (in reverse order)
-        for dependent in dependents.iter().rev() {
+        for dependent in &dependents {
             self.stop_service_with_timeout(dependent).await?;
         }
 
@@ -1106,7 +1104,12 @@ impl Orchestrator {
         }
     }
 
-    /// Get all transitive dependents of a service
+    /// Get all transitive dependents of a service in **deepest-first** order
+    /// (post-order DFS).
+    ///
+    /// For `A <- B <- C` (B depends on A, C depends on B), this returns
+    /// `["C", "B"]` — callers can iterate forward to stop dependents before
+    /// their dependencies, or iterate in reverse to start them dependency-first.
     fn get_all_dependents(&self, service_name: &str) -> Vec<String> {
         let mut visited = std::collections::HashSet::new();
         let mut result = Vec::new();
@@ -1239,6 +1242,59 @@ impl Orchestrator {
 
         // Then, start all services in dependency order
         self.start_all().await?;
+
+        Ok(())
+    }
+
+    /// Restart a single service, preserving the running state of its
+    /// transitive dependents.
+    ///
+    /// `stop` cascades down to dependents; `start` only walks dependencies.
+    /// A naive stop+start therefore leaves dependents stopped. This method:
+    ///
+    /// 1. Snapshots which transitive dependents are `Running`/`Healthy`.
+    /// 2. Stops the service (cascades to all dependents).
+    /// 3. Starts the service back (with its dependencies).
+    /// 4. Restarts each previously-running dependent in shallowest-first
+    ///    order so its own dependencies are healthy first.
+    ///
+    /// Dependents that were already stopped stay stopped — restart does not
+    /// resurrect services the operator chose to stop.
+    ///
+    /// # Cancellation & Timeouts
+    ///
+    /// Each phase respects `startup_timeout` / `stop_timeout` and the
+    /// orchestrator's cancellation token, matching `start` and `stop`.
+    pub async fn restart(&self, service_name: &str) -> Result<()> {
+        let dependents = self.get_all_dependents(service_name);
+        let statuses = self.get_status_passive().await;
+        let was_running: Vec<String> = dependents
+            .iter()
+            .filter(|name| {
+                matches!(
+                    statuses.get(name.as_str()).copied(),
+                    Some(Status::Running) | Some(Status::Healthy)
+                )
+            })
+            .cloned()
+            .collect();
+
+        self.stop(service_name).await?;
+
+        if self.cancellation_token.is_cancelled() {
+            return Err(Error::Cancelled(service_name.to_string()));
+        }
+
+        self.start(service_name).await?;
+
+        // Dependents come back in shallowest-first order (reverse of the
+        // stop iteration) so each one's own dependencies are already up.
+        for dependent in was_running.iter().rev() {
+            if self.cancellation_token.is_cancelled() {
+                return Err(Error::Cancelled(dependent.clone()));
+            }
+            self.start_service_with_timeout(dependent).await?;
+        }
 
         Ok(())
     }
@@ -1831,6 +1887,108 @@ mod tests {
         assert!(
             orchestrator.verify_service_alive(&service),
             "Service with no PID/container should be assumed alive"
+        );
+    }
+
+    /// Build an orchestrator whose dependency graph is `a <- b <- c`
+    /// (`b` depends on `a`, `c` depends on `b`).
+    async fn orch_with_chain_a_b_c() -> Orchestrator {
+        use crate::config::{DependsOn, Service};
+
+        let mut config = Config::default();
+        config.services.insert(
+            "a".to_string(),
+            Service {
+                process: Some("sleep 1".to_string()),
+                ..Default::default()
+            },
+        );
+        config.services.insert(
+            "b".to_string(),
+            Service {
+                process: Some("sleep 1".to_string()),
+                depends_on: vec![DependsOn::Simple("a".to_string())],
+                ..Default::default()
+            },
+        );
+        config.services.insert(
+            "c".to_string(),
+            Service {
+                process: Some("sleep 1".to_string()),
+                depends_on: vec![DependsOn::Simple("b".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        orchestrator.build_dependency_graph().unwrap();
+        // The state tracker holds an open SQLite handle inside `temp_dir`;
+        // leaking keeps it valid for the lifetime of the test.
+        std::mem::forget(temp_dir);
+        orchestrator
+    }
+
+    /// `get_all_dependents` must return deepest-first (post-order DFS) so
+    /// callers can iterate forward when stopping. `stop` relies on this.
+    #[tokio::test]
+    async fn test_get_all_dependents_returns_deepest_first() {
+        let orchestrator = orch_with_chain_a_b_c().await;
+        let dependents = orchestrator.get_all_dependents("a");
+
+        assert_eq!(
+            dependents,
+            vec!["c".to_string(), "b".to_string()],
+            "expected deepest-first order [c, b]; got {:?}",
+            dependents
+        );
+    }
+
+    /// `a` has two unrelated direct dependents — both must appear in the
+    /// result, in either order.
+    #[tokio::test]
+    async fn test_get_all_dependents_fan_out() {
+        use crate::config::{DependsOn, Service};
+
+        let mut config = Config::default();
+        config.services.insert(
+            "a".to_string(),
+            Service {
+                process: Some("sleep 1".to_string()),
+                ..Default::default()
+            },
+        );
+        for name in ["b", "c"] {
+            config.services.insert(
+                name.to_string(),
+                Service {
+                    process: Some("sleep 1".to_string()),
+                    depends_on: vec![DependsOn::Simple("a".to_string())],
+                    ..Default::default()
+                },
+            );
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        orchestrator.build_dependency_graph().unwrap();
+        std::mem::forget(temp_dir);
+
+        let dependents = orchestrator.get_all_dependents("a");
+        assert_eq!(
+            dependents.len(),
+            2,
+            "expected both fan-out dependents; got {:?}",
+            dependents
+        );
+        assert!(
+            dependents.contains(&"b".to_string()) && dependents.contains(&"c".to_string()),
+            "expected b and c in dependents; got {:?}",
+            dependents
         );
     }
 }
