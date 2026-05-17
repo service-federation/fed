@@ -354,6 +354,61 @@ entrypoint: hanging_service
     orchestrator.cleanup().await;
 }
 
+/// A per-service `startup_timeout` in the config takes precedence over the
+/// orchestrator-wide default. The orchestrator-wide default is generous (30s);
+/// the per-service value is tight (200ms). A `sleep 300` process plus a failing
+/// healthcheck would hang the start indefinitely without a per-service override,
+/// so a clean timeout within ~1s proves the override is wired.
+#[tokio::test]
+async fn test_per_service_startup_timeout_overrides_default() {
+    let config_content = r#"
+services:
+  slow_to_be_healthy:
+    process: 'sleep 300'
+    startup_timeout: "200ms"
+    healthcheck:
+      command: "false"
+
+entrypoint: slow_to_be_healthy
+"#;
+
+    let parser = Parser::new();
+    let config = parser
+        .parse_config(config_content)
+        .expect("Failed to parse config");
+
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
+        .await
+        .expect("Failed to create orchestrator");
+
+    orchestrator.startup_timeout = Duration::from_secs(30);
+    orchestrator.stop_timeout = Duration::from_secs(2);
+    orchestrator.set_auto_resolve_conflicts(true);
+    orchestrator
+        .initialize()
+        .await
+        .expect("Failed to initialize");
+    let orchestrator = Arc::new(orchestrator);
+
+    let started = std::time::Instant::now();
+    let result = orchestrator.start("slow_to_be_healthy").await;
+    let elapsed = started.elapsed();
+
+    match &result {
+        Err(fed::Error::Timeout(name)) => assert_eq!(name, "slow_to_be_healthy"),
+        Err(e) => panic!("expected Timeout, got {:?}", e),
+        Ok(()) => panic!("expected Timeout, got Ok"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "per-service startup_timeout did not preempt the 30s default — elapsed {:?}",
+        elapsed
+    );
+
+    orchestrator.cleanup().await;
+}
+
 // Note: Port allocation concurrency testing has been removed from this file.
 // The previous test created separate orchestrators (not testing shared allocator concurrency).
 // For comprehensive port allocation concurrency testing, see:

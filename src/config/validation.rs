@@ -94,6 +94,14 @@ impl Config {
                     )));
                 }
             }
+            if let Some(ref st) = service.startup_timeout {
+                if parse_duration_string(st).is_none() {
+                    return Err(Error::Validation(format!(
+                        "Service '{}' has invalid startup_timeout '{}'. Use formats like '60s', '5m', '500ms'",
+                        name, st
+                    )));
+                }
+            }
             if let Some(ref hc) = service.healthcheck {
                 let timeout_str = match hc {
                     HealthCheck::HttpGet { timeout, .. } => timeout.as_deref(),
@@ -1242,6 +1250,38 @@ mod tests {
             Service {
                 process: Some("echo hello".to_string()),
                 grace_period: Some("30s".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_invalid_startup_timeout_rejected() {
+        let mut config = Config::default();
+        config.services.insert(
+            "app".to_string(),
+            Service {
+                process: Some("echo hello".to_string()),
+                startup_timeout: Some("not-a-duration".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("invalid startup_timeout"));
+        assert!(err.contains("not-a-duration"));
+    }
+
+    #[test]
+    fn test_valid_startup_timeout_accepted() {
+        let mut config = Config::default();
+        config.services.insert(
+            "app".to_string(),
+            Service {
+                process: Some("echo hello".to_string()),
+                startup_timeout: Some("5m".to_string()),
                 ..Default::default()
             },
         );

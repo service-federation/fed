@@ -342,6 +342,15 @@ async fn run() -> anyhow::Result<()> {
         | Commands::Status { .. }
         | Commands::Logs { .. } => OutputMode::File,
         Commands::Tui { .. } => OutputMode::Captured,
+        Commands::Run {
+            output: Some(mode), ..
+        } => match mode.parse::<OutputMode>() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        },
         _ => OutputMode::Captured,
     };
 
@@ -462,7 +471,7 @@ async fn run() -> anyhow::Result<()> {
         Commands::Tui { watch } => {
             commands::run_tui(orchestrator, watch, Some(&config)).await?;
         }
-        Commands::Run { name, args } => {
+        Commands::Run { name, args, .. } => {
             // Strip leading "--" from args (clap captures it literally)
             let extra_args: Vec<String> = args.into_iter().skip_while(|arg| arg == "--").collect();
             commands::run_script(&mut orchestrator, &name, &extra_args, false, &out).await?;

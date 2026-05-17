@@ -105,10 +105,15 @@ Show resource usage for all services. Refreshes periodically.
 
 Run a named script. Services in `depends_on` are started first and stopped after the script completes.
 
+| Flag | Description |
+|------|-------------|
+| `--output <MODE>` | Output mode for the script's dependent process services: `file`, `captured` (default), `passthrough` |
+
 ```bash
 fed run db:migrate
-fed db:migrate                    # Shorthand (if no command collision)
-fed test:integration -- -t "auth" # Pass arguments after --
+fed db:migrate                          # Shorthand (if no command collision)
+fed test:integration -- -t "auth"       # Pass arguments after --
+fed run e2e --output passthrough        # Surface service logs (use in CI)
 ```
 
 ## Isolation

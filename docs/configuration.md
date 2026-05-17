@@ -129,6 +129,23 @@ services:
 
 Accepts duration strings: `"10s"`, `"1m"`, `"500ms"`.
 
+### Startup Timeout
+
+Per-service cap on time-to-healthy. Overrides the orchestrator default
+(120s) for one service. Useful when a single dependency is much slower
+to warm up than the rest of the stack, or under cold CI caches.
+
+```yaml
+services:
+  search:
+    process: ./bin/search-svc
+    startup_timeout: "5m"     # Default: orchestrator-wide (120s)
+    healthcheck:
+      httpGet: "http://localhost:9200/health"
+```
+
+Accepts the same duration strings as `grace_period`.
+
 ### Circuit Breaker
 
 Crash loop detection. Requires `restart: always` or `on_failure`:

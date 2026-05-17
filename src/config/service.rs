@@ -151,6 +151,12 @@ pub struct Service {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grace_period: Option<String>,
 
+    /// Per-service override of the orchestrator's startup_timeout.
+    /// Format: duration string like "60s", "5m". When unset, the
+    /// orchestrator default applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_timeout: Option<String>,
+
     /// Circuit breaker configuration for crash loop detection.
     ///
     /// When enabled, the circuit breaker monitors restart frequency and
@@ -261,6 +267,13 @@ impl Service {
             .as_ref()
             .and_then(|s| parse_duration_string(s))
             .unwrap_or(std::time::Duration::from_secs(10))
+    }
+
+    /// Parsed per-service startup_timeout override, if any.
+    pub fn get_startup_timeout(&self) -> Option<std::time::Duration> {
+        self.startup_timeout
+            .as_ref()
+            .and_then(|s| parse_duration_string(s))
     }
 }
 
@@ -511,5 +524,33 @@ image: redis:7
 "#;
         let svc: Service = serde_yaml::from_str(yaml).unwrap();
         assert!(svc.command.is_none());
+    }
+
+    #[test]
+    fn test_startup_timeout_parsed() {
+        let yaml = r#"
+process: cargo run
+startup_timeout: "5m"
+"#;
+        let svc: Service = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            svc.get_startup_timeout(),
+            Some(std::time::Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn test_startup_timeout_absent() {
+        let svc: Service = serde_yaml::from_str(r#"process: cargo run"#).unwrap();
+        assert_eq!(svc.get_startup_timeout(), None);
+    }
+
+    #[test]
+    fn test_startup_timeout_invalid_returns_none() {
+        let svc = Service {
+            startup_timeout: Some("not-a-duration".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(svc.get_startup_timeout(), None);
     }
 }

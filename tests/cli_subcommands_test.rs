@@ -291,6 +291,46 @@ fn test_run_help() {
 }
 
 #[test]
+fn test_run_help_lists_output_flag() {
+    let output = Command::new(fed_binary())
+        .args(["run", "--help"])
+        .output()
+        .expect("Failed to run fed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--output"));
+    assert!(stdout.contains("passthrough"));
+}
+
+#[test]
+fn test_run_rejects_invalid_output_mode() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = create_test_config(&temp_dir);
+
+    let output = Command::new(fed_binary())
+        .args([
+            "-c",
+            &config_path,
+            "-w",
+            temp_dir.path().to_str().unwrap(),
+            "run",
+            "test-script",
+            "--output",
+            "not-a-mode",
+        ])
+        .output()
+        .expect("Failed to run fed");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("output mode") || stderr.contains("Invalid"),
+        "Expected invalid-mode error, got: {}",
+        stderr
+    );
+}
+
+#[test]
 fn test_run_missing_script() {
     let temp_dir = TempDir::new().unwrap();
     let config_path = create_test_config(&temp_dir);

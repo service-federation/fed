@@ -828,9 +828,17 @@ impl Orchestrator {
     }
 
     /// Start a service with timeout and cancellation support.
+    ///
+    /// A per-service `startup_timeout` (set in the service config) takes
+    /// precedence over the orchestrator-wide default.
     async fn start_service_with_timeout(&self, name: &str) -> Result<()> {
         let cancel_token = self.cancellation_token.clone();
-        let timeout = self.startup_timeout;
+        let timeout = self
+            .config
+            .services
+            .get(name)
+            .and_then(|s| s.get_startup_timeout())
+            .unwrap_or(self.startup_timeout);
 
         tokio::select! {
             biased;

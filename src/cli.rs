@@ -111,6 +111,12 @@ pub enum Commands {
         /// Arguments to pass to the script (after --)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+        /// Output mode for the script's dependent process services.
+        /// - file: log to files in .fed/logs (default for background)
+        /// - captured: in-memory ring buffer (default)
+        /// - passthrough: inherit parent stdio (use to surface logs in CI)
+        #[arg(long, value_name = "MODE")]
+        output: Option<String>,
     },
     /// Run install commands for services
     Install {
