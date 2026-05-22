@@ -352,20 +352,25 @@ services:
 
     let (temp_dir, config_path) = create_clean_test_config(config_content);
     let workdir = temp_dir.path().to_path_buf();
+    let markers = fed::markers::LifecycleMarkers::new(workdir.clone(), None);
 
     // Simulate prior migration of both services. Only `cleanable` would
     // get its marker cleared by per-service clean (it's in the loop).
     // `migrate-only` has neither `clean:` nor `volumes:`, so it would
     // never be touched without the full-clean fix.
-    fed::markers::mark_migrated_global("cleanable", &workdir).expect("seed cleanable marker");
-    fed::markers::mark_migrated_global("migrate-only", &workdir).expect("seed migrate-only marker");
+    markers
+        .mark_migrated("cleanable")
+        .expect("seed cleanable marker");
+    markers
+        .mark_migrated("migrate-only")
+        .expect("seed migrate-only marker");
 
     assert!(
-        fed::markers::is_migrated_global("cleanable", &workdir).unwrap(),
+        markers.is_migrated("cleanable").unwrap(),
         "precondition: cleanable should be marked migrated"
     );
     assert!(
-        fed::markers::is_migrated_global("migrate-only", &workdir).unwrap(),
+        markers.is_migrated("migrate-only").unwrap(),
         "precondition: migrate-only should be marked migrated"
     );
 
@@ -387,11 +392,11 @@ services:
     );
 
     assert!(
-        !fed::markers::is_migrated_global("cleanable", &workdir).unwrap(),
+        !markers.is_migrated("cleanable").unwrap(),
         "cleanable's migrate marker should be cleared (covered by per-service clean)"
     );
     assert!(
-        !fed::markers::is_migrated_global("migrate-only", &workdir).unwrap(),
+        !markers.is_migrated("migrate-only").unwrap(),
         "migrate-only's marker should be cleared by full `fed clean` even \
          though it has no clean/volumes — this is the regression"
     );

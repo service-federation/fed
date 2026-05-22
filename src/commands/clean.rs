@@ -82,13 +82,14 @@ pub async fn run_clean(
         // fresh start" operation, so clear all install and migrate
         // markers in the workspace.
         let work_dir = orchestrator.work_dir();
-        if let Err(e) = fed::markers::clear_all_migrated_global(work_dir) {
+        let markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf(), None);
+        if let Err(e) = markers.clear_all_migrated() {
             out.warning(&format!(
                 "Warning: Failed to clear all migrate markers: {}",
                 e
             ));
         }
-        if let Err(e) = fed::markers::clear_all_installed_global(work_dir) {
+        if let Err(e) = markers.clear_all_installed() {
             out.warning(&format!(
                 "Warning: Failed to clear all install markers: {}",
                 e
