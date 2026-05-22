@@ -1391,7 +1391,10 @@ async fn init_orchestrator(
         .await
         .expect("Failed to set work dir");
     orchestrator.set_auto_resolve_conflicts(true);
-    orchestrator.initialize().await.expect("Failed to initialize");
+    orchestrator
+        .initialize()
+        .await
+        .expect("Failed to initialize");
     (orchestrator, orch_temp)
 }
 
