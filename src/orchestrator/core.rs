@@ -1462,10 +1462,14 @@ impl Orchestrator {
 
     /// Run a script non-interactively, capturing output.
     ///
+    /// This is a top-level entry point: services started to satisfy the script's
+    /// dependencies (that weren't already running) are stopped after it finishes
+    /// ("borrow-or-own"). Use `fed start` beforehand to keep a service up across runs.
+    ///
     /// Delegates to `ScriptRunner`.
     pub async fn run_script(&self, script_name: &str) -> Result<std::process::Output> {
         let runner = super::scripts::ScriptRunner::new(self);
-        runner.run_script(script_name).await
+        runner.run_script(script_name, true).await
     }
 
     /// Run a script interactively with stdin/stdout/stderr passthrough.
@@ -1478,6 +1482,10 @@ impl Orchestrator {
     /// If the script has `isolated: true`, it runs in an isolated context
     /// with fresh port allocations and isolated service instances.
     ///
+    /// This is a top-level entry point: services started to satisfy the script's
+    /// dependencies (that weren't already running) are stopped after it finishes
+    /// ("borrow-or-own"). Use `fed start` beforehand to keep a service up across runs.
+    ///
     /// Delegates to `ScriptRunner`.
     pub async fn run_script_interactive(
         &self,
@@ -1485,7 +1493,26 @@ impl Orchestrator {
         extra_args: &[String],
     ) -> Result<std::process::ExitStatus> {
         let runner = super::scripts::ScriptRunner::new(self);
-        runner.run_script_interactive(script_name, extra_args).await
+        runner
+            .run_script_interactive(script_name, extra_args, true)
+            .await
+    }
+
+    /// Run a script interactively as a *nested* dependency of another script.
+    ///
+    /// Identical to [`run_script_interactive`](Self::run_script_interactive) but
+    /// marks the invocation as non-top-level, so it does not perform borrow-or-own
+    /// cleanup — the outermost script owns tearing down everything the tree started.
+    /// Used by `ScriptRunner` when resolving script-to-script dependencies.
+    pub(crate) async fn run_script_interactive_nested(
+        &self,
+        script_name: &str,
+        extra_args: &[String],
+    ) -> Result<std::process::ExitStatus> {
+        let runner = super::scripts::ScriptRunner::new(self);
+        runner
+            .run_script_interactive(script_name, extra_args, false)
+            .await
     }
 
     /// Check if a service is currently running or healthy.

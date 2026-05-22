@@ -7,6 +7,8 @@
 
 use crate::config::Script;
 use crate::error::{Error, Result};
+use crate::service::Status;
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -29,7 +31,30 @@ impl<'a> ScriptRunner<'a> {
     ///
     /// Resolves dependencies (starting services or running dependent scripts),
     /// then executes the script with a 5-minute timeout.
-    pub async fn run_script(&self, script_name: &str) -> Result<std::process::Output> {
+    pub async fn run_script(
+        &self,
+        script_name: &str,
+        top_level: bool,
+    ) -> Result<std::process::Output> {
+        let before = if top_level {
+            Some(self.running_services_snapshot().await)
+        } else {
+            None
+        };
+
+        // Don't `?` — cleanup must run on both success and failure.
+        let result = self.run_script_captured(script_name).await;
+
+        if let Some(before) = before {
+            self.stop_services_started_since(&before).await;
+        }
+
+        result
+    }
+
+    /// Resolve dependencies and execute a script non-interactively, capturing
+    /// output. Does not perform borrow-or-own cleanup — the caller owns that.
+    async fn run_script_captured(&self, script_name: &str) -> Result<std::process::Output> {
         let script = self
             .orchestrator
             .config
@@ -43,11 +68,10 @@ impl<'a> ScriptRunner<'a> {
         // since run_script can't easily be made recursive without boxing
         for dep in &script.depends_on {
             if self.orchestrator.config.scripts.contains_key(dep) {
-                // Dependency is a script - run it via interactive runner
-                // (which handles recursion via Box::pin)
-                self.orchestrator.run_script_interactive(dep, &[]).await?;
+                self.orchestrator
+                    .run_script_interactive_nested(dep, &[])
+                    .await?;
             } else {
-                // Dependency is a service - start it if not running
                 if !self.orchestrator.is_service_running(dep).await {
                     self.orchestrator.start(dep).await?;
                 }
@@ -140,6 +164,7 @@ impl<'a> ScriptRunner<'a> {
         &self,
         script_name: &str,
         extra_args: &[String],
+        top_level: bool,
     ) -> Result<std::process::ExitStatus> {
         let script = self
             .orchestrator
@@ -149,7 +174,14 @@ impl<'a> ScriptRunner<'a> {
             .ok_or_else(|| Error::ScriptNotFound(script_name.to_string()))?
             .clone();
 
-        if script.isolated {
+        let before = if top_level {
+            Some(self.running_services_snapshot().await)
+        } else {
+            None
+        };
+
+        // Don't `?` — cleanup must run on both success and failure.
+        let result = if script.isolated {
             // Execute in isolated context with fresh port allocations
             // Delegated back to Orchestrator since it needs to create a child Orchestrator
             self.run_script_isolated(script_name, &script, extra_args)
@@ -158,7 +190,13 @@ impl<'a> ScriptRunner<'a> {
             // Execute in shared context (existing behavior)
             self.run_script_shared(script_name, &script, extra_args)
                 .await
+        };
+
+        if let Some(before) = before {
+            self.stop_services_started_since(&before).await;
         }
+
+        result
     }
 
     /// Run a script in shared context (reuses current ports and services).
@@ -171,12 +209,10 @@ impl<'a> ScriptRunner<'a> {
         // Resolve dependencies - can be services or other scripts (SF-00035)
         for dep in &script.depends_on {
             if self.orchestrator.config.scripts.contains_key(dep) {
-                // Dependency is a script - run it recursively
-                // Note: Circular dependencies are caught by graph validation during config parsing
-                // Use Box::pin to enable async recursion (avoids infinite future size)
-                Box::pin(self.orchestrator.run_script_interactive(dep, &[])).await?;
+                // Circular dependencies are caught by graph validation during config parsing.
+                // Box::pin to enable async recursion (avoids infinite future size).
+                Box::pin(self.orchestrator.run_script_interactive_nested(dep, &[])).await?;
             } else {
-                // Dependency is a service - start it if not running
                 if !self.orchestrator.is_service_running(dep).await {
                     self.orchestrator.start(dep).await?;
                 }
@@ -277,9 +313,8 @@ impl<'a> ScriptRunner<'a> {
         let mut service_deps = Vec::new();
         for dep in &original_script.depends_on {
             if self.orchestrator.config.scripts.contains_key(dep) {
-                // Script dependency: run in parent context
-                // (nested scripts get their own isolation if they have isolated)
-                Box::pin(self.orchestrator.run_script_interactive(dep, &[])).await?;
+                // Box::pin to enable async recursion (avoids infinite future size).
+                Box::pin(self.orchestrator.run_script_interactive_nested(dep, &[])).await?;
             } else {
                 // Service dependency: start in child context with isolated ports
                 child_orchestrator.start(dep).await?;
@@ -358,6 +393,40 @@ impl<'a> ScriptRunner<'a> {
     /// Get list of available scripts.
     pub fn list_scripts(&self) -> Vec<String> {
         self.orchestrator.config.scripts.keys().cloned().collect()
+    }
+
+    /// Snapshot the set of services currently `Running`/`Healthy`.
+    async fn running_services_snapshot(&self) -> HashSet<String> {
+        self.orchestrator
+            .get_status_passive()
+            .await
+            .into_iter()
+            .filter(|(_, status)| matches!(status, Status::Running | Status::Healthy))
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// Stop every service that became `Running`/`Healthy` since the `before`
+    /// snapshot — i.e. the ones this script run started.
+    ///
+    /// `Orchestrator::stop` is idempotent and cascades to dependents first, so
+    /// re-stopping an already-stopped service in the loop is harmless. A service
+    /// running before the run cannot depend on one that wasn't, so the cascade
+    /// never reaches a borrowed service.
+    async fn stop_services_started_since(&self, before: &HashSet<String>) {
+        let now = self.orchestrator.get_status_passive().await;
+        for (name, status) in now {
+            let running = matches!(status, Status::Running | Status::Healthy);
+            if running && !before.contains(&name) {
+                if let Err(e) = self.orchestrator.stop(&name).await {
+                    tracing::warn!(
+                        "borrow-or-own cleanup: failed to stop service '{}': {}",
+                        name,
+                        e
+                    );
+                }
+            }
+        }
     }
 }
 

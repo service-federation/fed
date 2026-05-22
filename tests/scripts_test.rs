@@ -72,7 +72,7 @@ scripts:
         .await
         .expect("Failed to initialize");
 
-    // Script should start backend service before running
+    // Backend isn't running, so the script starts it to satisfy the dependency.
     let output = orchestrator
         .run_script("check")
         .await
@@ -80,9 +80,11 @@ scripts:
 
     assert!(output.status.success(), "Script should succeed");
 
-    // Verify backend service was started
-    let status = orchestrator.get_status().await;
-    assert!(status.contains_key("backend"), "Backend should be started");
+    // Borrow-or-own: the script started backend, so it stops it again afterward.
+    assert!(
+        !orchestrator.is_service_running("backend").await,
+        "Backend should be stopped after a script that started it"
+    );
 
     // Cleanup
     orchestrator.cleanup().await;
@@ -336,11 +338,10 @@ scripts:
 
     assert!(output.status.success(), "Script should succeed");
 
-    // Verify all dependencies were started
-    let status = orchestrator.get_status().await;
-    assert!(status.contains_key("service1"));
-    assert!(status.contains_key("service2"));
-    assert!(status.contains_key("service3"));
+    // Borrow-or-own: the script started all three deps, so all are stopped after.
+    assert!(!orchestrator.is_service_running("service1").await);
+    assert!(!orchestrator.is_service_running("service2").await);
+    assert!(!orchestrator.is_service_running("service3").await);
 
     orchestrator.cleanup().await;
 }
@@ -446,11 +447,10 @@ scripts:
 
     assert!(status.success(), "Script should succeed");
 
-    // Verify backend service was started
-    let service_status = orchestrator.get_status().await;
+    // Borrow-or-own: the script started backend, so it stops it again afterward.
     assert!(
-        service_status.contains_key("backend"),
-        "Backend should be started"
+        !orchestrator.is_service_running("backend").await,
+        "Backend should be stopped after a script that started it"
     );
 
     orchestrator.cleanup().await;
@@ -1012,8 +1012,10 @@ scripts:
     orchestrator.cleanup().await;
 }
 
+/// Borrow-or-own: a service that was already running before the script (e.g.
+/// started via `fed start`) is *borrowed* — the script leaves it running.
 #[tokio::test]
-async fn test_script_without_isolated_reuses_services() {
+async fn test_script_borrows_already_running_service() {
     let temp_dir = tempdir().expect("Failed to create temp dir");
 
     let yaml = r#"
@@ -1046,7 +1048,17 @@ scripts:
         .await
         .expect("Failed to initialize");
 
-    // Run script - should start backend in main context
+    // Pre-start backend (this is the `fed start` keep-alive path).
+    orchestrator
+        .start("backend")
+        .await
+        .expect("Failed to start backend");
+    assert!(
+        orchestrator.is_service_running("backend").await,
+        "backend should be running before the script"
+    );
+
+    // Run script - backend is already up, so it is borrowed, not owned.
     let status = orchestrator
         .run_script_interactive("test", &[])
         .await
@@ -1054,11 +1066,10 @@ scripts:
 
     assert!(status.success(), "Script should succeed");
 
-    // Backend should still be running in main context (not cleaned up)
-    let status_after = orchestrator.get_status().await;
+    // Borrowed service is left running — the script must not stop what it didn't start.
     assert!(
-        status_after.contains_key("backend"),
-        "Backend should still be running after non-isolated script"
+        orchestrator.is_service_running("backend").await,
+        "backend was already running, so the script must leave it running"
     );
 
     orchestrator.cleanup().await;
@@ -1351,4 +1362,219 @@ scripts:
         .args(["rm", "-f", &container_name])
         .output()
         .await;
+}
+
+// ============================================================================
+// Borrow-or-own cleanup for non-isolated scripts
+//
+// A script stops the services *it* started and leaves alone services that were
+// already running. There is no config knob — lifecycle is decided at runtime by
+// who started the service. `fed start` is the keep-alive mechanism (covered by
+// `test_script_borrows_already_running_service`).
+// ============================================================================
+
+/// Helper: a standard test orchestrator initialized in `work_dir`.
+///
+/// Returns the orchestrator's state-dir guard alongside it; the caller must keep
+/// it alive for the orchestrator's lifetime.
+async fn init_orchestrator(
+    yaml: &str,
+    work_dir: &std::path::Path,
+) -> (Orchestrator, tempfile::TempDir) {
+    let config = Parser::new().parse_config(yaml).expect("Failed to parse");
+    let orch_temp = tempfile::tempdir().unwrap();
+    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
+        .await
+        .unwrap();
+    orchestrator
+        .set_work_dir(work_dir.to_path_buf())
+        .await
+        .expect("Failed to set work dir");
+    orchestrator.set_auto_resolve_conflicts(true);
+    orchestrator.initialize().await.expect("Failed to initialize");
+    (orchestrator, orch_temp)
+}
+
+/// Own: a script that starts a service stops it again afterward. The service
+/// writes a marker on startup, proving the run actually brought it up (not a
+/// no-op that left it stopped the whole time).
+#[tokio::test]
+async fn test_script_owns_and_stops_started_service() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let marker = temp_dir.path().join("worker-started");
+
+    let yaml = format!(
+        r#"
+services:
+  worker:
+    process: "sh -c 'touch {} && sleep 30'"
+
+scripts:
+  task:
+    depends_on:
+      - worker
+    script: "echo done"
+"#,
+        marker.display()
+    );
+
+    let (orchestrator, _orch_temp) = init_orchestrator(&yaml, temp_dir.path()).await;
+
+    assert!(
+        !orchestrator.is_service_running("worker").await,
+        "worker should not be running before the script"
+    );
+
+    let status = orchestrator
+        .run_script_interactive("task", &[])
+        .await
+        .expect("Failed to run script");
+    assert!(status.success(), "Script should succeed");
+
+    assert!(
+        marker.exists(),
+        "worker should have been started by the run (marker file written)"
+    );
+    assert!(
+        !orchestrator.is_service_running("worker").await,
+        "worker was started by the run, so it must be stopped afterward"
+    );
+
+    orchestrator.cleanup().await;
+}
+
+/// Transitive own: a script depends on `app`, which depends on `db`. Both are
+/// down; the run brings up the whole chain and must tear down *both* afterward,
+/// not just the directly-listed dep.
+#[tokio::test]
+async fn test_script_stops_transitive_dependencies() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let db_marker = temp_dir.path().join("db-started");
+
+    let yaml = format!(
+        r#"
+services:
+  db:
+    process: "sh -c 'touch {} && sleep 30'"
+  app:
+    process: "sleep 30"
+    depends_on:
+      - db
+
+scripts:
+  task:
+    depends_on:
+      - app
+    script: "echo done"
+"#,
+        db_marker.display()
+    );
+
+    let (orchestrator, _orch_temp) = init_orchestrator(&yaml, temp_dir.path()).await;
+
+    let status = orchestrator
+        .run_script_interactive("task", &[])
+        .await
+        .expect("Failed to run script");
+    assert!(status.success(), "Script should succeed");
+
+    assert!(
+        db_marker.exists(),
+        "db should have been started transitively (marker file written)"
+    );
+    assert!(
+        !orchestrator.is_service_running("app").await,
+        "app (direct dep) should be stopped after the run"
+    );
+    assert!(
+        !orchestrator.is_service_running("db").await,
+        "db (transitive dep) should also be stopped after the run"
+    );
+
+    orchestrator.cleanup().await;
+}
+
+/// Top-level ownership: script `main` depends on script `setup`, which depends
+/// on service `svc`. Cleanup is owned by the outermost run, so `svc` must stay
+/// up while `main`'s body runs (it liveness-checks `svc`'s pid) and only be
+/// stopped after `main` completes. A broken implementation that let `setup`
+/// clean up `svc` would kill it before `main`'s body, failing the pid check.
+#[tokio::test]
+async fn test_nested_script_dep_not_torn_down_midflight() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let pidfile = temp_dir.path().join("svc.pid");
+    let pid = pidfile.display();
+
+    let yaml = format!(
+        r#"
+services:
+  svc:
+    process: "sh -c 'echo $$ > {pid} && sleep 30'"
+
+scripts:
+  setup:
+    depends_on:
+      - svc
+    script: "echo setup"
+  main:
+    depends_on:
+      - setup
+    script: "for i in 1 2 3 4 5; do test -f {pid} && break; sleep 0.3; done; kill -0 $(cat {pid})"
+"#,
+        pid = pid
+    );
+
+    let (orchestrator, _orch_temp) = init_orchestrator(&yaml, temp_dir.path()).await;
+
+    // main's body asserts svc is still alive; success proves setup did not stop it.
+    let status = orchestrator
+        .run_script_interactive("main", &[])
+        .await
+        .expect("Failed to run script");
+    assert!(
+        status.success(),
+        "main should succeed — svc must remain alive through the whole top-level run"
+    );
+
+    // After the top-level run, svc (started by the chain) is stopped.
+    assert!(
+        !orchestrator.is_service_running("svc").await,
+        "svc should be stopped after the top-level run completes"
+    );
+
+    orchestrator.cleanup().await;
+}
+
+/// Failure cleanup: a script that starts a service and then exits non-zero still
+/// stops the service it started (parallels the isolated guarantee).
+#[tokio::test]
+async fn test_failing_script_stops_services_it_started() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+
+    let yaml = r#"
+services:
+  dep:
+    process: "sleep 30"
+
+scripts:
+  failing:
+    depends_on:
+      - dep
+    script: "exit 1"
+"#;
+
+    let (orchestrator, _orch_temp) = init_orchestrator(yaml, temp_dir.path()).await;
+
+    let status = orchestrator
+        .run_script_interactive("failing", &[])
+        .await
+        .expect("run_script_interactive should return the exit status, not error");
+    assert!(!status.success(), "script should fail (exit 1)");
+
+    assert!(
+        !orchestrator.is_service_running("dep").await,
+        "dep should be stopped even though the script failed"
+    );
+
+    orchestrator.cleanup().await;
 }

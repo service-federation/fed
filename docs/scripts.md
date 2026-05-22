@@ -25,7 +25,31 @@ fed db:migrate                        # Shorthand (if no command collision)
 fed test:integration -- -t "auth"     # Pass arguments after --
 ```
 
-Services started as script dependencies keep running after the script finishes. Use `fed stop` to stop them.
+## Service Lifecycle ("borrow or own")
+
+A script is a good guest: it stops the services *it* started, and leaves alone the
+services that were already running.
+
+- If a dependency was **not running**, the script starts it and **stops it again**
+  when the script finishes — including transitive dependencies, and even if the
+  script fails.
+- If a dependency was **already running** (e.g. you ran `fed start` first), the script
+  **borrows** it and leaves it running.
+
+So `fed start` is how you keep a service up across many script runs:
+
+```bash
+fed start database          # database is now session-owned
+fed test:integration        # borrows database, leaves it running
+fed test:integration        # ...and again, no slow restart
+
+fed run db:migrate          # nothing was running, so db is started…
+                            # …and stopped again when the migration finishes
+```
+
+There is no config flag for this — the lifecycle is decided at runtime by *who started
+the service*. When a script depends on another script, only the outermost run performs
+cleanup, so nested script-dependencies never tear down services mid-run.
 
 ## Isolated Scripts
 
