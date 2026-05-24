@@ -51,14 +51,19 @@ async fn enable(
     let config = parser.load_config(&resolved_config)?;
     config.validate()?;
 
+    // Generate the isolation ID up front and apply it BEFORE initialize so the
+    // randomized ports persist into this isolation scope — not the shared scope
+    // that non-isolated `fed start` reads from.
+    let isolation_id = format!("iso-{:08x}", rand::random::<u32>());
+
     // Create orchestrator with randomized ports and initialize to resolve them
     let mut orchestrator = Orchestrator::new(config, work_dir.to_path_buf()).await?;
     orchestrator.set_work_dir(work_dir.to_path_buf()).await?;
     orchestrator.set_randomize_ports(true);
+    orchestrator.set_isolation_id(isolation_id.clone());
     orchestrator.initialize().await?;
 
-    // Generate isolation ID and persist
-    let isolation_id = format!("iso-{:08x}", rand::random::<u32>());
+    // Persist isolation mode now that ports are resolved under this scope.
     let tracker = orchestrator.state_tracker.read().await;
     tracker
         .set_isolation_mode(true, Some(isolation_id.clone()))
@@ -68,8 +73,10 @@ async fn enable(
     // empty by construction — no clearing needed. The shared-scope markers
     // stay intact and will be reused when the user runs `fed isolate disable`.
 
-    // Display allocated ports
-    let ports = tracker.get_global_port_allocations().await;
+    // Display allocated ports for this isolation scope
+    let ports = tracker
+        .get_global_port_allocations(Some(&isolation_id))
+        .await;
     drop(tracker);
 
     out.status("\nIsolation mode enabled.");
@@ -93,45 +100,50 @@ async fn disable(
     force: bool,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
-    // Check if isolation is currently enabled
-    let previous_isolation_id = {
+    // Read current isolation state. Unlike before, "already disabled" is NOT a
+    // no-op: it still clears any persisted port allocations so that disable is
+    // always a reliable way back to configured ports. (This is the escape hatch
+    // for projects left with stale randomized ports by older versions or the
+    // deprecated `fed ports randomize`.)
+    let (was_enabled, previous_isolation_id) = {
         let tracker = StateTracker::new(work_dir.to_path_buf()).await?;
-        let (enabled, id) = tracker.get_isolation_mode().await;
-        if !enabled {
-            out.status("Isolation mode is already disabled.\n");
-            return Ok(());
-        }
-        id
+        tracker.get_isolation_mode().await
     };
 
     super::ports::ensure_services_stopped(work_dir, force, out).await?;
 
-    // Clear port resolutions
+    // Clear port resolutions across all scopes (shared + any isolation sessions)
     let mut tracker = StateTracker::new(work_dir.to_path_buf()).await?;
     tracker.initialize().await?;
     tracker.clear_port_resolutions().await?;
 
-    // Clear isolation mode
+    // Clear isolation mode (no-op if it was never set)
     tracker.clear_isolation_mode().await?;
 
-    // Clear shared-scope lifecycle markers so install/migrate re-run against
-    // the now-active shared containers. (The shared containers may have been
-    // torn down or diverged while the user was in isolation mode.)
-    let shared_markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf(), None);
-    shared_markers.clear_all_installed()?;
-    shared_markers.clear_all_migrated()?;
+    if was_enabled {
+        // Clear shared-scope lifecycle markers so install/migrate re-run against
+        // the now-active shared containers. (The shared containers may have been
+        // torn down or diverged while the user was in isolation mode.)
+        let shared_markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf(), None);
+        shared_markers.clear_all_installed()?;
+        shared_markers.clear_all_migrated()?;
 
-    // Also clean up the abandoned isolation scope's marker directory so it
-    // doesn't linger in `~/.fed/isolated/`.
-    if let Some(id) = previous_isolation_id {
-        let iso_markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf(), Some(id));
-        let _ = iso_markers.clear_all_installed();
-        let _ = iso_markers.clear_all_migrated();
+        // Also clean up the abandoned isolation scope's marker directory so it
+        // doesn't linger in `~/.fed/isolated/`.
+        if let Some(id) = previous_isolation_id {
+            let iso_markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf(), Some(id));
+            let _ = iso_markers.clear_all_installed();
+            let _ = iso_markers.clear_all_migrated();
+        }
+
+        out.success(
+            "Isolation mode disabled. Next `fed start` will use default ports and shared containers.\n",
+        );
+    } else {
+        out.success(
+            "Isolation already disabled; cleared persisted port allocations. Next `fed start` will use default ports.\n",
+        );
     }
-
-    out.success(
-        "Isolation mode disabled. Next `fed start` will use default ports and shared containers.\n",
-    );
 
     Ok(())
 }
@@ -150,8 +162,10 @@ async fn status(work_dir: &std::path::Path, out: &dyn UserOutput) -> anyhow::Res
             isolation_id.as_deref().unwrap_or("unknown")
         ));
 
-        // Show port allocations
-        let ports = tracker.get_global_port_allocations().await;
+        // Show port allocations for this isolation scope
+        let ports = tracker
+            .get_global_port_allocations(isolation_id.as_deref())
+            .await;
         if !ports.is_empty() {
             out.status("\n  Port allocations:");
             let mut sorted: Vec<_> = ports.iter().collect();
@@ -197,14 +211,26 @@ async fn rotate(
     let config = parser.load_config(&resolved_config)?;
     config.validate()?;
 
+    // Drop the previous session's persisted ports (all scopes) before resolving
+    // the new ones, so the abandoned isolation scope doesn't linger in the table.
+    {
+        let mut tracker = StateTracker::new(work_dir.to_path_buf()).await?;
+        tracker.initialize().await?;
+        tracker.clear_port_resolutions().await?;
+    }
+
+    // Generate the new isolation ID up front and apply it BEFORE initialize so
+    // the freshly randomized ports persist under the new scope.
+    let isolation_id = format!("iso-{:08x}", rand::random::<u32>());
+
     // Create orchestrator with randomized ports and initialize to resolve new ports
     let mut orchestrator = Orchestrator::new(config, work_dir.to_path_buf()).await?;
     orchestrator.set_work_dir(work_dir.to_path_buf()).await?;
     orchestrator.set_randomize_ports(true);
+    orchestrator.set_isolation_id(isolation_id.clone());
     orchestrator.initialize().await?;
 
-    // Generate new isolation ID and persist
-    let isolation_id = format!("iso-{:08x}", rand::random::<u32>());
+    // Persist the new isolation mode now that ports are resolved under this scope.
     let tracker = orchestrator.state_tracker.read().await;
     tracker
         .set_isolation_mode(true, Some(isolation_id.clone()))
@@ -220,8 +246,10 @@ async fn rotate(
         let _ = old_markers.clear_all_migrated();
     }
 
-    // Display new ports
-    let ports = tracker.get_global_port_allocations().await;
+    // Display new ports for this isolation scope
+    let ports = tracker
+        .get_global_port_allocations(Some(&isolation_id))
+        .await;
     drop(tracker);
 
     out.status("\nIsolation rotated.");

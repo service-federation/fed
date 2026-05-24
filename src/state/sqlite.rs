@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 const FED_DIR: &str = ".fed";
 const DB_FILE_NAME: &str = "lock.db";
 const LOCK_FILE_NAME: &str = ".lock";
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 /// SQLite-backed state tracker for persistent service state management
 /// Provides ACID transactions and crash recovery via WAL mode.
@@ -430,6 +430,11 @@ impl SqliteStateTracker {
             self.migrate_v4_to_v5().await?;
         }
 
+        // Migration from v5 to v6: Scope persisted_ports by isolation_id
+        if current_version < 6 {
+            self.migrate_v5_to_v6().await?;
+        }
+
         Ok(())
     }
 
@@ -664,6 +669,75 @@ impl SqliteStateTracker {
         Ok(())
     }
 
+    /// Migration v5 -> v6: Scope `persisted_ports` by `isolation_id`.
+    ///
+    /// Before v6 the table was a flat `param_name -> port` map with no isolation
+    /// boundary, so randomized ports (from `fed isolate enable` / the deprecated
+    /// `fed ports randomize`) leaked into the non-isolated start path and stuck
+    /// there permanently. v6 adds an `isolation_id` column (`''` = shared scope)
+    /// to the primary key.
+    ///
+    /// Legacy rows are intentionally dropped: we cannot tell which were genuine
+    /// conflict resolutions versus randomized leftovers, and the safe default is
+    /// to fall back to configured ports and re-resolve real conflicts on the next
+    /// `fed start`. This is what heals projects already stuck with random ports.
+    async fn migrate_v5_to_v6(&self) -> Result<()> {
+        debug!("Running migration v5 -> v6: Scoping persisted_ports by isolation_id");
+
+        self.conn
+            .call(
+                |conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+                    let tx = conn.transaction()?;
+
+                    let already_applied: bool = tx
+                        .query_row(
+                            "SELECT COUNT(*) > 0 FROM schema_version WHERE version = 6",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or(false);
+
+                    if already_applied {
+                        return Ok(());
+                    }
+
+                    // Recreate the table with the scoped schema. We discard legacy
+                    // rows (see method doc) rather than guess their scope.
+                    tx.execute_batch(
+                        "DROP TABLE IF EXISTS persisted_ports;
+                         CREATE TABLE persisted_ports (
+                            param_name TEXT NOT NULL,
+                            port INTEGER NOT NULL,
+                            source TEXT NOT NULL,
+                            allocated_at TEXT NOT NULL,
+                            isolation_id TEXT NOT NULL DEFAULT '',
+                            PRIMARY KEY (param_name, isolation_id)
+                         );",
+                    )?;
+
+                    // Release the bind reservations tied to the dropped ports so
+                    // they become reusable, but keep reservations for ports still
+                    // owned by tracked services.
+                    tx.execute(
+                        "DELETE FROM allocated_ports WHERE port NOT IN (SELECT port FROM port_allocations)",
+                        [],
+                    )?;
+
+                    tx.execute(
+                        "INSERT INTO schema_version (version, applied_at) VALUES (6, datetime('now'))",
+                        [],
+                    )?;
+
+                    tx.commit()?;
+                    Ok(())
+                },
+            )
+            .await?;
+
+        info!("Migration v5 -> v6 completed successfully");
+        Ok(())
+    }
+
     /// Create database schema
     async fn create_schema(&self) -> Result<()> {
         self.conn.call(|conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
@@ -724,12 +798,18 @@ impl SqliteStateTracker {
                     allocated_at TEXT NOT NULL
                 );
 
-                -- Persisted port resolutions (replaces _ports synthetic service)
+                -- Persisted port resolutions (replaces _ports synthetic service).
+                -- Scoped by isolation_id, mirroring container/volume/marker scoping:
+                -- '' is the shared (non-isolated) scope, 'iso-xxxx' an isolation
+                -- session. The shared scope only ever holds conflict-resolved ports;
+                -- randomized ports live under their isolation scope.
                 CREATE TABLE persisted_ports (
-                    param_name TEXT PRIMARY KEY,
+                    param_name TEXT NOT NULL,
                     port INTEGER NOT NULL,
                     source TEXT NOT NULL,
-                    allocated_at TEXT NOT NULL
+                    allocated_at TEXT NOT NULL,
+                    isolation_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (param_name, isolation_id)
                 );
 
                 -- Restart history for circuit breaker tracking
@@ -2025,28 +2105,42 @@ impl SqliteStateTracker {
         Ok(count)
     }
 
-    /// Save resolved port parameters globally.
+    /// Save resolved port parameters for an isolation scope.
     ///
     /// Writes to the `persisted_ports` table and updates `allocated_ports`
     /// for bind reservations. On subsequent `fed start`, `collect_managed_ports`
     /// reads these to detect ports owned by managed services.
-    pub async fn save_port_resolutions(&mut self, resolutions: &[(String, u16)]) -> Result<()> {
+    ///
+    /// `isolation_id` selects the scope: `None` is the shared (non-isolated)
+    /// scope, `Some(id)` an isolation session. Only the targeted scope's rows
+    /// are replaced — saving the shared scope never touches isolation rows and
+    /// vice versa. This is what keeps randomized ports from leaking into the
+    /// non-isolated start path.
+    pub async fn save_port_resolutions(
+        &mut self,
+        resolutions: &[(String, u16)],
+        isolation_id: Option<&str>,
+    ) -> Result<()> {
         let count = resolutions.len();
         let resolutions = resolutions.to_vec();
+        let scope = isolation_id.unwrap_or("").to_string();
         let now = Utc::now().to_rfc3339();
 
         self.conn
             .call(move |conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
                 let tx = conn.transaction()?;
 
-                // Clear previous persisted port resolutions
-                tx.execute("DELETE FROM persisted_ports", [])?;
+                // Clear previous resolutions for this scope only
+                tx.execute(
+                    "DELETE FROM persisted_ports WHERE isolation_id = ?1",
+                    rusqlite::params![&scope],
+                )?;
 
                 // Insert all resolved port parameters
                 for (param_name, port) in &resolutions {
                     tx.execute(
-                        "INSERT INTO persisted_ports (param_name, port, source, allocated_at) VALUES (?1, ?2, 'resolver', ?3)",
-                        rusqlite::params![param_name, port, &now],
+                        "INSERT INTO persisted_ports (param_name, port, source, allocated_at, isolation_id) VALUES (?1, ?2, 'resolver', ?3, ?4)",
+                        rusqlite::params![param_name, port, &now, &scope],
                     )?;
                     tx.execute(
                         "INSERT OR IGNORE INTO allocated_ports (port, allocated_at) VALUES (?1, ?2)",
@@ -2067,15 +2161,24 @@ impl SqliteStateTracker {
         Ok(())
     }
 
-    /// Get globally persisted port resolutions from the `persisted_ports` table.
-    pub async fn get_global_port_allocations(&self) -> HashMap<String, u16> {
+    /// Get persisted port resolutions for an isolation scope.
+    ///
+    /// `isolation_id` selects the scope: `None` reads the shared (non-isolated)
+    /// scope, `Some(id)` an isolation session.
+    pub async fn get_global_port_allocations(
+        &self,
+        isolation_id: Option<&str>,
+    ) -> HashMap<String, u16> {
+        let scope = isolation_id.unwrap_or("").to_string();
         match self
             .conn
             .call(
-                |conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<HashMap<String, u16>> {
-                    let mut stmt = conn.prepare("SELECT param_name, port FROM persisted_ports")?;
+                move |conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<HashMap<String, u16>> {
+                    let mut stmt = conn.prepare(
+                        "SELECT param_name, port FROM persisted_ports WHERE isolation_id = ?1",
+                    )?;
                     let ports: HashMap<String, u16> = stmt
-                        .query_map([], |row| {
+                        .query_map(rusqlite::params![&scope], |row| {
                             Ok((row.get::<_, String>(0)?, row.get::<_, u16>(1)?))
                         })?
                         .filter_map(|r| r.ok())
@@ -2094,7 +2197,9 @@ impl SqliteStateTracker {
     }
 
     /// Clear persisted port resolutions and allocated port bind reservations.
-    /// Used by `fed ports reset`.
+    ///
+    /// Wipes every isolation scope — used by `fed isolate disable` and
+    /// `fed clean` to return the project to configured ports.
     pub async fn clear_port_resolutions(&mut self) -> Result<()> {
         self.conn
             .call(
@@ -3419,9 +3524,12 @@ mod tests {
             ("HTTP_PORT".to_string(), 8080u16),
             ("GRPC_PORT".to_string(), 9090u16),
         ];
-        tracker.save_port_resolutions(&resolutions).await.unwrap();
+        tracker
+            .save_port_resolutions(&resolutions, None)
+            .await
+            .unwrap();
 
-        let globals = tracker.get_global_port_allocations().await;
+        let globals = tracker.get_global_port_allocations(None).await;
         assert_eq!(globals.len(), 2);
         assert_eq!(globals.get("HTTP_PORT"), Some(&8080));
         assert_eq!(globals.get("GRPC_PORT"), Some(&9090));
@@ -3437,12 +3545,12 @@ mod tests {
         let mut tracker = create_ephemeral_tracker().await;
 
         let first = vec![("OLD_PORT".to_string(), 3000u16)];
-        tracker.save_port_resolutions(&first).await.unwrap();
+        tracker.save_port_resolutions(&first, None).await.unwrap();
 
         let second = vec![("NEW_PORT".to_string(), 4000u16)];
-        tracker.save_port_resolutions(&second).await.unwrap();
+        tracker.save_port_resolutions(&second, None).await.unwrap();
 
-        let globals = tracker.get_global_port_allocations().await;
+        let globals = tracker.get_global_port_allocations(None).await;
         assert_eq!(globals.len(), 1, "Previous resolutions should be replaced");
         assert_eq!(globals.get("NEW_PORT"), Some(&4000));
         assert!(!globals.contains_key("OLD_PORT"));
@@ -3453,11 +3561,14 @@ mod tests {
         let mut tracker = create_ephemeral_tracker().await;
 
         let resolutions = vec![("PORT".to_string(), 5000u16)];
-        tracker.save_port_resolutions(&resolutions).await.unwrap();
+        tracker
+            .save_port_resolutions(&resolutions, None)
+            .await
+            .unwrap();
 
         tracker.clear_port_resolutions().await.unwrap();
 
-        let globals = tracker.get_global_port_allocations().await;
+        let globals = tracker.get_global_port_allocations(None).await;
         assert!(globals.is_empty(), "All port resolutions should be cleared");
 
         let allocated = tracker.get_allocated_ports().await;
@@ -3465,6 +3576,65 @@ mod tests {
             allocated.is_empty(),
             "Allocated ports should also be cleared"
         );
+    }
+
+    #[tokio::test]
+    async fn test_port_resolutions_scoped_by_isolation_id() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        // The shared scope and an isolation scope are independent namespaces,
+        // even for the same parameter name.
+        let shared = vec![("DB_PORT".to_string(), 5432u16)];
+        tracker.save_port_resolutions(&shared, None).await.unwrap();
+
+        let isolated = vec![("DB_PORT".to_string(), 51833u16)];
+        tracker
+            .save_port_resolutions(&isolated, Some("iso-cafebabe"))
+            .await
+            .unwrap();
+
+        // Reads are scoped: each scope sees only its own value.
+        assert_eq!(
+            tracker
+                .get_global_port_allocations(None)
+                .await
+                .get("DB_PORT"),
+            Some(&5432)
+        );
+        assert_eq!(
+            tracker
+                .get_global_port_allocations(Some("iso-cafebabe"))
+                .await
+                .get("DB_PORT"),
+            Some(&51833)
+        );
+
+        // Saving one scope must not disturb the other — this is the property
+        // that keeps randomized isolation ports out of the non-isolated path.
+        let shared2 = vec![("DB_PORT".to_string(), 5433u16)];
+        tracker.save_port_resolutions(&shared2, None).await.unwrap();
+        assert_eq!(
+            tracker
+                .get_global_port_allocations(Some("iso-cafebabe"))
+                .await
+                .get("DB_PORT"),
+            Some(&51833),
+            "Saving the shared scope must not touch the isolation scope"
+        );
+
+        // An empty scope falls back to nothing (caller then uses config defaults).
+        assert!(tracker
+            .get_global_port_allocations(Some("iso-other"))
+            .await
+            .is_empty());
+
+        // clear_port_resolutions wipes every scope.
+        tracker.clear_port_resolutions().await.unwrap();
+        assert!(tracker.get_global_port_allocations(None).await.is_empty());
+        assert!(tracker
+            .get_global_port_allocations(Some("iso-cafebabe"))
+            .await
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3567,7 +3737,10 @@ mod tests {
 
         // Save global port resolutions
         let resolutions = vec![("PRESERVED_PORT".to_string(), 9999u16)];
-        tracker.save_port_resolutions(&resolutions).await.unwrap();
+        tracker
+            .save_port_resolutions(&resolutions, None)
+            .await
+            .unwrap();
 
         // Register a service with its own port
         let state = make_service_state("svc", ServiceType::Process);
@@ -3582,7 +3755,7 @@ mod tests {
 
         assert!(tracker.get_services().await.is_empty());
 
-        let globals = tracker.get_global_port_allocations().await;
+        let globals = tracker.get_global_port_allocations(None).await;
         assert_eq!(
             globals.get("PRESERVED_PORT"),
             Some(&9999),

@@ -365,7 +365,12 @@ impl Orchestrator {
     /// Collect ports owned by running managed services so the resolver can
     /// avoid re-allocating them.
     async fn collect_managed_ports(&mut self) {
-        super::ports::collect_managed_ports(&mut self.resolver, &self.state_tracker).await;
+        super::ports::collect_managed_ports(
+            &mut self.resolver,
+            &self.state_tracker,
+            self.isolation_id.as_deref(),
+        )
+        .await;
     }
 
     /// Configure resolver port store for the current mode.
@@ -373,17 +378,18 @@ impl Orchestrator {
     /// When `read_only` is true, the resolver receives an in-memory snapshot so
     /// `resolve_parameters()` cannot mutate SQLite state.
     async fn configure_port_store(&mut self, read_only: bool) {
+        let scope = self.isolation_id.clone();
         let port_store: Box<dyn crate::port::PortStore> = if self.randomize_ports {
             tracing::debug!("Randomize mode: using NoopPortStore for fresh allocation");
             Box::new(crate::port::NoopPortStore)
         } else {
             let persisted_ports = if read_only {
-                Self::load_persisted_ports_read_only(&self.work_dir)
+                Self::load_persisted_ports_read_only(&self.work_dir, scope.as_deref())
             } else {
                 self.state_tracker
                     .read()
                     .await
-                    .get_global_port_allocations()
+                    .get_global_port_allocations(scope.as_deref())
                     .await
             };
             if !persisted_ports.is_empty() {
@@ -401,7 +407,45 @@ impl Orchestrator {
     ///
     /// Used by dry-run initialization so we can preview with existing persisted
     /// allocations without opening state tracker tables in write mode.
-    fn load_persisted_ports_read_only(work_dir: &std::path::Path) -> HashMap<String, u16> {
+    /// Read the active isolation id directly from SQLite in read-only mode.
+    ///
+    /// Used by dry-run, whose ephemeral in-memory state tracker has no project
+    /// settings: we consult the real `.fed/lock.db` so the preview adopts the
+    /// same isolation scope a real `fed start` would. Returns `None` when
+    /// isolation is disabled or the database is absent/unreadable.
+    fn load_isolation_id_read_only(work_dir: &std::path::Path) -> Option<String> {
+        let db_path = work_dir.join(".fed").join("lock.db");
+        if !db_path.exists() {
+            return None;
+        }
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .ok()?;
+        let enabled: String = conn
+            .query_row(
+                "SELECT value FROM project_settings WHERE key = 'isolation_enabled'",
+                [],
+                |row| row.get(0),
+            )
+            .ok()?;
+        if enabled != "true" {
+            return None;
+        }
+        conn.query_row(
+            "SELECT value FROM project_settings WHERE key = 'isolation_id'",
+            [],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    fn load_persisted_ports_read_only(
+        work_dir: &std::path::Path,
+        isolation_id: Option<&str>,
+    ) -> HashMap<String, u16> {
+        let scope = isolation_id.unwrap_or("");
         let db_path = work_dir.join(".fed").join("lock.db");
         if !db_path.exists() {
             return HashMap::new();
@@ -422,7 +466,9 @@ impl Orchestrator {
             }
         };
 
-        let mut stmt = match conn.prepare("SELECT param_name, port FROM persisted_ports") {
+        let mut stmt = match conn
+            .prepare("SELECT param_name, port FROM persisted_ports WHERE isolation_id = ?1")
+        {
             Ok(stmt) => stmt,
             Err(e) => {
                 tracing::debug!(
@@ -434,7 +480,7 @@ impl Orchestrator {
             }
         };
 
-        let rows = match stmt.query_map([], |row| {
+        let rows = match stmt.query_map(rusqlite::params![scope], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, u16>(1)?))
         }) {
             Ok(rows) => rows,
@@ -492,6 +538,14 @@ impl Orchestrator {
         // Work dir is required for resolving global env_file paths.
         self.resolver.set_work_dir(&self.work_dir);
 
+        // Adopt the persisted isolation scope so the dry-run previews the same
+        // ports a real `fed start` would use (configure_port_store reads it).
+        // Dry-run's state tracker is an ephemeral in-memory DB with no project
+        // settings, so we must read isolation state from the real `.fed/lock.db`.
+        if self.isolation_id.is_none() {
+            self.isolation_id = Self::load_isolation_id_read_only(&self.work_dir);
+        }
+
         // Use a read-only port-store snapshot so resolve_parameters() can't persist.
         self.configure_port_store(true).await;
 
@@ -544,6 +598,22 @@ impl Orchestrator {
         // Initialize state tracker (marks dead services as stale, doesn't delete)
         self.state_tracker.write().await.initialize().await?;
 
+        // Determine the active isolation scope BEFORE anything reads or writes
+        // ports. If project-level isolation is enabled, adopt its persisted
+        // isolation_id so port reads/writes, container names, and volumes all
+        // resolve to the same scope. An explicitly-set isolation_id (e.g. an
+        // isolated script) takes precedence and is left untouched.
+        if self.isolation_id.is_none() {
+            let tracker = self.state_tracker.read().await;
+            let (isolated, isolation_id) = tracker.get_isolation_mode().await;
+            if isolated {
+                if let Some(id) = isolation_id {
+                    tracing::debug!("Applying persisted isolation_id: {}", id);
+                    self.isolation_id = Some(id);
+                }
+            }
+        }
+
         // Collect ports owned by running managed services.
         // Safe to call after initialize because dead services are marked stale
         // (not deleted), so port_allocations for live services remain intact.
@@ -585,21 +655,6 @@ impl Orchestrator {
         // - Otherwise → SqlitePortStore (reads/writes persisted_ports table)
         self.configure_port_store(false).await;
 
-        // If project-level isolation is enabled, apply the persisted isolation_id
-        // so Docker containers get unique names matching the isolation ID.
-        {
-            let tracker = self.state_tracker.read().await;
-            let (isolated, isolation_id) = tracker.get_isolation_mode().await;
-            if isolated {
-                if let Some(id) = isolation_id {
-                    if self.isolation_id.is_none() {
-                        tracing::debug!("Applying persisted isolation_id: {}", id);
-                        self.isolation_id = Some(id);
-                    }
-                }
-            }
-        }
-
         // First pass: resolve parent parameters only (not services yet)
         // This allows us to use resolved parameter values when expanding external services
         self.resolver.resolve_parameters(&mut self.config)?;
@@ -634,7 +689,7 @@ impl Orchestrator {
             self.state_tracker
                 .write()
                 .await
-                .save_port_resolutions(&port_resolutions)
+                .save_port_resolutions(&port_resolutions, self.isolation_id.as_deref())
                 .await?;
         }
 

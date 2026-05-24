@@ -33,6 +33,7 @@ use tokio::sync::RwLock;
 pub(super) async fn collect_managed_ports(
     resolver: &mut Resolver,
     state_tracker: &Arc<RwLock<StateTracker>>,
+    isolation_id: Option<&str>,
 ) {
     let state = state_tracker.read().await;
     let services = state.get_services().await;
@@ -66,7 +67,7 @@ pub(super) async fn collect_managed_ports(
     // If any real service is alive, trust globally persisted port resolutions.
     // These cover all port parameters including process/Gradle services.
     if has_live_service {
-        let global_ports = state.get_global_port_allocations().await;
+        let global_ports = state.get_global_port_allocations(isolation_id).await;
         for port in global_ports.values() {
             managed_ports.insert(*port);
         }
