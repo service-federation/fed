@@ -109,23 +109,35 @@ fn scoped_migrated_dir(work_dir: &Path, isolation_id: Option<&str>) -> Result<Pa
     })
 }
 
-fn write_marker(dir: PathBuf, service_name: &str, kind: &str) -> Result<()> {
+fn write_marker(dir: PathBuf, service_name: &str, kind: &str, body: &str) -> Result<()> {
     fs::create_dir_all(&dir)
         .map_err(|e| Error::Filesystem(format!("Failed to create {} directory: {}", kind, e)))?;
     let sanitized = sanitize_service_name_for_path(service_name)?;
-    let marker_file = dir.join(sanitized);
-    let timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-        .as_secs();
-    fs::write(&marker_file, timestamp.to_string())
+    fs::write(dir.join(sanitized), body)
         .map_err(|e| Error::Filesystem(format!("Failed to create {} marker: {}", kind, e)))?;
     Ok(())
+}
+
+fn read_marker(dir: PathBuf, service_name: &str) -> Result<Option<String>> {
+    let sanitized = sanitize_service_name_for_path(service_name)?;
+    match fs::read_to_string(dir.join(sanitized)) {
+        Ok(body) => Ok(Some(body)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::Filesystem(format!("Failed to read marker: {}", e))),
+    }
 }
 
 fn marker_exists(dir: PathBuf, service_name: &str) -> Result<bool> {
     let sanitized = sanitize_service_name_for_path(service_name)?;
     Ok(dir.join(sanitized).exists())
+}
+
+fn now_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_secs()
+        .to_string()
 }
 
 fn remove_marker(dir: PathBuf, service_name: &str, kind: &str) -> Result<()> {
@@ -194,7 +206,12 @@ impl LifecycleMarkers {
 
     /// Mark a service as installed in this scope.
     pub fn mark_installed(&self, service_name: &str) -> Result<()> {
-        write_marker(self.installed_dir()?, service_name, "installed")
+        write_marker(
+            self.installed_dir()?,
+            service_name,
+            "installed",
+            &now_timestamp(),
+        )
     }
 
     /// Clear install state for a service in this scope.
@@ -207,9 +224,18 @@ impl LifecycleMarkers {
         marker_exists(self.migrated_dir()?, service_name)
     }
 
-    /// Mark a service as migrated in this scope.
-    pub fn mark_migrated(&self, service_name: &str) -> Result<()> {
-        write_marker(self.migrated_dir()?, service_name, "migrated")
+    /// Read the dependency-state fingerprint recorded when a service was last
+    /// migrated, or `None` if there is no marker. Markers written by older fed
+    /// versions hold a bare timestamp, which simply won't match a fingerprint
+    /// and so triggers one re-migrate on upgrade.
+    pub fn migrated_fingerprint(&self, service_name: &str) -> Result<Option<String>> {
+        read_marker(self.migrated_dir()?, service_name)
+    }
+
+    /// Mark a service as migrated in this scope, recording the dependency-state
+    /// `fingerprint` whose change should force a re-migrate.
+    pub fn mark_migrated(&self, service_name: &str, fingerprint: &str) -> Result<()> {
+        write_marker(self.migrated_dir()?, service_name, "migrated", fingerprint)
     }
 
     /// Clear migrate state for a service in this scope.
@@ -288,10 +314,25 @@ mod tests {
         let _ = ctx.clear_migrated(svc);
 
         assert!(!ctx.is_migrated(svc).unwrap());
-        ctx.mark_migrated(svc).unwrap();
+        ctx.mark_migrated(svc, "fp").unwrap();
         assert!(ctx.is_migrated(svc).unwrap());
         ctx.clear_migrated(svc).unwrap();
         assert!(!ctx.is_migrated(svc).unwrap());
+    }
+
+    #[test]
+    fn test_migrated_fingerprint_roundtrip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ctx = shared(&temp_dir);
+
+        assert_eq!(ctx.migrated_fingerprint("svc").unwrap(), None);
+        ctx.mark_migrated("svc", "deadbeef").unwrap();
+        assert_eq!(
+            ctx.migrated_fingerprint("svc").unwrap().as_deref(),
+            Some("deadbeef")
+        );
+        ctx.clear_migrated("svc").unwrap();
+        assert_eq!(ctx.migrated_fingerprint("svc").unwrap(), None);
     }
 
     #[test]
@@ -305,7 +346,7 @@ mod tests {
         let _ = ctx_a.clear_migrated(svc);
         let _ = ctx_b.clear_migrated(svc);
 
-        ctx_a.mark_migrated(svc).unwrap();
+        ctx_a.mark_migrated(svc, "fp").unwrap();
         assert!(ctx_a.is_migrated(svc).unwrap());
         assert!(!ctx_b.is_migrated(svc).unwrap());
 
@@ -335,9 +376,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let ctx = shared(&temp_dir);
 
-        ctx.mark_migrated("svc-a").unwrap();
-        ctx.mark_migrated("svc-b").unwrap();
-        ctx.mark_migrated("svc-c").unwrap();
+        ctx.mark_migrated("svc-a", "fp").unwrap();
+        ctx.mark_migrated("svc-b", "fp").unwrap();
+        ctx.mark_migrated("svc-c", "fp").unwrap();
         assert!(ctx.is_migrated("svc-a").unwrap());
         assert!(ctx.is_migrated("svc-b").unwrap());
         assert!(ctx.is_migrated("svc-c").unwrap());
@@ -368,7 +409,7 @@ mod tests {
         let iso_ctx = isolated(&temp_dir, "iso-test1234");
 
         shared_ctx.mark_installed("api").unwrap();
-        shared_ctx.mark_migrated("api").unwrap();
+        shared_ctx.mark_migrated("api", "fp").unwrap();
 
         // Isolated scope must be empty even though shared has markers
         assert!(!iso_ctx.is_installed("api").unwrap());
@@ -376,7 +417,7 @@ mod tests {
 
         // Writing to isolated scope must not leak back to shared scope
         iso_ctx.mark_installed("api").unwrap();
-        iso_ctx.mark_migrated("api").unwrap();
+        iso_ctx.mark_migrated("api", "fp").unwrap();
         assert!(shared_ctx.is_installed("api").unwrap());
         assert!(shared_ctx.is_migrated("api").unwrap());
 

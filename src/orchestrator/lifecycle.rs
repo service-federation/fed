@@ -231,12 +231,19 @@ impl<'a> ServiceLifecycleCommands<'a> {
             None => return Ok(()),
         };
 
+        let fingerprint = self.migrate_state_fingerprint(service_name).await;
         let ctx = self.markers();
-        let is_migrated = ctx.is_migrated(service_name)?;
+        let up_to_date = match ctx.migrated_fingerprint(service_name)? {
+            // Nothing to fingerprint (no dependency volumes): honor presence,
+            // preserving the original behavior for stateless dependencies.
+            Some(_) if fingerprint.is_empty() => true,
+            Some(recorded) => recorded == fingerprint,
+            None => false,
+        };
 
-        if is_migrated {
+        if up_to_date {
             tracing::debug!(
-                "Service '{}' already migrated, skipping migrate step",
+                "Service '{}' already migrated and dependency state unchanged, skipping migrate step",
                 service_name
             );
             return Ok(());
@@ -289,13 +296,44 @@ impl<'a> ServiceLifecycleCommands<'a> {
         }
 
         let ctx = self.markers();
-        ctx.mark_migrated(service_name)?;
+        ctx.mark_migrated(service_name, &fingerprint)?;
 
         tracing::info!(
             "Successfully completed migrate for service '{}'",
             service_name
         );
         Ok(())
+    }
+
+    /// Fingerprint the dependency state this service's migrate relies on.
+    ///
+    /// A migrate's side effects (created databases, seeded rows) live in the
+    /// volumes of the service's dependencies. Recording each volume's creation
+    /// identity means a destroyed-and-recreated volume invalidates the marker
+    /// and re-runs migrate, rather than the dependent service later crashing on
+    /// a database that the skipped migrate would have created. Empty when there
+    /// is no dependency volume to track.
+    async fn migrate_state_fingerprint(&self, service_name: &str) -> String {
+        let Some(service) = self.config.services.get(service_name) else {
+            return String::new();
+        };
+        let client = DockerClient::new();
+        let timeout = std::time::Duration::from_secs(10);
+        let session = self.isolation_id.as_deref();
+
+        let mut entries = Vec::new();
+        for dep in &service.depends_on {
+            let container =
+                crate::service::docker_container_name(dep.service_name(), session, self.work_dir);
+            for volume in client.inspect_volume_names(&container, timeout).await {
+                let created = client
+                    .volume_created_at(&volume, timeout)
+                    .await
+                    .unwrap_or_else(|| "gone".to_string());
+                entries.push(format!("{volume}@{created}"));
+            }
+        }
+        compose_state_fingerprint(entries)
     }
 
     /// Run build command for a service.
@@ -771,9 +809,43 @@ impl<'a> ServiceLifecycleCommands<'a> {
     }
 }
 
+/// Reduce per-volume `name@created_at` entries to a stable fingerprint. Order
+/// independent; empty input yields an empty fingerprint.
+fn compose_state_fingerprint(mut entries: Vec<String>) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    entries.sort();
+    entries.dedup();
+    format!(
+        "{:08x}",
+        crate::service::fnv1a_32(entries.join(";").as_bytes())
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_empty_input_is_empty() {
+        assert_eq!(compose_state_fingerprint(vec![]), "");
+    }
+
+    #[test]
+    fn fingerprint_is_order_independent() {
+        let a = compose_state_fingerprint(vec!["v1@t1".into(), "v2@t2".into()]);
+        let b = compose_state_fingerprint(vec!["v2@t2".into(), "v1@t1".into()]);
+        assert_eq!(a, b);
+        assert!(!a.is_empty());
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_volume_is_recreated() {
+        let before = compose_state_fingerprint(vec!["pg@2026-01-01".into()]);
+        let after = compose_state_fingerprint(vec!["pg@2026-02-02".into()]);
+        assert_ne!(before, after);
+    }
 
     #[test]
     fn test_extract_named_volume_basic() {

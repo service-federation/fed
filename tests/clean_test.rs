@@ -359,10 +359,10 @@ services:
     // `migrate-only` has neither `clean:` nor `volumes:`, so it would
     // never be touched without the full-clean fix.
     markers
-        .mark_migrated("cleanable")
+        .mark_migrated("cleanable", "fp")
         .expect("seed cleanable marker");
     markers
-        .mark_migrated("migrate-only")
+        .mark_migrated("migrate-only", "fp")
         .expect("seed migrate-only marker");
 
     assert!(

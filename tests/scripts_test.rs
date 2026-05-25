@@ -1644,8 +1644,8 @@ services:
 
     shared.mark_installed(svc_a).expect("seed install a");
     shared.mark_installed(svc_b).expect("seed install b");
-    shared.mark_migrated(svc_a).expect("seed migrate a");
-    shared.mark_migrated(svc_b).expect("seed migrate b");
+    shared.mark_migrated(svc_a, "fp").expect("seed migrate a");
+    shared.mark_migrated(svc_b, "fp").expect("seed migrate b");
 
     assert!(shared.is_installed(svc_a).unwrap());
     assert!(shared.is_installed(svc_b).unwrap());
