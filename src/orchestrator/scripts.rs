@@ -412,13 +412,14 @@ impl<'a> ScriptRunner<'a> {
         self.orchestrator.config.scripts.keys().cloned().collect()
     }
 
-    /// Snapshot the set of services currently `Running`/`Healthy`.
+    /// Snapshot the set of services that are already *present* when a run
+    /// begins — the services this run must borrow rather than own.
     async fn running_services_snapshot(&self) -> HashSet<String> {
         self.orchestrator
             .get_status_passive()
             .await
             .into_iter()
-            .filter(|(_, status)| matches!(status, Status::Running | Status::Healthy))
+            .filter(|(_, status)| service_is_present(*status))
             .map(|(name, _)| name)
             .collect()
     }
@@ -445,6 +446,21 @@ impl<'a> ScriptRunner<'a> {
             }
         }
     }
+}
+
+/// Whether a service counts as "already present" when a script run begins.
+///
+/// Borrow-or-own decides ownership by diffing the set of present services
+/// before and after the run. A service that is anything other than fully
+/// `Stopped` was brought up by someone else — including one still `Starting`
+/// (e.g. a slow first-time Docker pull) or `Failing` a health check — so the
+/// run must borrow it and leave it alone, never claim and stop it on exit.
+///
+/// Counting only `Running`/`Healthy` here was a bug: a service caught mid
+/// `Starting` at snapshot time looked absent, then became `Running` during the
+/// run and got mis-attributed to (and stopped by) the script.
+fn service_is_present(status: Status) -> bool {
+    !matches!(status, Status::Stopped)
 }
 
 /// Execute a script command with the given environment.
@@ -565,6 +581,27 @@ pub(super) fn script_uses_positional_params(script: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // service_is_present (borrow-or-own snapshot) tests
+    // ========================================================================
+
+    #[test]
+    fn present_excludes_only_stopped() {
+        // Stopped is the only status that means "not there to borrow".
+        assert!(!service_is_present(Status::Stopped));
+    }
+
+    #[test]
+    fn present_includes_transitional_and_live_states() {
+        // Anything live or transitioning was started outside this run and must
+        // be borrowed, not owned — this is the Starting-state fix.
+        assert!(service_is_present(Status::Starting));
+        assert!(service_is_present(Status::Running));
+        assert!(service_is_present(Status::Healthy));
+        assert!(service_is_present(Status::Failing));
+        assert!(service_is_present(Status::Stopping));
+    }
 
     // ========================================================================
     // script_uses_positional_params tests
