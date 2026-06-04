@@ -45,8 +45,20 @@ impl<'a> ScriptRunner<'a> {
         // Don't `?` — cleanup must run on both success and failure.
         let result = self.run_script_captured(script_name).await;
 
+        // `keep_services` leaves the started services running (see the
+        // interactive path for the full rationale). An unknown script can't
+        // keep anything — `run_script_captured` already surfaced that error.
+        let keep_services = self
+            .orchestrator
+            .config
+            .scripts
+            .get(script_name)
+            .is_some_and(|s| s.keep_services);
+
         if let Some(before) = before {
-            self.stop_services_started_since(&before).await;
+            if !keep_services {
+                self.stop_services_started_since(&before).await;
+            }
         }
 
         result
@@ -202,8 +214,14 @@ impl<'a> ScriptRunner<'a> {
             exec.await
         };
 
+        // `keep_services` opts the top-level run out of ownership: the services
+        // it started are left running (like `fed start`) for the caller to use
+        // and later tear down with `fed stop`. Nested runs never reach here
+        // (`before` is None), so only the invoked script's flag is consulted.
         if let Some(before) = before {
-            self.stop_services_started_since(&before).await;
+            if !script.keep_services {
+                self.stop_services_started_since(&before).await;
+            }
         }
 
         result
@@ -253,14 +271,15 @@ impl<'a> ScriptRunner<'a> {
                 ))
             })?;
 
-        // Create resolved script for execution
+        // Create resolved script for execution. Dependencies are already
+        // resolved above and ownership/keep-services decisions belong to the
+        // top-level run, so this inner execution script keeps only the command
+        // and environment; everything else stays at its default.
         let resolved = Script {
             cwd: script.cwd.clone(),
-            depends_on: vec![], // Already resolved above
             environment: resolved_env,
             script: resolved_script,
-            isolated: false,
-            timeout: None,
+            ..Default::default()
         };
 
         // Execute the script command
@@ -374,14 +393,15 @@ impl<'a> ScriptRunner<'a> {
                 ))
             })?;
 
-        // Create a modified script with resolved environment and command
+        // Create a modified script with resolved environment and command.
+        // Deps are already resolved and `isolated`/`keep_services` are decided
+        // by the top-level run, so everything else stays at its default
+        // (notably `isolated: false` — don't recurse).
         let isolated_script = Script {
             cwd: original_script.cwd.clone(),
-            depends_on: vec![], // Already resolved
             environment: resolved_env,
             script: resolved_script_cmd,
-            isolated: false, // Don't recurse
-            timeout: None,
+            ..Default::default()
         };
 
         // Execute script in child context
@@ -740,9 +760,7 @@ mod tests {
         // should fall back to awaiting exec.
         let signal_err =
             || -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>>>> {
-                Box::pin(async {
-                    Err(std::io::Error::new(std::io::ErrorKind::Other, "no handler"))
-                })
+                Box::pin(async { Err(std::io::Error::other("no handler")) })
             };
         let out = guard_against_interrupt(async { 5 }, signal_err, || -1).await;
         assert_eq!(out, 5);

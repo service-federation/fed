@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Script configuration for custom commands.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Script {
     /// Working directory for the script
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,4 +37,43 @@ pub struct Script {
     /// not to interactive execution.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
+
+    /// When true, services this script starts are left running after it
+    /// finishes instead of being stopped ("borrow-or-own" cleanup is skipped).
+    ///
+    /// This opts the script out of ownership: it behaves like the services were
+    /// pre-started with `fed start`, so they persist until `fed stop`. Useful
+    /// for scenario/seed scripts that set up state for manual testing in the
+    /// browser, where the stack must stay up after the script returns.
+    ///
+    /// Applies only to the script you invoke directly. When this script is
+    /// pulled in as another script's dependency, the outermost run owns
+    /// cleanup and its setting governs.
+    #[serde(default)]
+    pub keep_services: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keep_services_defaults_to_false() {
+        let script: Script = serde_yaml::from_str("script: echo hi").unwrap();
+        assert!(
+            !script.keep_services,
+            "keep_services must default to false (own-and-stop)"
+        );
+    }
+
+    #[test]
+    fn keep_services_parses_true() {
+        let script: Script = serde_yaml::from_str("script: echo hi\nkeep_services: true").unwrap();
+        assert!(script.keep_services);
+    }
+
+    #[test]
+    fn default_script_does_not_keep_services() {
+        assert!(!Script::default().keep_services);
+    }
 }

@@ -652,7 +652,6 @@ fn validate_cpus_string(cpus: &str) -> std::result::Result<(), String> {
 mod tests {
     use super::*;
     use crate::config::{Parameter, Service};
-    use std::collections::HashMap;
 
     #[test]
     fn test_validate_circular_dependency() {
@@ -757,9 +756,7 @@ mod tests {
             script: "echo script".to_string(),
             cwd: None,
             depends_on: vec![],
-            environment: HashMap::new(),
-            isolated: false,
-            timeout: None,
+            ..Default::default()
         };
 
         config.services.insert("app".to_string(), service);
@@ -781,9 +778,7 @@ mod tests {
             script: "echo test".to_string(),
             cwd: None,
             depends_on: vec!["nonexistent".to_string()],
-            environment: HashMap::new(),
-            isolated: false,
-            timeout: None,
+            ..Default::default()
         };
 
         config.scripts.insert("test".to_string(), script);
@@ -809,9 +804,7 @@ mod tests {
             script: "echo script".to_string(),
             cwd: None,
             depends_on: vec!["database".to_string()],
-            environment: HashMap::new(),
-            isolated: false,
-            timeout: None,
+            ..Default::default()
         };
 
         config.services.insert("database".to_string(), service);
@@ -830,18 +823,14 @@ mod tests {
             script: "echo script1".to_string(),
             cwd: None,
             depends_on: vec![],
-            environment: HashMap::new(),
-            isolated: false,
-            timeout: None,
+            ..Default::default()
         };
 
         let script2 = Script {
             script: "echo script2".to_string(),
             cwd: None,
             depends_on: vec!["script1".to_string()],
-            environment: HashMap::new(),
-            isolated: false,
-            timeout: None,
+            ..Default::default()
         };
 
         config.scripts.insert("script1".to_string(), script1);
@@ -1007,18 +996,14 @@ mod tests {
             script: "echo a".to_string(),
             cwd: None,
             depends_on: vec!["script_b".to_string()],
-            environment: HashMap::new(),
-            isolated: false,
-            timeout: None,
+            ..Default::default()
         };
 
         let script_b = Script {
             script: "echo b".to_string(),
             cwd: None,
             depends_on: vec!["script_a".to_string()],
-            environment: HashMap::new(),
-            isolated: false,
-            timeout: None,
+            ..Default::default()
         };
 
         config.scripts.insert("script_a".to_string(), script_a);
@@ -1040,27 +1025,21 @@ mod tests {
             script: "echo x".to_string(),
             cwd: None,
             depends_on: vec!["y".to_string()],
-            environment: HashMap::new(),
-            isolated: false,
-            timeout: None,
+            ..Default::default()
         };
 
         let script_y = Script {
             script: "echo y".to_string(),
             cwd: None,
             depends_on: vec!["z".to_string()],
-            environment: HashMap::new(),
-            isolated: false,
-            timeout: None,
+            ..Default::default()
         };
 
         let script_z = Script {
             script: "echo z".to_string(),
             cwd: None,
             depends_on: vec!["x".to_string()],
-            environment: HashMap::new(),
-            isolated: false,
-            timeout: None,
+            ..Default::default()
         };
 
         config.scripts.insert("x".to_string(), script_x);
@@ -1097,9 +1076,7 @@ mod tests {
             script: "echo script".to_string(),
             cwd: None,
             depends_on: vec!["database".to_string()],
-            environment: HashMap::new(),
-            isolated: false,
-            timeout: None,
+            ..Default::default()
         };
 
         config.services.insert("database".to_string(), service);
@@ -1126,18 +1103,14 @@ mod tests {
             script: "echo b".to_string(),
             cwd: None,
             depends_on: vec!["db".to_string()],
-            environment: HashMap::new(),
-            isolated: false,
-            timeout: None,
+            ..Default::default()
         };
 
         let script_a = Script {
             script: "echo a".to_string(),
             cwd: None,
             depends_on: vec!["script_b".to_string()],
-            environment: HashMap::new(),
-            isolated: false,
-            timeout: None,
+            ..Default::default()
         };
 
         config.services.insert("db".to_string(), service);
@@ -1383,9 +1356,8 @@ mod tests {
                 script: "echo migrate".to_string(),
                 cwd: None,
                 depends_on: vec![],
-                environment: HashMap::new(),
-                isolated: false,
                 timeout: Some("nope".to_string()),
+                ..Default::default()
             },
         );
 
@@ -1407,9 +1379,8 @@ mod tests {
                 script: "echo migrate".to_string(),
                 cwd: None,
                 depends_on: vec![],
-                environment: HashMap::new(),
-                isolated: false,
                 timeout: Some("5m".to_string()),
+                ..Default::default()
             },
         );
 

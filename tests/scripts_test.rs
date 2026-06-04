@@ -1583,6 +1583,146 @@ scripts:
 }
 
 // ============================================================================
+// Tests for `keep_services` — opting out of borrow-or-own cleanup
+// ============================================================================
+
+/// keep_services: a script that opts in leaves the service it started running,
+/// the exact inverse of `test_script_owns_and_stops_started_service`. This is
+/// the scenario/seed-script use case: set up state, then keep the stack up for
+/// manual testing.
+#[tokio::test]
+async fn test_keep_services_leaves_started_service_running() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let marker = temp_dir.path().join("worker-started");
+
+    let yaml = format!(
+        r#"
+services:
+  worker:
+    process: "sh -c 'touch {} && sleep 30'"
+
+scripts:
+  task:
+    keep_services: true
+    depends_on:
+      - worker
+    script: "echo done"
+"#,
+        marker.display()
+    );
+
+    let (orchestrator, _orch_temp) = init_orchestrator(&yaml, temp_dir.path()).await;
+
+    assert!(
+        !orchestrator.is_service_running("worker").await,
+        "worker should not be running before the script"
+    );
+
+    let status = orchestrator
+        .run_script_interactive("task", &[])
+        .await
+        .expect("Failed to run script");
+    assert!(status.success(), "Script should succeed");
+
+    assert!(
+        marker.exists(),
+        "worker should have been started by the run (marker file written)"
+    );
+    assert!(
+        orchestrator.is_service_running("worker").await,
+        "keep_services: worker started by the run must stay running afterward"
+    );
+
+    // We opted out of automatic cleanup, so tear the stack down explicitly.
+    orchestrator.cleanup().await;
+}
+
+/// keep_services keeps the *whole* started subtree up, not just the directly
+/// listed dependency — the inverse of `test_script_stops_transitive_dependencies`.
+#[tokio::test]
+async fn test_keep_services_leaves_transitive_dependencies_running() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+
+    let yaml = r#"
+services:
+  db:
+    process: "sleep 30"
+  app:
+    process: "sleep 30"
+    depends_on:
+      - db
+
+scripts:
+  task:
+    keep_services: true
+    depends_on:
+      - app
+    script: "echo done"
+"#;
+
+    let (orchestrator, _orch_temp) = init_orchestrator(yaml, temp_dir.path()).await;
+
+    let status = orchestrator
+        .run_script_interactive("task", &[])
+        .await
+        .expect("Failed to run script");
+    assert!(status.success(), "Script should succeed");
+
+    assert!(
+        orchestrator.is_service_running("app").await,
+        "keep_services: directly-depended service must stay running"
+    );
+    assert!(
+        orchestrator.is_service_running("db").await,
+        "keep_services: transitive dependency must also stay running"
+    );
+
+    orchestrator.cleanup().await;
+}
+
+/// keep_services applies to the script you invoke, not to a script pulled in as
+/// a dependency: the outermost run owns cleanup. Here the top-level `main` does
+/// NOT keep services, so the service started via its keep_services-tagged
+/// dependency `setup` is still stopped.
+#[tokio::test]
+async fn test_keep_services_on_nested_dependency_does_not_leak() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+
+    let yaml = r#"
+services:
+  svc:
+    process: "sleep 30"
+
+scripts:
+  setup:
+    keep_services: true
+    depends_on:
+      - svc
+    script: "echo setup"
+  main:
+    depends_on:
+      - setup
+    script: "echo main"
+"#;
+
+    let (orchestrator, _orch_temp) = init_orchestrator(yaml, temp_dir.path()).await;
+
+    let status = orchestrator
+        .run_script_interactive("main", &[])
+        .await
+        .expect("Failed to run script");
+    assert!(status.success(), "Script should succeed");
+
+    assert!(
+        !orchestrator.is_service_running("svc").await,
+        "keep_services on a nested dep must not apply: the top-level run owns \
+         cleanup and 'main' does not keep services"
+    );
+
+    orchestrator.cleanup().await;
+}
+
+// ============================================================================
 // Tests for isolated script marker scoping
 // ============================================================================
 
