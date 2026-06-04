@@ -103,7 +103,7 @@ Show resource usage for all services. Refreshes periodically.
 
 ### `fed run <script> [-- args...]`
 
-Run a named script. Services in `depends_on` are started first and, if the script started them, stopped again after it completes ("borrow or own"). Services that were already running (e.g. via `fed start`) are left running. See [Scripts](scripts.md#service-lifecycle-borrow-or-own).
+Run a named script. Services in `depends_on` are started first and, if the script started them, stopped again after it completes — or fails, or is interrupted with Ctrl+C ("borrow or own"). Services that were already running (e.g. via `fed start`) are left running, as are all services when the script sets [`keep_services: true`](scripts.md#keeping-services-running-keep_services). See [Scripts](scripts.md#service-lifecycle-borrow-or-own).
 
 | Flag | Description |
 |------|-------------|

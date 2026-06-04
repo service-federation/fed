@@ -585,13 +585,21 @@ scripts:
     script: npm run test:integration
     depends_on: [database, redis]
     isolated: true            # Fresh ports, scoped volumes, full cleanup
+
+  scenario:
+    script: ./seed-scenario.sh
+    depends_on: [web]
+    keep_services: true       # Leave started services running after the script exits
 ```
 
 ```bash
 fed run test                  # Start deps, run script, stop deps
 fed run integration           # Runs in complete isolation
+fed run scenario              # Start deps, run script, leave deps running
 ```
 
 `isolated: true` allocates fresh random ports, scopes Docker volumes, and cleans up after completion.
+
+`keep_services: true` skips borrow-or-own cleanup so the services the script starts persist (like `fed start`) until `fed stop`. See [Scripts](./scripts.md#keeping-services-running-keep_services).
 
 See also [Isolation](./isolation.md) for how directory scoping works.

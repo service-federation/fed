@@ -5,12 +5,14 @@
 # - Mixed script + service dependencies
 # - Argument passthrough (fed test -- -t "specific test")
 # - Isolated test execution with isolated: true
+# - keep_services: true to leave the started stack running after the script exits
 #
 # Run with:
 #   fed run db:migrate              # Run migrations
 #   fed test:unit                   # Run unit tests (no deps)
 #   fed test:integration            # Run integration tests (isolated ports)
 #   fed test:integration -- -t auth # Run specific tests with args
+#   fed run scenario                # Seed a demo and leave the stack up (fed stop to tear down)
 
 parameters:
   DB_PORT:
@@ -58,6 +60,14 @@ scripts:
     cwd: ./api
     environment:
       DATABASE_URL: "postgres://postgres:password@localhost:{{DB_PORT}}/myapp"
+
+  # Demo scenario - seed state, then leave the stack running for manual testing.
+  # keep_services skips borrow-or-own cleanup, so api (+ postgres) stay up until
+  # you run `fed stop`.
+  scenario:
+    keep_services: true
+    depends_on: [db:seed, api]
+    script: echo "Demo ready at http://localhost:{{API_PORT}} — run 'fed stop' when done"
 
   # Unit tests - no service dependencies
   test:unit:

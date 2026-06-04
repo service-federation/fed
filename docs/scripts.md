@@ -32,9 +32,14 @@ services that were already running.
 
 - If a dependency was **not running**, the script starts it and **stops it again**
   when the script finishes — including transitive dependencies, and even if the
-  script fails.
+  script fails or you interrupt it with Ctrl+C.
 - If a dependency was **already running** (e.g. you ran `fed start` first), the script
   **borrows** it and leaves it running.
+
+Cleanup runs on every exit path: success, failure, and interruption. The first
+Ctrl+C lets the script shut down and then tears down what it started; a second
+Ctrl+C force-quits a script that ignores the first (the services it started are
+still stopped).
 
 So `fed start` is how you keep a service up across many script runs:
 
@@ -47,9 +52,39 @@ fed run db:migrate          # nothing was running, so db is started…
                             # …and stopped again when the migration finishes
 ```
 
-There is no config flag for this — the lifecycle is decided at runtime by *who started
-the service*. When a script depends on another script, only the outermost run performs
-cleanup, so nested script-dependencies never tear down services mid-run.
+By default the lifecycle is decided at runtime by *who started the service* — no
+per-service configuration needed. When a script depends on another script, only the
+outermost run performs cleanup, so nested script-dependencies never tear down services
+mid-run. A script can opt out of ownership entirely with
+[`keep_services`](#keeping-services-running-keep_services).
+
+## Keeping services running (`keep_services`)
+
+Sometimes you *want* a script to leave its services up — a seed or scenario script
+that sets up state, prints a few URLs, and expects you to keep poking at the running
+stack afterward. Set `keep_services: true` and the run skips its borrow-or-own cleanup:
+
+```yaml
+scripts:
+  scenario:
+    keep_services: true
+    depends_on: [web]
+    script: ./seed-scenario.sh
+```
+
+```bash
+fed scenario     # starts web (+ its deps), seeds state, and leaves them running
+# ...poke at the app in a browser...
+fed stop         # tear the stack down when you're done
+```
+
+The services the run started are left on the same footing as a `fed start`: they
+persist until you stop them. Services that were *already* running are still borrowed,
+exactly as without the flag.
+
+`keep_services` is read only for the script you invoke directly. When a `keep_services`
+script is pulled in as another script's dependency, the outermost run owns cleanup and
+its setting wins — a non-keeping parent still tears everything down.
 
 ## Isolated Scripts
 
