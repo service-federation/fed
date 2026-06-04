@@ -180,16 +180,26 @@ impl<'a> ScriptRunner<'a> {
             None
         };
 
-        // Don't `?` — cleanup must run on both success and failure.
-        let result = if script.isolated {
-            // Execute in isolated context with fresh port allocations
-            // Delegated back to Orchestrator since it needs to create a child Orchestrator
-            self.run_script_isolated(script_name, &script, extra_args)
-                .await
+        let exec = async {
+            if script.isolated {
+                // Execute in isolated context with fresh port allocations
+                // Delegated back to Orchestrator since it needs to create a child Orchestrator
+                self.run_script_isolated(script_name, &script, extra_args)
+                    .await
+            } else {
+                // Execute in shared context (existing behavior)
+                self.run_script_shared(script_name, &script, extra_args)
+                    .await
+            }
+        };
+
+        // Don't `?` — borrow-or-own cleanup must run on success, failure AND
+        // interruption. Only the top-level run owns cleanup, so only it guards
+        // against Ctrl+C killing us before we get there; nested runs just await.
+        let result = if top_level {
+            run_with_interrupt_guard(exec).await
         } else {
-            // Execute in shared context (existing behavior)
-            self.run_script_shared(script_name, &script, extra_args)
-                .await
+            exec.await
         };
 
         if let Some(before) = before {
@@ -448,6 +458,63 @@ impl<'a> ScriptRunner<'a> {
     }
 }
 
+/// Run `exec` while absorbing Ctrl+C so borrow-or-own cleanup can still run.
+///
+/// The script's child shares fed's process group and receives the same SIGINT
+/// from the terminal, so it shuts down on its own; fed must merely stay alive
+/// until it does, rather than letting the default SIGINT handler kill the
+/// process and orphan every service the run started. A second Ctrl+C is the
+/// escape hatch for a child that ignores the first: it abandons the wait
+/// (the child is SIGKILLed via `kill_on_drop`) and returns `Aborted`, after
+/// which cleanup still runs in the caller.
+async fn run_with_interrupt_guard<F>(exec: F) -> Result<std::process::ExitStatus>
+where
+    F: std::future::Future<Output = Result<std::process::ExitStatus>>,
+{
+    guard_against_interrupt(exec, tokio::signal::ctrl_c, || Err(Error::Aborted)).await
+}
+
+/// Core of [`run_with_interrupt_guard`], with the interrupt source and the
+/// abort value injected so it can be unit-tested without raising real signals.
+///
+/// `next_interrupt` is called once per wait to obtain a future that resolves on
+/// the next interrupt. If it ever yields an error (no signal handler could be
+/// installed), the guard stops watching and simply awaits `exec`.
+async fn guard_against_interrupt<T, F, S, SF>(
+    exec: F,
+    mut next_interrupt: S,
+    aborted: impl FnOnce() -> T,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+    S: FnMut() -> SF,
+    SF: std::future::Future<Output = std::io::Result<()>>,
+{
+    tokio::pin!(exec);
+    let mut interrupts = 0u32;
+    loop {
+        tokio::select! {
+            // Poll exec first: if it is already done, return it rather than
+            // spuriously treating a co-arriving interrupt as a force-quit.
+            biased;
+            result = &mut exec => return result,
+            res = next_interrupt() => {
+                if res.is_err() {
+                    // Can't observe interrupts — degrade to a plain await so we
+                    // don't spin re-arming a failing signal source.
+                    return (&mut exec).await;
+                }
+                interrupts += 1;
+                if interrupts >= 2 {
+                    return aborted();
+                }
+                // First interrupt: the child got it too and is winding down.
+                // Loop and keep waiting so its exit drives normal cleanup.
+            }
+        }
+    }
+}
+
 /// Whether a service counts as "already present" when a script run begins.
 ///
 /// Borrow-or-own decides ownership by diffing the set of present services
@@ -533,6 +600,11 @@ pub(super) async fn execute_script_command(
     command.stdout(Stdio::inherit());
     command.stderr(Stdio::inherit());
 
+    // If a second Ctrl+C force-quits the run, `run_with_interrupt_guard` drops
+    // this future; kill_on_drop then SIGKILLs a child that ignored the first
+    // SIGINT so it can't linger after cleanup stops its services.
+    command.kill_on_drop(true);
+
     // Spawn and wait for completion (no timeout for interactive scripts)
     let mut child = command
         .spawn()
@@ -601,6 +673,79 @@ mod tests {
         assert!(service_is_present(Status::Healthy));
         assert!(service_is_present(Status::Failing));
         assert!(service_is_present(Status::Stopping));
+    }
+
+    // ========================================================================
+    // guard_against_interrupt (Ctrl+C cleanup) tests
+    // ========================================================================
+
+    use std::cell::Cell;
+
+    /// An interrupt source that fires (Ok) for its first `n` calls, then parks
+    /// forever — models "the user pressed Ctrl+C n times".
+    fn interrupts_then_idle(
+        n: usize,
+    ) -> impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>>>>
+    {
+        let calls = Cell::new(0usize);
+        move || {
+            let fired = calls.get();
+            calls.set(fired + 1);
+            if fired < n {
+                Box::pin(async { Ok(()) })
+            } else {
+                Box::pin(std::future::pending())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_returns_exec_result_when_uninterrupted() {
+        // No interrupts ever fire; exec's value passes straight through.
+        let out = guard_against_interrupt(async { 42 }, interrupts_then_idle(0), || -1).await;
+        assert_eq!(out, 42);
+    }
+
+    #[tokio::test]
+    async fn guard_absorbs_first_interrupt_and_waits_for_exec() {
+        // exec completes only after yielding once; a single interrupt arrives
+        // first and must be absorbed (not treated as abort).
+        let out = guard_against_interrupt(
+            async {
+                tokio::task::yield_now().await;
+                7
+            },
+            interrupts_then_idle(1),
+            || -1,
+        )
+        .await;
+        assert_eq!(out, 7, "first interrupt should be absorbed, exec wins");
+    }
+
+    #[tokio::test]
+    async fn guard_aborts_on_second_interrupt() {
+        // exec never completes; two interrupts force the abort path.
+        let out = guard_against_interrupt(
+            std::future::pending::<i32>(),
+            interrupts_then_idle(2),
+            || -1,
+        )
+        .await;
+        assert_eq!(out, -1, "second interrupt should force the abort value");
+    }
+
+    #[tokio::test]
+    async fn guard_degrades_to_plain_await_when_signal_source_errors() {
+        // A signal source that errors immediately must not spin; the guard
+        // should fall back to awaiting exec.
+        let signal_err =
+            || -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>>>> {
+                Box::pin(async {
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, "no handler"))
+                })
+            };
+        let out = guard_against_interrupt(async { 5 }, signal_err, || -1).await;
+        assert_eq!(out, 5);
     }
 
     // ========================================================================
