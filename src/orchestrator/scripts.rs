@@ -192,26 +192,19 @@ impl<'a> ScriptRunner<'a> {
             None
         };
 
-        let exec = async {
-            if script.isolated {
-                // Execute in isolated context with fresh port allocations
-                // Delegated back to Orchestrator since it needs to create a child Orchestrator
-                self.run_script_isolated(script_name, &script, extra_args)
-                    .await
-            } else {
-                // Execute in shared context (existing behavior)
-                self.run_script_shared(script_name, &script, extra_args)
-                    .await
-            }
-        };
-
         // Don't `?` — borrow-or-own cleanup must run on success, failure AND
-        // interruption. Only the top-level run owns cleanup, so only it guards
-        // against Ctrl+C killing us before we get there; nested runs just await.
-        let result = if top_level {
-            run_with_interrupt_guard(exec).await
+        // interruption. Each path guards only its own setup+execution (when
+        // top-level) and runs its service teardown *after* that guard, so a
+        // second Ctrl+C can abandon the script without abandoning cleanup.
+        let result = if script.isolated {
+            // Execute in isolated context with fresh port allocations
+            // Delegated back to Orchestrator since it needs to create a child Orchestrator
+            self.run_script_isolated(script_name, &script, extra_args, top_level)
+                .await
         } else {
-            exec.await
+            // Execute in shared context (existing behavior)
+            self.run_script_shared(script_name, &script, extra_args, top_level)
+                .await
         };
 
         // `keep_services` opts the top-level run out of ownership: the services
@@ -228,62 +221,72 @@ impl<'a> ScriptRunner<'a> {
     }
 
     /// Run a script in shared context (reuses current ports and services).
+    ///
+    /// Dependency startup and script execution run under the interrupt guard
+    /// (when `top_level`); the services started here live in the parent
+    /// orchestrator, so the caller's borrow-or-own cleanup tears them down
+    /// after the guard returns — even on a second-Ctrl+C abort.
     async fn run_script_shared(
         &self,
         script_name: &str,
         script: &Script,
         extra_args: &[String],
+        top_level: bool,
     ) -> Result<std::process::ExitStatus> {
-        // Resolve dependencies - can be services or other scripts (SF-00035)
-        for dep in &script.depends_on {
-            if self.orchestrator.config.scripts.contains_key(dep) {
-                // Circular dependencies are caught by graph validation during config parsing.
-                // Box::pin to enable async recursion (avoids infinite future size).
-                Box::pin(self.orchestrator.run_script_interactive_nested(dep, &[])).await?;
-            } else {
-                if !self.orchestrator.is_service_running(dep).await {
-                    self.orchestrator.start(dep).await?;
+        let run = async {
+            // Resolve dependencies - can be services or other scripts (SF-00035)
+            for dep in &script.depends_on {
+                if self.orchestrator.config.scripts.contains_key(dep) {
+                    // Circular dependencies are caught by graph validation during config parsing.
+                    // Box::pin to enable async recursion (avoids infinite future size).
+                    Box::pin(self.orchestrator.run_script_interactive_nested(dep, &[])).await?;
+                } else {
+                    if !self.orchestrator.is_service_running(dep).await {
+                        self.orchestrator.start(dep).await?;
+                    }
                 }
             }
-        }
 
-        // Resolve script at execution time (scripts are not pre-resolved to support isolated)
-        let params = self.orchestrator.resolver.get_resolved_parameters().clone();
-        let resolved_env = self
-            .orchestrator
-            .resolver
-            .resolve_environment(&script.environment, &params)
-            .map_err(|e| {
-                Error::TemplateResolution(format!(
-                    "Failed to resolve environment for script '{}': {}",
-                    script_name, e
-                ))
-            })?;
+            // Resolve script at execution time (scripts are not pre-resolved to support isolated)
+            let params = self.orchestrator.resolver.get_resolved_parameters().clone();
+            let resolved_env = self
+                .orchestrator
+                .resolver
+                .resolve_environment(&script.environment, &params)
+                .map_err(|e| {
+                    Error::TemplateResolution(format!(
+                        "Failed to resolve environment for script '{}': {}",
+                        script_name, e
+                    ))
+                })?;
 
-        let resolved_script = self
-            .orchestrator
-            .resolver
-            .resolve_template_shell_safe(&script.script, &params)
-            .map_err(|e| {
-                Error::TemplateResolution(format!(
-                    "Failed to resolve script '{}': {}",
-                    script_name, e
-                ))
-            })?;
+            let resolved_script = self
+                .orchestrator
+                .resolver
+                .resolve_template_shell_safe(&script.script, &params)
+                .map_err(|e| {
+                    Error::TemplateResolution(format!(
+                        "Failed to resolve script '{}': {}",
+                        script_name, e
+                    ))
+                })?;
 
-        // Create resolved script for execution. Dependencies are already
-        // resolved above and ownership/keep-services decisions belong to the
-        // top-level run, so this inner execution script keeps only the command
-        // and environment; everything else stays at its default.
-        let resolved = Script {
-            cwd: script.cwd.clone(),
-            environment: resolved_env,
-            script: resolved_script,
-            ..Default::default()
+            // Create resolved script for execution. Dependencies are already
+            // resolved above and ownership/keep-services decisions belong to the
+            // top-level run, so this inner execution script keeps only the command
+            // and environment; everything else stays at its default.
+            let resolved = Script {
+                cwd: script.cwd.clone(),
+                environment: resolved_env,
+                script: resolved_script,
+                ..Default::default()
+            };
+
+            // Execute the script command
+            execute_script_command(&resolved, extra_args, &self.orchestrator.work_dir).await
         };
 
-        // Execute the script command
-        execute_script_command(&resolved, extra_args, &self.orchestrator.work_dir).await
+        run_guarded(run, top_level).await
     }
 
     /// Run a script in isolated context with fresh port allocations (SF-00034).
@@ -298,6 +301,7 @@ impl<'a> ScriptRunner<'a> {
         script_name: &str,
         _script: &Script, // Unused - we get the script from original_config
         extra_args: &[String],
+        top_level: bool,
     ) -> Result<std::process::ExitStatus> {
         tracing::info!(
             "Running script '{}' in isolated context (isolated: true)",
@@ -321,6 +325,11 @@ impl<'a> ScriptRunner<'a> {
             .ok_or_else(|| Error::ScriptNotFound(script_name.to_string()))?
             .clone();
 
+        // The child orchestrator lives in this stack frame, *outside* the guarded
+        // block below. The block only borrows it, so a second-Ctrl+C abort that
+        // drops the block still leaves `child_orchestrator` intact for the
+        // cleanup that follows — keeping isolated teardown symmetric with the
+        // shared path, whose cleanup likewise runs after the guard.
         let mut child_orchestrator =
             Orchestrator::new_ephemeral(child_config, self.orchestrator.work_dir.clone()).await?;
         child_orchestrator.output_mode = self.orchestrator.output_mode;
@@ -339,76 +348,82 @@ impl<'a> ScriptRunner<'a> {
         // `run_migrate_if_needed` against the child sees an empty scope and correctly
         // runs migrations against the fresh isolated containers.
 
-        // Initialize child orchestrator (allocates fresh ports due to isolated mode)
-        child_orchestrator.initialize().await?;
+        // Bring up the isolated stack and run the script under the interrupt
+        // guard. Everything here only borrows `child_orchestrator`.
+        let run = async {
+            // Initialize child orchestrator (allocates fresh ports due to isolated mode)
+            child_orchestrator.initialize().await?;
 
-        // Run script dependencies in the child context
-        // Script-to-script dependencies run in parent context (they don't need isolation
-        // unless they also have isolated)
-        let mut service_deps = Vec::new();
-        for dep in &original_script.depends_on {
-            if self.orchestrator.config.scripts.contains_key(dep) {
-                // Box::pin to enable async recursion (avoids infinite future size).
-                Box::pin(self.orchestrator.run_script_interactive_nested(dep, &[])).await?;
-            } else {
-                // Service dependency: start in child context with isolated ports
-                child_orchestrator.start(dep).await?;
-                service_deps.push(dep.clone());
+            // Run script dependencies in the child context
+            // Script-to-script dependencies run in parent context (they don't need isolation
+            // unless they also have isolated)
+            let mut service_deps = Vec::new();
+            for dep in &original_script.depends_on {
+                if self.orchestrator.config.scripts.contains_key(dep) {
+                    // Box::pin to enable async recursion (avoids infinite future size).
+                    Box::pin(self.orchestrator.run_script_interactive_nested(dep, &[])).await?;
+                } else {
+                    // Service dependency: start in child context with isolated ports
+                    child_orchestrator.start(dep).await?;
+                    service_deps.push(dep.clone());
+                }
             }
-        }
 
-        // Wait for service dependencies to become healthy
-        // This is important for isolated scripts that need DB connections etc.
-        for dep in &service_deps {
-            child_orchestrator
-                .wait_for_healthy(dep, Duration::from_secs(60))
-                .await?;
-        }
+            // Wait for service dependencies to become healthy
+            // This is important for isolated scripts that need DB connections etc.
+            for dep in &service_deps {
+                child_orchestrator
+                    .wait_for_healthy(dep, Duration::from_secs(60))
+                    .await?;
+            }
 
-        // Get the child's resolved parameters for the script environment
-        let child_params = child_orchestrator
-            .resolver
-            .get_resolved_parameters()
-            .clone();
+            // Get the child's resolved parameters for the script environment
+            let child_params = child_orchestrator
+                .resolver
+                .get_resolved_parameters()
+                .clone();
 
-        // Re-resolve the script's environment and command with child parameters
-        // Using original_script which has unresolved templates like {{DB_PORT}}
-        let resolved_env = child_orchestrator
-            .resolver
-            .resolve_environment(&original_script.environment, &child_params)
-            .map_err(|e| {
-                Error::TemplateResolution(format!(
-                    "Failed to resolve environment for script '{}': {}",
-                    script_name, e
-                ))
-            })?;
+            // Re-resolve the script's environment and command with child parameters
+            // Using original_script which has unresolved templates like {{DB_PORT}}
+            let resolved_env = child_orchestrator
+                .resolver
+                .resolve_environment(&original_script.environment, &child_params)
+                .map_err(|e| {
+                    Error::TemplateResolution(format!(
+                        "Failed to resolve environment for script '{}': {}",
+                        script_name, e
+                    ))
+                })?;
 
-        let resolved_script_cmd = child_orchestrator
-            .resolver
-            .resolve_template_shell_safe(&original_script.script, &child_params)
-            .map_err(|e| {
-                Error::TemplateResolution(format!(
-                    "Failed to resolve script '{}': {}",
-                    script_name, e
-                ))
-            })?;
+            let resolved_script_cmd = child_orchestrator
+                .resolver
+                .resolve_template_shell_safe(&original_script.script, &child_params)
+                .map_err(|e| {
+                    Error::TemplateResolution(format!(
+                        "Failed to resolve script '{}': {}",
+                        script_name, e
+                    ))
+                })?;
 
-        // Create a modified script with resolved environment and command.
-        // Deps are already resolved and `isolated`/`keep_services` are decided
-        // by the top-level run, so everything else stays at its default
-        // (notably `isolated: false` — don't recurse).
-        let isolated_script = Script {
-            cwd: original_script.cwd.clone(),
-            environment: resolved_env,
-            script: resolved_script_cmd,
-            ..Default::default()
+            // Create a modified script with resolved environment and command.
+            // Deps are already resolved and `isolated`/`keep_services` are decided
+            // by the top-level run, so everything else stays at its default
+            // (notably `isolated: false` — don't recurse).
+            let isolated_script = Script {
+                cwd: original_script.cwd.clone(),
+                environment: resolved_env,
+                script: resolved_script_cmd,
+                ..Default::default()
+            };
+
+            // Execute script in child context
+            execute_script_command(&isolated_script, extra_args, &self.orchestrator.work_dir).await
         };
+        let result = run_guarded(run, top_level).await;
 
-        // Execute script in child context
-        let result =
-            execute_script_command(&isolated_script, extra_args, &self.orchestrator.work_dir).await;
-
-        // Cleanup child orchestrator (stops all services started in isolation)
+        // Cleanup child orchestrator (stops all services started in isolation).
+        // Always runs — success, failure, or interrupt — because it lives after
+        // the guard and operates on the frame-owned `child_orchestrator`.
         tracing::debug!("Cleaning up isolated context for script '{}'", script_name);
         child_orchestrator.cleanup().await;
 
@@ -422,17 +437,6 @@ impl<'a> ScriptRunner<'a> {
         );
         let _ = child_markers.clear_all_installed();
         let _ = child_markers.clear_all_migrated();
-
-        // Log which ports were used (helpful for debugging)
-        if !child_params.is_empty() {
-            let port_params: Vec<_> = child_params
-                .iter()
-                .filter(|(k, _)| k.to_uppercase().contains("PORT"))
-                .collect();
-            if !port_params.is_empty() {
-                tracing::debug!("Isolated ports released: {:?}", port_params);
-            }
-        }
 
         result
     }
@@ -492,6 +496,24 @@ where
     F: std::future::Future<Output = Result<std::process::ExitStatus>>,
 {
     guard_against_interrupt(exec, tokio::signal::ctrl_c, || Err(Error::Aborted)).await
+}
+
+/// Run a script's setup+execution future, guarding it against Ctrl+C only when
+/// it is the top-level run; nested runs just await.
+///
+/// Callers place their service teardown *after* awaiting this, operating on
+/// resources that outlive `exec` (the parent orchestrator, or a frame-owned
+/// child orchestrator the future merely borrows). That way a second-Ctrl+C
+/// abort drops `exec` without dropping the resources, so cleanup still runs.
+async fn run_guarded<F>(exec: F, top_level: bool) -> Result<std::process::ExitStatus>
+where
+    F: std::future::Future<Output = Result<std::process::ExitStatus>>,
+{
+    if top_level {
+        run_with_interrupt_guard(exec).await
+    } else {
+        exec.await
+    }
 }
 
 /// Core of [`run_with_interrupt_guard`], with the interrupt source and the
@@ -764,6 +786,32 @@ mod tests {
             };
         let out = guard_against_interrupt(async { 5 }, signal_err, || -1).await;
         assert_eq!(out, 5);
+    }
+
+    #[tokio::test]
+    async fn cleanup_after_guard_runs_when_block_is_aborted() {
+        // Models the isolated path: a resource lives in the frame, the guarded
+        // block only *borrows* it and then hangs (a script that ignores the
+        // first Ctrl+C). A second interrupt aborts and drops the block — but the
+        // resource survives the drop, so the cleanup that runs after the guard
+        // can still touch it. This is the property that keeps isolated teardown
+        // from leaking on a force-quit.
+        let mut resource = String::from("alive");
+        {
+            let run = async {
+                resource.push_str("-borrowed");
+                std::future::pending::<i32>().await
+            };
+            // Two interrupts → abort → `run` is dropped, releasing its borrow.
+            let aborted = guard_against_interrupt(run, interrupts_then_idle(2), || -1).await;
+            assert_eq!(aborted, -1, "second interrupt should abort the block");
+        }
+        // The borrow is gone; cleanup still has the frame-owned resource.
+        resource.push_str("-cleaned");
+        assert_eq!(
+            resource, "alive-borrowed-cleaned",
+            "resource must survive the aborted block so post-guard cleanup runs"
+        );
     }
 
     // ========================================================================
