@@ -107,7 +107,7 @@ When `isolated: true` is set:
 
 - **Fresh ports** are allocated, independent of your dev stack.
 - **Docker containers and volumes** are scoped with a unique isolation ID — no collisions with your running services.
-- **Cleanup happens automatically** when the script finishes — containers are stopped and removed.
+- **Cleanup happens automatically** on every exit path — success, failure, or Ctrl+C — so the isolated containers are always stopped and removed.
 
 This is the recommended way to run integration tests. Your dev stack is untouched, and each test run gets a clean environment.
 
