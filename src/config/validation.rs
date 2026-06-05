@@ -128,6 +128,23 @@ impl Config {
                     )));
                 }
             }
+
+            // `keep_services` keeps the started stack up for later use, but an
+            // isolated script runs in a throwaway context that is always torn
+            // down on exit — the two requests directly contradict each other.
+            if script.keep_services && script.isolated {
+                return Err(Error::Validation(format!(
+                    "Script '{name}' can't set both `keep_services: true` and `isolated: true` — they contradict each other.\n\n\
+                    scripts:\n  \
+                      {name}:\n    \
+                        isolated: true        # throwaway stack, always cleaned up on exit\n    \
+                        keep_services: true   # ← keep the stack running — but there's nothing left to keep\n\n\
+                    Pick one:\n  \
+                      • drop `keep_services: true` to run in throwaway isolation, or\n  \
+                      • drop `isolated: true` to leave the started stack running after the script.",
+                    name = name
+                )));
+            }
         }
 
         // Validate parameter defaults against either constraints
@@ -809,6 +826,48 @@ mod tests {
 
         config.services.insert("database".to_string(), service);
         config.scripts.insert("migrate".to_string(), script);
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_keep_services_with_isolated_is_rejected() {
+        use crate::config::Script;
+
+        let mut config = Config::default();
+        config.scripts.insert(
+            "scenario".to_string(),
+            Script {
+                script: "echo hi".to_string(),
+                isolated: true,
+                keep_services: true,
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("keep_services + isolated must be rejected")
+            .to_string();
+        // Names the script and both conflicting keys so the message is actionable.
+        assert!(err.contains("scenario"));
+        assert!(err.contains("keep_services"));
+        assert!(err.contains("isolated"));
+    }
+
+    #[test]
+    fn test_keep_services_without_isolated_is_allowed() {
+        use crate::config::Script;
+
+        let mut config = Config::default();
+        config.scripts.insert(
+            "scenario".to_string(),
+            Script {
+                script: "echo hi".to_string(),
+                keep_services: true,
+                ..Default::default()
+            },
+        );
 
         assert!(config.validate().is_ok());
     }

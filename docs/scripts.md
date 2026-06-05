@@ -86,6 +86,10 @@ exactly as without the flag.
 script is pulled in as another script's dependency, the outermost run owns cleanup and
 its setting wins — a non-keeping parent still tears everything down.
 
+`keep_services` can't be combined with [`isolated: true`](#isolated-scripts): an isolated
+script runs in a throwaway stack that is always cleaned up on exit, so there is nothing to
+keep running. `fed` rejects that combination at config-validation time.
+
 ## Isolated Scripts
 
 For integration tests that need a throwaway stack without interfering with your running dev services:
