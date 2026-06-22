@@ -1,4 +1,4 @@
-variables:
+parameters:
   # Simple environment overrides
   DEBUG_MODE:
     default: "true"

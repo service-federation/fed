@@ -13,13 +13,17 @@ use std::collections::HashMap;
 /// Root configuration structure for service-federation.yaml
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
-    /// Legacy field for backward compatibility
+    /// Variables/parameters declared for this config. Values support
+    /// environment-specific overrides (`development`/`staging`/`production`).
     #[serde(default)]
     pub parameters: HashMap<String, Parameter>,
 
-    /// Preferred field for variables with environment overrides
-    #[serde(default)]
-    pub variables: HashMap<String, Parameter>,
+    /// `variables` was an accepted alias for `parameters`, removed in 4.0.
+    /// Captured here only so [`Config::validate`] can emit a clear migration
+    /// error when an old config still uses the key, instead of silently
+    /// ignoring it. Never read for values.
+    #[serde(default, rename = "variables", skip_serializing)]
+    pub legacy_variables: Option<serde_yaml::Value>,
 
     #[serde(default)]
     pub services: HashMap<String, Service>,
@@ -70,23 +74,14 @@ pub struct Config {
 }
 
 impl Config {
-    /// Get effective parameters/variables.
-    /// Priority: variables (if present) > parameters (backward compatibility)
+    /// The parameters declared for this config.
     pub fn get_effective_parameters(&self) -> &HashMap<String, Parameter> {
-        if !self.variables.is_empty() {
-            &self.variables
-        } else {
-            &self.parameters
-        }
+        &self.parameters
     }
 
-    /// Get mutable effective parameters/variables.
+    /// Mutable access to the parameters declared for this config.
     pub fn get_effective_parameters_mut(&mut self) -> &mut HashMap<String, Parameter> {
-        if !self.variables.is_empty() {
-            &mut self.variables
-        } else {
-            &mut self.parameters
-        }
+        &mut self.parameters
     }
 
     /// Expand service names and tag references to a list of services.

@@ -1,7 +1,7 @@
 # Example: Service Templates
 # Demonstrates using local templates to reduce configuration duplication
 
-variables:
+parameters:
   AUTH_PORT:
     type: port
     default: 8080

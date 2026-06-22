@@ -221,9 +221,11 @@ parameters:
     either: [debug, info, warn, error]    # Validated at parse time
 ```
 
-### `variables` vs `parameters`
+### `variables` removed in 4.0
 
-Both keys are accepted at the top level. `variables` takes precedence if both are present. `parameters` is the original key and remains supported.
+`variables` was an alias for `parameters` at the top level. It was removed in 4.0 — use `parameters`. A config still using `variables:` fails validation with a message telling you to rename it. The schema is identical, so renaming the key is the only change needed.
+
+> Note: this is unrelated to per-parameter environment overrides (`development`/`staging`/`production`), which are still supported under `parameters`.
 
 ### Secrets
 

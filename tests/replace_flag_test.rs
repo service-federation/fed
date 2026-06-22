@@ -17,7 +17,7 @@ fn test_replace_does_not_kill_self() {
 
     // Config with a port parameter - fed will bind to this during parameter resolution
     let config = r#"
-variables:
+parameters:
   TEST_PORT:
     default: "18765"
 
@@ -78,7 +78,7 @@ fn test_replace_kills_other_processes() {
     // Config that needs this specific port
     let config = format!(
         r#"
-variables:
+parameters:
   CONFLICT_PORT:
     default: "{}"
 

@@ -14,7 +14,7 @@ fn fed_binary() -> String {
 fn create_test_config(temp_dir: &TempDir) -> String {
     let config_path = temp_dir.path().join("service-federation.yaml");
     let config = r#"
-variables:
+parameters:
   TEST_PORT:
     default: "19876"
 

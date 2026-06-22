@@ -7,7 +7,7 @@ fn test_environment_specific_values() {
     let mut resolver = Resolver::with_environment(Environment::Production);
     let mut config = Config::default();
 
-    // Create a variable with environment-specific values
+    // Create a parameter with environment-specific values
     let param = Parameter {
         default: Some(Value::String("dev-value".to_string())),
         staging: Some(Value::String("staging-value".to_string())),
@@ -15,7 +15,7 @@ fn test_environment_specific_values() {
         ..Default::default()
     };
 
-    config.variables.insert("TEST_VAR".to_string(), param);
+    config.parameters.insert("TEST_VAR".to_string(), param);
 
     resolver.resolve_parameters(&mut config).unwrap();
 
@@ -28,14 +28,14 @@ fn test_environment_fallback_to_default() {
     let mut resolver = Resolver::with_environment(Environment::Staging);
     let mut config = Config::default();
 
-    // Variable with default but no staging-specific value
+    // Parameter with default but no staging-specific value
     let param = Parameter {
         default: Some(Value::String("default-value".to_string())),
         production: Some(Value::String("prod-value".to_string())),
         ..Default::default()
     };
 
-    config.variables.insert("TEST_VAR".to_string(), param);
+    config.parameters.insert("TEST_VAR".to_string(), param);
 
     resolver.resolve_parameters(&mut config).unwrap();
 
@@ -48,14 +48,14 @@ fn test_development_alias() {
     let mut resolver = Resolver::with_environment(Environment::Development);
     let mut config = Config::default();
 
-    // Variable with "develop" (alias) instead of "development"
+    // Parameter with "develop" (alias) instead of "development"
     let param = Parameter {
         default: Some(Value::String("default-value".to_string())),
         develop: Some(Value::String("develop-value".to_string())),
         ..Default::default()
     };
 
-    config.variables.insert("TEST_VAR".to_string(), param);
+    config.parameters.insert("TEST_VAR".to_string(), param);
 
     resolver.resolve_parameters(&mut config).unwrap();
 
@@ -68,7 +68,7 @@ fn test_development_precedence() {
     let mut resolver = Resolver::with_environment(Environment::Development);
     let mut config = Config::default();
 
-    // Variable with both "development" and "develop" - "development" takes precedence
+    // Parameter with both "development" and "develop" - "development" takes precedence
     let param = Parameter {
         default: Some(Value::String("default-value".to_string())),
         development: Some(Value::String("development-value".to_string())),
@@ -76,7 +76,7 @@ fn test_development_precedence() {
         ..Default::default()
     };
 
-    config.variables.insert("TEST_VAR".to_string(), param);
+    config.parameters.insert("TEST_VAR".to_string(), param);
 
     resolver.resolve_parameters(&mut config).unwrap();
 
@@ -85,40 +85,10 @@ fn test_development_precedence() {
 }
 
 #[test]
-fn test_variables_take_precedence_over_parameters() {
-    let mut resolver = Resolver::with_environment(Environment::Production);
-    let mut config = Config::default();
-
-    // Add both parameters and variables
-    let param_param = Parameter {
-        default: Some(Value::String("param-value".to_string())),
-        ..Default::default()
-    };
-
-    let var_param = Parameter {
-        default: Some(Value::String("var-value".to_string())),
-        production: Some(Value::String("var-prod-value".to_string())),
-        ..Default::default()
-    };
-
-    config
-        .parameters
-        .insert("TEST_VAR".to_string(), param_param);
-    config.variables.insert("TEST_VAR".to_string(), var_param);
-
-    resolver.resolve_parameters(&mut config).unwrap();
-
-    let resolved = resolver.get_resolved_parameters();
-    // variables should take precedence
-    assert_eq!(resolved.get("TEST_VAR").unwrap(), "var-prod-value");
-}
-
-#[test]
-fn test_backward_compatibility_with_parameters() {
+fn test_basic_parameter_resolution() {
     let mut resolver = Resolver::new();
     let mut config = Config::default();
 
-    // Only parameters field is used (backward compatibility)
     let param = Parameter {
         default: Some(Value::String("param-value".to_string())),
         ..Default::default()
@@ -150,7 +120,7 @@ fn test_port_type_with_environment() {
         ..Default::default()
     };
 
-    config.variables.insert("API_PORT".to_string(), param);
+    config.parameters.insert("API_PORT".to_string(), param);
 
     resolver.resolve_parameters(&mut config).unwrap();
 
@@ -166,7 +136,7 @@ fn test_template_resolution_with_environment() {
     let mut resolver = Resolver::with_environment(Environment::Staging);
     let mut config = Config::default();
 
-    // Base variable
+    // Base parameter
     let base_param = Parameter {
         default: Some(Value::String("dev-db".to_string())),
         staging: Some(Value::String("staging-db".to_string())),
@@ -174,14 +144,14 @@ fn test_template_resolution_with_environment() {
         ..Default::default()
     };
 
-    // Variable that references base
+    // Parameter that references base
     let url_param = Parameter {
         default: Some(Value::String("postgres://{{DB_NAME}}".to_string())),
         ..Default::default()
     };
 
-    config.variables.insert("DB_NAME".to_string(), base_param);
-    config.variables.insert("DB_URL".to_string(), url_param);
+    config.parameters.insert("DB_NAME".to_string(), base_param);
+    config.parameters.insert("DB_URL".to_string(), url_param);
 
     resolver.resolve_parameters(&mut config).unwrap();
 
@@ -218,13 +188,13 @@ fn test_complex_multi_environment_config() {
     };
 
     config
-        .variables
+        .parameters
         .insert("DEBUG_MODE".to_string(), debug_param);
     config
-        .variables
+        .parameters
         .insert("REPLICA_COUNT".to_string(), replica_param);
     config
-        .variables
+        .parameters
         .insert("JWT_SECRET".to_string(), secret_param);
 
     resolver.resolve_parameters(&mut config).unwrap();
@@ -238,34 +208,44 @@ fn test_complex_multi_environment_config() {
     );
 }
 
+/// The `variables:` top-level key was an alias for `parameters:`, removed in
+/// 4.0. A config still using it must fail validation with a migration message
+/// rather than being silently ignored.
 #[test]
-fn test_get_effective_parameters() {
-    let mut config = Config::default();
+fn test_legacy_variables_key_rejected() {
+    let yaml = r#"
+variables:
+  API_PORT:
+    type: port
+    default: 8080
+services:
+  api:
+    process: "echo hi"
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    let err = config.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("`variables:`") && err.contains("`parameters:`"),
+        "expected a migration message pointing variables -> parameters, got: {err}"
+    );
+}
 
-    // Add parameters
-    let param1 = Parameter {
-        default: Some(Value::String("param-value".to_string())),
-        ..Default::default()
-    };
-    config.parameters.insert("PARAM1".to_string(), param1);
-
-    // Add variables
-    let var1 = Parameter {
-        default: Some(Value::String("var-value".to_string())),
-        ..Default::default()
-    };
-    config.variables.insert("VAR1".to_string(), var1);
-
-    // When variables are present, they should be returned
-    let effective = config.get_effective_parameters();
-    assert!(effective.contains_key("VAR1"));
-    assert!(!effective.contains_key("PARAM1"));
-
-    // When variables are empty, parameters should be returned
-    config.variables.clear();
-    let effective = config.get_effective_parameters();
-    assert!(effective.contains_key("PARAM1"));
-    assert!(!effective.contains_key("VAR1"));
+/// An empty/absent `variables:` key must not trip the migration error.
+#[test]
+fn test_no_variables_key_is_fine() {
+    let yaml = r#"
+parameters:
+  API_PORT:
+    type: port
+    default: 8080
+services:
+  api:
+    process: "echo hi"
+    startup_message: "http://localhost:{{API_PORT}}"
+entrypoint: api
+"#;
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    assert!(config.validate().is_ok());
 }
 
 #[test]

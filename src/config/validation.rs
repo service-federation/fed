@@ -5,6 +5,15 @@ use std::collections::HashSet;
 impl Config {
     /// Validate the configuration
     pub fn validate(&self) -> Result<()> {
+        // `variables` was an alias for `parameters`; removed in 4.0.
+        if self.legacy_variables.as_ref().is_some_and(|v| !v.is_null()) {
+            return Err(Error::Validation(
+                "The top-level `variables:` key was removed in fed 4.0. \
+                 Rename it to `parameters:` — the schema is identical."
+                    .to_string(),
+            ));
+        }
+
         // Check entrypoint/entrypoints exclusivity
         if self.entrypoint.is_some() && !self.entrypoints.is_empty() {
             return Err(Error::Validation(
@@ -1489,7 +1498,7 @@ mod tests {
         use crate::config::Parameter;
 
         let mut config = Config::default();
-        config.variables.insert(
+        config.parameters.insert(
             "ENV".to_string(),
             Parameter {
                 either: vec![
@@ -1514,7 +1523,7 @@ mod tests {
         use crate::config::Parameter;
 
         let mut config = Config::default();
-        config.variables.insert(
+        config.parameters.insert(
             "ENV".to_string(),
             Parameter {
                 either: vec![
@@ -1535,7 +1544,7 @@ mod tests {
         use crate::config::Parameter;
 
         let mut config = Config::default();
-        config.variables.insert(
+        config.parameters.insert(
             "PORT".to_string(),
             Parameter {
                 default: Some(serde_yaml::Value::String("8080".to_string())),
