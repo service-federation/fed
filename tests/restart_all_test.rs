@@ -219,7 +219,7 @@ services:
 fn count_running(status: &str) -> usize {
     status
         .lines()
-        .filter(|line| line.contains("Running") || line.contains("Healthy"))
+        .filter(|line| line.contains("running") || line.contains("healthy"))
         .count()
 }
 
@@ -618,6 +618,6 @@ fn test_restart_all_preserves_services() {
 
     let status = String::from_utf8_lossy(&status_output.stdout);
     // After stop, services should either not appear or show as stopped
-    let has_running = status.contains("Running") || status.contains("Healthy");
+    let has_running = status.contains("running") || status.contains("healthy");
     assert!(!has_running, "No services should be running after stop");
 }

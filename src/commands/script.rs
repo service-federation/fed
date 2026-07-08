@@ -16,11 +16,19 @@ pub async fn run_script(
     }
 
     if !available_scripts.contains(&name.to_string()) {
-        out.warning("Available scripts:");
-        for script in &available_scripts {
-            out.warning(&format!("  - {}", script));
+        // One rich error, printed once by main: did-you-mean + script list.
+        let mut msg = super::suggest::with_did_you_mean(
+            &format!("Script '{}' not found.", name),
+            name,
+            available_scripts.iter().map(String::as_str),
+        );
+        msg.push_str("\n\nAvailable scripts:");
+        let mut names: Vec<_> = available_scripts.iter().collect();
+        names.sort();
+        for script in names {
+            msg.push_str(&format!("\n  - {}", script));
         }
-        return Err(FedError::ScriptNotFound(name.to_string()).into());
+        return Err(anyhow::anyhow!(msg));
     }
 
     // Run interactively with stdin/stdout/stderr passthrough

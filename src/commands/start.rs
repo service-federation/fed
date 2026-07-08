@@ -38,7 +38,20 @@ pub async fn run_start(
         } else if !config.entrypoints.is_empty() {
             config.entrypoints.clone()
         } else {
-            out.status("No services specified and no entrypoint configured");
+            let mut msg = String::from(
+                "No services specified and no entrypoint configured.\n\n\
+                 Start a specific service with 'fed start <service>' or set an \
+                 'entrypoint:' in your config.",
+            );
+            if !config.services.is_empty() {
+                msg.push_str("\n\nConfigured services:");
+                let mut names: Vec<_> = config.services.keys().collect();
+                names.sort();
+                for name in names {
+                    msg.push_str(&format!("\n  - {}", name));
+                }
+            }
+            out.status(&msg);
             return Ok(());
         }
     } else {
@@ -193,8 +206,9 @@ pub async fn run_start(
                         started.insert(dep.clone());
                     }
                     Err(e) => {
+                        // The progress line above names the failing dependency;
+                        // main prints the error itself (once, with hints).
                         out.error(" failed");
-                        out.error(&format!("\nError starting dependency '{}': {}", dep, e));
                         orchestrator.cleanup().await;
                         return Err(e.into());
                     }
@@ -212,23 +226,27 @@ pub async fn run_start(
                 }
                 Err(e) => {
                     out.error(" failed");
-                    out.error(&format!("\nError: {}", e));
+                    orchestrator.cleanup().await;
 
-                    // If service not found, show available services
+                    // Unknown service: build one rich error (did-you-mean + service
+                    // list) and let main print it once.
                     if matches!(e, FedError::ServiceNotFound(_)) {
-                        let status = orchestrator.get_status().await;
-                        if !status.is_empty() {
-                            out.error("\nAvailable services:");
-                            for name in status.keys() {
-                                out.error(&format!("  - {}", name));
+                        let mut msg = super::suggest::with_did_you_mean(
+                            &format!("Service '{}' not found.", service),
+                            service,
+                            config.services.keys().map(String::as_str),
+                        );
+                        if !config.services.is_empty() {
+                            msg.push_str("\n\nAvailable services:");
+                            let mut names: Vec<_> = config.services.keys().collect();
+                            names.sort();
+                            for name in names {
+                                msg.push_str(&format!("\n  - {}", name));
                             }
                         }
-                        out.error(
-                            "\nHint: Check your service-federation.yaml or run 'fed validate'",
-                        );
+                        return Err(anyhow::anyhow!(msg));
                     }
 
-                    orchestrator.cleanup().await;
                     return Err(e.into());
                 }
             }

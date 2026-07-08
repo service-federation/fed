@@ -323,9 +323,10 @@ fn test_run_rejects_invalid_output_mode() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // clap rejects invalid modes at parse time and lists the valid values
     assert!(
-        stderr.contains("output mode") || stderr.contains("Invalid"),
-        "Expected invalid-mode error, got: {}",
+        stderr.contains("invalid value") && stderr.contains("possible values"),
+        "Expected clap invalid-value error listing possible values, got: {}",
         stderr
     );
 }

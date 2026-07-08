@@ -57,7 +57,8 @@ pub async fn run_clean(
     for service in &services_to_clean {
         out.status(&format!("\n[clean] {}", service));
         if let Err(e) = orchestrator.run_clean(service).await {
-            out.status(&format!("[clean] {} failed: {}", service, e));
+            // Name the failing service here; main prints the error once.
+            out.error(&format!("[clean] {} failed", service));
             return Err(e.into());
         }
     }

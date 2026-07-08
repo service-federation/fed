@@ -40,17 +40,7 @@ pub async fn run_logs(
                             }
                         }
                         Err(e) => {
-                            out.error(&format!("Error getting logs: {}", e));
-                            if matches!(e, FedError::ServiceNotFound(_)) {
-                                let status = orchestrator.get_status().await;
-                                if !status.is_empty() {
-                                    out.error("\nAvailable services:");
-                                    for name in status.keys() {
-                                        out.error(&format!("  - {}", name));
-                                    }
-                                }
-                            }
-                            return Err(e.into());
+                            return Err(logs_error(orchestrator, service, e).await);
                         }
                     }
                 }
@@ -70,20 +60,33 @@ pub async fn run_logs(
                 }
             }
             Err(e) => {
-                out.error(&format!("Error getting logs: {}", e));
-                if matches!(e, FedError::ServiceNotFound(_)) {
-                    let status = orchestrator.get_status().await;
-                    if !status.is_empty() {
-                        out.error("\nAvailable services:");
-                        for name in status.keys() {
-                            out.error(&format!("  - {}", name));
-                        }
-                    }
-                }
-                return Err(e.into());
+                return Err(logs_error(orchestrator, service, e).await);
             }
         }
     }
 
     Ok(())
+}
+
+/// Turn a get_logs failure into a single, rich error for main to print once.
+/// For unknown services this includes a did-you-mean hint and the service list.
+async fn logs_error(orchestrator: &Orchestrator, service: &str, e: FedError) -> anyhow::Error {
+    if matches!(e, FedError::ServiceNotFound(_)) {
+        let status = orchestrator.get_status().await;
+        if !status.is_empty() {
+            let mut msg = super::suggest::with_did_you_mean(
+                &format!("Service '{}' not found.", service),
+                service,
+                status.keys().map(String::as_str),
+            );
+            msg.push_str("\n\nAvailable services:");
+            let mut names: Vec<_> = status.keys().collect();
+            names.sort();
+            for name in names {
+                msg.push_str(&format!("\n  - {}", name));
+            }
+            return anyhow::anyhow!(msg);
+        }
+    }
+    e.into()
 }

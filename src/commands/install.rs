@@ -32,7 +32,8 @@ pub async fn run_install(
     for service in &services_to_install {
         out.status(&format!("\n[install] {}", service));
         if let Err(e) = orchestrator.run_install(service).await {
-            out.status(&format!("[install] {} failed: {}", service, e));
+            // Name the failing service here; main prints the error once.
+            out.error(&format!("[install] {} failed", service));
             return Err(e.into());
         }
     }

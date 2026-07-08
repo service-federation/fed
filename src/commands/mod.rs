@@ -20,6 +20,8 @@ mod tui;
 mod validate;
 mod workspace;
 
+pub(crate) mod suggest;
+
 pub use build::run_build;
 pub use clean::run_clean;
 pub use debug::{run_debug, DebugCommand};

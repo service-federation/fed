@@ -10,27 +10,18 @@ pub fn run_validate(config_path: Option<PathBuf>, out: &dyn UserOutput) -> anyho
         match parser.find_config_file() {
             Ok(path) => path,
             Err(_) => {
-                out.error("Error: No configuration file found");
-                out.error(&format!(
-                    "\nSearched for service-federation.yaml in:\n  - Current directory: {}\n  - Parent directories up to root",
+                anyhow::bail!(
+                    "No configuration file found.\n\nSearched for service-federation.yaml in:\n  - Current directory: {}\n  - Parent directories up to root\n\nRun 'fed init' to create a starter configuration.",
                     std::env::current_dir()?.display()
-                ));
-                out.error("\nHint: Run 'fed init' to create a starter configuration");
-                return Err(anyhow::anyhow!("Configuration file not found"));
+                );
             }
         }
     };
 
     out.status(&format!("Validating {}...", config_path.display()));
 
-    let config = match parser.load_config(&config_path) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            out.error("Configuration failed to load");
-            out.error(&format!("\nError: {}", e));
-            return Err(e.into());
-        }
-    };
+    // On failure, return the error and let main print it once (with hints).
+    let config = parser.load_config(&config_path)?;
 
     config.validate()?;
 

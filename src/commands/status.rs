@@ -9,10 +9,12 @@ pub async fn run_status(
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
     let mut status = orchestrator.get_status().await;
+    let total_services = status.len();
 
     // Filter by tag if specified
-    if let Some(tag_filter) = tag {
-        let services_with_tag = config.services_with_tag(&tag_filter);
+    let tag_filter = tag;
+    if let Some(ref tag_filter) = tag_filter {
+        let services_with_tag = config.services_with_tag(tag_filter);
         status.retain(|name, _| services_with_tag.contains(name));
     }
 
@@ -45,17 +47,26 @@ pub async fn run_status(
         out.status(&format!("{:-<50}", ""));
 
         if status.is_empty() {
-            out.status("  No services configured");
+            match tag_filter {
+                Some(tag) if total_services > 0 => {
+                    out.status(&format!(
+                        "  No services match tag '{}' ({} service(s) configured)",
+                        tag, total_services
+                    ));
+                }
+                _ => out.status("  No services configured"),
+            }
         } else {
             for (name, stat) in status {
                 let status_icon = match stat {
-                    fed::Status::Running | fed::Status::Healthy => "+",
+                    fed::Status::Healthy => "✓",
+                    fed::Status::Running => "+",
                     fed::Status::Stopped => "o",
-                    fed::Status::Starting => ".",
+                    fed::Status::Starting => "~",
+                    fed::Status::Stopping => "-",
                     fed::Status::Failing => "x",
-                    fed::Status::Stopping => ".",
                 };
-                out.status(&format!("  {} {:<30} {:?}", status_icon, name, stat));
+                out.status(&format!("  {} {:<30} {}", status_icon, name, stat));
             }
         }
     }

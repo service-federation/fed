@@ -129,11 +129,10 @@ pub enum Error {
     #[error("Multiple errors occurred:\n{}", .0.iter().map(|e| format!("  - {}", e)).collect::<Vec<_>>().join("\n"))]
     Multiple(Vec<Error>),
 
+    // No help/suggestion: validation messages already describe the offending
+    // field — telling the user to run `fed validate` again would be circular.
     #[error("Invalid configuration: {0}")]
-    #[diagnostic(
-        code(fed::config::validation),
-        help("Run `fed validate` for detailed validation errors")
-    )]
+    #[diagnostic(code(fed::config::validation))]
     Validation(String),
 
     #[error("Package error: {0}")]
@@ -216,7 +215,7 @@ impl Error {
     pub fn suggestion(&self) -> Option<String> {
         match self {
             Error::ServiceNotFound(name) => Some(format!(
-                "Did you mean to run 'fed start {}' first? Or check 'fed status' for running services.",
+                "No service named '{}' is defined in your config. Run 'fed status' to list services, or check service-federation.yaml for typos.",
                 name
             )),
             Error::ServiceNotRunning(name) => Some(format!(
@@ -240,8 +239,11 @@ impl Error {
                 service
             )),
             Error::Config(msg) if msg.contains("Could not find") => None,
-            Error::Config(_) | Error::Validation(_) => Some(
+            Error::Config(_) => Some(
                 "Validate your config with: fed validate".to_string()
+            ),
+            Error::Parse(_) | Error::Yaml(_) => Some(
+                "Check the YAML syntax at the line/column mentioned above — indentation errors are the most common cause. YAML requires consistent spaces (no tabs).".to_string()
             ),
             Error::Docker(ref docker_err) => match docker_err {
                 DockerError::Timeout { command, timeout } => Some(format!(

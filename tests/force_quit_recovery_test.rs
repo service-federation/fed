@@ -195,8 +195,9 @@ fn test_lock_file_cleared_on_clean_exit() {
 
     // After clean stop, no services should be running
     assert!(
-        !status_text.contains("Running"),
-        "No services should be running after clean stop"
+        !status_text.contains("running") && !status_text.contains("healthy"),
+        "No services should be running after clean stop, got:\n{}",
+        status_text
     );
 }
 

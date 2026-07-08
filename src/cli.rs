@@ -48,11 +48,10 @@ pub enum Commands {
         #[arg(long)]
         replace: bool,
 
-        /// Output mode for process services.
-        /// - file: Background mode, logs to files (default for start)
-        /// - captured: Interactive mode, logs to memory (default for watch/tui)
-        /// - passthrough: Pass-through mode, inherit stdio (for testing/CI)
-        #[arg(long, value_name = "MODE")]
+        /// Output mode for process services: file = logs to files (default for
+        /// start), captured = logs to memory (default for watch/tui),
+        /// passthrough = inherit stdio (for testing/CI)
+        #[arg(long, value_name = "MODE", value_parser = ["file", "captured", "passthrough"])]
         output: Option<String>,
 
         /// Preview what would happen without actually starting services
@@ -111,11 +110,10 @@ pub enum Commands {
         /// Arguments to pass to the script (after --)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
-        /// Output mode for the script's dependent process services.
-        /// - file: log to files in .fed/logs (default for background)
-        /// - captured: in-memory ring buffer (default)
-        /// - passthrough: inherit parent stdio (use to surface logs in CI)
-        #[arg(long, value_name = "MODE")]
+        /// Output mode for the script's dependent process services: file =
+        /// logs to .fed/logs, captured = in-memory ring buffer (default),
+        /// passthrough = inherit stdio (use to surface logs in CI)
+        #[arg(long, value_name = "MODE", value_parser = ["file", "captured", "passthrough"])]
         output: Option<String>,
     },
     /// Run install commands for services

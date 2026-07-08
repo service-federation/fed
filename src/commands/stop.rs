@@ -50,14 +50,51 @@ pub async fn run_stop(
         // Expand tag references (e.g., @backend) into service names
         let services_to_stop = config.expand_service_selection(&services);
 
+        // Reject unknown names up front — a typo'd name must not report success.
+        // Services running from an older config live in state, so accept those too.
+        let state_services = orchestrator.state_tracker.read().await.get_services().await;
+        let unknown: Vec<&String> = services_to_stop
+            .iter()
+            .filter(|name| {
+                !config.services.contains_key(*name) && !state_services.contains_key(*name)
+            })
+            .collect();
+        if let Some(name) = unknown.first() {
+            let mut msg = super::suggest::with_did_you_mean(
+                &format!("Service '{}' not found.", name),
+                name,
+                config.services.keys().map(String::as_str),
+            );
+            msg.push_str("\n\nConfigured services:");
+            let mut names: Vec<_> = config.services.keys().collect();
+            names.sort();
+            for n in names {
+                msg.push_str(&format!("\n  - {}", n));
+            }
+            anyhow::bail!(msg);
+        }
+
+        let mut failures: Vec<(String, String)> = Vec::new();
         for service in services_to_stop {
             out.progress(&format!("  Stopping {}...", service));
             match orchestrator.stop(&service).await {
                 Ok(_) => out.finish_progress(" done"),
-                Err(e) => out.finish_progress(&format!(" failed ({})", e)),
+                Err(e) => {
+                    out.finish_progress(&format!(" failed ({})", e));
+                    failures.push((service, e.to_string()));
+                }
             }
         }
         orchestrator.state_tracker.write().await.save().await?;
+
+        if !failures.is_empty() {
+            let list = failures
+                .iter()
+                .map(|(name, err)| format!("  - {}: {}", name, err))
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!("Failed to stop {} service(s):\n{}", failures.len(), list);
+        }
     }
     out.success("Services stopped");
 

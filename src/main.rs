@@ -499,10 +499,50 @@ async fn run() -> anyhow::Result<()> {
                 commands::run_script(&mut orchestrator, script_name, &extra_args, false, &out)
                     .await?;
             } else {
-                eprintln!("Unknown command or script: '{}'", script_name);
-                eprintln!("\nAvailable scripts:");
-                for script in available_scripts {
-                    eprintln!("  - {}", script);
+                // Suggest the closest script or built-in command for typos
+                // like `fed strat` or `fed migrte`.
+                const BUILTIN_COMMANDS: &[&str] = &[
+                    "start",
+                    "stop",
+                    "restart",
+                    "status",
+                    "logs",
+                    "tui",
+                    "run",
+                    "install",
+                    "clean",
+                    "build",
+                    "package",
+                    "ports",
+                    "init",
+                    "validate",
+                    "completions",
+                    "doctor",
+                    "top",
+                    "debug",
+                    "docker",
+                    "isolate",
+                    "workspace",
+                ];
+                let candidates = available_scripts
+                    .iter()
+                    .map(String::as_str)
+                    .chain(BUILTIN_COMMANDS.iter().copied());
+                eprintln!(
+                    "{}",
+                    commands::suggest::with_did_you_mean(
+                        &format!("Unknown command or script: '{}'.", script_name),
+                        script_name,
+                        candidates,
+                    )
+                );
+                if !available_scripts.is_empty() {
+                    eprintln!("\nAvailable scripts:");
+                    let mut names = available_scripts.clone();
+                    names.sort();
+                    for script in names {
+                        eprintln!("  - {}", script);
+                    }
                 }
                 eprintln!("\nRun 'fed --help' for available commands.");
                 std::process::exit(1);

@@ -66,7 +66,8 @@ pub async fn run_build(
             }
             Ok(None) => {}
             Err(e) => {
-                out.status(&format!("[build] {} failed: {}", service, e));
+                // Name the failing service here; main prints the error once.
+                out.error(&format!("[build] {} failed", service));
                 return Err(e.into());
             }
         }
