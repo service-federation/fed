@@ -401,6 +401,11 @@ impl Orchestrator {
             Box::new(crate::port::SqlitePortStore::new(persisted_ports))
         };
         self.resolver.set_port_store(port_store);
+        // Normal (non-isolated) starts honor config `default:` ports over cached
+        // ports. Isolated scopes keep cache priority — their random ports are
+        // intentional and must not snap back to config defaults.
+        self.resolver
+            .set_prefer_config_defaults(scope.is_none() && !self.randomize_ports);
     }
 
     /// Read persisted port allocations directly from SQLite in read-only mode.
@@ -944,11 +949,13 @@ impl Orchestrator {
             if let Some(arc) = services.get(name) {
                 Arc::clone(arc)
             } else {
-                // Enhanced debugging for the "Service not found" paradox
+                // Normal user-error path (typo'd service name) — the returned
+                // ServiceNotFound carries the user-facing message. Keep the
+                // registered-service list at debug level for diagnosing the
+                // rarer removed-during-startup case.
                 let available: Vec<_> = services.keys().collect();
-                tracing::error!(
-                    "Service '{}' not found in HashMap. Available services: {:?}. \
-                     This should not happen - the service might have been removed during startup.",
+                tracing::debug!(
+                    "Service '{}' not found in service map. Registered services: {:?}",
                     name,
                     available
                 );
