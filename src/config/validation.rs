@@ -248,8 +248,9 @@ impl Config {
             for dep in &service.depends_on {
                 let dep_name = dep.service_name();
                 // For external dependencies, we can't validate at config load time
-                // They will be validated when external configs are loaded
-                if dep.is_simple() && !self.services.contains_key(dep_name) {
+                // They will be validated when external configs are loaded.
+                // Simple and structured (service: + on_failure:) deps must exist locally.
+                if !dep.is_external() && !self.services.contains_key(dep_name) {
                     // Build a dynamically-sized hint box
                     let hint_text =
                         format!("Did you remove '{}'? Update the depends_on list:", dep_name);
@@ -755,6 +756,38 @@ mod tests {
             "Error should mention services in the cycle, got: {}",
             error_msg
         );
+    }
+
+    #[test]
+    fn test_structured_dependency_on_missing_service_rejected() {
+        use crate::config::{DependencyFailurePolicy, DependsOn};
+        let mut config = Config::default();
+
+        let service = Service {
+            process: Some("echo app".to_string()),
+            depends_on: vec![DependsOn::Structured {
+                service: "databse".to_string(), // typo of "database"
+                on_failure: DependencyFailurePolicy::default(),
+            }],
+            ..Default::default()
+        };
+
+        config.services.insert("app".to_string(), service);
+        config.services.insert(
+            "database".to_string(),
+            Service {
+                process: Some("echo db".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "structured dependency on a missing service must fail validation"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("depends on non-existent service 'databse'"));
     }
 
     #[test]
