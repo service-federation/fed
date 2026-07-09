@@ -92,6 +92,20 @@ impl<'a> OrphanCleaner<'a> {
                 let is_stopped = matches!(svc.status, Status::Stopped | Status::Failing);
 
                 if is_stopped && super::core::is_pid_alive(pid) {
+                    // Guard against PID reuse: a stale entry can sit in the
+                    // state DB for days, and the OS may have handed the PID to
+                    // an unrelated process. Killing here would take out that
+                    // process (and its whole group). Same check as
+                    // ProcessService::stop.
+                    if !crate::error::validate_pid_start_time(pid, svc.started_at) {
+                        tracing::warn!(
+                            "Skipping orphan cleanup for '{}': PID {} appears to have been \
+                             reused by a different process",
+                            name,
+                            pid
+                        );
+                        continue;
+                    }
                     orphans.push((name, pid));
                 }
             }
