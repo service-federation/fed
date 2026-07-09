@@ -922,14 +922,54 @@ impl Orchestrator {
             biased;
 
             _ = cancel_token.cancelled() => {
+                self.stop_interrupted_start(name).await;
                 Err(Error::Cancelled(name.to_string()))
             }
 
             result = tokio::time::timeout(timeout, self.start_service(name)) => {
                 match result {
                     Ok(inner_result) => inner_result,
-                    Err(_elapsed) => Err(Error::Timeout(name.to_string())),
+                    Err(_elapsed) => {
+                        self.stop_interrupted_start(name).await;
+                        Err(Error::Timeout(name.to_string()))
+                    }
                 }
+            }
+        }
+    }
+
+    /// Best-effort stop after an interrupted (timed-out or cancelled) start.
+    ///
+    /// Dropping the start future mid-await can land after the process or
+    /// container was already spawned but before registration committed — the
+    /// registration guard then removes the state entry, so nothing tracks the
+    /// live process. Kill it here so a timed-out start doesn't leak an
+    /// untracked instance (and a port conflict for the next start).
+    async fn stop_interrupted_start(&self, name: &str) {
+        let manager_arc = {
+            let services = self.services.read().await;
+            services.get(name).map(Arc::clone)
+        };
+        let Some(manager_arc) = manager_arc else {
+            return;
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut manager = manager_arc.lock().await;
+            if manager.status() == Status::Stopped {
+                return Ok(());
+            }
+            manager.kill().await
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("Failed to kill '{}' after interrupted start: {}", name, e);
+            }
+            Err(_) => {
+                tracing::warn!("Timed out killing '{}' after interrupted start", name);
             }
         }
     }
@@ -1184,12 +1224,56 @@ impl Orchestrator {
         match tokio::time::timeout(timeout, self.stop_service(name)).await {
             Ok(result) => result,
             Err(_elapsed) => {
-                tracing::warn!("Stop timeout exceeded for service '{}', forcing stop", name);
-                // Even on timeout, we try to continue - the service might be stuck
-                // but we don't want to leave other services hanging
-                Ok(())
+                // The graceful stop future was dropped mid-flight (possibly
+                // after SIGTERM but before its own SIGKILL escalation and
+                // before unregistering). Force-kill and unregister here —
+                // returning Ok while the process still runs would report a
+                // successful stop for a service that is still alive.
+                tracing::warn!(
+                    "Stop timeout exceeded for service '{}', force-killing",
+                    name
+                );
+                self.force_kill_service(name).await
             }
         }
+    }
+
+    /// Force-kill a service whose graceful stop timed out, then unregister it.
+    ///
+    /// Returns an error if the kill itself fails or times out — in that case
+    /// the state entry is kept so the still-running process remains tracked.
+    async fn force_kill_service(&self, name: &str) -> Result<()> {
+        let manager_arc = {
+            let services = self.services.read().await;
+            services.get(name).map(Arc::clone)
+        };
+
+        if let Some(manager_arc) = manager_arc {
+            let kill_result = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut manager = manager_arc.lock().await;
+                if manager.status() == Status::Stopped {
+                    return Ok(());
+                }
+                manager.kill().await
+            })
+            .await;
+
+            match kill_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!("Failed to force-kill service '{}': {}", name, e);
+                    return Err(e);
+                }
+                Err(_) => {
+                    return Err(Error::Timeout(name.to_string()));
+                }
+            }
+        }
+
+        let mut tracker = self.state_tracker.write().await;
+        tracker.unregister_service(name).await?;
+        tracker.save().await?;
+        Ok(())
     }
 
     /// Get all transitive dependents of a service in **deepest-first** order
