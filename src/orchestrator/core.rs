@@ -918,10 +918,11 @@ impl Orchestrator {
             .and_then(|s| s.get_startup_timeout())
             .unwrap_or(self.startup_timeout);
 
-        // If the service was already running before this start attempt (a
-        // no-op re-start), an interruption must NOT kill it — cleanup is only
-        // for a process/container this attempt may have spawned itself.
-        let was_running_before = {
+        // If the service was already running — or being started by a
+        // concurrent attempt — before this call, an interruption must NOT
+        // kill it: cleanup is only for a process/container this attempt may
+        // have spawned itself.
+        let was_active_before = {
             let manager_arc = {
                 let services = self.services.read().await;
                 services.get(name).map(Arc::clone)
@@ -929,7 +930,10 @@ impl Orchestrator {
             match manager_arc {
                 Some(arc) => {
                     let manager = arc.lock().await;
-                    matches!(manager.status(), Status::Running | Status::Healthy)
+                    matches!(
+                        manager.status(),
+                        Status::Running | Status::Healthy | Status::Starting
+                    )
                 }
                 None => false,
             }
@@ -939,7 +943,7 @@ impl Orchestrator {
             biased;
 
             _ = cancel_token.cancelled() => {
-                if !was_running_before {
+                if !was_active_before {
                     self.stop_interrupted_start(name).await;
                 }
                 Err(Error::Cancelled(name.to_string()))
@@ -949,7 +953,7 @@ impl Orchestrator {
                 match result {
                     Ok(inner_result) => inner_result,
                     Err(_elapsed) => {
-                        if !was_running_before {
+                        if !was_active_before {
                             self.stop_interrupted_start(name).await;
                         }
                         Err(Error::Timeout(name.to_string()))

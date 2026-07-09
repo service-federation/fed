@@ -68,7 +68,7 @@ pub async fn run_start(
     // then kill any remaining external processes occupying required ports
     if replace {
         // First, gracefully stop stale services from a previous run
-        let stopped_services = stop_stale_services(orchestrator, out).await;
+        let (stopped_services, failed_stops) = stop_stale_services(orchestrator, out).await;
         if stopped_services > 0 {
             out.status(&format!(
                 "Stopped {} service(s) from previous run\n",
@@ -114,6 +114,29 @@ pub async fn run_start(
         // now provably dead — a leftover row would make registration return
         // AlreadyExists and silently skip starting the replacement.
         unregister_dead_services(orchestrator).await;
+
+        // If a stale service survived both the graceful stop and the port
+        // kill, its row is still registered: the start below would get
+        // AlreadyExists and report success while the old process keeps
+        // running. Fail honestly instead.
+        if !failed_stops.is_empty() {
+            let conn = orchestrator.state_tracker.read().await.clone_connection();
+            let remaining =
+                fed::state::SqliteStateTracker::fetch_services_from_connection(&conn).await;
+            let still_alive: Vec<String> = failed_stops
+                .into_iter()
+                .filter(|name| remaining.iter().any(|(n, _)| n == name))
+                .collect();
+            if !still_alive.is_empty() {
+                anyhow::bail!(
+                    "--replace could not stop {} service(s) from the previous run: {}. \
+                     Stop them manually (e.g. fed stop or kill the PID shown by fed status) \
+                     and retry.",
+                    still_alive.len(),
+                    still_alive.join(", ")
+                );
+            }
+        }
     }
 
     // Show what we're about to start with their dependencies
@@ -944,7 +967,10 @@ fn mask_sensitive_value(key: &str, value: &str) -> String {
 /// before killing any remaining external processes.
 ///
 /// Returns the number of services stopped.
-async fn stop_stale_services(orchestrator: &Orchestrator, out: &dyn UserOutput) -> usize {
+async fn stop_stale_services(
+    orchestrator: &Orchestrator,
+    out: &dyn UserOutput,
+) -> (usize, Vec<String>) {
     use fed::state::SqliteStateTracker;
 
     // Clone the database connection while briefly holding the read lock.
@@ -956,10 +982,11 @@ async fn stop_stale_services(orchestrator: &Orchestrator, out: &dyn UserOutput) 
     let services = SqliteStateTracker::fetch_services_from_connection(&conn).await;
 
     if services.is_empty() {
-        return 0;
+        return (0, Vec::new());
     }
 
     let mut stopped = 0;
+    let mut failed: Vec<String> = Vec::new();
     // Services whose state row is safe to remove: stopped successfully, or
     // skipped because there is provably nothing to stop.
     let mut cleaned: Vec<String> = Vec::new();
@@ -1003,6 +1030,7 @@ async fn stop_stale_services(orchestrator: &Orchestrator, out: &dyn UserOutput) 
             cleaned.push(name.clone());
         } else {
             out.warning("failed");
+            failed.push(name.clone());
         }
     }
 
@@ -1021,7 +1049,7 @@ async fn stop_stale_services(orchestrator: &Orchestrator, out: &dyn UserOutput) 
         }
     }
 
-    stopped
+    (stopped, failed)
 }
 
 /// Unregister state rows for process services whose PID is no longer alive
