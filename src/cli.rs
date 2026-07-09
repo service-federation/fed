@@ -183,6 +183,28 @@ pub enum Commands {
     #[command(subcommand)]
     Isolate(IsolateCommands),
 
+    /// Sign in to Service Federation Cloud
+    Login {
+        /// Print the URL and paste the token manually (for SSH sessions)
+        #[arg(long)]
+        no_browser: bool,
+        /// Cloud URL override (defaults to https://app.service-federation.com)
+        #[arg(long, hide = true)]
+        url: Option<String>,
+    },
+    /// Sign out (removes local credentials)
+    Logout,
+    /// Show who you're signed in as
+    Whoami,
+    /// Bind this checkout to a Cloud project (org/project)
+    Link {
+        /// Target as org/project (interactive picker if omitted)
+        target: Option<String>,
+    },
+    /// Team development secrets (Service Federation Cloud)
+    #[command(subcommand)]
+    Secrets(SecretsCommands),
+
     /// Manage git worktrees for isolated service stacks
     #[command(subcommand, alias = "ws")]
     Workspace(WorkspaceCommands),
@@ -190,6 +212,24 @@ pub enum Commands {
     /// Run a script by name (shorthand for `fed run <script>`)
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Subcommand)]
+pub enum SecretsCommands {
+    /// List the linked project's secrets (names only)
+    Ls {
+        /// Environment
+        #[arg(long, default_value = "development")]
+        env: String,
+    },
+    /// Set a secret in the team vault (value read from stdin, never argv)
+    Set {
+        /// Secret name (A-Z, digits, _)
+        name: String,
+        /// Environment
+        #[arg(long, default_value = "development")]
+        env: String,
+    },
 }
 
 #[derive(Subcommand)]

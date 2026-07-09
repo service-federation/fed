@@ -151,6 +151,7 @@ pub struct Resolver {
     prefer_config_defaults: bool,
     /// Whether stdin is a TTY (for interactive secret generation prompts).
     is_interactive: bool,
+    offline: bool,
 }
 
 impl Resolver {
@@ -169,6 +170,7 @@ impl Resolver {
             force_random_ports: false,
             prefer_config_defaults: false,
             is_interactive: false,
+            offline: false,
         }
     }
 
@@ -188,6 +190,7 @@ impl Resolver {
             force_random_ports: false,
             prefer_config_defaults: false,
             is_interactive: false,
+            offline: false,
         }
     }
 
@@ -231,6 +234,11 @@ impl Resolver {
     /// Set whether stdin is a TTY (for interactive secret generation prompts).
     pub fn set_is_interactive(&mut self, is_interactive: bool) {
         self.is_interactive = is_interactive;
+    }
+
+    /// Offline mode: never call the cloud vault for manual secrets.
+    pub fn set_offline(&mut self, offline: bool) {
+        self.offline = offline;
     }
 
     /// Register ports owned by already-running managed services.
@@ -361,7 +369,7 @@ impl Resolver {
             }
         });
 
-        let analysis = match super::secret::analyze_secrets(
+        let mut analysis = match super::secret::analyze_secrets(
             config,
             &work_dir,
             secrets_file_path.as_deref(),
@@ -381,6 +389,66 @@ impl Resolver {
             }
         }
 
+        // Team vault: try Service Federation Cloud for missing manual secrets
+        // (requires `fed login` + `fed link`; skipped with --offline). Hits are
+        // cached in generated_secrets_file so later runs work offline.
+        let mut vault_resolved: Vec<(String, String)> = Vec::new();
+        if !analysis.missing_manual.is_empty() && !self.offline {
+            let names: Vec<String> = analysis
+                .missing_manual
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect();
+            match crate::cloud::fetch_values_blocking(
+                &work_dir,
+                &self.environment.to_string(),
+                &names,
+            ) {
+                Some(Ok(values)) => {
+                    for (name, value) in values {
+                        if let Some(param) = config.get_effective_parameters_mut().get_mut(&name) {
+                            param.value = Some(value.clone());
+                        }
+                        vault_resolved.push((name, value));
+                    }
+                    let resolved_names: HashSet<&str> =
+                        vault_resolved.iter().map(|(n, _)| n.as_str()).collect();
+                    analysis
+                        .missing_manual
+                        .retain(|(name, _)| !resolved_names.contains(name.as_str()));
+                    if !vault_resolved.is_empty() {
+                        tracing::info!(
+                            "Resolved {} secret(s) from the team vault",
+                            vault_resolved.len()
+                        );
+                    }
+                }
+                Some(Err(e)) => {
+                    // Network/auth trouble: don't fail here — the cache or env_file
+                    // may still cover it; if not, the error below names what's missing.
+                    tracing::warn!("team vault lookup failed: {}", e);
+                }
+                None => {} // not logged in or checkout not linked — normal local mode
+            }
+        }
+
+        // Cache vault values in the generated secrets file (same gitignore gate
+        // as generated secrets) so --offline and flaky networks keep working.
+        if !vault_resolved.is_empty() {
+            if let Some(path) = secrets_file_path.as_deref() {
+                if !analysis.in_git_repo || analysis.is_gitignored {
+                    if let Err(e) = super::secret::write_env_file(path, &vault_resolved) {
+                        tracing::warn!("could not cache vault secrets: {}", e);
+                    }
+                } else {
+                    tracing::warn!(
+                        "not caching vault secrets: {} is not gitignored",
+                        path.display()
+                    );
+                }
+            }
+        }
+
         // Fail on missing manual secrets — user must provide these
         if !analysis.missing_manual.is_empty() {
             let details: Vec<String> = analysis
@@ -397,7 +465,7 @@ impl Resolver {
                 config.env_file.join(", ")
             };
             return Err(Error::Validation(format!(
-                "Missing secret values — add them to your env_file ({}):\n{}\n\nThese secrets have source: manual, so fed won't generate them.",
+                "Missing secret values — add them to your env_file ({}), or put them in your team vault (fed login, fed link, fed secrets set NAME):\n{}\n\nThese secrets have source: manual, so fed won't generate them.",
                 env_files_hint,
                 details.join("\n")
             )));

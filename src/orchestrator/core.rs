@@ -316,6 +316,10 @@ impl Orchestrator {
         self.resolver.set_is_interactive(interactive);
     }
 
+    pub fn set_offline(&mut self, offline: bool) {
+        self.resolver.set_offline(offline);
+    }
+
     /// Enable randomized port allocation.
     ///
     /// Skips persisted ports and allocates fresh random ports for all

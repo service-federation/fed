@@ -47,6 +47,7 @@
 //! - Timeouts prevent hanging on stuck services
 //! - Cleanup runs exactly once even with concurrent calls
 
+pub mod cloud;
 pub mod config;
 pub mod dependency;
 pub mod docker;

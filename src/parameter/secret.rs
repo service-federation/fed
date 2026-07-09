@@ -159,6 +159,13 @@ pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Res
     file.lock_exclusive()
         .map_err(|e| Error::Filesystem(format!("Cannot lock '{}': {}", path.display(), e)))?;
 
+    // Secrets file is 0600: readable by the owner only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+
     let existing = load_existing_env(path);
     let generated_map: HashMap<&str, &str> = generated_values
         .iter()

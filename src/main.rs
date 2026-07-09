@@ -195,6 +195,21 @@ async fn run() -> anyhow::Result<()> {
         Commands::Workspace(ref ws_cmd) => {
             return commands::run_workspace(ws_cmd, &out).await;
         }
+        Commands::Login { no_browser, url } => {
+            return commands::run_login(*no_browser, url.clone(), &out).await;
+        }
+        Commands::Logout => {
+            return commands::run_logout(&out).await;
+        }
+        Commands::Whoami => {
+            return commands::run_whoami(&out).await;
+        }
+        Commands::Link { target } => {
+            return commands::run_link(target.clone(), cli.workdir.clone(), &out).await;
+        }
+        Commands::Secrets(ref secrets_cmd) => {
+            return commands::run_secrets(secrets_cmd, cli.workdir.clone(), &out).await;
+        }
         Commands::Isolate(ref isolate_cmd) => {
             return commands::run_isolate(
                 isolate_cmd,
@@ -425,6 +440,7 @@ async fn run() -> anyhow::Result<()> {
         .auto_resolve_conflicts(auto_resolve)
         .readonly(readonly)
         .is_interactive(is_interactive)
+        .offline(cli.offline)
         .build()
         .await?;
 
@@ -503,6 +519,11 @@ async fn run() -> anyhow::Result<()> {
                 // like `fed strat` or `fed migrte`.
                 const BUILTIN_COMMANDS: &[&str] = &[
                     "start",
+                    "login",
+                    "logout",
+                    "whoami",
+                    "link",
+                    "secrets",
                     "stop",
                     "restart",
                     "status",
@@ -584,7 +605,12 @@ async fn run() -> anyhow::Result<()> {
         | Commands::Docker(_)
         | Commands::Debug(_)
         | Commands::Workspace(_)
-        | Commands::Isolate(_) => {
+        | Commands::Isolate(_)
+        | Commands::Login { .. }
+        | Commands::Logout
+        | Commands::Whoami
+        | Commands::Link { .. }
+        | Commands::Secrets(_) => {
             unreachable!("handled in earlier dispatch tiers");
         }
     }

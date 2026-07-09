@@ -42,6 +42,7 @@ pub struct OrchestratorBuilder {
     dry_run: bool,
     readonly: bool,
     is_interactive: bool,
+    offline: bool,
     profiles: Vec<String>,
     startup_timeout: Option<Duration>,
     stop_timeout: Option<Duration>,
@@ -60,6 +61,7 @@ impl OrchestratorBuilder {
             dry_run: false,
             readonly: false,
             is_interactive: false,
+            offline: false,
             profiles: Vec::new(),
             startup_timeout: None,
             stop_timeout: None,
@@ -159,6 +161,12 @@ impl OrchestratorBuilder {
         self
     }
 
+    /// Offline mode: skip cloud vault lookups for manual secrets.
+    pub fn offline(mut self, offline: bool) -> Self {
+        self.offline = offline;
+        self
+    }
+
     /// Enable readonly initialization.
     ///
     /// When enabled, `build()` calls `initialize_readonly()` instead of
@@ -217,6 +225,9 @@ impl OrchestratorBuilder {
         }
         if self.is_interactive {
             orchestrator.set_is_interactive(true);
+        }
+        if self.offline {
+            orchestrator.set_offline(true);
         }
 
         if let Some(timeout) = self.startup_timeout {
