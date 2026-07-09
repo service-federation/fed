@@ -78,33 +78,34 @@ pub async fn run_start(
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
-        // Only try to free ports if we didn't stop any fed services
-        // (if we did, the ports should be available now, or in TIME_WAIT briefly)
+        // Free ports still held by external processes. This must run even when
+        // fed services were stopped above: a service whose stop failed (or a
+        // crash-looping predecessor) may still hold its port, and skipping this
+        // pass would hand the new instance an EADDRINUSE. PortConflict::check
+        // is a no-op for ports that are already free.
         let mut freed_any = false;
-        if stopped_services == 0 {
-            for resolution in orchestrator.get_port_resolutions() {
-                let Some(conflict) = PortConflict::check(resolution.resolved_port) else {
-                    continue;
-                };
+        for resolution in orchestrator.get_port_resolutions() {
+            let Some(conflict) = PortConflict::check(resolution.resolved_port) else {
+                continue;
+            };
 
-                out.progress(&format!(
-                    "Freeing port {} ({})... ",
-                    resolution.resolved_port, resolution.param_name
-                ));
-                match conflict.free_port() {
-                    Ok(msg) => {
-                        out.finish_progress(&msg);
-                        freed_any = true;
-                    }
-                    Err(e) => {
-                        out.error(&format!("failed: {}", e));
-                    }
+            out.progress(&format!(
+                "Freeing port {} ({})... ",
+                resolution.resolved_port, resolution.param_name
+            ));
+            match conflict.free_port() {
+                Ok(msg) => {
+                    out.finish_progress(&msg);
+                    freed_any = true;
+                }
+                Err(e) => {
+                    out.error(&format!("failed: {}", e));
                 }
             }
+        }
 
-            if freed_any {
-                out.blank();
-            }
+        if freed_any {
+            out.blank();
         }
     }
 
@@ -952,10 +953,16 @@ async fn stop_stale_services(orchestrator: &Orchestrator, out: &dyn UserOutput) 
     }
 
     let mut stopped = 0;
+    // Services whose state row is safe to remove: stopped successfully, or
+    // skipped because there is provably nothing to stop.
+    let mut cleaned: Vec<String> = Vec::new();
 
     for (name, state) in &services {
-        // Skip services that aren't running
-        if !matches!(state.status, Status::Running | Status::Healthy) {
+        // Starting/Failing/Stopping services also have (or may have) a live
+        // process — skipping them here and then clearing state would orphan
+        // exactly the conflicting process --replace exists to remove.
+        if !super::stop::state_status_is_active(state.status) {
+            cleaned.push(name.clone());
             continue;
         }
 
@@ -971,6 +978,7 @@ async fn stop_stale_services(orchestrator: &Orchestrator, out: &dyn UserOutput) 
                     "skipped (PID {} was reused by another process)",
                     pid
                 ));
+                cleaned.push(name.clone());
                 continue;
             }
             // Process service - graceful kill
@@ -978,21 +986,31 @@ async fn stop_stale_services(orchestrator: &Orchestrator, out: &dyn UserOutput) 
         } else {
             // No PID or container - nothing to stop
             out.finish_progress("skipped (no PID/container)");
+            cleaned.push(name.clone());
             continue;
         };
 
         if success {
             out.finish_progress("stopped");
             stopped += 1;
+            cleaned.push(name.clone());
         } else {
             out.warning("failed");
         }
     }
 
-    // Clear the state tracker so we start fresh
-    if stopped > 0 {
-        if let Err(e) = orchestrator.state_tracker.write().await.clear().await {
-            tracing::warn!("Failed to clear state after stopping services: {}", e);
+    // Remove state rows only for services that were actually stopped (or had
+    // nothing to stop). A blanket clear() would erase rows for services whose
+    // stop failed, orphaning their still-running processes.
+    if !cleaned.is_empty() {
+        let mut tracker = orchestrator.state_tracker.write().await;
+        for name in &cleaned {
+            if let Err(e) = tracker.unregister_service(name).await {
+                tracing::warn!("Failed to unregister service '{}' from state: {}", name, e);
+            }
+        }
+        if let Err(e) = tracker.save().await {
+            tracing::warn!("Failed to save state after stopping services: {}", e);
         }
     }
 

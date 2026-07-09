@@ -477,7 +477,7 @@ fn test_dry_run_no_port_conflicts_message() {
 parameters:
   FREE_PORT:
     type: port
-    default: 0
+    default: 47391
 
 services:
   simple-service:

@@ -101,7 +101,7 @@ pub async fn run_stop(
     Ok(())
 }
 
-fn state_status_is_active(status: Status) -> bool {
+pub(crate) fn state_status_is_active(status: Status) -> bool {
     matches!(
         status,
         Status::Running | Status::Healthy | Status::Starting | Status::Failing | Status::Stopping
@@ -197,12 +197,11 @@ pub async fn run_stop_from_state(
         services_to_stop.len()
     ));
 
+    let mut failed: Vec<String> = Vec::new();
     for (name, state) in &services_to_stop {
-        let is_active = matches!(
-            state.status,
-            Status::Running | Status::Healthy | Status::Starting
-        );
-        if !is_active {
+        // Failing/Stopping services still have a live process or container —
+        // they must be stopped here, not skipped and then erased from state.
+        if !state_status_is_active(state.status) {
             continue;
         }
 
@@ -217,17 +216,22 @@ pub async fn run_stop_from_state(
             }
             StopResult::Failed => {
                 out.finish_progress(" failed");
+                failed.push(name.clone());
             }
         }
     }
 
     // Update state:
-    // - stop all: clear entire DB
-    // - stop subset: only unregister the named services (leave others intact)
-    if services.is_empty() {
+    // - stop all with no failures: clear entire DB
+    // - otherwise: unregister only the services we actually stopped, so a
+    //   still-running process is never erased from state
+    if services.is_empty() && failed.is_empty() {
         tracker.clear().await?;
     } else {
         for (name, _) in &services_to_stop {
+            if failed.contains(name) {
+                continue;
+            }
             if let Err(e) = tracker.unregister_service(name).await {
                 tracing::warn!("Failed to unregister service '{}' from state: {}", name, e);
             }
@@ -239,6 +243,14 @@ pub async fn run_stop_from_state(
     let removed = remove_orphan_containers_for_workdir(work_dir).await;
     if removed > 0 {
         out.status(&format!("Removed {} orphaned container(s)", removed));
+    }
+
+    if !failed.is_empty() {
+        anyhow::bail!(
+            "Failed to stop {} service(s): {} (still tracked in state)",
+            failed.len(),
+            failed.join(", ")
+        );
     }
 
     out.success("Services stopped");
