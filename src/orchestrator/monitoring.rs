@@ -213,10 +213,14 @@ pub(super) fn should_restart_service(
 /// `true` if restart was successful
 async fn restart_single_service(
     name: &str,
-    manager: &Arc<Mutex<Box<dyn ServiceManager>>>,
+    manager_arc: &ServiceEntry,
     consecutive_failures: u32,
+    state_tracker: &StateTrackerRef,
+    cancel_token: &CancellationToken,
 ) -> bool {
-    // Calculate and apply backoff delay
+    // Calculate and apply backoff delay. The backoff can be up to ~90s, so it
+    // must be cancellable: cleanup() only waits a few seconds for this task,
+    // and restarting after shutdown would spawn a process nothing tracks.
     let delay = calculate_backoff_delay(consecutive_failures);
     if delay.as_secs() > 0 {
         tracing::info!(
@@ -225,26 +229,81 @@ async fn restart_single_service(
             name,
             consecutive_failures
         );
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                tracing::info!("Restart of '{}' cancelled during backoff", name);
+                return false;
+            }
+            _ = tokio::time::sleep(delay) => {}
+        }
     }
-
-    tracing::info!("Restarting service '{}'", name);
 
     // Lock and restart the service
-    let mut manager = manager.lock().await;
+    let start_result = {
+        let mut manager = manager_arc.lock().await;
 
-    // Stop
-    if let Err(e) = manager.stop().await {
-        tracing::error!("Failed to stop service '{}': {}", name, e);
-    }
+        if cancel_token.is_cancelled() {
+            tracing::info!("Restart of '{}' cancelled", name);
+            return false;
+        }
 
-    // Brief delay to ensure clean shutdown
-    tokio::time::sleep(Duration::from_millis(500)).await;
+        // The user may have stopped the service while we were backing off —
+        // resurrecting it here would leave a running process with no state
+        // entry (it was unregistered by the stop).
+        if matches!(manager.status(), Status::Stopped | Status::Stopping) {
+            tracing::info!(
+                "Skipping restart of '{}': service was stopped during backoff",
+                name
+            );
+            return false;
+        }
 
-    // Start
-    match manager.start().await {
+        tracing::info!("Restarting service '{}'", name);
+
+        // Stop
+        if let Err(e) = manager.stop().await {
+            tracing::error!("Failed to stop service '{}': {}", name, e);
+        }
+
+        // Brief delay to ensure clean shutdown
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Start
+        manager.start().await
+    }; // manager lock released
+
+    match start_result {
         Ok(_) => {
             tracing::info!("Successfully restarted service '{}'", name);
+
+            // Record the new PID/container ID — the old ones are dead, and a
+            // future fed process restoring from the DB would otherwise treat
+            // the restarted service as stale (or adopt a reused PID).
+            // LOCK ORDER: state_tracker before service mutex (see lock_order.rs).
+            let mut tracker = state_tracker.write().await;
+            {
+                let manager = manager_arc.lock().await;
+                if let Some(pid) = manager.get_pid() {
+                    if let Err(e) = tracker.update_service_pid(name, pid).await {
+                        tracing::warn!("Failed to update PID for restarted '{}': {}", name, e);
+                    }
+                }
+                if let Some(container_id) = manager.get_container_id() {
+                    if let Err(e) = tracker
+                        .update_service_container_id(name, container_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to update container ID for restarted '{}': {}",
+                            name,
+                            e
+                        );
+                    }
+                }
+            }
+            if let Err(e) = tracker.save().await {
+                tracing::warn!("Failed to save state after restarting '{}': {}", name, e);
+            }
             true
         }
         Err(e) => {
@@ -270,6 +329,7 @@ async fn execute_health_check_cycle(
     services: &ServicesMap,
     state_tracker: &StateTrackerRef,
     config: &Config,
+    cancel_token: &CancellationToken,
 ) {
     // Check all services concurrently
     let health_results = check_all_services(services).await;
@@ -412,7 +472,15 @@ async fn execute_health_check_cycle(
                 continue;
             }
 
-            if restart_single_service(&service_name, &manager_arc, consecutive_failures).await {
+            if restart_single_service(
+                &service_name,
+                &manager_arc,
+                consecutive_failures,
+                state_tracker,
+                cancel_token,
+            )
+            .await
+            {
                 successful_restarts.push(service_name);
             }
         } else {
@@ -657,11 +725,13 @@ async fn run_monitoring_loop(
                 let state_tracker_clone = Arc::clone(&state_tracker);
                 let config_clone = config.clone();
 
+                let cancel_token_clone = cancel_token.clone();
                 let health_check_result = AssertUnwindSafe(async {
                     execute_health_check_cycle(
                         &services_clone,
                         &state_tracker_clone,
                         &config_clone,
+                        &cancel_token_clone,
                     )
                     .await;
                 })

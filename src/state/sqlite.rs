@@ -1082,11 +1082,14 @@ impl SqliteStateTracker {
         let service_id = service_id.to_string();
         let service_id_for_tx = service_id.clone();
 
+        // A new PID means a new process: refresh started_at so PID-reuse
+        // guards (validate_pid_start_time) compare against the right epoch.
+        let started_at = Utc::now().to_rfc3339();
         let rows = self
             .with_transaction(move |tx| {
                 tx.execute(
-                    "UPDATE services SET pid = ?1 WHERE id = ?2",
-                    rusqlite::params![pid, &service_id_for_tx],
+                    "UPDATE services SET pid = ?1, started_at = ?2 WHERE id = ?3",
+                    rusqlite::params![pid, &started_at, &service_id_for_tx],
                 )
             })
             .await?;
