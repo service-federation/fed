@@ -918,11 +918,30 @@ impl Orchestrator {
             .and_then(|s| s.get_startup_timeout())
             .unwrap_or(self.startup_timeout);
 
+        // If the service was already running before this start attempt (a
+        // no-op re-start), an interruption must NOT kill it — cleanup is only
+        // for a process/container this attempt may have spawned itself.
+        let was_running_before = {
+            let manager_arc = {
+                let services = self.services.read().await;
+                services.get(name).map(Arc::clone)
+            };
+            match manager_arc {
+                Some(arc) => {
+                    let manager = arc.lock().await;
+                    matches!(manager.status(), Status::Running | Status::Healthy)
+                }
+                None => false,
+            }
+        };
+
         tokio::select! {
             biased;
 
             _ = cancel_token.cancelled() => {
-                self.stop_interrupted_start(name).await;
+                if !was_running_before {
+                    self.stop_interrupted_start(name).await;
+                }
                 Err(Error::Cancelled(name.to_string()))
             }
 
@@ -930,7 +949,9 @@ impl Orchestrator {
                 match result {
                     Ok(inner_result) => inner_result,
                     Err(_elapsed) => {
-                        self.stop_interrupted_start(name).await;
+                        if !was_running_before {
+                            self.stop_interrupted_start(name).await;
+                        }
                         Err(Error::Timeout(name.to_string()))
                     }
                 }

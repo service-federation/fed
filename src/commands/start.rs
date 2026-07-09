@@ -1034,22 +1034,32 @@ async fn unregister_dead_services(orchestrator: &Orchestrator) {
     let conn = orchestrator.state_tracker.read().await.clone_connection();
     let services = SqliteStateTracker::fetch_services_from_connection(&conn).await;
 
+    // Consult Docker only if the daemon responds — with the daemon down we
+    // can't prove a container is gone, so its row must be kept.
+    let docker_available = fed::docker::is_daemon_healthy().await;
+
     let mut dead: Vec<String> = Vec::new();
     for (name, state) in services {
-        // Only judge process services: a missing/dead PID is proof there is
-        // nothing left to track. Container rows are left alone.
-        if state.container_id.is_some() {
-            continue;
-        }
-        let Some(pid) = state.pid else {
+        let alive = if let Some(ref container_id) = state.container_id {
+            // graceful_docker_stop can report failure even after its rm -f
+            // removed the container, and the port-free pass can kill one too.
+            if !docker_available {
+                continue;
+            }
+            fed::docker::is_container_running(container_id).await
+        } else if let Some(pid) = state.pid {
+            #[cfg(unix)]
+            {
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+                    && validate_pid_start_time(pid, state.started_at)
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        } else {
             continue;
         };
-
-        #[cfg(unix)]
-        let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
-            && validate_pid_start_time(pid, state.started_at);
-        #[cfg(not(unix))]
-        let alive = true;
 
         if !alive {
             dead.push(name);
