@@ -134,6 +134,9 @@ impl<'a> ScriptRunner<'a> {
 
         command.current_dir(&work_dir);
         command.envs(&resolved_env);
+        // On timeout the future (and its Child) is dropped — without this the
+        // script process would keep running after we report the timeout.
+        command.kill_on_drop(true);
 
         // Execute with timeout - configurable, default 5 minutes to prevent hanging
         let timeout = script
