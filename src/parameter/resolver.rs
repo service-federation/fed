@@ -272,24 +272,48 @@ impl Resolver {
         template: &str,
         parameters: &HashMap<String, String>,
     ) -> Result<String> {
+        Self::replace_placeholders(template, parameters, false)
+    }
+
+    /// Substitute `{{PARAM}}` placeholders in a single pass over the template.
+    /// Substituted values are never re-scanned, so a value that itself contains
+    /// `{{...}}` is inserted literally instead of being expanded (which would
+    /// let one parameter's value smuggle in another's — including past shell
+    /// escaping in the shell-safe variant).
+    fn replace_placeholders(
+        template: &str,
+        parameters: &HashMap<String, String>,
+        escape: bool,
+    ) -> Result<String> {
         if template.is_empty() {
             return Ok(String::new());
         }
 
-        let mut result = template.to_string();
+        let mut missing: Option<String> = None;
+        let result = get_template_regex().replace_all(template, |cap: &regex::Captures| {
+            // Trim so `{{ FOO }}` resolves like `{{FOO}}`, matching how
+            // generate_dependencies extracts names for DAG ordering.
+            let var_name = cap[1].trim();
+            match parameters.get(var_name) {
+                Some(value) => {
+                    if escape {
+                        shell_escape(value)
+                    } else {
+                        value.clone()
+                    }
+                }
+                None => {
+                    missing.get_or_insert_with(|| var_name.to_string());
+                    String::new()
+                }
+            }
+        });
 
-        for cap in get_template_regex().captures_iter(template) {
-            let full_match = &cap[0]; // {{VAR}}
-            let var_name = &cap[1]; // VAR
-
-            let value = parameters
-                .get(var_name)
-                .ok_or_else(|| Error::ParameterNotFound(var_name.to_string()))?;
-
-            result = result.replace(full_match, value);
+        if let Some(name) = missing {
+            return Err(Error::ParameterNotFound(name));
         }
 
-        Ok(result)
+        Ok(result.into_owned())
     }
 
     /// Resolve template placeholders with shell escaping for safe use in shell commands.
@@ -299,26 +323,7 @@ impl Resolver {
         template: &str,
         parameters: &HashMap<String, String>,
     ) -> Result<String> {
-        if template.is_empty() {
-            return Ok(String::new());
-        }
-
-        let mut result = template.to_string();
-
-        for cap in get_template_regex().captures_iter(template) {
-            let full_match = &cap[0]; // {{VAR}}
-            let var_name = &cap[1]; // VAR
-
-            let value = parameters
-                .get(var_name)
-                .ok_or_else(|| Error::ParameterNotFound(var_name.to_string()))?;
-
-            // Apply shell escaping to the value before substitution
-            let escaped_value = shell_escape(value);
-            result = result.replace(full_match, &escaped_value);
-        }
-
-        Ok(result)
+        Self::replace_placeholders(template, parameters, true)
     }
 
     /// Resolve environment variables
@@ -2227,6 +2232,40 @@ mod tests {
         assert_eq!(process, "echo '; rm -rf /'");
         // Should NOT be the unescaped dangerous version
         assert_ne!(process, "echo ; rm -rf /");
+    }
+
+    #[test]
+    fn test_resolve_template_no_double_expansion() {
+        // A value that literally contains another placeholder must be inserted
+        // verbatim, not re-expanded — re-expansion after escaping would break
+        // out of the quoting and defeat shell_escape entirely.
+        let mut params = HashMap::new();
+        params.insert("A".to_string(), "{{B}}".to_string());
+        params.insert("B".to_string(), "x; rm -rf ~".to_string());
+
+        let shell = Resolver::replace_placeholders("run {{A}} {{B}}", &params, true).unwrap();
+        assert_eq!(shell, "run '{{B}}' 'x; rm -rf ~'");
+
+        let plain = Resolver::resolve_template_static("run {{A}} {{B}}", &params).unwrap();
+        assert_eq!(plain, "run {{B}} x; rm -rf ~");
+    }
+
+    #[test]
+    fn test_resolve_template_trims_placeholder_names() {
+        // generate_dependencies trims captured names; resolution must agree so
+        // `{{ FOO }}` doesn't pass DAG validation and then fail at runtime.
+        let mut params = HashMap::new();
+        params.insert("FOO".to_string(), "bar".to_string());
+
+        let result = Resolver::resolve_template_static("v={{ FOO }}", &params).unwrap();
+        assert_eq!(result, "v=bar");
+    }
+
+    #[test]
+    fn test_resolve_template_missing_parameter_errors() {
+        let params = HashMap::new();
+        let err = Resolver::resolve_template_static("{{MISSING}}", &params).unwrap_err();
+        assert!(matches!(err, Error::ParameterNotFound(name) if name == "MISSING"));
     }
 
     #[test]
