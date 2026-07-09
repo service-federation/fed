@@ -109,7 +109,7 @@ async fn collect_state_info(work_dir: PathBuf) -> anyhow::Result<StateDebugOutpu
     let all_services = state_tracker.get_services().await;
 
     let mut services = Vec::new();
-    for (_, service_state) in all_services.iter() {
+    for service_state in all_services.values() {
         let circuit_breaker_open = state_tracker
             .is_circuit_breaker_open(&service_state.id)
             .await;
@@ -136,7 +136,7 @@ async fn collect_state_info(work_dir: PathBuf) -> anyhow::Result<StateDebugOutpu
     }
 
     let mut allocated_ports = Vec::new();
-    for (_, service_state) in all_services.iter() {
+    for service_state in all_services.values() {
         for (param_name, port) in &service_state.port_allocations {
             allocated_ports.push(PortDebugInfo {
                 port: *port,

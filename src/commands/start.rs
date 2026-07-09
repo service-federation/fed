@@ -617,7 +617,7 @@ async fn run_watch_mode(
 
                         // Kill all running services before exit
                         let services_map = services_clone.read().await;
-                        for (_, service_arc) in services_map.iter() {
+                        for service_arc in services_map.values() {
                             if let Ok(mut manager) = service_arc.try_lock() {
                                 let _ = manager.kill().await;
                             }
