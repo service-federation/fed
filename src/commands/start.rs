@@ -107,6 +107,13 @@ pub async fn run_start(
         if freed_any {
             out.blank();
         }
+
+        // A service whose graceful stop failed keeps its state row (so the
+        // live process stays tracked), but the port-freeing pass above may
+        // have killed that same process by port. Drop rows whose process is
+        // now provably dead — a leftover row would make registration return
+        // AlreadyExists and silently skip starting the replacement.
+        unregister_dead_services(orchestrator).await;
     }
 
     // Show what we're about to start with their dependencies
@@ -1015,6 +1022,53 @@ async fn stop_stale_services(orchestrator: &Orchestrator, out: &dyn UserOutput) 
     }
 
     stopped
+}
+
+/// Unregister state rows for process services whose PID is no longer alive
+/// (or was reused by another process). Used by --replace after force-freeing
+/// ports, which can kill processes whose rows were deliberately kept when
+/// their graceful stop failed.
+async fn unregister_dead_services(orchestrator: &Orchestrator) {
+    use fed::state::SqliteStateTracker;
+
+    let conn = orchestrator.state_tracker.read().await.clone_connection();
+    let services = SqliteStateTracker::fetch_services_from_connection(&conn).await;
+
+    let mut dead: Vec<String> = Vec::new();
+    for (name, state) in services {
+        // Only judge process services: a missing/dead PID is proof there is
+        // nothing left to track. Container rows are left alone.
+        if state.container_id.is_some() {
+            continue;
+        }
+        let Some(pid) = state.pid else {
+            continue;
+        };
+
+        #[cfg(unix)]
+        let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+            && validate_pid_start_time(pid, state.started_at);
+        #[cfg(not(unix))]
+        let alive = true;
+
+        if !alive {
+            dead.push(name);
+        }
+    }
+
+    if dead.is_empty() {
+        return;
+    }
+
+    let mut tracker = orchestrator.state_tracker.write().await;
+    for name in &dead {
+        if let Err(e) = tracker.unregister_service(name).await {
+            tracing::warn!("Failed to unregister dead service '{}': {}", name, e);
+        }
+    }
+    if let Err(e) = tracker.save().await {
+        tracing::warn!("Failed to save state after removing dead services: {}", e);
+    }
 }
 
 #[cfg(test)]

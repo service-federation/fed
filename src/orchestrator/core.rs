@@ -943,34 +943,17 @@ impl Orchestrator {
     /// Dropping the start future mid-await can land after the process or
     /// container was already spawned but before registration committed — the
     /// registration guard then removes the state entry, so nothing tracks the
-    /// live process. Kill it here so a timed-out start doesn't leak an
-    /// untracked instance (and a port conflict for the next start).
+    /// live process. It can also land *after* the commit (e.g. during the
+    /// healthcheck wait), where the state row would outlive the killed
+    /// process and block a retry with AlreadyExists. Kill and unregister so
+    /// neither a leaked process nor a stale row survives the timeout.
     async fn stop_interrupted_start(&self, name: &str) {
-        let manager_arc = {
-            let services = self.services.read().await;
-            services.get(name).map(Arc::clone)
-        };
-        let Some(manager_arc) = manager_arc else {
-            return;
-        };
-
-        let result = tokio::time::timeout(Duration::from_secs(10), async {
-            let mut manager = manager_arc.lock().await;
-            if manager.status() == Status::Stopped {
-                return Ok(());
-            }
-            manager.kill().await
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::warn!("Failed to kill '{}' after interrupted start: {}", name, e);
-            }
-            Err(_) => {
-                tracing::warn!("Timed out killing '{}' after interrupted start", name);
-            }
+        if let Err(e) = self.force_kill_service(name).await {
+            tracing::warn!(
+                "Cleanup after interrupted start of '{}' failed: {}",
+                name,
+                e
+            );
         }
     }
 
