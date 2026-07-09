@@ -306,9 +306,11 @@ impl App {
                 }
                 KeyCode::Backspace => {
                     self.params_filter.pop();
+                    self.params_selected = 0;
                 }
                 KeyCode::Char(c) => {
                     self.params_filter.push(c);
+                    self.params_selected = 0;
                 }
                 _ => {}
             }
@@ -536,8 +538,12 @@ impl App {
                     let result = {
                         let orch = self.orchestrator.write().await;
                         match status {
-                            Status::Running | Status::Healthy => orch.stop(&service_name).await,
-                            Status::Stopped | Status::Failing => orch.start(&service_name).await,
+                            // Failing means a live process failing health checks —
+                            // toggle stops it (start would no-op with AlreadyExists).
+                            Status::Running | Status::Healthy | Status::Failing => {
+                                orch.stop(&service_name).await
+                            }
+                            Status::Stopped => orch.start(&service_name).await,
                             _ => Ok(()),
                         }
                     };
@@ -664,10 +670,14 @@ impl App {
         Ok(())
     }
 
-    /// Get filtered parameters list
+    /// Get filtered parameters list, sorted by key.
+    ///
+    /// The order must be deterministic and match the renderer exactly: this
+    /// list is indexed by `params_selected` for navigation and clipboard copy.
     pub fn get_filtered_params(&self) -> Vec<(&String, &String)> {
         let filter_lower = self.params_filter.to_lowercase();
-        self.parameters_cache
+        let mut params: Vec<_> = self
+            .parameters_cache
             .iter()
             .filter(|(k, v)| {
                 if filter_lower.is_empty() {
@@ -677,7 +687,9 @@ impl App {
                         || v.to_lowercase().contains(&filter_lower)
                 }
             })
-            .collect()
+            .collect();
+        params.sort_by_key(|(k, _)| k.as_str());
+        params
     }
 
     /// Called on each tick (e.g., every 250ms)
@@ -881,7 +893,11 @@ impl App {
                 let result = {
                     let orch = self.orchestrator.write().await;
                     match status {
-                        Status::Running | Status::Healthy => orch.stop(&name).await,
+                        // Same Failing semantics as the details and graph views:
+                        // a Failing service is running, so toggle stops it.
+                        Status::Running | Status::Healthy | Status::Failing => {
+                            orch.stop(&name).await
+                        }
                         Status::Stopped => orch.start(&name).await,
                         _ => Ok(()),
                     }

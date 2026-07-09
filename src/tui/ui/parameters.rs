@@ -42,69 +42,59 @@ fn draw_title(f: &mut Frame, area: Rect) {
 }
 
 fn draw_parameters(f: &mut Frame, app: &App, area: Rect) {
-    let params = &app.parameters_cache;
+    // Render exactly the list the key handler indexes with params_selected —
+    // same source, same filter, same order — so navigation and clipboard copy
+    // always act on the highlighted row.
+    let params = app.get_filtered_params();
 
-    let mut sorted_params: Vec<_> = params.iter().collect();
-    sorted_params.sort_by_key(|(k, _)| k.as_str());
-
-    if sorted_params.is_empty() {
-        let lines = vec![
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "  No parameters defined",
-                Style::default().fg(Color::DarkGray),
-            )]),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "  Parameters are defined in your service-federation.yaml",
-                Style::default().fg(Color::DarkGray),
-            )]),
-            Line::from(vec![Span::styled(
-                "  under the 'parameters' section.",
-                Style::default().fg(Color::DarkGray),
-            )]),
-        ];
+    if params.is_empty() {
+        let message = if app.params_filter.is_empty() {
+            vec![
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "  No parameters defined",
+                    Style::default().fg(Color::DarkGray),
+                )]),
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "  Parameters are defined in your service-federation.yaml",
+                    Style::default().fg(Color::DarkGray),
+                )]),
+                Line::from(vec![Span::styled(
+                    "  under the 'parameters' section.",
+                    Style::default().fg(Color::DarkGray),
+                )]),
+            ]
+        } else {
+            vec![
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    format!("  No parameters match '{}'", app.params_filter),
+                    Style::default().fg(Color::DarkGray),
+                )]),
+                Line::from(vec![Span::styled(
+                    "  Press [c] to clear the filter",
+                    Style::default().fg(Color::DarkGray),
+                )]),
+            ]
+        };
 
         let block = Block::default()
             .title(" Parameter List ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Blue));
 
-        let paragraph = Paragraph::new(lines).block(block);
+        let paragraph = Paragraph::new(message).block(block);
         f.render_widget(paragraph, area);
         return;
     }
 
-    // Group parameters by prefix (e.g., "api.", "db.", etc.)
-    let mut grouped_params: std::collections::HashMap<String, Vec<(&String, &String)>> =
-        std::collections::HashMap::new();
+    let selected = app.params_selected.min(params.len() - 1);
 
-    for (key, value) in &sorted_params {
-        let prefix = if let Some(pos) = key.find('.') {
-            key[..pos].to_string()
-        } else {
-            "global".to_string()
-        };
-
-        grouped_params.entry(prefix).or_default().push((key, value));
-    }
-
-    let mut sorted_groups: Vec<_> = grouped_params.iter().collect();
-    sorted_groups.sort_by_key(|(k, _)| k.as_str());
-
-    let mut items = vec![];
-
-    for (group, params) in sorted_groups {
-        // Group header
-        items.push(ListItem::new(Line::from(vec![Span::styled(
-            format!("  [{}]", group),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )])));
-
-        // Parameters in this group
-        for (key, value) in params {
+    let items: Vec<ListItem> = params
+        .iter()
+        .enumerate()
+        .map(|(i, (key, value))| {
             // Determine if value looks like a sensitive parameter
             let is_sensitive = key.to_lowercase().contains("password")
                 || key.to_lowercase().contains("secret")
@@ -125,42 +115,68 @@ fn draw_parameters(f: &mut Frame, app: &App, area: Rect) {
                 Color::Green
             };
 
-            items.push(ListItem::new(Line::from(vec![
-                Span::raw("    "),
-                Span::styled(format!("{:<30}", key), Style::default().fg(Color::Cyan)),
+            let is_selected = i == selected;
+            let marker = if is_selected { "  ▶ " } else { "    " };
+            let key_style = if is_selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+
+            let line = Line::from(vec![
+                Span::raw(marker),
+                Span::styled(format!("{:<30}", key), key_style),
                 Span::styled(" = ", Style::default().fg(Color::DarkGray)),
                 Span::styled(display_value, Style::default().fg(value_color)),
-            ])));
-        }
+            ]);
 
-        items.push(ListItem::new(Line::from("")));
-    }
+            if is_selected {
+                ListItem::new(line).style(Style::default().bg(Color::Rgb(40, 40, 60)))
+            } else {
+                ListItem::new(line)
+            }
+        })
+        .collect();
 
-    // Add summary at bottom
-    items.push(ListItem::new(Line::from(vec![Span::styled(
-        format!("  Total: {} parameters", sorted_params.len()),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC),
-    )])));
+    let title = if app.params_filter.is_empty() {
+        format!(" Parameter List ({}) ", params.len())
+    } else {
+        format!(
+            " Parameter List ({} matching '{}') ",
+            params.len(),
+            app.params_filter
+        )
+    };
 
     let block = Block::default()
-        .title(" Parameter List (read-only) ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue));
 
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(selected));
     let list = List::new(items).block(block);
-    f.render_widget(list, area);
+    f.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_status_bar(f: &mut Frame, area: Rect) {
     let shortcuts = vec![
+        Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
+        Span::raw(" navigate "),
+        Span::styled("[/]", Style::default().fg(Color::Cyan)),
+        Span::raw(" filter "),
+        Span::styled("[c]", Style::default().fg(Color::Cyan)),
+        Span::raw(" clear "),
+        Span::styled("[y]", Style::default().fg(Color::Cyan)),
+        Span::raw(" copy value "),
+        Span::styled("[Y]", Style::default().fg(Color::Cyan)),
+        Span::raw(" copy key=value "),
         Span::styled("[Esc]", Style::default().fg(Color::Cyan)),
-        Span::raw(" back to dashboard "),
+        Span::raw(" back "),
         Span::styled("[q]", Style::default().fg(Color::Cyan)),
-        Span::raw("uit "),
-        Span::styled("", Style::default().fg(Color::DarkGray)),
-        Span::raw("(parameters are read-only)"),
+        Span::raw("uit"),
     ];
 
     let paragraph =
