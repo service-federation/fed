@@ -607,6 +607,28 @@ impl Resolver {
                 parameters.insert(name.clone(), value.clone());
                 self.resolved_parameters.insert(name.clone(), value.clone());
             } else if param.is_port_type() {
+                // Validate the config default up front. Without this, an
+                // unparseable default (a template like {{BASE_PORT}}, or an
+                // out-of-range value like 70000) silently falls back to a
+                // random port, and `default: 0` "binds" successfully because
+                // the OS assigns an ephemeral port — while the same values in
+                // `value:` are hard errors.
+                if let Some(env_value) = param.get_value_for_environment(&self.environment) {
+                    let default_str = Self::value_to_string(env_value);
+                    let default_port = default_str.parse::<u16>().map_err(|_| {
+                        Error::TemplateResolution(format!(
+                            "Parameter '{}' has invalid port default '{}': must be a literal number between 1 and 65535 (templates are not supported in port defaults)",
+                            name, default_str
+                        ))
+                    })?;
+                    if default_port == 0 {
+                        return Err(Error::TemplateResolution(format!(
+                            "Parameter '{}' has invalid port default '0': must be between 1 and 65535",
+                            name
+                        )));
+                    }
+                }
+
                 // Port resolution via unified PortStore.
                 // The store may be SQLite-backed or no-op (isolated).
                 // One lookup path, one save path — no dual-cache priority chain.
@@ -653,6 +675,12 @@ impl Resolver {
             let mut any_resolved = false;
 
             for (name, param) in &effective_params {
+                // Port parameters were already resolved by the allocator above;
+                // re-resolving their default here would overwrite the allocated
+                // port with an unchecked value.
+                if param.is_port_type() {
+                    continue;
+                }
                 if let Some(env_value) = param.get_value_for_environment(&self.environment) {
                     let default_str = Self::value_to_string(env_value);
                     if default_str.contains("{{") {
@@ -1532,14 +1560,9 @@ mod tests {
 
         config.parameters.insert("API_PORT".to_string(), param);
 
-        resolver.resolve_parameters(&mut config).unwrap();
-
-        let resolved = resolver.get_resolved_parameters();
-        let port_str = resolved.get("API_PORT").unwrap();
-        let port: u16 = port_str.parse().unwrap();
-
-        // Should have allocated a random port (fallback due to invalid default)
-        assert!(port > 0);
+        // An unparseable default is a config error, not a silent random port.
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        assert!(err.to_string().contains("invalid port default"), "{err}");
     }
 
     #[test]
@@ -2266,6 +2289,77 @@ mod tests {
         let params = HashMap::new();
         let err = Resolver::resolve_template_static("{{MISSING}}", &params).unwrap_err();
         assert!(matches!(err, Error::ParameterNotFound(name) if name == "MISSING"));
+    }
+
+    #[test]
+    fn test_port_default_zero_rejected() {
+        use crate::config::{Config, Parameter};
+
+        let mut resolver = Resolver::new();
+        let mut config = Config::default();
+        let param = Parameter {
+            param_type: Some("port".to_string()),
+            default: Some(serde_yaml::Value::Number(0.into())),
+            ..Default::default()
+        };
+        config.parameters.insert("PORT".to_string(), param);
+
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid port default '0'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_port_default_template_rejected() {
+        use crate::config::{Config, Parameter};
+
+        let mut resolver = Resolver::new();
+        let mut config = Config::default();
+        config.parameters.insert(
+            "BASE_PORT".to_string(),
+            Parameter {
+                default: Some(serde_yaml::Value::Number(3000.into())),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "API_PORT".to_string(),
+            Parameter {
+                param_type: Some("port".to_string()),
+                default: Some(serde_yaml::Value::String("{{BASE_PORT}}".to_string())),
+                ..Default::default()
+            },
+        );
+
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        assert!(err.to_string().contains("invalid port default"), "{err}");
+    }
+
+    #[test]
+    fn test_port_default_out_of_range_rejected() {
+        use crate::config::{Config, Parameter};
+
+        let mut resolver = Resolver::new();
+        let mut config = Config::default();
+        config.parameters.insert(
+            "PORT".to_string(),
+            Parameter {
+                param_type: Some("port".to_string()),
+                default: Some(serde_yaml::Value::Number(70000.into())),
+                ..Default::default()
+            },
+        );
+
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        assert!(err.to_string().contains("invalid port default"), "{err}");
+    }
+
+    #[test]
+    fn test_try_allocate_port_zero_fails() {
+        let mut allocator = PortAllocator::new();
+        assert!(allocator.try_allocate_port(0).is_err());
     }
 
     #[test]

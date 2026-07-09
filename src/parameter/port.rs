@@ -65,6 +65,11 @@ impl PortAllocator {
     ///
     /// Thread-safe: Uses interior mutability to allow concurrent allocation.
     pub fn allocate_port_with_default(&mut self, default_port: u16) -> Result<u16> {
+        // Binding port 0 always succeeds (the OS picks an ephemeral port), so it
+        // can never be honored as a literal default.
+        if default_port == 0 {
+            return self.allocate_random_port();
+        }
         // Try to bind to the default port on 127.0.0.1
         let listener_v4 = match TcpListener::bind(("127.0.0.1", default_port)) {
             Ok(l) => l,
@@ -94,6 +99,13 @@ impl PortAllocator {
     ///
     /// Thread-safe: Uses interior mutability to allow concurrent allocation.
     pub fn try_allocate_port(&mut self, port: u16) -> Result<u16> {
+        // bind(0) always succeeds by assigning an ephemeral port, which would
+        // make this function report success for a port nothing can listen on.
+        if port == 0 {
+            return Err(Error::PortAllocation(
+                "Port 0 cannot be allocated: valid ports are 1-65535".to_string(),
+            ));
+        }
         let listener_v4 = TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
             Error::PortAllocation(format!("Port {} not available (127.0.0.1): {}", port, e))
         })?;
