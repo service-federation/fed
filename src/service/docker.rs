@@ -24,13 +24,22 @@ pub(crate) fn docker_container_name(
     work_dir: &Path,
 ) -> String {
     let sanitized_service = sanitize_container_name_component(service_name);
+    format!(
+        "{}{}",
+        docker_stack_prefix(session_id, work_dir),
+        sanitized_service
+    )
+}
 
+/// The container-name prefix shared by every container of this stack
+/// (`fed-{session_id}-` or `fed-{work_dir_hash}-`). A running `fed-*`
+/// container that does NOT carry this prefix belongs to another stack —
+/// typically another checkout or worktree of the same project.
+pub(crate) fn docker_stack_prefix(session_id: Option<&str>, work_dir: &Path) -> String {
     if let Some(session_id) = session_id {
-        let sanitized_session = sanitize_container_name_component(session_id);
-        format!("fed-{}-{}", sanitized_session, sanitized_service)
+        format!("fed-{}-", sanitize_container_name_component(session_id))
     } else {
-        let hash = hash_work_dir(work_dir);
-        format!("fed-{}-{}", hash, sanitized_service)
+        format!("fed-{}-", hash_work_dir(work_dir))
     }
 }
 
@@ -185,6 +194,17 @@ impl DockerService {
         let port_str = &addr_port[colon_idx + 1..];
 
         port_str.parse().ok()
+    }
+
+    /// From the running containers that hold a conflicting port, pick the one
+    /// that proves the conflict comes from another fed stack: a `fed-*` name
+    /// without this stack's own prefix. Non-fed holders return None — the
+    /// generic port-conflict hint covers those.
+    fn other_stack_holder(holders: &[String], own_prefix: &str) -> Option<String> {
+        holders
+            .iter()
+            .find(|name| name.starts_with("fed-") && !name.starts_with(own_prefix))
+            .cloned()
     }
 
     /// Scope a volume specification with an isolation ID.
@@ -599,6 +619,25 @@ impl ServiceManager for DockerService {
 
             // Parse port conflict errors for better messaging
             if let Some(port) = Self::parse_port_conflict(&error) {
+                // Attribute the port: if a running fed container from another
+                // stack holds it, the right fix is `fed isolate enable`, and
+                // `--replace` would kill that other checkout's services.
+                let own_prefix = {
+                    let base = self.base.read();
+                    docker_stack_prefix(self.session_id.as_deref(), Path::new(&base.work_dir))
+                };
+                let holders = self
+                    .client
+                    .ps_running_names(&format!("publish={}", port), DOCKER_REMOVE_TIMEOUT)
+                    .await
+                    .unwrap_or_default();
+                if let Some(container) = Self::other_stack_holder(&holders, &own_prefix) {
+                    return Err(Error::DockerPortConflictOtherStack {
+                        service: service_name,
+                        port,
+                        container,
+                    });
+                }
                 return Err(Error::DockerPortConflict {
                     service: service_name,
                     port,
@@ -1381,6 +1420,36 @@ mod tests {
         // With isolation ID, should use it instead of work_dir hash
         let name = docker_container_name("my-service", Some("abc123"), Path::new("/tmp/project"));
         assert_eq!(name, "fed-abc123-my-service");
+    }
+
+    #[test]
+    fn test_stack_prefix_matches_container_name() {
+        // Attribution relies on this invariant: every container of a stack
+        // starts with that stack's prefix, with or without isolation.
+        let dir = Path::new("/tmp/project");
+        assert!(docker_container_name("db", None, dir).starts_with(&docker_stack_prefix(None, dir)));
+        assert!(docker_container_name("db", Some("iso-abc123"), dir)
+            .starts_with(&docker_stack_prefix(Some("iso-abc123"), dir)));
+    }
+
+    #[test]
+    fn test_other_stack_holder_finds_foreign_fed_container() {
+        let holders = vec!["nginx".to_string(), "fed-iso-abc123-postgres".to_string()];
+        assert_eq!(
+            DockerService::other_stack_holder(&holders, "fed-deadbeef-"),
+            Some("fed-iso-abc123-postgres".to_string())
+        );
+    }
+
+    #[test]
+    fn test_other_stack_holder_ignores_own_stack_and_non_fed() {
+        // Our own containers and unrelated containers must not be attributed
+        // to "another stack" — that would tell the user to isolate for nothing.
+        let holders = vec!["fed-deadbeef-postgres".to_string(), "nginx".to_string()];
+        assert_eq!(
+            DockerService::other_stack_holder(&holders, "fed-deadbeef-"),
+            None
+        );
     }
 
     #[test]

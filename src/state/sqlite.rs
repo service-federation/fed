@@ -1878,7 +1878,13 @@ impl SqliteStateTracker {
         }).await {
             Ok(services) => services,
             Err(e) => {
-                warn!("Failed to get services: {}", e);
+                // A fresh directory has a state DB with no tables yet — that's
+                // legitimately empty state, not a condition to warn about.
+                if e.to_string().contains("no such table") {
+                    tracing::debug!("State DB has no tables yet; treating as empty");
+                } else {
+                    warn!("Failed to get services: {}", e);
+                }
                 HashMap::new()
             }
         }

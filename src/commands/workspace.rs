@@ -138,8 +138,13 @@ async fn count_running_services(worktree_path: &Path) -> Option<usize> {
         .call(|conn| {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "query_only", "ON")?;
-            let mut stmt = conn
-                .prepare("SELECT COUNT(*) FROM services WHERE status IN ('running', 'starting')")?;
+            // Every status that still holds resources (matches
+            // `status_indicates_should_be_running` in state/sqlite.rs).
+            // 'healthy' matters most: healthchecked services park there, and
+            // omitting it made `ws rm` skip its stop and orphan containers.
+            let mut stmt = conn.prepare(
+                "SELECT COUNT(*) FROM services WHERE status IN ('running', 'starting', 'healthy', 'failing')",
+            )?;
             let count: i64 = stmt.query_row([], |row| row.get(0))?;
             Ok(count as usize)
         })
@@ -206,6 +211,9 @@ async fn ws_new(branch: &str, create_branch: bool, out: &dyn UserOutput) -> anyh
         out.status(&format!("  Created branch '{}'", branch));
     }
     out.status(&format!("  Created worktree at {}", target.display()));
+    out.status("");
+    out.status("  Run `fed isolate enable` there before any other fed command —");
+    out.status("  the worktree gets its own ports, containers, and volumes.");
 
     write_cd_file(&target, out);
     Ok(())

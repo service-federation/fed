@@ -421,8 +421,13 @@ pub async fn run_start(
                 }
             }
             out.blank();
-            out.status("Hint: Run 'fed start --replace' to kill conflicting processes");
-            out.status("      Or manually stop the external services first");
+            out.status("Hint: If another checkout of this project owns these ports (worktree, parallel agent):");
+            out.status("          fed isolate enable      # give this directory its own ports");
+            out.status("      If a stray external process holds them:");
+            out.status(
+                "          fed start --replace     # kills whatever holds the ports — including",
+            );
+            out.status("                                  # other checkouts' fed services");
         }
 
         // Show per-service failure details

@@ -98,9 +98,20 @@ pub enum Error {
     #[error("{service} – port {port} already allocated")]
     #[diagnostic(
         code(fed::docker::port_conflict),
-        help("To stop existing processes and containers run:\n\n    fed start --replace")
+        help("If another checkout of this project owns the port (worktree, parallel agent):\n\n    fed isolate enable      # give this directory its own ports\n\nIf a stray external process holds it:\n\n    fed start --replace     # kills whatever holds the port — including\n                            # other checkouts' fed services")
     )]
     DockerPortConflict { service: String, port: u16 },
+
+    #[error("{service} – port {port} is held by another fed stack ({container})")]
+    #[diagnostic(
+        code(fed::docker::port_conflict_other_stack),
+        help("Container '{container}' belongs to another checkout or worktree of this project.\nGive this directory its own ports instead (persisted, applies to every later fed command):\n\n    fed isolate enable\n\nDo not use `fed start --replace` here — it would kill the other checkout's services.")
+    )]
+    DockerPortConflictOtherStack {
+        service: String,
+        port: u16,
+        container: String,
+    },
 
     #[error("Operation aborted by user")]
     Aborted,
@@ -227,8 +238,12 @@ impl Error {
                 msg
             )),
             Error::DockerPortConflict { port, .. } => Some(format!(
-                "Port {} is in use by another container or process.\n\nTo stop existing processes and containers run:\n\n    fed start --replace",
+                "Port {} is in use.\n\nIf another checkout of this project owns it (worktree, parallel agent):\n\n    fed isolate enable      # give this directory its own ports\n\nIf a stray external process holds it:\n\n    fed start --replace     # kills whatever holds the port — including\n                            # other checkouts' fed services",
                 port
+            )),
+            Error::DockerPortConflictOtherStack { port, container, .. } => Some(format!(
+                "Port {} is held by container '{}' — another checkout or worktree of this project.\n\nGive this directory its own ports instead (persisted, applies to every later fed command):\n\n    fed isolate enable\n\nDo not use `fed start --replace` here — it would kill the other checkout's services.",
+                port, container
             )),
             Error::CircularDependency(path) => Some(format!(
                 "Services cannot depend on each other in a cycle. Review the depends_on fields for: {}",
@@ -479,6 +494,46 @@ pub fn validate_pid_start_time(pid: u32, expected_start: chrono::DateTime<chrono
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    // Port-conflict hints must lead with `fed isolate enable`: in a worktree,
+    // `fed start --replace` kills the other checkout's services, and agents
+    // follow whatever the error message suggests first.
+    #[test]
+    fn generic_port_conflict_suggests_isolation_before_replace() {
+        let err = Error::DockerPortConflict {
+            service: "db".to_string(),
+            port: 5433,
+        };
+        let s = err.suggestion().expect("has suggestion");
+        let isolate = s.find("fed isolate enable").expect("mentions isolate");
+        let replace = s.find("fed start --replace").expect("mentions replace");
+        assert!(isolate < replace, "isolation must come first: {}", s);
+    }
+
+    #[test]
+    fn other_stack_port_conflict_names_container_and_forbids_replace() {
+        let err = Error::DockerPortConflictOtherStack {
+            service: "db".to_string(),
+            port: 5433,
+            container: "fed-7a80d381-postgres".to_string(),
+        };
+        let s = err.suggestion().expect("has suggestion");
+        assert!(
+            s.contains("fed-7a80d381-postgres"),
+            "names the holder: {}",
+            s
+        );
+        assert!(
+            s.contains("fed isolate enable"),
+            "recommends isolation: {}",
+            s
+        );
+        assert!(
+            s.contains("Do not use `fed start --replace`"),
+            "warns against --replace: {}",
+            s
+        );
+    }
 
     // ========================================================================
     // validate_pid_start_time tests

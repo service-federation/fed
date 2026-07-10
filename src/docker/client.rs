@@ -296,6 +296,27 @@ impl DockerClient {
             .collect())
     }
 
+    /// List names of RUNNING containers matching a filter (no `-a`).
+    /// Used to attribute port conflicts: only a running container can hold a
+    /// host port, so stopped ones would misattribute.
+    pub async fn ps_running_names(
+        &self,
+        filter: &str,
+        timeout: Duration,
+    ) -> Result<Vec<String>, DockerError> {
+        let output = self
+            .run_success(
+                &["ps", "--filter", filter, "--format", "{{.Names}}"],
+                timeout,
+            )
+            .await?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
+    }
+
     /// List container names and ports (for port conflict detection, synchronous).
     pub fn ps_names_and_ports_sync(&self) -> Vec<(String, String)> {
         let output = match self.run_sync(&["ps", "--format", "{{.Names}}\t{{.Ports}}"]) {
