@@ -104,7 +104,8 @@ pub struct PortResolution {
 ///
 /// In isolated mode, persisted ports take priority over `default:` — the
 /// whole point of isolation is stable random ports, so a config default
-/// must not pull allocations back to well-known ports.
+/// must not pull allocations back to well-known ports. Fresh (uncached)
+/// parameters skip the default entirely and allocate a random port.
 ///
 /// In force-random mode (`fed start --randomize`, `fed ports randomize`),
 /// steps 2 and 3 are skipped and all port parameters allocate random ports.
@@ -168,7 +169,7 @@ impl Resolver {
             managed_ports: HashSet::new(),
             port_store: Box::new(crate::port::NoopPortStore),
             force_random_ports: false,
-            prefer_config_defaults: false,
+            prefer_config_defaults: true,
             is_interactive: false,
             offline: false,
         }
@@ -188,7 +189,7 @@ impl Resolver {
             managed_ports: HashSet::new(),
             port_store: Box::new(crate::port::NoopPortStore),
             force_random_ports: false,
-            prefer_config_defaults: false,
+            prefer_config_defaults: true,
             is_interactive: false,
             offline: false,
         }
@@ -1131,7 +1132,11 @@ impl Resolver {
         param: &crate::config::Parameter,
         param_name: &str,
     ) -> Result<(u16, PortResolutionReason)> {
-        if self.force_random_ports {
+        // Isolated scopes (and --randomize) must not allocate the config
+        // default: well-known ports defeat the point of isolation — a fresh
+        // parameter would collide with the non-isolated stack or another
+        // workspace. Cached ports are handled before we get here.
+        if self.force_random_ports || !self.prefer_config_defaults {
             return Ok((
                 self.port_allocator.allocate_random_port()?,
                 PortResolutionReason::Random,
@@ -1542,8 +1547,8 @@ mod tests {
     fn test_cached_port_wins_when_defaults_not_preferred() {
         use crate::config::Config;
 
-        // prefer_config_defaults defaults to false (isolated-mode behavior)
         let mut resolver = Resolver::new();
+        resolver.set_prefer_config_defaults(false); // isolated-mode behavior
 
         let mut cached = HashMap::new();
         cached.insert("API_PORT".to_string(), 59913u16);
@@ -1565,6 +1570,39 @@ mod tests {
         assert_eq!(
             port, 59913,
             "cached port should win when defaults are not preferred (isolated mode)"
+        );
+    }
+
+    #[test]
+    fn test_fresh_port_is_random_when_defaults_not_preferred() {
+        use crate::config::Config;
+
+        let mut resolver = Resolver::new();
+        resolver.set_prefer_config_defaults(false); // isolated-mode behavior
+                                                    // No cached port in the store — this is a fresh allocation.
+        resolver.set_port_store(Box::new(crate::port::SqlitePortStore::new(HashMap::new())));
+
+        // Hold the default port open so allocating it would succeed if tried.
+        let default_port = 59915u16;
+        let _listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_PORT".to_string(),
+            port_param_with_default(default_port),
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        let port: u16 = resolver
+            .get_resolved_parameters()
+            .get("API_PORT")
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        assert_ne!(
+            port, default_port,
+            "fresh allocation in isolated mode must not use the well-known config default"
         );
     }
 
