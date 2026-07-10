@@ -110,6 +110,20 @@ parameters:
 
 `fed start` will tell you exactly what's missing and where to put it. See [docs/configuration.md](docs/configuration.md) for details.
 
+### Share them with your team
+
+Manual secrets are the ones teammates end up passing around in Slack. Put them in your team's vault instead — then `fed start` fills them in for everyone:
+
+```bash
+fed login              # GitHub sign-in, once per machine
+fed link acme/web      # bind this repo to your team's project (commit .fed/cloud.yaml)
+fed secrets set STRIPE_SECRET_KEY   # value read from stdin, never argv
+```
+
+From then on, every teammate's `fed start` resolves `source: manual` secrets from the vault — clone, `fed login`, running. Values are cached locally (0600, gitignored), so `--offline` keeps working, and removing someone from the org revokes their access immediately.
+
+Team secrets are part of [Service Federation Cloud](https://www.service-federation.com) — free during early access, development secrets only (it's a dev tool, not a production vault). See [docs/team-secrets.md](docs/team-secrets.md).
+
 ## Worktree & Cursor Isolation
 
 Git worktrees are first-class. Each worktree gets its own ports, containers, and volumes:
@@ -138,6 +152,9 @@ fed install / build / clean                      # Lifecycle hooks
 fed validate                                     # Validate config
 fed docker build [--json] / push                 # Docker images
 fed ws new / list / cd / rm                      # Worktrees (beta)
+fed login / logout / whoami                      # Service Federation Cloud auth
+fed link <org>/<project>                         # Bind checkout to a Cloud project
+fed secrets ls / set <NAME>                      # Team development secrets
 fed doctor                                       # Check requirements
 fed init                                         # Create starter config
 ```
@@ -184,6 +201,7 @@ fed start --replace     # Kill conflicting processes
 - [Scripts](docs/scripts.md) — Scripts, isolated scripts, argument passing
 - [Isolation](docs/isolation.md) — Directory scoping, worktrees, Cursor agents
 - [Command Reference](docs/commands.md) — All commands, flags, and subcommands
+- [Team Secrets](docs/team-secrets.md) — Shared development secrets via Service Federation Cloud
 
 ## Contributing
 

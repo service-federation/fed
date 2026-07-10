@@ -276,7 +276,11 @@ parameters:
     description: "From https://dashboard.stripe.com/apikeys"
 ```
 
-Fed will not generate a value for manual secrets. Instead, it fails at startup with a message listing what's missing and where to add it (your `env_file` entries). The `description` field is shown in this error message.
+Fed will not generate a value for manual secrets. It resolves them in this order:
+
+1. **Team vault** — if you've run `fed login` and the checkout is linked (`fed link`), missing values are fetched from your org's vault and cached in `generated_secrets_file`. See [team-secrets.md](team-secrets.md). Skipped with `--offline`.
+2. **Local files** — `generated_secrets_file` (which is also the vault cache) and your `env_file` entries.
+3. **Failure** — startup stops with a message listing exactly what's missing and where to add it. The `description` field is shown in this error message.
 
 Add `optional: true` for secrets that not every team member needs (e.g., a Stripe key only some developers have). Optional manual secrets resolve to an empty string when not provided, instead of failing at startup.
 

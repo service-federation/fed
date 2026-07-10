@@ -311,3 +311,52 @@ Show circuit breaker state for a service.
 | Flag | Description |
 |------|-------------|
 | `--json` | Machine-readable output |
+
+## Service Federation Cloud
+
+Team development secrets. All of these are additive — fed works fully offline and logged out.
+
+### `fed login`
+
+Sign in to [Service Federation Cloud](https://app.service-federation.com). Opens your browser; the token lands in `~/.fed/credentials` (mode 0600).
+
+| Flag | Description |
+|------|-------------|
+| `--no-browser` | Print the URL and paste the token manually (SSH sessions) |
+
+For CI, skip `fed login` and set `FED_TOKEN` (and optionally `FED_CLOUD_URL`) in the environment.
+
+### `fed logout`
+
+Remove local credentials. Revoke the token itself in the dashboard under API tokens.
+
+### `fed whoami`
+
+Show the signed-in account and its orgs.
+
+### `fed link [org/project]`
+
+Bind the current checkout to a Cloud project by writing `.fed/cloud.yaml`. Commit that file — teammates inherit the link. Run without arguments for an interactive picker.
+
+```bash
+fed link acme/web
+```
+
+### `fed secrets ls`
+
+List the linked project's secret names (never values).
+
+| Flag | Description |
+|------|-------------|
+| `--env <ENV>` | Environment (default: `development`) |
+
+### `fed secrets set <NAME>`
+
+Set a secret in the team vault. The value is read from stdin — never from argv, so it stays out of shell history:
+
+```bash
+fed secrets set STRIPE_SECRET_KEY            # interactive prompt
+printf '%s' "$VALUE" | fed secrets set API_KEY   # piped
+```
+
+With the vault in place, `fed start` resolves missing `source: manual` secrets automatically: vault → local cache (`generated_secrets_file`) → error. `--offline` skips the vault and uses the cache.
