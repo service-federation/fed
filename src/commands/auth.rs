@@ -37,16 +37,40 @@ fn open_browser(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn http_response(status: u16, body: &str) -> String {
+    let reason = if status == 200 { "OK" } else { "Bad Request" };
+    format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+        status,
+        reason,
+        body.len(),
+        body
+    )
+}
+
 /// Wait for the browser to hit http://127.0.0.1:<port>/callback?token=..&state=..
 /// One request, hand-parsed — not a web server.
 fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<String> {
-    listener.set_nonblocking(false).ok();
+    // Non-blocking accept + poll, so an abandoned browser flow actually hits the
+    // deadline instead of blocking in accept() forever.
+    listener.set_nonblocking(true)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     loop {
         if std::time::Instant::now() > deadline {
             bail!("timed out waiting for the browser (5 minutes) — run `fed login` again");
         }
-        let (mut stream, _) = listener.accept()?;
+        let (mut stream, _) = match listener.accept() {
+            Ok(conn) => conn,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // The accepted socket inherits O_NONBLOCK on some platforms; clear it and
+        // bound the read so a half-open connection can't stall the flow either.
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut request_line = String::new();
         reader.read_line(&mut request_line)?;
@@ -65,20 +89,18 @@ fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<Stri
                 _ => {}
             }
         }
+        // Validate before telling the browser it worked.
+        if state.as_deref() != Some(expected_state) {
+            let body = "<!doctype html><meta charset=utf-8><title>fed login</title>\
+                <body style=\"font-family:sans-serif;padding:40px\">\
+                <h2>Login failed.</h2><p>Return to your terminal and run <code>fed login</code> again.</p>";
+            let _ = stream.write_all(http_response(400, body).as_bytes());
+            bail!("state mismatch in login callback — run `fed login` again");
+        }
         let body = "<!doctype html><meta charset=utf-8><title>fed login</title>\
             <body style=\"font-family:sans-serif;padding:40px\">\
             <h2>Signed in.</h2><p>You can close this tab and return to your terminal.</p>";
-        let _ = stream.write_all(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .as_bytes(),
-        );
-        if state.as_deref() != Some(expected_state) {
-            bail!("state mismatch in login callback — run `fed login` again");
-        }
+        let _ = stream.write_all(http_response(200, body).as_bytes());
         return token.ok_or_else(|| anyhow!("no token in login callback"));
     }
 }

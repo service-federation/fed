@@ -118,6 +118,34 @@ pub fn analyze_secrets(
     }))
 }
 
+/// Encode a value for a `.env` line.
+///
+/// Generated secrets are alphanumeric, but vault-sourced values can be anything —
+/// PEM keys, values with spaces, `#`, or newlines. Anything outside a conservative
+/// safe set is double-quoted with escapes, which `dotenvy` parses back exactly.
+pub fn encode_env_value(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.:/@+-".contains(c));
+    if safe {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Generate a random secret string using a CSPRNG (ChaCha12 via `thread_rng`).
 ///
 /// 32-char alphanumeric (~190 bits of entropy).
@@ -189,7 +217,7 @@ pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Res
             if let Some(eq_pos) = line.find('=') {
                 let key = &line[..eq_pos];
                 if let Some(new_value) = generated_map.get(key) {
-                    output.push_str(&format!("{key}={new_value}\n"));
+                    output.push_str(&format!("{key}={}\n", encode_env_value(new_value)));
                     written_keys.insert(key);
                 } else {
                     output.push_str(line);
@@ -204,7 +232,7 @@ pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Res
         // Append any truly new keys.
         for (key, value) in generated_values {
             if !written_keys.contains(key.as_str()) && !existing.contains_key(key) {
-                output.push_str(&format!("{key}={value}\n"));
+                output.push_str(&format!("{key}={}\n", encode_env_value(value)));
             }
         }
 
@@ -239,7 +267,7 @@ pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Res
             .map_err(|e| Error::Filesystem(format!("Seek error: {}", e)))?;
 
         for (key, value) in &new_keys {
-            writeln!(writer, "{}={}", key, value)
+            writeln!(writer, "{}={}", key, encode_env_value(value))
                 .map_err(|e| Error::Filesystem(format!("Write error: {}", e)))?;
         }
     }
@@ -491,5 +519,48 @@ mod tests {
         assert!(analysis.needs_generation.is_empty());
         assert_eq!(analysis.missing_manual.len(), 1);
         assert_eq!(analysis.missing_manual[0].0, "API_KEY");
+    }
+}
+
+#[cfg(test)]
+mod env_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn plain_values_are_unquoted() {
+        assert_eq!(encode_env_value("abc123"), "abc123");
+        assert_eq!(
+            encode_env_value("postgres://host:5432/db"),
+            "postgres://host:5432/db"
+        );
+    }
+
+    #[test]
+    fn tricky_values_roundtrip_through_dotenvy() {
+        let cases = [
+            "value with spaces",
+            "has#hash",
+            "-----BEGIN KEY-----\nline2\nline3\n-----END KEY-----",
+            "quote\"inside",
+            "back\\slash",
+            "",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let pairs: Vec<(String, String)> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (format!("K{i}"), v.to_string()))
+            .collect();
+        write_env_file(&path, &pairs).unwrap();
+
+        let loaded = load_existing_env(&path);
+        for (k, v) in &pairs {
+            assert_eq!(
+                loaded.get(k).map(String::as_str),
+                Some(v.as_str()),
+                "key {k}"
+            );
+        }
     }
 }
