@@ -54,7 +54,12 @@ impl Parser {
             ))
         })?;
 
-        self.parse_config(&content)
+        let mut config = self.parse_config(&content)?;
+        // Resolve local template extensions here so every loader — including
+        // the synchronous one behind `fed validate` — sees merged services.
+        // Package extensions still require the async packages-aware loader.
+        crate::package::ServiceMerger::merge_local_templates(&mut config)?;
+        Ok(config)
     }
 
     /// Load config and resolve packages (async version with package extension)
@@ -70,11 +75,8 @@ impl Parser {
         path: P,
         offline: bool,
     ) -> Result<Config> {
-        // Load the base config
+        // Load the base config (local template extensions resolve in load_config)
         let mut config = self.load_config(path.as_ref())?;
-
-        // First, resolve local template extensions
-        crate::package::ServiceMerger::merge_local_templates(&mut config)?;
 
         // If there are no packages, return config after template resolution
         if config.packages.is_empty() {

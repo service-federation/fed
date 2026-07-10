@@ -15,7 +15,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/service-federation/fed/
 cargo install --git https://github.com/service-federation/fed
 ```
 
-Create `service-federation.yaml`:
+Create `service-federation.yaml`. Adapt it to your app — this example assumes a Node backend in `./backend` that reads `PORT` and serves `/health`:
 
 ```yaml
 parameters:
@@ -32,6 +32,7 @@ services:
     ports: ["{{DB_PORT}}:5432"]
     environment:
       POSTGRES_PASSWORD: password
+      POSTGRES_DB: app
     healthcheck:
       command: pg_isready -U postgres
 
@@ -41,7 +42,7 @@ services:
     depends_on: [database]
     environment:
       PORT: '{{API_PORT}}'
-      DATABASE_URL: 'postgres://localhost:{{DB_PORT}}/db'
+      DATABASE_URL: 'postgres://postgres:password@localhost:{{DB_PORT}}/app'
     healthcheck:
       httpGet: 'http://localhost:{{API_PORT}}/health'
 
@@ -60,7 +61,7 @@ That's the whole workflow. `git clone`, add a config, `fed start`, the project i
 ## Why fed
 
 - **One config, one command** — Docker containers, native processes, and Compose services all live in one `service-federation.yaml`. `fed start` handles dependency ordering and health checks.
-- **Directory-scoped isolation** — All state (ports, containers, volumes) is scoped by working directory. Two directories are two independent stacks. Git worktrees give you parallel environments for free.
+- **Directory-scoped isolation** — Containers, volumes, and state are namespaced by working directory automatically; `fed start --isolate` gives a checkout its own ports too. Git worktrees plus one flag = parallel environments.
 - **No Docker Compose sprawl** — Port parameters, templating, profiles, and cross-project packages replace the pile of override files and `.env` juggling.
 
 ## Isolated Scripts
@@ -120,13 +121,13 @@ fed link acme/web      # bind this repo to your team's project (commit .fed/clou
 fed secrets set STRIPE_SECRET_KEY   # value read from stdin, never argv
 ```
 
-From then on, every teammate's `fed start` resolves `source: manual` secrets from the vault — clone, `fed login`, running. Values are cached locally (0600, gitignored), so `--offline` keeps working, and removing someone from the org revokes their access immediately.
+From then on, every teammate's `fed start` resolves `source: manual` secrets from the vault — clone, `fed login`, running. Values are cached locally (0600, gitignored), so `--offline` keeps working. Removing someone from the org blocks their next fetch — values already cached on their disk stay readable, as with any local cache.
 
-Team secrets are part of [Service Federation Cloud](https://www.service-federation.com) — free during early access, development secrets only (it's a dev tool, not a production vault). See [docs/team-secrets.md](docs/team-secrets.md).
+Team secrets are part of [Service Federation Cloud](https://www.service-federation.com) — free during early access, development secrets only (it's a dev tool, not a production vault). See [the team secrets docs](https://www.service-federation.com/docs/secrets/).
 
 ## Worktree & Cursor Isolation
 
-Git worktrees are first-class. Each worktree gets its own ports, containers, and volumes:
+Git worktrees are first-class. Each worktree gets its own containers, volumes, and state automatically — add `--isolate` for its own ports too:
 
 ```bash
 ~/project        $ fed start                # Default ports
@@ -175,7 +176,7 @@ See [`examples/`](./examples):
 - [`scripts-example.yaml`](./examples/scripts-example.yaml) — Scripts with dependencies
 - [`env-file/`](./examples/env-file) — Environment files
 - [`templates-example.yaml`](./examples/templates-example.yaml) — Service templates
-- [`variables-example.yaml`](./examples/variables-example.yaml) — Environment-specific variables
+- [`parameters-example.yaml`](./examples/parameters-example.yaml) — Environment-specific parameters
 - [`resource-limits-example.yaml`](./examples/resource-limits-example.yaml) — Memory, CPU, file descriptor limits
 - [`docker-compose-example/`](./examples/docker-compose-example) — Docker Compose integration
 - [`profiles-example.yaml`](./examples/profiles-example.yaml) — Profiles
@@ -200,7 +201,7 @@ fed start --replace     # Kill conflicting processes
 - [Scripts](https://www.service-federation.com/docs/scripts/) — Scripts, isolated scripts, argument passing
 - [Isolation](https://www.service-federation.com/docs/isolation/) — Directory scoping, worktrees, Cursor agents
 - [Command Reference](https://www.service-federation.com/docs/commands/) — All commands, flags, and subcommands
-- [Team Secrets](docs/team-secrets.md) — Shared development secrets via Service Federation Cloud
+- [Team Secrets](https://www.service-federation.com/docs/secrets/) — Shared development secrets via Service Federation Cloud
 
 ## Contributing
 
