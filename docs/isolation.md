@@ -2,6 +2,37 @@
 
 Service Federation scopes all state by working directory. This gives you isolation between projects, worktrees, and CI agents without any explicit configuration.
 
+## Ports must be parameters
+
+Isolation can only remap ports it knows about — the ones declared as `type: port` parameters and interpolated with `{{...}}`. A literal `4321` in a command or healthcheck is invisible to fed and will collide across workspaces. Write every port the fed way:
+
+```yaml
+parameters:
+  APP_PORT:
+    type: port
+    default: 4321
+  DB_PORT:
+    type: port
+    default: 5433
+
+services:
+  database:
+    image: postgres:16-alpine
+    ports: ["{{DB_PORT}}:5432"]          # never "5433:5432"
+
+  app:
+    process: npm run dev -- --port {{APP_PORT}}
+    startup_message: 'http://localhost:{{APP_PORT}}'
+    environment:
+      DATABASE_URL: 'postgres://localhost:{{DB_PORT}}/app'
+    healthcheck:
+      httpGet: 'http://localhost:{{APP_PORT}}/health'
+
+entrypoint: app
+```
+
+In normal (non-isolated) mode the defaults are used, so nothing changes day to day. Under isolation each workspace gets its own random ports — but only for ports declared this way. fed warns once at startup when it finds literal `localhost:<port>` references or literal host ports in the config.
+
 ## Directory Scoping
 
 All state is scoped to the directory containing your `service-federation.yaml`:
@@ -34,7 +65,7 @@ fed start --isolate      # Enable isolation + start (one command)
 
 ### What isolation does
 
-- **Ports**: All port-type parameters get randomized values instead of defaults
+- **Ports**: All port-type parameters get randomized values instead of defaults. Literal ports (a hardcoded `4321` in a command or healthcheck) are **not** remapped — see [Ports must be parameters](#ports-must-be-parameters)
 - **Docker containers**: Containers get a unique isolation ID in their names, preventing collisions
 - **Docker volumes**: Scoped to the isolation ID
 

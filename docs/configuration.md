@@ -2,6 +2,34 @@
 
 Service Federation is configured through a `service-federation.yaml` file in your project root. Run `fed init` to generate a starter config.
 
+The canonical shape — note that every port is a `type: port` parameter, interpolated with `{{...}}` wherever it appears. Never hardcode a port: literal ports can't be remapped by [isolation](isolation.md) and fed warns about them at startup.
+
+```yaml
+parameters:
+  API_PORT:
+    type: port
+    default: 8080
+  DB_PORT:
+    type: port
+    default: 5432
+
+services:
+  database:
+    image: postgres:16-alpine
+    ports: ["{{DB_PORT}}:5432"]
+
+  api:
+    process: npm start -- --port {{API_PORT}}
+    depends_on: [database]
+    startup_message: 'http://localhost:{{API_PORT}}'
+    environment:
+      DATABASE_URL: 'postgres://localhost:{{DB_PORT}}/app'
+    healthcheck:
+      httpGet: 'http://localhost:{{API_PORT}}/health'
+
+entrypoint: api
+```
+
 ## Services
 
 Every service has one type-defining field — `process`, `image`, `composeFile`+`composeService`, or `gradleTask`.
@@ -22,10 +50,15 @@ services:
 Run a Docker image:
 
 ```yaml
+parameters:
+  REDIS_PORT:
+    type: port
+    default: 6379
+
 services:
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    ports: ["{{REDIS_PORT}}:6379"]
 ```
 
 ### Docker Compose Service
@@ -141,7 +174,7 @@ services:
     process: ./bin/search-svc
     startup_timeout: "5m"     # Default: orchestrator-wide (120s)
     healthcheck:
-      httpGet: "http://localhost:9200/health"
+      httpGet: "http://localhost:{{ES_PORT}}/health"
 ```
 
 Accepts the same duration strings as `grace_period`.
@@ -379,7 +412,7 @@ services:
 Simple string form (uses default 5s timeout):
 
 ```yaml
-healthcheck: "curl -f http://localhost:8080/health"
+healthcheck: "curl -f http://localhost:{{API_PORT}}/health"
 ```
 
 ## Environment Files
@@ -444,7 +477,7 @@ templates:
 services:
   auth-service:
     extends: java-service
-    ports: ["8080:8080"]
+    ports: ["{{API_PORT}}:8080"]
 ```
 
 See [`examples/templates-example.yaml`](../examples/templates-example.yaml).

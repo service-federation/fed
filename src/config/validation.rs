@@ -60,6 +60,8 @@ impl Config {
             }
         }
 
+        self.warn_on_literal_local_ports();
+
         // Validate each service has exactly one type
         for (name, service) in &self.services {
             if service.service_type() == ServiceType::Undefined {
@@ -453,6 +455,83 @@ impl Config {
         path.pop();
         None
     }
+
+    /// Warn (once, aggregated) when the config references literal local ports
+    /// instead of `type: port` parameters. Literal ports work in normal mode
+    /// but silently break isolation: every isolated workspace needs its own
+    /// ports, and only `{{PARAM}}` interpolation gets remapped.
+    fn warn_on_literal_local_ports(&self) {
+        use std::fmt::Write as _;
+        let findings = self.literal_local_port_findings();
+        if !findings.is_empty() {
+            let mut msg = String::new();
+            let _ = write!(
+                msg,
+                "Warning: literal local ports in config — service {}.\n\
+                 Literal ports work in normal mode but break isolated mode, where every\n\
+                 workspace gets its own ports. Declare a port parameter and interpolate it:\n\
+                 \x20 parameters:\n\
+                 \x20   APP_PORT:\n\
+                 \x20     type: port\n\
+                 \x20     default: 4321\n\
+                 \x20 healthcheck:\n\
+                 \x20   httpGet: \"http://localhost:{{{{APP_PORT}}}}/health\"",
+                findings.join(", service ")
+            );
+            eprintln!("{}", msg);
+        }
+    }
+
+    /// One entry per offending service: `'name' (place, place)`.
+    fn literal_local_port_findings(&self) -> Vec<String> {
+        use std::sync::OnceLock;
+        static LOCAL_PORT: OnceLock<regex::Regex> = OnceLock::new();
+        let local_port = LOCAL_PORT.get_or_init(|| {
+            regex::Regex::new(r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0):\d{2,5}").unwrap()
+        });
+
+        let mut findings: Vec<String> = Vec::new();
+        for (name, service) in &self.services {
+            let mut places: Vec<&str> = Vec::new();
+            if let Some(hc) = &service.healthcheck {
+                if hc.get_http_url().is_some_and(|u| local_port.is_match(u)) {
+                    places.push("healthcheck");
+                }
+            }
+            if service
+                .startup_message
+                .as_deref()
+                .is_some_and(|m| local_port.is_match(m))
+            {
+                places.push("startup_message");
+            }
+            if service
+                .process
+                .as_deref()
+                .is_some_and(|p| local_port.is_match(p))
+            {
+                places.push("process");
+            }
+            if service.environment.values().any(|v| local_port.is_match(v)) {
+                places.push("environment");
+            }
+            // Docker port mappings: a literal host port ("5433:5432") is the
+            // same antipattern; the fed way is "{{DB_PORT}}:5432".
+            if service.ports.iter().any(|p| {
+                p.split(':').next().is_some_and(|host| {
+                    !host.is_empty() && host.chars().all(|c| c.is_ascii_digit())
+                })
+            }) {
+                places.push("ports");
+            }
+            if !places.is_empty() {
+                findings.push(format!("'{}' ({})", name, places.join(", ")));
+            }
+        }
+        // services is a HashMap — sort for deterministic warning output
+        findings.sort();
+        findings
+    }
 }
 
 /// Validate parameter value against constraints
@@ -679,6 +758,72 @@ fn validate_cpus_string(cpus: &str) -> std::result::Result<(), String> {
 mod tests {
     use super::*;
     use crate::config::{Parameter, Service};
+
+    #[test]
+    fn literal_local_ports_detected_once_per_service() {
+        let mut config = Config::default();
+        config.services.insert(
+            "app".to_string(),
+            Service {
+                process: Some("npm run dev".to_string()),
+                startup_message: Some("http://localhost:4321".to_string()),
+                healthcheck: Some(HealthCheck::HttpGet {
+                    http_get: "http://localhost:4321/login".to_string(),
+                    timeout: None,
+                }),
+                ..Default::default()
+            },
+        );
+        config.services.insert(
+            "db".to_string(),
+            Service {
+                image: Some("postgres:16".to_string()),
+                ports: vec!["5433:5432".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let findings = config.literal_local_port_findings();
+        assert_eq!(
+            findings,
+            vec![
+                "'app' (healthcheck, startup_message)".to_string(),
+                "'db' (ports)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn interpolated_ports_produce_no_findings() {
+        let mut config = Config::default();
+        config.services.insert(
+            "app".to_string(),
+            Service {
+                process: Some("npm run dev -- --port {{APP_PORT}}".to_string()),
+                startup_message: Some("http://localhost:{{APP_PORT}}".to_string()),
+                healthcheck: Some(HealthCheck::HttpGet {
+                    http_get: "http://localhost:{{APP_PORT}}/login".to_string(),
+                    timeout: None,
+                }),
+                environment: [(
+                    "DATABASE_URL".to_string(),
+                    "postgres://localhost:{{DB_PORT}}/x".to_string(),
+                )]
+                .into(),
+                ..Default::default()
+            },
+        );
+        config.services.insert(
+            "db".to_string(),
+            Service {
+                image: Some("postgres:16".to_string()),
+                ports: vec!["{{DB_PORT}}:5432".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert!(config.literal_local_port_findings().is_empty());
+    }
 
     #[test]
     fn test_validate_circular_dependency() {
