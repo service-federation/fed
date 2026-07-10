@@ -102,6 +102,40 @@ impl<'a> HealthCheckRunner<'a> {
         }
     }
 
+    /// Fail fast if a service's healthcheck already passes BEFORE the service
+    /// is started: whatever is answering it is not ours, and once our process
+    /// starts we could never tell the two apart. Without this, a leftover
+    /// process on the service's port makes the healthcheck pass instantly
+    /// while the actual service crashes (e.g. dev servers that refuse to
+    /// start because "another server is already running").
+    ///
+    /// Docker command healthchecks run inside the not-yet-created container,
+    /// so they can only error here — that is treated as "nothing listening".
+    pub async fn preflight_foreign_listener(&self, name: &str) -> Result<()> {
+        let checker = {
+            let health_checkers = self.orchestrator.health_checkers.read().await;
+            match health_checkers.get(name) {
+                Some(c) => Arc::clone(c),
+                None => return Ok(()),
+            }
+        };
+
+        if let Ok(true) = checker.check().await {
+            return Err(Error::ServiceStartFailed(
+                name.to_string(),
+                format!(
+                    "The healthcheck for '{}' already passes before the service was \
+                     started — another process is already serving it. Starting anyway \
+                     would make the healthcheck meaningless (it can't tell the two \
+                     apart). Stop the other process first. A common cause is a dev \
+                     server that daemonized and outlived a previous run.",
+                    name
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Wait for a service to become healthy (used by script dependencies).
     /// Returns Ok(()) when healthy, or Err after timeout.
     pub async fn wait_for_healthy(&self, service_name: &str, timeout: Duration) -> Result<()> {
@@ -253,6 +287,31 @@ impl<'a> HealthCheckRunner<'a> {
             // Poll the healthcheck
             match checker.check().await {
                 Ok(true) => {
+                    // The healthcheck endpoint responding does not prove OUR process
+                    // is serving it: a leftover process on the same port answers too
+                    // (e.g. `astro dev` daemonizes-and-exits under agent environments,
+                    // leaving a foreign listener). Re-verify liveness before declaring
+                    // the service healthy.
+                    if let Some(pid) = pid {
+                        let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+                        if nix::sys::signal::kill(nix_pid, None).is_err() {
+                            let mut tracker = self.orchestrator.state_tracker.write().await;
+                            tracker.update_service_status(name, Status::Stopped).await?;
+                            tracker.save().await?;
+                            return Err(Error::ServiceStartFailed(
+                                name.to_string(),
+                                format!(
+                                    "Service '{}' exited, but its healthcheck still passes. \
+                                     Another process is likely already listening on the \
+                                     healthcheck port, or the command daemonizes and exits \
+                                     (some dev servers background themselves in agent \
+                                     environments). Stop the other process, or make the \
+                                     command stay in the foreground.",
+                                    name
+                                ),
+                            ));
+                        }
+                    }
                     tracing::info!("Service '{}' is healthy", name);
                     let mut tracker = self.orchestrator.state_tracker.write().await;
                     tracker.update_service_status(name, Status::Healthy).await?;

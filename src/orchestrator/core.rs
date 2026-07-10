@@ -1085,6 +1085,13 @@ impl Orchestrator {
             return Err(Error::Cancelled(name.to_string()));
         }
 
+        // Refuse to start if something foreign already answers the healthcheck —
+        // once our process is up we could never tell the two apart.
+        super::health::HealthCheckRunner::new(self)
+            .preflight_foreign_listener(name)
+            .instrument(tracing::info_span!("preflight_foreign_listener"))
+            .await?;
+
         // Start the service — hold manager lock for cancellation check + start
         async {
             let mut manager = manager_arc.lock().await;
