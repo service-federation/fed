@@ -1,6 +1,6 @@
 [package]
 name = "fed"
-version = "5.1.3"
+version = "5.1.4"
 edition = "2021"
 authors = ["Adrian Helvik"]
 description = "Orchestrate your local dev stack from one config file"
