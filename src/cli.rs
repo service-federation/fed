@@ -163,7 +163,7 @@ pub enum Commands {
         #[arg(value_name = "SHELL")]
         shell: clap_complete::Shell,
     },
-    /// Check system requirements (Docker, Gradle, etc.)
+    /// Check system requirements (Docker, etc.)
     Doctor,
     /// Show resource usage for all services
     Top {

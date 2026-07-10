@@ -80,7 +80,7 @@ fed start                # Dev stack stays running
 fed test:integration     # Tests get their own stack, cleaned up after
 ```
 
-`isolated: true` gives the script fresh ports, scoped Docker containers and volumes, and automatic cleanup when it finishes. See [docs/scripts.md](docs/scripts.md) for details.
+`isolated: true` gives the script fresh ports, scoped Docker containers and volumes, and automatic cleanup when it finishes. See [the scripts docs](https://www.service-federation.com/docs/scripts/) for details.
 
 ## Secrets
 
@@ -108,7 +108,7 @@ parameters:
     description: "From https://dashboard.stripe.com/apikeys"
 ```
 
-`fed start` will tell you exactly what's missing and where to put it. See [docs/configuration.md](docs/configuration.md) for details.
+`fed start` will tell you exactly what's missing and where to put it. See [the configuration reference](https://www.service-federation.com/docs/configuration/) for details.
 
 ### Share them with your team
 
@@ -135,7 +135,7 @@ Git worktrees are first-class. Each worktree gets its own ports, containers, and
 
 Cursor's parallel agents create worktrees under the hood — `fed install && fed start --isolate` just works in each one. No plugin needed.
 
-`fed ws` manages worktrees directly: `fed ws new feature -b`, `fed ws list`, `fed ws cd main`. See [docs/isolation.md](docs/isolation.md).
+`fed ws` manages worktrees directly: `fed ws new feature -b`, `fed ws list`, `fed ws cd main`. See [the isolation docs](https://www.service-federation.com/docs/isolation/).
 
 ## Commands
 
@@ -159,13 +159,13 @@ fed doctor                                       # Check requirements
 fed init                                         # Create starter config
 ```
 
-Global flags: `-v`, `-c <config>`, `-e <env>`, `-p <profile>`, `--offline`. Full reference: [docs/commands.md](docs/commands.md).
+Global flags: `-v`, `-c <config>`, `-e <env>`, `-p <profile>`, `--offline`. Full reference: [the command reference](https://www.service-federation.com/docs/commands/).
 
 ## Configuration
 
-Services can be processes, Docker images, Compose services, or Gradle tasks. Config supports parameters with port allocation and secret generation, `.env` files, templates, profiles, cross-project packages, lifecycle hooks (`install`, `migrate`, `build`, `clean`), and startup messages.
+Services can be processes, Docker images, or Compose services. Config supports parameters with port allocation and secret generation, `.env` files, templates, profiles, cross-project packages, lifecycle hooks (`install`, `migrate`, `build`, `clean`), and startup messages.
 
-Full reference: [docs/configuration.md](docs/configuration.md).
+Full reference: [the configuration reference](https://www.service-federation.com/docs/configuration/).
 
 ## Examples
 
@@ -178,7 +178,6 @@ See [`examples/`](./examples):
 - [`variables-example.yaml`](./examples/variables-example.yaml) — Environment-specific variables
 - [`resource-limits-example.yaml`](./examples/resource-limits-example.yaml) — Memory, CPU, file descriptor limits
 - [`docker-compose-example/`](./examples/docker-compose-example) — Docker Compose integration
-- [`gradle-grouping.yaml`](./examples/gradle-grouping.yaml) — Gradle task batching
 - [`profiles-example.yaml`](./examples/profiles-example.yaml) — Profiles
 - [`service-merging/`](./examples/service-merging) — Package imports
 
@@ -197,10 +196,10 @@ fed start --replace     # Kill conflicting processes
 
 ## Documentation
 
-- [Configuration Reference](docs/configuration.md) — Services, parameters, health checks, templates, profiles, packages, resource limits, restart policies
-- [Scripts](docs/scripts.md) — Scripts, isolated scripts, argument passing
-- [Isolation](docs/isolation.md) — Directory scoping, worktrees, Cursor agents
-- [Command Reference](docs/commands.md) — All commands, flags, and subcommands
+- [Configuration Reference](https://www.service-federation.com/docs/configuration/) — Services, parameters, health checks, templates, profiles, packages, resource limits, restart policies
+- [Scripts](https://www.service-federation.com/docs/scripts/) — Scripts, isolated scripts, argument passing
+- [Isolation](https://www.service-federation.com/docs/isolation/) — Directory scoping, worktrees, Cursor agents
+- [Command Reference](https://www.service-federation.com/docs/commands/) — All commands, flags, and subcommands
 - [Team Secrets](docs/team-secrets.md) — Shared development secrets via Service Federation Cloud
 
 ## Contributing
