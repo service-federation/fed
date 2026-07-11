@@ -928,7 +928,7 @@ async fn run_dry_run(
     out.status("  Configuration: OK (parsed successfully)");
     out.status(&format!("  Services to start: {}", all_services.len()));
     if conflicts_found {
-        out.status("  Port conflicts: DETECTED (use --replace to kill conflicting processes)");
+        out.status("  Port conflicts: DETECTED (auto-resolved to alternative ports; `fed start --replace` reclaims the defaults by killing their holders)");
     } else {
         out.status("  Port conflicts: None");
     }

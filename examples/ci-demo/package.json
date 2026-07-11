@@ -1,0 +1,8 @@
+{
+  "name": "fed-ci-demo",
+  "private": true,
+  "scripts": {
+    "dev": "node server.js",
+    "integration-test": "node itest.js"
+  }
+}

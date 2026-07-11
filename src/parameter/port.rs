@@ -34,29 +34,28 @@ impl PortAllocator {
     ///
     /// Thread-safe: Uses interior mutability to allow concurrent allocation.
     pub fn allocate_random_port(&mut self) -> Result<u16> {
-        // Bind to port 0 to let the OS assign an available port
-        let listener_v4 = TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| Error::PortAllocation(format!("Failed to bind to random port: {}", e)))?;
-
-        let port = listener_v4
-            .local_addr()
-            .map_err(|e| Error::PortAllocation(format!("Failed to get local address: {}", e)))?
-            .port();
-
-        // Also try 0.0.0.0 to catch dual-stack conflicts (e.g. :::PORT).
-        // On Linux, this may fail with EADDRINUSE because the kernel treats
-        // 127.0.0.1:PORT as overlapping with 0.0.0.0:PORT — that's fine,
-        // the 127.0.0.1 bind already reserves it.
-        let listener_any = TcpListener::bind(("0.0.0.0", port)).ok();
-
-        let mut listeners = self.listeners.lock();
-        listeners.push(listener_v4);
-        if let Some(l) = listener_any {
-            listeners.push(l);
+        // Let the OS pick a port that's free on the v4 wildcard. Picking via
+        // the wildcard (not loopback) matters: the kernel then avoids ports
+        // held by dual-stack [::] listeners. The candidate still goes
+        // through try_allocate_port so it also passes the loopback probe —
+        // re-roll on the rare case where a loopback-only server holds it
+        // (or another process grabbed it in the gap).
+        for _ in 0..16 {
+            let probe = TcpListener::bind("0.0.0.0:0").map_err(|e| {
+                Error::PortAllocation(format!("Failed to bind to random port: {}", e))
+            })?;
+            let port = probe
+                .local_addr()
+                .map_err(|e| Error::PortAllocation(format!("Failed to get local address: {}", e)))?
+                .port();
+            drop(probe);
+            if let Ok(port) = self.try_allocate_port(port) {
+                return Ok(port);
+            }
         }
-        self.allocated_ports.lock().insert(port);
-
-        Ok(port)
+        Err(Error::PortAllocation(
+            "Failed to find an available random port after 16 attempts".to_string(),
+        ))
     }
 
     /// Allocate a port, preferring the default port if available, otherwise allocating a random port.
@@ -70,24 +69,10 @@ impl PortAllocator {
         if default_port == 0 {
             return self.allocate_random_port();
         }
-        // Try to bind to the default port on 127.0.0.1
-        let listener_v4 = match TcpListener::bind(("127.0.0.1", default_port)) {
-            Ok(l) => l,
-            Err(_) => return self.allocate_random_port(),
-        };
-        // Also try 0.0.0.0 to catch dual-stack conflicts.
-        // On Linux this may fail because 127.0.0.1 already covers it — that's fine.
-        // On macOS the two binds coexist, so holding both prevents conflicts from
-        // processes binding on either address.
-        let listener_any = TcpListener::bind(("0.0.0.0", default_port)).ok();
-
-        let mut listeners = self.listeners.lock();
-        listeners.push(listener_v4);
-        if let Some(l) = listener_any {
-            listeners.push(l);
+        match self.try_allocate_port(default_port) {
+            Ok(port) => Ok(port),
+            Err(_) => self.allocate_random_port(),
         }
-        self.allocated_ports.lock().insert(default_port);
-        Ok(default_port)
     }
 
     /// Try to allocate a specific port, keeping listeners alive to prevent TOCTOU races.
@@ -106,16 +91,45 @@ impl PortAllocator {
                 "Port 0 cannot be allocated: valid ports are 1-65535".to_string(),
             ));
         }
-        let listener_v4 = TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
-            Error::PortAllocation(format!("Port {} not available (127.0.0.1): {}", port, e))
+        // The wildcard bind is the load-bearing conflict check and is bound
+        // FIRST. It is MANDATORY: with SO_REUSEADDR (which std sets), a
+        // loopback bind succeeds alongside a dual-stack [::]:PORT listener —
+        // every node/Next.js dev server — while the wildcard bind correctly
+        // fails. Swallowing this failure used to let fed hand out ports that
+        // dual-stack listeners already held.
+        let listener_any = TcpListener::bind(("0.0.0.0", port)).map_err(|e| {
+            Error::PortAllocation(format!("Port {} not available (0.0.0.0): {}", port, e))
         })?;
-        // Also try 0.0.0.0 to catch dual-stack conflicts.
-        // On Linux this may fail because 127.0.0.1 already covers it — that's fine.
-        let listener_any = TcpListener::bind(("0.0.0.0", port)).ok();
+        // Also hold loopback (TOCTOU guard: on BSD kernels a 127.0.0.1 bind
+        // coexists with our wildcard, so without this a squatter could still
+        // steal the port before the service starts).
+        let listener_lo = match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                if cfg!(any(
+                    target_os = "macos",
+                    target_os = "freebsd",
+                    target_os = "openbsd",
+                    target_os = "netbsd",
+                    target_os = "dragonfly"
+                )) {
+                    // Coexistence is allowed here, so this failure means a
+                    // real loopback-only holder (e.g. Vite's default bind).
+                    return Err(Error::PortAllocation(format!(
+                        "Port {} not available (127.0.0.1): {}",
+                        port, e
+                    )));
+                }
+                // Linux/Windows: our own wildcard listener blocks the
+                // loopback bind, and the wildcard bind above already proved
+                // nobody else holds any v4 address on this port.
+                None
+            }
+        };
 
         let mut listeners = self.listeners.lock();
-        listeners.push(listener_v4);
-        if let Some(l) = listener_any {
+        listeners.push(listener_any);
+        if let Some(l) = listener_lo {
             listeners.push(l);
         }
         self.allocated_ports.lock().insert(port);
@@ -180,6 +194,54 @@ impl Drop for PortAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test: a node/Next.js dev server binds the IPv6 dual-stack
+    /// wildcard ([::]). With SO_REUSEADDR a loopback bind still succeeds
+    /// alongside it on macOS, so only the (previously swallowed) wildcard
+    /// bind reveals the conflict. fed used to hand out such ports and the
+    /// service then crashed with EADDRINUSE.
+    #[test]
+    #[cfg(unix)]
+    fn test_try_allocate_rejects_dual_stack_v6_listener() {
+        let v6_holder = TcpListener::bind("[::]:0").unwrap();
+        let port = v6_holder.local_addr().unwrap().port();
+
+        let mut allocator = PortAllocator::new();
+        assert!(
+            allocator.try_allocate_port(port).is_err(),
+            "port {} is held by a [::] dual-stack listener and must not be allocated",
+            port
+        );
+    }
+
+    /// A server bound only to 127.0.0.1 (e.g. Vite's default) must also be
+    /// detected — the loopback probe covers what the wildcard bind can miss
+    /// on macOS.
+    #[test]
+    fn test_try_allocate_rejects_loopback_only_listener() {
+        let lo_holder = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = lo_holder.local_addr().unwrap().port();
+
+        let mut allocator = PortAllocator::new();
+        assert!(
+            allocator.try_allocate_port(port).is_err(),
+            "port {} is held by a loopback-only listener and must not be allocated",
+            port
+        );
+    }
+
+    /// allocate_port_with_default falls back to a random port instead of
+    /// failing when the default is held by a dual-stack [::] listener.
+    #[test]
+    #[cfg(unix)]
+    fn test_default_held_by_v6_listener_falls_back_to_random() {
+        let v6_holder = TcpListener::bind("[::]:0").unwrap();
+        let taken = v6_holder.local_addr().unwrap().port();
+
+        let mut allocator = PortAllocator::new();
+        let port = allocator.allocate_port_with_default(taken).unwrap();
+        assert_ne!(port, taken, "must not allocate the held default");
+    }
 
     #[test]
     fn test_allocate_random_port() {

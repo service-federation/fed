@@ -1,0 +1,37 @@
+# The demo project from the docs/announcement post, adapted for CI
+# (npm instead of pnpm). Exercised end-to-end by run-e2e.sh on Linux:
+# dependency-ordered start, healthcheck gating, port parameters with
+# conflict fallback, isolated scripts, borrow-or-own cleanup.
+parameters:
+  APP_PORT:
+    type: port
+    default: 3000
+  DB_PORT:
+    type: port
+    default: 5432
+
+services:
+  app:
+    process: npm run dev
+    startup_message: "App running on http://localhost:{{APP_PORT}}"
+    depends_on: ["postgres"]
+    environment:
+      DB_PORT: '{{DB_PORT}}'
+      PORT: '{{APP_PORT}}'
+  postgres:
+    image: postgres:16-alpine
+    ports: ["{{DB_PORT}}:5432"]
+    environment:
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      command: pg_isready -U postgres
+
+entrypoint: app
+
+scripts:
+  integration-test:
+    script: npm run integration-test
+    isolated: true
+    depends_on: ["postgres"]
+    environment:
+      DB_PORT: '{{DB_PORT}}'
