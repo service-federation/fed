@@ -91,7 +91,7 @@ scripts:
 
 **Generated secrets** — `type: secret` parameters are generated on first `fed start` and written to a gitignored file; `source: manual` secrets fail startup with a message saying exactly what to provide and where. No more `POSTGRES_PASSWORD: password` in the config.
 
-**Team secrets** — put manual secrets in your team's vault once (`fed login`, `fed link acme/web`, `fed secrets set STRIPE_SECRET_KEY`) and every teammate's `fed start` resolves them. Part of [Service Federation Cloud](https://www.service-federation.com), free during early access. Development secrets only — it's a dev tool, not a production vault.
+**Team secrets** — put manual secrets in your team's vault once (`fed login`, `fed link acme/web`, `fed secrets set STRIPE_SECRET_KEY`) and every teammate's `fed start` resolves them. Part of [Service Federation Cloud](https://www.service-federation.com) — free for orgs up to 10 people, €5/seat/month beyond. Development secrets only — it's a dev tool, not a production vault.
 
 **Worktrees & coding agents** — Claude Code, Cursor, and Codex parallelize with one worktree per agent, and each worktree can run its own full stack. Add one rule to your `AGENTS.md` so every agent isolates before it collides:
 
