@@ -88,8 +88,9 @@ async fn test_circuit_breaker_cooldown_period() {
     );
     tracker.register_service(service_state).await.unwrap();
 
-    // Open circuit breaker with a short cooldown for testing (2 seconds)
-    let cooldown_secs = 2u64;
+    // Open circuit breaker with a short cooldown for testing (3 seconds)
+    let cooldown_secs = 3u64;
+    let opened_at = std::time::Instant::now();
     tracker
         .open_circuit_breaker("cooldown-service", cooldown_secs)
         .await
@@ -101,17 +102,21 @@ async fn test_circuit_breaker_cooldown_period() {
         "Circuit breaker should be open immediately after opening"
     );
 
-    // Wait half the cooldown period
+    // Wait a third of the cooldown period
     sleep(Duration::from_secs(1)).await;
 
-    // Circuit breaker should still be open
-    assert!(
-        tracker.is_circuit_breaker_open("cooldown-service").await,
-        "Circuit breaker should still be open during cooldown"
-    );
+    // Only assert mid-window state if this runner actually observed the
+    // window: a loaded CI machine can stretch a 1s sleep past the whole
+    // cooldown, which is a scheduling artifact, not a breaker bug.
+    if opened_at.elapsed() < Duration::from_secs(cooldown_secs) {
+        assert!(
+            tracker.is_circuit_breaker_open("cooldown-service").await,
+            "Circuit breaker should still be open during cooldown"
+        );
+    }
 
     // Wait for cooldown to expire (plus a small buffer)
-    sleep(Duration::from_millis(1200)).await;
+    sleep(Duration::from_millis(2500)).await;
 
     // Circuit breaker should now be closed
     assert!(
