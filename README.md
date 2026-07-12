@@ -79,7 +79,10 @@ Details: [isolation docs](https://www.service-federation.com/docs/isolation/).
 
 ## Highlights
 
-**Setup steps that gate startup (`run:`)** — a oneshot service runs a command to completion *after its dependencies are healthy*, and holds its dependents back until it exits 0. Use it for one-time setup (migrations, `pnpm install`) so later services never boot against an empty database or missing `node_modules`:
+**Lifecycle hooks that gate startup (`install:` and `migrate:`)** — fed runs setup steps *after a service's dependencies are healthy* and *before the service itself starts*, so later services never boot against an empty database or missing `node_modules`. There are exactly two hooks:
+
+- **`install:`** runs once per scope — the first `fed start` runs it, later starts skip it (a marker records that it ran). Re-run it with `fed install`; `fed clean` clears the marker. Use it for `pnpm install`, `cargo fetch` — expensive setup that only changes when you say so.
+- **`migrate:`** runs on *every* start, after dependencies are healthy and before the service is ready. There is no marker: idempotency is the contract (migration tools are no-ops when the schema is already current). Use it for `prisma db push`, `flyway migrate`, schema sync.
 
 ```yaml
 services:
@@ -87,15 +90,31 @@ services:
     image: postgres:15
     healthcheck:
       command: pg_isready -U postgres
-  migrate:
-    run: pnpm prisma db push   # runs to completion, then api may start
+  api:
+    process: pnpm start
+    install: pnpm install         # once per scope
+    migrate: pnpm prisma db push  # every start, before api is ready
+    depends_on: [db]
+```
+
+**Hook-only services** — a service with `install:` and/or `migrate:` but no `process` / `image` / `gradleTask` / `composeFile` is a node of its own. It runs its hooks to completion during startup and holds its dependents back until they finish; `fed status` reports it as `completed`. Reach for one when several services share a setup step:
+
+```yaml
+services:
+  schema:
+    migrate: pnpm prisma db push  # no process — this node IS the migration
     depends_on: [db]
   api:
     process: pnpm start
-    depends_on: [migrate]
+    depends_on: [schema]
+  worker:
+    process: pnpm worker
+    depends_on: [schema]
 ```
 
-`run:` is a service type of its own — mutually exclusive with `process` / `image` / `gradleTask` / `composeFile`. It re-runs on every `fed start`, so the command must be idempotent. A oneshot has no long-running process, so it takes no `healthcheck` or `restart` (completion *is* its readiness); `fed status` reports it as `completed`.
+A hook-only node completes when its hooks finish, so it takes no `healthcheck` or `restart` (completion *is* its readiness). A failing hook aborts `fed start`, naming the node. Under concurrent dependents the node runs its hooks once per startup.
+
+> **Removed in 6.0:** `run:` is gone. Replace `run: <cmd>` with a hook-only service declaring `migrate: <cmd>` (and optionally `install:`) — the same "runs to completion on every start and gates dependents" behavior, now expressed through the migrate hook.
 
 **Isolated scripts** — integration tests get a throwaway stack (fresh ports, scoped containers, cleaned up on every exit path) while your dev stack keeps running:
 
