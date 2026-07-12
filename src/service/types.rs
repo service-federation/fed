@@ -33,6 +33,9 @@ pub enum Status {
     Failing,
     /// Service is in the process of stopping
     Stopping,
+    /// Oneshot service (`run:`) that executed to completion successfully.
+    /// Not a running process — completion is its terminal, healthy state.
+    Completed,
 }
 
 impl fmt::Display for Status {
@@ -44,6 +47,7 @@ impl fmt::Display for Status {
             Status::Healthy => write!(f, "healthy"),
             Status::Failing => write!(f, "failing"),
             Status::Stopping => write!(f, "stopping"),
+            Status::Completed => write!(f, "completed"),
         }
     }
 }
@@ -58,6 +62,7 @@ impl std::str::FromStr for Status {
             "healthy" => Ok(Status::Healthy),
             "failing" => Ok(Status::Failing),
             "stopping" => Ok(Status::Stopping),
+            "completed" => Ok(Status::Completed),
             other => Err(format!("Unknown status: {}", other)),
         }
     }
@@ -107,6 +112,15 @@ impl Status {
 
             // Stopping always transitions to Stopped
             (Stopping, Stopped) => true,
+
+            // Oneshot (`run:`) completion: reached from Starting/Running, and
+            // torn down like any terminal state. Re-running a restored-Completed
+            // oneshot goes back through Starting.
+            (Starting, Completed) => true,
+            (Running, Completed) => true,
+            (Completed, Stopping) => true,
+            (Completed, Stopped) => true,
+            (Completed, Starting) => true,
 
             // Same state is always valid (no-op transition)
             (s1, s2) if *s1 == s2 => true,

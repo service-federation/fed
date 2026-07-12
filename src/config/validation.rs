@@ -14,6 +14,20 @@ impl Config {
             ));
         }
 
+        // `FED_PROJECT_ID` is a built-in template variable (a stable, cookie-safe
+        // per-project identifier). It is injected automatically and must not be
+        // declared as a user parameter.
+        if self
+            .get_effective_parameters()
+            .contains_key("FED_PROJECT_ID")
+        {
+            return Err(Error::Validation(
+                "`FED_PROJECT_ID` is a reserved built-in parameter and cannot be declared under `parameters:`. \
+                 It is provided automatically for template resolution — just reference it as `{{FED_PROJECT_ID}}`."
+                    .to_string(),
+            ));
+        }
+
         // Check entrypoint/entrypoints exclusivity
         if self.entrypoint.is_some() && !self.entrypoints.is_empty() {
             return Err(Error::Validation(
@@ -66,7 +80,7 @@ impl Config {
         for (name, service) in &self.services {
             if service.service_type() == ServiceType::Undefined {
                 return Err(Error::Validation(format!(
-                    "Service '{}' has no type defined. Add one of: process, image, gradle_task, or compose_file + compose_service",
+                    "Service '{}' has no type defined. Add one of: process, image, gradle_task, run, or compose_file + compose_service",
                     name
                 )));
             }
@@ -76,6 +90,7 @@ impl Config {
                 service.process.as_ref().map(|_| "process"),
                 service.image.as_ref().map(|_| "image"),
                 service.gradle_task.as_ref().map(|_| "gradle_task"),
+                service.run.as_ref().map(|_| "run"),
                 service
                     .compose_file
                     .as_ref()
@@ -92,6 +107,23 @@ impl Config {
                     name,
                     type_fields.join(", ")
                 )));
+            }
+
+            // A oneshot (`run:`) completes to signal readiness, so a healthcheck
+            // or restart policy is contradictory — reject both.
+            if service.run.is_some() {
+                if service.healthcheck.is_some() {
+                    return Err(Error::Validation(format!(
+                        "Oneshot service '{}' cannot have a `healthcheck` — completion of the `run:` command IS its readiness signal. Remove the healthcheck.",
+                        name
+                    )));
+                }
+                if service.restart.is_some() {
+                    return Err(Error::Validation(format!(
+                        "Oneshot service '{}' cannot have a `restart` policy — a `run:` command runs once to completion, it is never restarted. Remove the restart policy.",
+                        name
+                    )));
+                }
             }
         }
 

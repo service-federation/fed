@@ -558,6 +558,9 @@ impl Orchestrator {
         // Use a read-only port-store snapshot so resolve_parameters() can't persist.
         self.configure_port_store(true).await;
 
+        // Scope the built-in FED_PROJECT_ID to the active isolation session (if any).
+        self.resolver.set_isolation_id(self.isolation_id.clone());
+
         // Resolve parameters and expand external dependencies.
         self.resolver.resolve_parameters(&mut self.config)?;
         let expander =
@@ -658,6 +661,10 @@ impl Orchestrator {
 
         // Work dir is required for resolving global env_file paths.
         self.resolver.set_work_dir(&self.work_dir);
+
+        // Scope the built-in FED_PROJECT_ID to the active isolation session (if any)
+        // — determined just above — so parallel isolated stacks get distinct ids.
+        self.resolver.set_isolation_id(self.isolation_id.clone());
 
         // Build the port store based on mode:
         // - Randomize mode → NoopPortStore (forces fresh random allocation)
@@ -1015,6 +1022,18 @@ impl Orchestrator {
             }
         };
 
+        // Oneshot (`run:`) services take a dedicated run-to-completion path:
+        // execute once, gate dependents on completion, re-run every startup.
+        if self
+            .config
+            .services
+            .get(name)
+            .map(|s| s.service_type() == ServiceType::Oneshot)
+            .unwrap_or(false)
+        {
+            return self.run_oneshot(name, &manager_arc).await;
+        }
+
         // Check if already running (deduplication) and check for cancellation
         // IMPORTANT: We check cancellation inside the lock to prevent TOCTOU race
         // where cancellation happens between check and acquiring the lock
@@ -1147,6 +1166,92 @@ impl Orchestrator {
         self.await_healthcheck(name, &manager_arc)
             .instrument(tracing::info_span!("await_healthcheck"))
             .await?;
+
+        Ok(())
+    }
+
+    /// Run a oneshot (`run:`) service to completion.
+    ///
+    /// Semantics:
+    /// - Dependencies are already healthy (dependency-graph ordering starts them
+    ///   before this node is reached), so this only runs the install/migrate
+    ///   markers and then the `run:` command, streaming its output.
+    /// - Exit 0 satisfies the node → dependents may proceed. A non-zero exit is a
+    ///   startup error naming this service, aborting `fed start`.
+    /// - Re-runs on every `fed start`/`fed restart`: managers are rebuilt fresh
+    ///   each process, so a `Completed` state from a previous session (restored
+    ///   only for display) never suppresses re-execution.
+    ///
+    /// Concurrency: the per-service manager mutex is held across the whole run,
+    /// so two dependents that reach the same oneshot are serialized — the second
+    /// blocks until the first execution finishes, then sees `has_run` and skips
+    /// re-running (never proceeding before the run completed). The mutex is
+    /// released before the state-tracker write so the documented
+    /// Services < StateTracker < ServiceMutex lock ordering is respected.
+    async fn run_oneshot(
+        &self,
+        name: &str,
+        manager_arc: &Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>>,
+    ) -> Result<()> {
+        {
+            let mut manager = manager_arc.lock().await;
+
+            if self.cancellation_token.is_cancelled() {
+                return Err(Error::Cancelled(name.to_string()));
+            }
+
+            // Already executed in THIS startup? A concurrent dependent that waited
+            // on the mutex lands here after the first run finished — skip re-running.
+            {
+                let oneshot = manager
+                    .as_any_mut()
+                    .downcast_mut::<crate::service::OneshotService>()
+                    .ok_or_else(|| {
+                        Error::Config(format!("Service '{}' is not a oneshot service", name))
+                    })?;
+                if oneshot.has_run() {
+                    return Ok(());
+                }
+            }
+
+            // Install/migrate run exactly as for any service (markers gate them).
+            self.run_install_if_needed(name)
+                .instrument(tracing::info_span!("install_if_needed"))
+                .await?;
+            self.run_migrate_if_needed(name)
+                .instrument(tracing::info_span!("migrate_if_needed"))
+                .await?;
+
+            if self.cancellation_token.is_cancelled() {
+                return Err(Error::Cancelled(name.to_string()));
+            }
+
+            // Execute the `run:` command to completion (sets Completed + has_run
+            // on success, or returns an error naming this service on failure).
+            manager
+                .start()
+                .instrument(tracing::info_span!("run_oneshot"))
+                .await?;
+        } // manager mutex released before touching the state tracker
+
+        // Record completion for `fed status` (cross-process display). Replace any
+        // stale entry from a previous session so the status is fresh and the
+        // oneshot is never wrongly short-circuited on a later start.
+        {
+            let mut tracker = self.state_tracker.write().await;
+            let _ = tracker.unregister_service(name).await;
+            let mut state = ServiceState::new(
+                name.to_string(),
+                ServiceType::Oneshot,
+                self.namespace.clone(),
+            );
+            state.status = Status::Completed;
+            if let Some(cfg) = self.config.services.get(name) {
+                state.startup_message = cfg.startup_message.clone();
+            }
+            tracker.register_service(state).await?;
+            tracker.save().await?;
+        }
 
         Ok(())
     }

@@ -310,6 +310,7 @@ pub async fn run_start(
             Status::Stopped => "Stopped",
             Status::Starting => "Starting",
             Status::Stopping => "Stopping",
+            Status::Completed => "Completed",
         };
         out.status(&format!("  {}: {}", name, status_str));
     }

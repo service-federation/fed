@@ -76,6 +76,14 @@ pub struct Service {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process: Option<String>,
 
+    /// Oneshot command: runs to completion during startup after this service's
+    /// dependencies are healthy, and gates its dependents on that completion.
+    /// Unlike `process`, there is no long-running process — exit 0 satisfies the
+    /// node. Re-runs on every `fed start`, so the command must be idempotent
+    /// (e.g. `prisma db push`). Mutually exclusive with the other type fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+
     // Docker-based service
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -208,6 +216,8 @@ pub enum ServiceType {
     External,
     GradleTask,
     DockerCompose,
+    /// A command that runs to completion during startup (`run:`).
+    Oneshot,
     Undefined,
 }
 
@@ -219,6 +229,7 @@ impl std::fmt::Display for ServiceType {
             ServiceType::External => write!(f, "external"),
             ServiceType::GradleTask => write!(f, "gradle"),
             ServiceType::DockerCompose => write!(f, "docker-compose"),
+            ServiceType::Oneshot => write!(f, "oneshot"),
             ServiceType::Undefined => write!(f, "undefined"),
         }
     }
@@ -234,6 +245,7 @@ impl std::str::FromStr for ServiceType {
             "external" => Ok(ServiceType::External),
             "gradle" | "gradletask" | "gradle_task" => Ok(ServiceType::GradleTask),
             "docker-compose" | "dockercompose" | "docker_compose" => Ok(ServiceType::DockerCompose),
+            "oneshot" | "run" => Ok(ServiceType::Oneshot),
             "undefined" => Ok(ServiceType::Undefined),
             _ => Err(format!("Unknown service type: {}", s)),
         }
@@ -253,6 +265,8 @@ impl Service {
             ServiceType::External
         } else if self.gradle_task.is_some() {
             ServiceType::GradleTask
+        } else if self.run.is_some() {
+            ServiceType::Oneshot
         } else {
             ServiceType::Undefined
         }
@@ -398,6 +412,7 @@ environment:
             ServiceType::External,
             ServiceType::GradleTask,
             ServiceType::DockerCompose,
+            ServiceType::Oneshot,
             ServiceType::Undefined,
         ];
         for variant in &variants {

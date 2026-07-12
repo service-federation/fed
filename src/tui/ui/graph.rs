@@ -118,6 +118,7 @@ fn draw_dependency_tree(
                 let status_icon = if let Some(status) = status_map.get(node) {
                     match status {
                         crate::service::Status::Running | crate::service::Status::Healthy => "✓",
+                        crate::service::Status::Completed => "✓",
                         crate::service::Status::Starting => "⋯",
                         crate::service::Status::Failing => "✗",
                         crate::service::Status::Stopped => "○",
@@ -132,6 +133,7 @@ fn draw_dependency_tree(
                         crate::service::Status::Running | crate::service::Status::Healthy => {
                             Color::Green
                         }
+                        crate::service::Status::Completed => Color::Green,
                         crate::service::Status::Starting => Color::Yellow,
                         crate::service::Status::Failing => Color::Red,
                         crate::service::Status::Stopped => Color::DarkGray,

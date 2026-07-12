@@ -9,8 +9,8 @@
 use crate::config::ServiceType;
 use crate::error::{validate_pid_for_check, Error, Result};
 use crate::service::{
-    DockerComposeService, DockerService, ExternalService, GradleService, ProcessService,
-    ServiceManager,
+    DockerComposeService, DockerService, ExternalService, GradleService, OneshotService,
+    ProcessService, ServiceManager,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -192,6 +192,12 @@ impl Orchestrator {
                 env,
                 work_dir,
             )?),
+            ServiceType::Oneshot => Box::new(OneshotService::new(
+                name.to_string(),
+                service.clone(),
+                env,
+                work_dir,
+            )),
             ServiceType::Undefined => {
                 return Err(Error::Config(format!(
                     "Undefined service type for service '{}'",
@@ -304,6 +310,14 @@ impl Orchestrator {
                 if let Some(container_id) = &service_state.container_id {
                     self.restore_container_id(&mut manager, service_name, container_id)
                         .await;
+                }
+
+                // Oneshots have no PID/container to restore — carry over their
+                // persisted status (e.g. Completed) so `fed status` reflects the
+                // last run honestly. `restore_status` deliberately does not set
+                // the run flag, so the oneshot still re-runs on the next start.
+                if let Some(oneshot) = manager.as_any_mut().downcast_mut::<OneshotService>() {
+                    oneshot.restore_status(service_state.status);
                 }
             }
         }

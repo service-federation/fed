@@ -48,6 +48,7 @@ pub async fn run_top(
                 for (name, stat) in &status {
                     let status_str = match stat {
                         fed::Status::Running | fed::Status::Healthy => "running",
+                        fed::Status::Completed => "completed",
                         fed::Status::Stopped => "stopped",
                         fed::Status::Starting => "starting",
                         fed::Status::Failing => "failing",

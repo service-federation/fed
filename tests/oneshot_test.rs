@@ -54,7 +54,7 @@ services:
     depends_on:
       - base
   consumer:
-    process: "sh -c 'test -f {marker} && exec sleep 30'"
+    process: "test -f {marker} && exec sleep 30"
     depends_on:
       - schema
     startup_message: "consumer is up"
@@ -241,7 +241,7 @@ fn test_run_plus_restart_is_rejected() {
 services:
   schema:
     run: "echo hi"
-    restart: "on-failure"
+    restart: "always"
 "#;
     let config = Parser::new().parse_config(yaml).expect("parse");
     let err = config

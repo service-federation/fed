@@ -50,6 +50,7 @@ fn draw_service_info(f: &mut Frame, app: &App, service_name: &str, area: Rect) {
     let lines = if let Some(service) = service {
         let status_color = match service.status {
             Status::Running | Status::Healthy => Color::Green,
+            Status::Completed => Color::Green,
             Status::Starting => Color::Yellow,
             Status::Failing => Color::Red,
             Status::Stopped => Color::DarkGray,
@@ -58,6 +59,7 @@ fn draw_service_info(f: &mut Frame, app: &App, service_name: &str, area: Rect) {
 
         let status_icon = match service.status {
             Status::Running | Status::Healthy => "✓",
+            Status::Completed => "✓",
             Status::Starting => "⋯",
             Status::Failing => "✗",
             Status::Stopped => "○",
@@ -176,7 +178,8 @@ fn draw_actions(f: &mut Frame, app: &App, service_name: &str, area: Rect) {
                     Span::raw("Restart service"),
                 ])));
             }
-            Status::Stopped => {
+            // A completed oneshot has no running process — offer a re-run (start).
+            Status::Stopped | Status::Completed => {
                 actions.push(ListItem::new(Line::from(vec![
                     Span::styled("  [s] ", Style::default().fg(Color::Cyan)),
                     Span::raw("Start service"),

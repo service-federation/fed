@@ -37,6 +37,58 @@ pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Name of the built-in project-identifier parameter.
+///
+/// Injected automatically into every service/script templating context; may not
+/// be declared as a user parameter (enforced by config validation).
+pub const FED_PROJECT_ID: &str = "FED_PROJECT_ID";
+
+/// Restrict a string to the cookie-safe alphabet `[a-z0-9-]`.
+///
+/// Lowercases, replaces every other character with `-`, and trims leading and
+/// trailing dashes. An empty result falls back to `project`.
+fn sanitize_project_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "project".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Compute the built-in `FED_PROJECT_ID` value for a work dir and optional
+/// isolation scope.
+///
+/// Shape: `<project>-<hash>[-<isolation>]`, lowercased and restricted to
+/// `[a-z0-9-]` so it is safe to embed inside a cookie name. `<project>` is the
+/// sanitized basename of `work_dir`, `<hash>` is the 8-hex
+/// [`crate::service::hash_work_dir`] digest (stable across runs, unique per
+/// path), and `<isolation>` is appended when an isolation session is active.
+pub fn compute_project_id(work_dir: &Path, isolation_id: Option<&str>) -> String {
+    let project = work_dir
+        .file_name()
+        .map(|n| sanitize_project_component(&n.to_string_lossy()))
+        .unwrap_or_else(|| "project".to_string());
+    let hash = crate::service::hash_work_dir(work_dir);
+    let mut id = format!("{}-{}", project, hash);
+    if let Some(iso) = isolation_id {
+        let iso = sanitize_project_component(iso);
+        if !iso.is_empty() {
+            id.push('-');
+            id.push_str(&iso);
+        }
+    }
+    id
+}
+
 /// Reason a port was resolved to its final value
 #[derive(Debug, Clone, PartialEq)]
 pub enum PortResolutionReason {
@@ -153,6 +205,9 @@ pub struct Resolver {
     /// Whether stdin is a TTY (for interactive secret generation prompts).
     is_interactive: bool,
     offline: bool,
+    /// Active isolation session id, if any. Scopes the built-in
+    /// `FED_PROJECT_ID` so parallel isolated stacks get distinct identifiers.
+    isolation_id: Option<String>,
 }
 
 impl Resolver {
@@ -172,6 +227,7 @@ impl Resolver {
             prefer_config_defaults: true,
             is_interactive: false,
             offline: false,
+            isolation_id: None,
         }
     }
 
@@ -192,6 +248,7 @@ impl Resolver {
             prefer_config_defaults: true,
             is_interactive: false,
             offline: false,
+            isolation_id: None,
         }
     }
 
@@ -264,6 +321,15 @@ impl Resolver {
     /// Set working directory for resolving relative paths (e.g., .env files)
     pub fn set_work_dir<P: Into<PathBuf>>(&mut self, work_dir: P) {
         self.work_dir = Some(work_dir.into());
+    }
+
+    /// Set the active isolation session id.
+    ///
+    /// This scopes the built-in `{{FED_PROJECT_ID}}` so that parallel isolated
+    /// stacks of the same project (e.g. worktrees under `fed isolate enable`)
+    /// each get a distinct, stable identifier.
+    pub fn set_isolation_id(&mut self, isolation_id: Option<String>) {
+        self.isolation_id = isolation_id;
     }
 
     /// Resolve template placeholders {{VAR}} with their values
@@ -646,6 +712,16 @@ impl Resolver {
         // Build parameters map - first pass for direct values and port allocation
         let mut parameters = HashMap::new();
 
+        // Inject the built-in FED_PROJECT_ID before user parameters so their
+        // defaults can interpolate it. It needs the work_dir (basename + hash);
+        // without one (e.g. bare unit tests) there is nothing stable to derive.
+        if let Some(ref work_dir) = self.work_dir {
+            let project_id = compute_project_id(work_dir, self.isolation_id.as_deref());
+            parameters.insert(FED_PROJECT_ID.to_string(), project_id.clone());
+            self.resolved_parameters
+                .insert(FED_PROJECT_ID.to_string(), project_id);
+        }
+
         // Use effective parameters (variables take precedence over parameters)
         let effective_params = config.get_effective_parameters().clone();
 
@@ -900,6 +976,18 @@ impl Resolver {
                             ))
                         })?,
                 );
+            }
+
+            // Resolve oneshot `run` command with shell escaping for security
+            if let Some(ref run) = service.run {
+                service.run = Some(self.resolve_template_shell_safe(run, &parameters).map_err(
+                    |e| {
+                        Error::TemplateResolution(format!(
+                            "Failed to resolve run for service '{}': {}",
+                            name, e
+                        ))
+                    },
+                )?);
             }
 
             // Resolve ports
