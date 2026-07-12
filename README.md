@@ -79,6 +79,24 @@ Details: [isolation docs](https://www.service-federation.com/docs/isolation/).
 
 ## Highlights
 
+**Setup steps that gate startup (`run:`)** — a oneshot service runs a command to completion *after its dependencies are healthy*, and holds its dependents back until it exits 0. Use it for one-time setup (migrations, `pnpm install`) so later services never boot against an empty database or missing `node_modules`:
+
+```yaml
+services:
+  db:
+    image: postgres:15
+    healthcheck:
+      command: pg_isready -U postgres
+  migrate:
+    run: pnpm prisma db push   # runs to completion, then api may start
+    depends_on: [db]
+  api:
+    process: pnpm start
+    depends_on: [migrate]
+```
+
+`run:` is a service type of its own — mutually exclusive with `process` / `image` / `gradleTask` / `composeFile`. It re-runs on every `fed start`, so the command must be idempotent. A oneshot has no long-running process, so it takes no `healthcheck` or `restart` (completion *is* its readiness); `fed status` reports it as `completed`.
+
 **Isolated scripts** — integration tests get a throwaway stack (fresh ports, scoped containers, cleaned up on every exit path) while your dev stack keeps running:
 
 ```yaml
@@ -92,6 +110,18 @@ scripts:
 **Generated secrets** — `type: secret` parameters are generated on first `fed start` and written to a gitignored file; `source: manual` secrets fail startup with a message saying exactly what to provide and where. No more `POSTGRES_PASSWORD: password` in the config.
 
 **Team secrets** — put manual secrets in your team's vault once (`fed login`, `fed link acme/web`, `fed secrets set STRIPE_SECRET_KEY`) and every teammate's `fed start` resolves them. Part of [Service Federation Cloud](https://www.service-federation.com) — free for orgs up to 10 people, €5/seat/month beyond. Development secrets only — it's a dev tool, not a production vault.
+
+**Built-in `{{FED_PROJECT_ID}}`** — a stable, cookie-safe identifier available in every service and script template *without* declaring it under `parameters:`. Its value is `<project>-<hash>` (the work-dir basename plus an 8-char digest of its path), with the isolation id appended when `fed isolate enable` is active — so it's distinct per checkout and per isolated stack. Use it to keep things that must not collide across parallel stacks unique, e.g. cookie names so two worktrees' logins don't clobber each other:
+
+```yaml
+services:
+  web:
+    process: pnpm start
+    environment:
+      SESSION_COOKIE: 'session_{{FED_PROJECT_ID}}'
+```
+
+Declaring a parameter named `FED_PROJECT_ID` is a config error — it's reserved.
 
 **Worktrees & coding agents** — Claude Code, Cursor, and Codex parallelize with one worktree per agent, and each worktree can run its own full stack. Add one rule to your `AGENTS.md` so every agent isolates before it collides:
 
