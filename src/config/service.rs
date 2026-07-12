@@ -76,11 +76,12 @@ pub struct Service {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process: Option<String>,
 
-    /// Oneshot command: runs to completion during startup after this service's
-    /// dependencies are healthy, and gates its dependents on that completion.
-    /// Unlike `process`, there is no long-running process — exit 0 satisfies the
-    /// node. Re-runs on every `fed start`, so the command must be idempotent
-    /// (e.g. `prisma db push`). Mutually exclusive with the other type fields.
+    /// Removed in fed 6.0. Retained only so a config still declaring `run:`
+    /// deserializes and fails validation with actionable guidance rather than a
+    /// confusing "no type defined" error. Its old behavior — a command that runs
+    /// to completion during startup and gates dependents — is now expressed by a
+    /// hook-only service: `migrate:` (and optionally `install:`) on a service
+    /// with no process/image/etc.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
 
@@ -216,9 +217,20 @@ pub enum ServiceType {
     External,
     GradleTask,
     DockerCompose,
-    /// A command that runs to completion during startup (`run:`).
+    /// A hook-only node: only `install:`/`migrate:`, no process/image/etc. Runs
+    /// its hooks to completion during startup and gates its dependents on that
+    /// completion. (In fed <6.0 this was the `run:` service type.)
     Oneshot,
     Undefined,
+}
+
+impl ServiceType {
+    /// A hook-only node (only `install:`/`migrate:`, no process/image/etc.) —
+    /// the oneshot node. It runs its hooks to completion during startup and
+    /// gates its dependents on that completion.
+    pub fn is_hook_only(self) -> bool {
+        matches!(self, ServiceType::Oneshot)
+    }
 }
 
 impl std::fmt::Display for ServiceType {
@@ -265,7 +277,11 @@ impl Service {
             ServiceType::External
         } else if self.gradle_task.is_some() {
             ServiceType::GradleTask
-        } else if self.run.is_some() {
+        } else if self.install.is_some() || self.migrate.is_some() {
+            // Hook-only node: no process/image/etc, just lifecycle hooks. Runs
+            // its hooks to completion during startup and gates dependents.
+            // (`run:` is intentionally NOT a type here — it was removed in 6.0
+            // and is rejected by validation.)
             ServiceType::Oneshot
         } else {
             ServiceType::Undefined

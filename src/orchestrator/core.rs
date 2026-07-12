@@ -1170,22 +1170,24 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Run a oneshot (`run:`) service to completion.
+    /// Run a hook-only node (the oneshot node) to completion.
     ///
-    /// Semantics:
+    /// A hook-only service declares `install:` and/or `migrate:` but no
+    /// process/image/etc. Semantics:
     /// - Dependencies are already healthy (dependency-graph ordering starts them
-    ///   before this node is reached), so this only runs the install/migrate
-    ///   markers and then the `run:` command, streaming its output.
-    /// - Exit 0 satisfies the node → dependents may proceed. A non-zero exit is a
-    ///   startup error naming this service, aborting `fed start`.
-    /// - Re-runs on every `fed start`/`fed restart`: managers are rebuilt fresh
-    ///   each process, so a `Completed` state from a previous session (restored
-    ///   only for display) never suppresses re-execution.
+    ///   before this node is reached), so this runs the install hook (marker-
+    ///   gated) and the migrate hook (every start), streaming their output, then
+    ///   marks the node completed.
+    /// - Hooks succeeding satisfies the node → dependents may proceed. A hook
+    ///   failure is a startup error naming this service, aborting `fed start`.
+    /// - `migrate:` re-runs on every `fed start`/`fed restart`: managers are
+    ///   rebuilt fresh each process, so a `Completed` state from a previous
+    ///   session (restored only for display) never suppresses re-execution.
     ///
     /// Concurrency: the per-service manager mutex is held across the whole run,
-    /// so two dependents that reach the same oneshot are serialized — the second
+    /// so two dependents that reach the same node are serialized — the second
     /// blocks until the first execution finishes, then sees `has_run` and skips
-    /// re-running (never proceeding before the run completed). The mutex is
+    /// re-running the hooks (never proceeding before they completed). The mutex is
     /// released before the state-tracker write so the documented
     /// Services < StateTracker < ServiceMutex lock ordering is respected.
     async fn run_oneshot(
@@ -1214,7 +1216,9 @@ impl Orchestrator {
                 }
             }
 
-            // Install/migrate run exactly as for any service (markers gate them).
+            // Run the hooks: install is marker-gated (once per scope), migrate
+            // runs every start. A hook failure returns an error naming this
+            // service and aborts the start before the node is marked complete.
             self.run_install_if_needed(name)
                 .instrument(tracing::info_span!("install_if_needed"))
                 .await?;
@@ -1226,8 +1230,8 @@ impl Orchestrator {
                 return Err(Error::Cancelled(name.to_string()));
             }
 
-            // Execute the `run:` command to completion (sets Completed + has_run
-            // on success, or returns an error naming this service on failure).
+            // Mark the node completed (sets Completed + has_run). The hooks above
+            // are the node's actual work; start() is just the completion signal.
             manager
                 .start()
                 .instrument(tracing::info_span!("run_oneshot"))

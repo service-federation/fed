@@ -73,23 +73,14 @@ pub async fn run_clean(
             .clear_port_resolutions()
             .await?;
 
-        // Per-service clean already cleared install/migrate markers for
-        // each service in `services_to_clean` (those with `clean:` or
-        // `volumes:`). But services that only have `migrate:` (e.g. a
-        // Rust service whose migrate creates a database in a sibling
-        // postgres) aren't in that list — yet their migrations are
-        // effectively invalidated when the dependency's volumes are
-        // wiped. A full `fed clean` is the "wipe everything for a
-        // fresh start" operation, so clear all install and migrate
-        // markers in the workspace.
+        // Per-service clean already cleared install markers for each service
+        // in `services_to_clean` (those with `clean:` or `volumes:`). But a
+        // service that only has `install:` isn't in that list — yet a full
+        // `fed clean` is the "wipe everything for a fresh start" operation, so
+        // clear all install markers in the workspace. (migrate has no marker in
+        // fed 6.0 — it re-runs on every start — so there's nothing to clear.)
         let work_dir = orchestrator.work_dir();
         let markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf(), None);
-        if let Err(e) = markers.clear_all_migrated() {
-            out.warning(&format!(
-                "Warning: Failed to clear all migrate markers: {}",
-                e
-            ));
-        }
         if let Err(e) = markers.clear_all_installed() {
             out.warning(&format!(
                 "Warning: Failed to clear all install markers: {}",

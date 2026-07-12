@@ -92,23 +92,6 @@ fn scoped_installed_dir(work_dir: &Path, isolation_id: Option<&str>) -> Result<P
     })
 }
 
-/// Get the migrated directory for a (work_dir, isolation_id) scope. See
-/// [`scoped_installed_dir`] for the layout rationale.
-fn scoped_migrated_dir(work_dir: &Path, isolation_id: Option<&str>) -> Result<PathBuf> {
-    let hash = crate::service::hash_work_dir(work_dir);
-    let base = fed_home()?;
-    Ok(match isolation_id {
-        None => base.join("migrated").join(hash),
-        Some(id) => {
-            let sanitized = sanitize_isolation_id_for_path(id)?;
-            base.join("isolated")
-                .join("migrated")
-                .join(hash)
-                .join(sanitized)
-        }
-    })
-}
-
 fn write_marker(dir: PathBuf, service_name: &str, kind: &str, body: &str) -> Result<()> {
     fs::create_dir_all(&dir)
         .map_err(|e| Error::Filesystem(format!("Failed to create {} directory: {}", kind, e)))?;
@@ -116,15 +99,6 @@ fn write_marker(dir: PathBuf, service_name: &str, kind: &str, body: &str) -> Res
     fs::write(dir.join(sanitized), body)
         .map_err(|e| Error::Filesystem(format!("Failed to create {} marker: {}", kind, e)))?;
     Ok(())
-}
-
-fn read_marker(dir: PathBuf, service_name: &str) -> Result<Option<String>> {
-    let sanitized = sanitize_service_name_for_path(service_name)?;
-    match fs::read_to_string(dir.join(sanitized)) {
-        Ok(body) => Ok(Some(body)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(Error::Filesystem(format!("Failed to read marker: {}", e))),
-    }
 }
 
 fn marker_exists(dir: PathBuf, service_name: &str) -> Result<bool> {
@@ -164,7 +138,10 @@ fn remove_dir(dir: PathBuf, kind: &str) -> Result<()> {
     }
 }
 
-/// Lifecycle markers for install/migrate state tracking.
+/// Lifecycle markers for install state tracking.
+///
+/// Only `install:` is marker-gated (once per scope). `migrate:` runs on every
+/// start in fed 6.0, so it has no markers here.
 ///
 /// Markers are scoped by `(work_dir, isolation_id)`. A `None` isolation id
 /// refers to shared (non-isolated) containers; a `Some(id)` refers to the
@@ -195,10 +172,6 @@ impl LifecycleMarkers {
         scoped_installed_dir(&self.work_dir, self.isolation_id.as_deref())
     }
 
-    fn migrated_dir(&self) -> Result<PathBuf> {
-        scoped_migrated_dir(&self.work_dir, self.isolation_id.as_deref())
-    }
-
     /// Check if a service has been installed in this scope.
     pub fn is_installed(&self, service_name: &str) -> Result<bool> {
         marker_exists(self.installed_dir()?, service_name)
@@ -219,44 +192,12 @@ impl LifecycleMarkers {
         remove_marker(self.installed_dir()?, service_name, "install")
     }
 
-    /// Check if a service has been migrated in this scope.
-    pub fn is_migrated(&self, service_name: &str) -> Result<bool> {
-        marker_exists(self.migrated_dir()?, service_name)
-    }
-
-    /// Read the dependency-state fingerprint recorded when a service was last
-    /// migrated, or `None` if there is no marker. Markers written by older fed
-    /// versions hold a bare timestamp, which simply won't match a fingerprint
-    /// and so triggers one re-migrate on upgrade.
-    pub fn migrated_fingerprint(&self, service_name: &str) -> Result<Option<String>> {
-        read_marker(self.migrated_dir()?, service_name)
-    }
-
-    /// Mark a service as migrated in this scope, recording the dependency-state
-    /// `fingerprint` whose change should force a re-migrate.
-    pub fn mark_migrated(&self, service_name: &str, fingerprint: &str) -> Result<()> {
-        write_marker(self.migrated_dir()?, service_name, "migrated", fingerprint)
-    }
-
-    /// Clear migrate state for a service in this scope.
-    pub fn clear_migrated(&self, service_name: &str) -> Result<()> {
-        remove_marker(self.migrated_dir()?, service_name, "migrate")
-    }
-
     /// Clear all install markers in this scope.
     ///
     /// Only affects the current `(work_dir, isolation_id)` tuple — markers in
     /// other isolation scopes are untouched.
     pub fn clear_all_installed(&self) -> Result<()> {
         remove_dir(self.installed_dir()?, "install")
-    }
-
-    /// Clear all migrate markers in this scope.
-    ///
-    /// Only affects the current `(work_dir, isolation_id)` tuple — markers in
-    /// other isolation scopes are untouched.
-    pub fn clear_all_migrated(&self) -> Result<()> {
-        remove_dir(self.migrated_dir()?, "migrate")
     }
 }
 
@@ -306,54 +247,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lifecycle_markers_shared_migrate_tracking() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let ctx = shared(&temp_dir);
-
-        let svc = "test-service-migrate";
-        let _ = ctx.clear_migrated(svc);
-
-        assert!(!ctx.is_migrated(svc).unwrap());
-        ctx.mark_migrated(svc, "fp").unwrap();
-        assert!(ctx.is_migrated(svc).unwrap());
-        ctx.clear_migrated(svc).unwrap();
-        assert!(!ctx.is_migrated(svc).unwrap());
-    }
-
-    #[test]
-    fn test_migrated_fingerprint_roundtrip() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let ctx = shared(&temp_dir);
-
-        assert_eq!(ctx.migrated_fingerprint("svc").unwrap(), None);
-        ctx.mark_migrated("svc", "deadbeef").unwrap();
-        assert_eq!(
-            ctx.migrated_fingerprint("svc").unwrap().as_deref(),
-            Some("deadbeef")
-        );
-        ctx.clear_migrated("svc").unwrap();
-        assert_eq!(ctx.migrated_fingerprint("svc").unwrap(), None);
-    }
-
-    #[test]
-    fn test_shared_migrate_markers_isolated_by_work_dir() {
-        let dir_a = tempfile::tempdir().unwrap();
-        let dir_b = tempfile::tempdir().unwrap();
-        let ctx_a = shared(&dir_a);
-        let ctx_b = shared(&dir_b);
-
-        let svc = "test-isolated-migrate";
-        let _ = ctx_a.clear_migrated(svc);
-        let _ = ctx_b.clear_migrated(svc);
-
-        ctx_a.mark_migrated(svc, "fp").unwrap();
-        assert!(ctx_a.is_migrated(svc).unwrap());
-        assert!(!ctx_b.is_migrated(svc).unwrap());
-
-        let _ = ctx_a.clear_migrated(svc);
-    }
-
-    #[test]
     fn test_clear_all_installed_removes_all_markers() {
         let temp_dir = tempfile::tempdir().unwrap();
         let ctx = shared(&temp_dir);
@@ -372,29 +265,10 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_all_migrated_removes_all_markers() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let ctx = shared(&temp_dir);
-
-        ctx.mark_migrated("svc-a", "fp").unwrap();
-        ctx.mark_migrated("svc-b", "fp").unwrap();
-        ctx.mark_migrated("svc-c", "fp").unwrap();
-        assert!(ctx.is_migrated("svc-a").unwrap());
-        assert!(ctx.is_migrated("svc-b").unwrap());
-        assert!(ctx.is_migrated("svc-c").unwrap());
-
-        ctx.clear_all_migrated().unwrap();
-        assert!(!ctx.is_migrated("svc-a").unwrap());
-        assert!(!ctx.is_migrated("svc-b").unwrap());
-        assert!(!ctx.is_migrated("svc-c").unwrap());
-    }
-
-    #[test]
     fn test_clear_all_is_idempotent_on_empty() {
         let temp_dir = tempfile::tempdir().unwrap();
         let ctx = shared(&temp_dir);
         ctx.clear_all_installed().unwrap();
-        ctx.clear_all_migrated().unwrap();
     }
 
     /// Shared and isolated scopes for the same work_dir must not share state.
@@ -409,32 +283,24 @@ mod tests {
         let iso_ctx = isolated(&temp_dir, "iso-test1234");
 
         shared_ctx.mark_installed("api").unwrap();
-        shared_ctx.mark_migrated("api", "fp").unwrap();
 
         // Isolated scope must be empty even though shared has markers
         assert!(!iso_ctx.is_installed("api").unwrap());
-        assert!(!iso_ctx.is_migrated("api").unwrap());
 
         // Writing to isolated scope must not leak back to shared scope
         iso_ctx.mark_installed("api").unwrap();
-        iso_ctx.mark_migrated("api", "fp").unwrap();
         assert!(shared_ctx.is_installed("api").unwrap());
-        assert!(shared_ctx.is_migrated("api").unwrap());
 
         // Clearing isolated scope must not touch shared scope — this is the
         // regression guard: previously `clear_all_*` on work_dir wiped every
         // marker in that work_dir, so an isolated cleanup would also wipe
         // the parent's shared markers.
         iso_ctx.clear_all_installed().unwrap();
-        iso_ctx.clear_all_migrated().unwrap();
         assert!(shared_ctx.is_installed("api").unwrap());
-        assert!(shared_ctx.is_migrated("api").unwrap());
         assert!(!iso_ctx.is_installed("api").unwrap());
-        assert!(!iso_ctx.is_migrated("api").unwrap());
 
         // Cleanup
         let _ = shared_ctx.clear_installed("api");
-        let _ = shared_ctx.clear_migrated("api");
     }
 
     /// Two different isolation ids on the same work_dir must not share state.

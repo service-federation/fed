@@ -978,16 +978,21 @@ impl Resolver {
                 );
             }
 
-            // Resolve oneshot `run` command with shell escaping for security
-            if let Some(ref run) = service.run {
-                service.run = Some(self.resolve_template_shell_safe(run, &parameters).map_err(
-                    |e| {
-                        Error::TemplateResolution(format!(
-                            "Failed to resolve run for service '{}': {}",
-                            name, e
-                        ))
-                    },
-                )?);
+            // Resolve migrate command with shell escaping for security. (This is
+            // the resolution `run:` used to get — hook-only nodes and process
+            // services both express staged setup through `migrate:` in fed 6.0,
+            // so it must resolve templates the same way. `run:` itself was
+            // removed and is rejected by validation, so it is not resolved here.)
+            if let Some(ref migrate) = service.migrate {
+                service.migrate = Some(
+                    self.resolve_template_shell_safe(migrate, &parameters)
+                        .map_err(|e| {
+                            Error::TemplateResolution(format!(
+                                "Failed to resolve migrate for service '{}': {}",
+                                name, e
+                            ))
+                        })?,
+                );
             }
 
             // Resolve ports

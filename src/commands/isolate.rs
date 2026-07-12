@@ -121,19 +121,18 @@ async fn disable(
     tracker.clear_isolation_mode().await?;
 
     if was_enabled {
-        // Clear shared-scope lifecycle markers so install/migrate re-run against
-        // the now-active shared containers. (The shared containers may have been
-        // torn down or diverged while the user was in isolation mode.)
+        // Clear shared-scope install markers so install re-runs against the
+        // now-active shared containers. (The shared containers may have been
+        // torn down or diverged while the user was in isolation mode. migrate
+        // has no marker in fed 6.0 — it re-runs on every start regardless.)
         let shared_markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf(), None);
         shared_markers.clear_all_installed()?;
-        shared_markers.clear_all_migrated()?;
 
         // Also clean up the abandoned isolation scope's marker directory so it
         // doesn't linger in `~/.fed/isolated/`.
         if let Some(id) = previous_isolation_id {
             let iso_markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf(), Some(id));
             let _ = iso_markers.clear_all_installed();
-            let _ = iso_markers.clear_all_migrated();
         }
 
         out.success(
@@ -238,12 +237,12 @@ async fn rotate(
 
     // Clean up the previous isolation session's marker directory. The new
     // session's namespace is empty by construction (scoped by isolation_id),
-    // so `install/migrate` will re-run against the rotated containers without
-    // us having to clear anything — we just tidy up the abandoned dir.
+    // so `install` will re-run against the rotated containers without us having
+    // to clear anything — we just tidy up the abandoned dir. (migrate has no
+    // marker in fed 6.0 — it re-runs on every start regardless.)
     if let Some(id) = previous_id {
         let old_markers = fed::markers::LifecycleMarkers::new(work_dir.to_path_buf(), Some(id));
         let _ = old_markers.clear_all_installed();
-        let _ = old_markers.clear_all_migrated();
     }
 
     // Display new ports for this isolation scope

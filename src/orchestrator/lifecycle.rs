@@ -45,9 +45,9 @@ pub struct ServiceLifecycleCommands<'a> {
 impl<'a> ServiceLifecycleCommands<'a> {
     /// Create a new lifecycle commands handler.
     ///
-    /// Install/migrate marker lookups are scoped by `(work_dir, isolation_id)`
-    /// so isolated child orchestrators never read or mutate the parent's
-    /// shared marker state.
+    /// Install marker lookups are scoped by `(work_dir, isolation_id)` so
+    /// isolated child orchestrators never read or mutate the parent's shared
+    /// marker state. (migrate is not marker-gated in fed 6.0.)
     ///
     /// # Arguments
     ///
@@ -200,25 +200,22 @@ impl<'a> ServiceLifecycleCommands<'a> {
         Ok(())
     }
 
-    /// Force run migrate command for a service (clears migrate state first).
+    /// Run migrate command for a service, on demand (`fed migrate`-style).
     ///
-    /// This method will:
-    /// 1. Clear any existing migrate state
-    /// 2. Run the migrate command unconditionally
+    /// In fed 6.0 migrate has no marker — it runs on every start — so a forced
+    /// run and the startup run are identical. This is a thin alias kept for the
+    /// public API surface.
     pub async fn run_migrate(&self, service_name: &str) -> Result<()> {
-        let ctx = self.markers();
-        ctx.clear_migrated(service_name)?;
         self.run_migrate_if_needed(service_name).await
     }
 
-    /// Run migrate command for a service if needed.
+    /// Run a service's migrate command, if it has one.
     ///
-    /// This checks if the service has already been migrated (via marker files).
-    /// If already migrated, it skips the migrate step.
-    ///
-    /// The migrate command runs after dependencies are healthy but before the service
-    /// starts. Use it for database migrations, schema setup, or anything that needs
-    /// a running dependency.
+    /// fed 6.0 semantics: migrate runs on EVERY start of its service, after
+    /// dependencies are healthy and before the service starts / counts as ready.
+    /// There is no marker and no fingerprint — idempotency is the documented
+    /// contract (migration tools are no-ops when the schema is already current).
+    /// The "if needed" is purely "does this service declare a migrate command".
     pub async fn run_migrate_if_needed(&self, service_name: &str) -> Result<()> {
         let service_config = self
             .config
@@ -230,24 +227,6 @@ impl<'a> ServiceLifecycleCommands<'a> {
             Some(cmd) => cmd,
             None => return Ok(()),
         };
-
-        let fingerprint = self.migrate_state_fingerprint(service_name).await;
-        let ctx = self.markers();
-        let up_to_date = match ctx.migrated_fingerprint(service_name)? {
-            // Nothing to fingerprint (no dependency volumes): honor presence,
-            // preserving the original behavior for stateless dependencies.
-            Some(_) if fingerprint.is_empty() => true,
-            Some(recorded) => recorded == fingerprint,
-            None => false,
-        };
-
-        if up_to_date {
-            tracing::debug!(
-                "Service '{}' already migrated and dependency state unchanged, skipping migrate step",
-                service_name
-            );
-            return Ok(());
-        }
 
         tracing::info!(
             "Running migrate command for service '{}': {}",
@@ -295,45 +274,11 @@ impl<'a> ServiceLifecycleCommands<'a> {
             )));
         }
 
-        let ctx = self.markers();
-        ctx.mark_migrated(service_name, &fingerprint)?;
-
         tracing::info!(
             "Successfully completed migrate for service '{}'",
             service_name
         );
         Ok(())
-    }
-
-    /// Fingerprint the dependency state this service's migrate relies on.
-    ///
-    /// A migrate's side effects (created databases, seeded rows) live in the
-    /// volumes of the service's dependencies. Recording each volume's creation
-    /// identity means a destroyed-and-recreated volume invalidates the marker
-    /// and re-runs migrate, rather than the dependent service later crashing on
-    /// a database that the skipped migrate would have created. Empty when there
-    /// is no dependency volume to track.
-    async fn migrate_state_fingerprint(&self, service_name: &str) -> String {
-        let Some(service) = self.config.services.get(service_name) else {
-            return String::new();
-        };
-        let client = DockerClient::new();
-        let timeout = std::time::Duration::from_secs(10);
-        let session = self.isolation_id.as_deref();
-
-        let mut entries = Vec::new();
-        for dep in &service.depends_on {
-            let container =
-                crate::service::docker_container_name(dep.service_name(), session, self.work_dir);
-            for volume in client.inspect_volume_names(&container, timeout).await {
-                let created = client
-                    .volume_created_at(&volume, timeout)
-                    .await
-                    .unwrap_or_else(|| "gone".to_string());
-                entries.push(format!("{volume}@{created}"));
-            }
-        }
-        compose_state_fingerprint(entries)
     }
 
     /// Run build command for a service.
@@ -528,7 +473,7 @@ impl<'a> ServiceLifecycleCommands<'a> {
     /// This will:
     /// 1. Run the user-defined clean command (if present)
     /// 2. Remove any Docker volumes associated with the service
-    /// 3. Clear the install state
+    /// 3. Clear the install state (migrate has no state in fed 6.0)
     ///
     /// Only Docker volumes with the `fed-` prefix are automatically removed for safety.
     ///
@@ -616,10 +561,10 @@ impl<'a> ServiceLifecycleCommands<'a> {
                 .await?;
         }
 
-        // Clear install and migrate state since we cleaned up
+        // Clear install state since we cleaned up. (migrate has no marker in
+        // fed 6.0 — it re-runs on every start — so there is nothing to clear.)
         let ctx = self.markers();
         ctx.clear_installed(service_name)?;
-        ctx.clear_migrated(service_name)?;
 
         tracing::info!(
             "Successfully completed clean for service '{}'",
@@ -809,43 +754,9 @@ impl<'a> ServiceLifecycleCommands<'a> {
     }
 }
 
-/// Reduce per-volume `name@created_at` entries to a stable fingerprint. Order
-/// independent; empty input yields an empty fingerprint.
-fn compose_state_fingerprint(mut entries: Vec<String>) -> String {
-    if entries.is_empty() {
-        return String::new();
-    }
-    entries.sort();
-    entries.dedup();
-    format!(
-        "{:08x}",
-        crate::service::fnv1a_32(entries.join(";").as_bytes())
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fingerprint_empty_input_is_empty() {
-        assert_eq!(compose_state_fingerprint(vec![]), "");
-    }
-
-    #[test]
-    fn fingerprint_is_order_independent() {
-        let a = compose_state_fingerprint(vec!["v1@t1".into(), "v2@t2".into()]);
-        let b = compose_state_fingerprint(vec!["v2@t2".into(), "v1@t1".into()]);
-        assert_eq!(a, b);
-        assert!(!a.is_empty());
-    }
-
-    #[test]
-    fn fingerprint_changes_when_a_volume_is_recreated() {
-        let before = compose_state_fingerprint(vec!["pg@2026-01-01".into()]);
-        let after = compose_state_fingerprint(vec!["pg@2026-02-02".into()]);
-        assert_ne!(before, after);
-    }
 
     #[test]
     fn test_extract_named_volume_basic() {

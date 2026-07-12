@@ -248,35 +248,6 @@ impl DockerClient {
         mappings
     }
 
-    /// Names of the named volumes mounted into a container (bind mounts excluded).
-    pub async fn inspect_volume_names(&self, container: &str, timeout: Duration) -> Vec<String> {
-        let Ok(output) = self
-            .run(
-                &["inspect", "--format={{json .Mounts}}", container],
-                timeout,
-            )
-            .await
-        else {
-            return Vec::new();
-        };
-        if !output.status.success() {
-            return Vec::new();
-        }
-        let json_str = String::from_utf8_lossy(&output.stdout);
-        let Ok(mounts) = serde_json::from_str::<serde_json::Value>(&json_str) else {
-            return Vec::new();
-        };
-        mounts
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter(|m| m.get("Type").and_then(|t| t.as_str()) == Some("volume"))
-                    .filter_map(|m| m.get("Name").and_then(|n| n.as_str()).map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     /// List container names matching a filter.
     pub async fn ps_names(
         &self,
@@ -474,23 +445,6 @@ impl DockerClient {
     pub async fn volume_rm(&self, volume: &str) -> Result<Output, DockerError> {
         self.run(&["volume", "rm", "-f", volume], Duration::from_secs(10))
             .await
-    }
-
-    /// Creation timestamp of a named volume, or `None` if it does not exist.
-    /// A recreated volume reports a new timestamp even under the same name.
-    pub async fn volume_created_at(&self, volume: &str, timeout: Duration) -> Option<String> {
-        let output = self
-            .run(
-                &["volume", "inspect", "--format={{.CreatedAt}}", volume],
-                timeout,
-            )
-            .await
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let stamp = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        (!stamp.is_empty()).then_some(stamp)
     }
 
     // ========================================================================

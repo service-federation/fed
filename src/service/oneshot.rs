@@ -1,74 +1,61 @@
 use super::{ServiceManager, Status};
 use crate::config::Service as ServiceConfig;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use tokio::process::Command;
 
-/// Oneshot service manager (`run:`).
+/// Hook-only service manager — the oneshot node.
 ///
-/// Executes a shell command to completion during startup. There is no
-/// long-running process: exit 0 marks the node satisfied ([`Status::Completed`])
-/// and lets dependents proceed, while a non-zero exit is a startup error. The
-/// command re-runs on every `fed start`, so it must be idempotent
-/// (e.g. `prisma db push`).
+/// A hook-only service declares `install:` and/or `migrate:` but no
+/// process/image/gradle/compose field. Its actual work (the install/migrate
+/// hooks) is run by the orchestrator *before* this manager's [`start`] is
+/// called; the manager itself is a pure completion marker. There is no
+/// long-running process: once its hooks have run, [`start`] marks the node
+/// [`Status::Completed`] and its dependents may proceed.
+///
+/// The node "re-runs" on every `fed start` because managers are rebuilt fresh
+/// each invocation — `has_run` is `false` at the start of every startup — and
+/// `migrate:` is executed unconditionally by the orchestrator each time.
+///
+/// [`start`]: OneshotService::start
 pub struct OneshotService {
     name: String,
-    /// The resolved `run:` command.
-    run_command: String,
-    /// Absolute working directory the command runs in.
-    cwd: PathBuf,
-    /// Resolved environment for the command.
-    environment: HashMap<String, String>,
     status: Status,
-    /// Whether the `run:` command executed successfully in THIS `fed` process.
+    /// Whether this node already completed in THIS `fed` process.
     ///
     /// Managers are rebuilt fresh each `fed` invocation, so this is `false` at
-    /// the start of every `fed start`/`fed restart` — the oneshot runs every
-    /// invocation. Within a single startup it is the concurrency-dedup signal:
-    /// a second dependent that reaches a shared oneshot sees `has_run` and skips
-    /// re-executing (it only gets here after the first execution finished).
+    /// the start of every `fed start`/`fed restart`. Within a single startup it
+    /// is the concurrency-dedup signal: a second dependent that reaches a shared
+    /// hook-only node sees `has_run` and skips re-running its hooks (it only
+    /// gets here after the first execution finished).
     has_run: bool,
 }
 
 impl OneshotService {
+    /// Create a hook-only node manager. `config`/`environment`/`work_dir` are
+    /// accepted for a uniform factory signature but unused: the node runs no
+    /// process of its own — its hooks are executed by the orchestrator.
     pub fn new(
         name: String,
-        config: ServiceConfig,
-        environment: HashMap<String, String>,
-        work_dir: String,
+        _config: ServiceConfig,
+        _environment: HashMap<String, String>,
+        _work_dir: String,
     ) -> Self {
-        let cwd = match config.cwd {
-            Some(ref c) => {
-                let p = Path::new(c);
-                if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    Path::new(&work_dir).join(c)
-                }
-            }
-            None => PathBuf::from(&work_dir),
-        };
         Self {
-            run_command: config.run.clone().unwrap_or_default(),
             name,
-            cwd,
-            environment,
             status: Status::Stopped,
             has_run: false,
         }
     }
 
-    /// Whether the `run:` command already executed successfully this session.
+    /// Whether this node already completed this session.
     pub fn has_run(&self) -> bool {
         self.has_run
     }
 
     /// Restore a persisted status for display (e.g. `Completed` from a previous
     /// session's state tracker). Deliberately does NOT set `has_run`, so the
-    /// oneshot still re-runs on the next `fed start`.
+    /// node's hooks still re-run on the next `fed start`.
     pub fn restore_status(&mut self, status: Status) {
         self.status = status;
     }
@@ -77,57 +64,20 @@ impl OneshotService {
 #[async_trait]
 impl ServiceManager for OneshotService {
     async fn start(&mut self) -> Result<()> {
-        self.status = Status::Starting;
-        tracing::info!(
-            "Running oneshot command for service '{}': {}",
-            self.name,
-            self.run_command
-        );
-
-        // Stream output like install/migrate commands do (inherit stdio).
-        let result = Command::new("sh")
-            .arg("-ec")
-            .arg(&self.run_command)
-            .current_dir(&self.cwd)
-            .envs(&self.environment)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .await;
-
-        let exit = match result {
-            Ok(exit) => exit,
-            Err(e) => {
-                self.status = Status::Failing;
-                return Err(Error::Process(format!(
-                    "Failed to execute run command for oneshot service '{}': {}",
-                    self.name, e
-                )));
-            }
-        };
-
-        if !exit.success() {
-            self.status = Status::Failing;
-            let code = exit
-                .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "signal".to_string());
-            return Err(Error::Process(format!(
-                "Oneshot service '{}' run command failed (exit {})",
-                self.name, code
-            )));
-        }
-
+        // A hook-only node runs no process of its own. Its install/migrate hooks
+        // were already executed by the orchestrator before this point, so start
+        // is simply the completion signal that lets dependents proceed. A hook
+        // failure surfaces earlier (from the orchestrator's install/migrate
+        // step) and aborts the start before we get here.
         self.status = Status::Completed;
         self.has_run = true;
-        tracing::info!("Oneshot service '{}' completed", self.name);
+        tracing::info!("Hook-only service '{}' completed", self.name);
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<()> {
-        // Nothing to kill — a oneshot has no running process. Stopping clears the
-        // completion so a subsequent start re-runs it.
+        // Nothing to kill — a hook-only node has no running process. Stopping
+        // clears the completion so a subsequent start re-runs its hooks.
         self.status = Status::Stopped;
         self.has_run = false;
         Ok(())
@@ -160,50 +110,35 @@ impl ServiceManager for OneshotService {
 mod tests {
     use super::*;
 
-    fn oneshot(name: &str, run: &str, dir: &std::path::Path) -> OneshotService {
-        let config = ServiceConfig {
-            run: Some(run.to_string()),
-            ..Default::default()
-        };
+    // A hook-only node has no run command of its own — its hooks are executed by
+    // the orchestrator. The manager only tracks completion. (Hook-failure naming
+    // is covered end-to-end by tests/oneshot_test.rs, where a failing `migrate:`
+    // aborts `fed start` naming the node.)
+    fn hook_node(name: &str) -> OneshotService {
         OneshotService::new(
             name.to_string(),
-            config,
+            ServiceConfig::default(),
             HashMap::new(),
-            dir.to_string_lossy().to_string(),
+            "/tmp".to_string(),
         )
     }
 
     #[tokio::test]
     async fn completes_and_marks_has_run() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("ran");
-        let mut svc = oneshot("schema", &format!("touch {}", marker.display()), dir.path());
+        let mut svc = hook_node("schema");
 
         assert_eq!(svc.status(), Status::Stopped);
         assert!(!svc.has_run());
 
-        svc.start().await.expect("oneshot should succeed");
+        svc.start().await.expect("hook-only node should complete");
 
         assert_eq!(svc.status(), Status::Completed);
         assert!(svc.has_run());
-        assert!(marker.exists(), "run command should have executed");
-    }
-
-    #[tokio::test]
-    async fn failing_run_returns_error_naming_service() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut svc = oneshot("migrate", "exit 3", dir.path());
-
-        let err = svc.start().await.expect_err("non-zero exit is an error");
-        assert!(err.to_string().contains("migrate"));
-        assert_eq!(svc.status(), Status::Failing);
-        assert!(!svc.has_run());
     }
 
     #[tokio::test]
     async fn stop_is_a_clean_noop_that_clears_completion() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut svc = oneshot("schema", "true", dir.path());
+        let mut svc = hook_node("schema");
         svc.start().await.unwrap();
         assert!(svc.has_run());
 
@@ -214,8 +149,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_status_does_not_set_has_run() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut svc = oneshot("schema", "true", dir.path());
+        let mut svc = hook_node("schema");
         svc.restore_status(Status::Completed);
         assert_eq!(svc.status(), Status::Completed);
         assert!(

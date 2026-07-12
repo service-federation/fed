@@ -78,9 +78,19 @@ impl Config {
 
         // Validate each service has exactly one type
         for (name, service) in &self.services {
+            // `run:` was removed in fed 6.0. Reject it before any type check so
+            // the user gets actionable migration guidance instead of a generic
+            // "no type defined" error (a lone `run:` is otherwise Undefined now).
+            if service.run.is_some() {
+                return Err(Error::Validation(format!(
+                    "Service '{}': run: was removed in 6.0 — declare migrate: (and optionally install:) on a service with no process instead; it runs to completion on every start and gates dependents.",
+                    name
+                )));
+            }
+
             if service.service_type() == ServiceType::Undefined {
                 return Err(Error::Validation(format!(
-                    "Service '{}' has no type defined. Add one of: process, image, gradle_task, run, or compose_file + compose_service",
+                    "Service '{}' has no type defined. Add one of: process, image, gradle_task, compose_file + compose_service, or make it a hook-only node with install and/or migrate.",
                     name
                 )));
             }
@@ -90,7 +100,6 @@ impl Config {
                 service.process.as_ref().map(|_| "process"),
                 service.image.as_ref().map(|_| "image"),
                 service.gradle_task.as_ref().map(|_| "gradle_task"),
-                service.run.as_ref().map(|_| "run"),
                 service
                     .compose_file
                     .as_ref()
@@ -109,18 +118,20 @@ impl Config {
                 )));
             }
 
-            // A oneshot (`run:`) completes to signal readiness, so a healthcheck
-            // or restart policy is contradictory — reject both.
-            if service.run.is_some() {
+            // A hook-only node completes to signal readiness, so a healthcheck
+            // or restart policy is contradictory — reject both. (A process/image
+            // service with install/migrate is a normal service, not hook-only,
+            // and may have either.)
+            if service.service_type().is_hook_only() {
                 if service.healthcheck.is_some() {
                     return Err(Error::Validation(format!(
-                        "Oneshot service '{}' cannot have a `healthcheck` — completion of the `run:` command IS its readiness signal. Remove the healthcheck.",
+                        "Hook-only service '{}' cannot have a `healthcheck` — completion of its install/migrate hooks IS its readiness signal. Remove the healthcheck.",
                         name
                     )));
                 }
                 if service.restart.is_some() {
                     return Err(Error::Validation(format!(
-                        "Oneshot service '{}' cannot have a `restart` policy — a `run:` command runs once to completion, it is never restarted. Remove the restart policy.",
+                        "Hook-only service '{}' cannot have a `restart` policy — its hooks run once to completion, they are never restarted. Remove the restart policy.",
                         name
                     )));
                 }

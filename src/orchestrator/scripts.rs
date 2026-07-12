@@ -345,11 +345,11 @@ impl<'a> ScriptRunner<'a> {
         // Enable randomize mode for port isolation — NoopPortStore forces fresh allocation
         child_orchestrator.set_randomize_ports(true);
 
-        // Install/migrate markers are scoped by `(work_dir, isolation_id)`, so the
-        // child's isolation_id gives it a fresh, empty marker namespace automatically.
-        // No clearing is needed: the parent's shared-scope markers stay intact, and
-        // `run_migrate_if_needed` against the child sees an empty scope and correctly
-        // runs migrations against the fresh isolated containers.
+        // Install markers are scoped by `(work_dir, isolation_id)`, so the
+        // child's isolation_id gives it a fresh, empty marker namespace
+        // automatically — install re-runs against the fresh isolated containers.
+        // No clearing is needed: the parent's shared-scope markers stay intact.
+        // (migrate has no marker in fed 6.0 — it re-runs on every start.)
 
         // Bring up the isolated stack and run the script under the interrupt
         // guard. Everything here only borrows `child_orchestrator`.
@@ -439,7 +439,6 @@ impl<'a> ScriptRunner<'a> {
             Some(isolation_id),
         );
         let _ = child_markers.clear_all_installed();
-        let _ = child_markers.clear_all_migrated();
 
         result
     }
