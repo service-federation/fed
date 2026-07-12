@@ -1727,21 +1727,24 @@ scripts:
 // ============================================================================
 
 /// Regression test: when a script runs with `isolated: true`, the child
-/// orchestrator's install/migrate marker namespace must be scoped by its own
+/// orchestrator's install marker namespace must be scoped by its own
 /// `isolation_id` — so it can't observe (or mutate) the parent's shared-scope
 /// markers.
 ///
-/// Before the fix, markers were keyed only by work_dir hash. That meant
-/// `run_migrate_if_needed` inside an isolated child would see stale "already
-/// migrated" markers left by a previous non-isolated `fed start` against the
-/// same work_dir and skip migrations — silently breaking runs against the
-/// fresh empty databases in the isolated containers.
+/// Before the fix, markers were keyed only by work_dir hash. That meant an
+/// isolated child would see stale "already installed" markers left by a
+/// previous non-isolated `fed start` against the same work_dir and skip
+/// install — silently breaking runs against the fresh isolated containers.
 ///
 /// The fix is structural: shared-scope markers live under
 /// `~/.fed/installed/<hash>/`, isolated-scope markers live under
 /// `~/.fed/isolated/installed/<hash>/<isolation_id>/`. The two trees are
 /// disjoint, so parent markers can't affect the child's view and clearing
 /// one scope can never wipe the other.
+///
+/// (Converted for fed 6.0: `migrate:` no longer writes markers — it re-runs on
+/// every start — so this now only exercises the install-marker scoping, which
+/// retains the disjoint-scope contract.)
 #[tokio::test]
 async fn test_isolated_script_marker_scope_is_disjoint_from_parent() {
     let temp_dir = tempdir().expect("Failed to create temp dir");
@@ -1784,13 +1787,9 @@ services:
 
     shared.mark_installed(svc_a).expect("seed install a");
     shared.mark_installed(svc_b).expect("seed install b");
-    shared.mark_migrated(svc_a, "fp").expect("seed migrate a");
-    shared.mark_migrated(svc_b, "fp").expect("seed migrate b");
 
     assert!(shared.is_installed(svc_a).unwrap());
     assert!(shared.is_installed(svc_b).unwrap());
-    assert!(shared.is_migrated(svc_a).unwrap());
-    assert!(shared.is_migrated(svc_b).unwrap());
 
     // Run the isolated script. The child orchestrator gets its own
     // isolation_id → its own empty marker namespace; it never touches the
@@ -1802,9 +1801,9 @@ services:
     assert!(status.success(), "Isolated script should succeed");
 
     // The shared-scope markers seeded above must still be present. Before
-    // the fix these were wiped by `clear_all_installed/migrated` inside
+    // the fix these were wiped by `clear_all_installed` inside
     // `run_script_isolated`, which broke any subsequent non-isolated
-    // `fed start` by re-running install/migrate unnecessarily (and, worse,
+    // `fed start` by re-running install unnecessarily (and, worse,
     // stomped on a concurrent non-isolated `fed start`'s marker state).
     assert!(
         shared.is_installed(svc_a).unwrap(),
@@ -1816,23 +1815,11 @@ services:
         "shared-scope install marker for {} must survive an isolated script run",
         svc_b
     );
-    assert!(
-        shared.is_migrated(svc_a).unwrap(),
-        "shared-scope migrate marker for {} must survive an isolated script run",
-        svc_a
-    );
-    assert!(
-        shared.is_migrated(svc_b).unwrap(),
-        "shared-scope migrate marker for {} must survive an isolated script run",
-        svc_b
-    );
 
     // Cleanup the test's shared-scope markers (they live in the user's
     // global `~/.fed/installed/<hash>/` keyed by temp_dir path hash).
     let _ = shared.clear_installed(svc_a);
     let _ = shared.clear_installed(svc_b);
-    let _ = shared.clear_migrated(svc_a);
-    let _ = shared.clear_migrated(svc_b);
 
     orchestrator.cleanup().await;
 }

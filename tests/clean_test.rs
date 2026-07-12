@@ -328,50 +328,54 @@ services:
     );
 }
 
-/// Regression: `fed clean` (no args) must clear migrate markers for ALL
+/// Regression: `fed clean` (no args) must clear install markers for ALL
 /// services in the workspace, not just services that appear in
 /// `services_to_clean` (those with `clean:` or `volumes:`).
 ///
-/// The bug this catches: a Rust service whose `migrate:` step creates a
-/// database in a sibling postgres has its marker stranded when postgres's
-/// volumes are wiped — Fed thinks "already migrated" on next start but
-/// the database is gone, so the service crashes with "database does not
-/// exist". Full `fed clean` is the "wipe everything" operation; migrate
-/// markers must follow.
+/// The bug this catches: a service whose `install:` step populated
+/// `node_modules` has its marker stranded when a full clean wipes the
+/// workspace — Fed thinks "already installed" on the next start but the
+/// artifacts are gone. Full `fed clean` is the "wipe everything" operation;
+/// install markers must follow.
+///
+/// (Converted for fed 6.0: `migrate:` no longer writes markers — it re-runs on
+/// every start — so `fed clean` now clears install state only. This test keeps
+/// the "unlisted services are still cleared" coverage, now on install markers.)
 #[test]
-fn test_clean_clears_migrate_markers_for_unlisted_services() {
+fn test_clean_clears_install_markers_for_unlisted_services() {
     let config_content = r#"
 services:
   cleanable:
     process: "echo running"
+    install: "true"
     clean: "true"
-  migrate-only:
+  install-only:
     process: "echo running"
-    migrate: "true"
+    install: "true"
 "#;
 
     let (temp_dir, config_path) = create_clean_test_config(config_content);
     let workdir = temp_dir.path().to_path_buf();
     let markers = fed::markers::LifecycleMarkers::new(workdir.clone(), None);
 
-    // Simulate prior migration of both services. Only `cleanable` would
+    // Simulate prior installs of both services. Only `cleanable` would
     // get its marker cleared by per-service clean (it's in the loop).
-    // `migrate-only` has neither `clean:` nor `volumes:`, so it would
+    // `install-only` has neither `clean:` nor `volumes:`, so it would
     // never be touched without the full-clean fix.
     markers
-        .mark_migrated("cleanable", "fp")
+        .mark_installed("cleanable")
         .expect("seed cleanable marker");
     markers
-        .mark_migrated("migrate-only", "fp")
-        .expect("seed migrate-only marker");
+        .mark_installed("install-only")
+        .expect("seed install-only marker");
 
     assert!(
-        markers.is_migrated("cleanable").unwrap(),
-        "precondition: cleanable should be marked migrated"
+        markers.is_installed("cleanable").unwrap(),
+        "precondition: cleanable should be marked installed"
     );
     assert!(
-        markers.is_migrated("migrate-only").unwrap(),
-        "precondition: migrate-only should be marked migrated"
+        markers.is_installed("install-only").unwrap(),
+        "precondition: install-only should be marked installed"
     );
 
     let clean_out = Command::new(fed_binary())
@@ -392,12 +396,12 @@ services:
     );
 
     assert!(
-        !markers.is_migrated("cleanable").unwrap(),
-        "cleanable's migrate marker should be cleared (covered by per-service clean)"
+        !markers.is_installed("cleanable").unwrap(),
+        "cleanable's install marker should be cleared (covered by per-service clean)"
     );
     assert!(
-        !markers.is_migrated("migrate-only").unwrap(),
-        "migrate-only's marker should be cleared by full `fed clean` even \
+        !markers.is_installed("install-only").unwrap(),
+        "install-only's marker should be cleared by full `fed clean` even \
          though it has no clean/volumes — this is the regression"
     );
 }
