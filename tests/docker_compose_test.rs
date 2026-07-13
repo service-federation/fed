@@ -87,7 +87,7 @@ async fn docker_compose_available() -> bool {
 }
 
 #[tokio::test]
-#[ignore] // Run with --ignored flag, requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_file_not_found() {
     let yaml = r#"
 services:
@@ -113,7 +113,7 @@ services:
 }
 
 #[tokio::test]
-#[ignore] // Run with --ignored flag, requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_service_not_found() {
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
@@ -150,7 +150,7 @@ services:
 }
 
 #[tokio::test]
-#[ignore] // Run with --ignored flag, requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_basic_lifecycle() {
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
@@ -208,7 +208,7 @@ services:
 }
 
 #[tokio::test]
-#[ignore] // Run with --ignored flag, requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_environment_override() {
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
@@ -263,7 +263,7 @@ services:
 }
 
 #[tokio::test]
-#[ignore] // Run with --ignored flag, requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_with_process_dependency() {
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
@@ -328,7 +328,7 @@ services:
 }
 
 #[tokio::test]
-#[ignore] // Run with --ignored flag, requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_project_isolation() {
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
@@ -420,7 +420,7 @@ services:
 }
 
 #[tokio::test]
-#[ignore] // Run with --ignored flag, requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_idempotent_start() {
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
@@ -463,7 +463,7 @@ services:
 }
 
 #[tokio::test]
-#[ignore] // Run with --ignored flag, requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_health_check() {
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
@@ -512,7 +512,7 @@ services:
 }
 
 #[tokio::test]
-#[ignore] // Run with --ignored flag, requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_port_conflict() {
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
@@ -570,7 +570,7 @@ services:
 }
 
 #[tokio::test]
-#[ignore] // Requires Docker, tests cleanup behavior
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker, tests cleanup behavior
 async fn test_compose_process_cleanup() {
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");

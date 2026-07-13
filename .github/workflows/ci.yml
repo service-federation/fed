@@ -69,6 +69,31 @@ jobs:
       - name: Run demo project end-to-end
         run: FED="$PWD/target/debug/fed" examples/ci-demo/run-e2e.sh
 
+  docker-tests:
+    name: Docker integration tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # ubuntu-latest ships a working Docker daemon; the 32 container-backed tests are
+      # #[ignore]d without this feature (kept off local `cargo test`) and run here.
+      - name: Run Docker-backed integration tests
+        run: cargo test --features docker-tests
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

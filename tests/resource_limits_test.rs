@@ -43,7 +43,7 @@ fn cleanup_docker_container(container_name: &str) {
 }
 
 #[test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 fn test_docker_memory_limit_in_command() {
     require_docker!();
 
@@ -82,7 +82,7 @@ services:
 }
 
 #[test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 fn test_docker_cpu_limit_in_command() {
     require_docker!();
 
@@ -115,7 +115,7 @@ services:
 }
 
 #[test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 fn test_docker_multiple_resource_limits() {
     require_docker!();
 
@@ -152,7 +152,7 @@ services:
 }
 
 #[test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 fn test_docker_memory_swap_limit() {
     require_docker!();
 

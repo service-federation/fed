@@ -17,6 +17,14 @@ rust-version = "1.80"
 name = "fed"
 path = "src/main.rs"
 
+[features]
+# Docker-backed integration tests are gated OFF by default so `cargo test` stays fast and
+# never spins containers on a dev's — or a coding agent's — machine. CI runs them with
+# `cargo test --features docker-tests`. The tests carry
+# `#[cfg_attr(not(feature = "docker-tests"), ignore)]`, so without the feature they're
+# skipped, and with it they run.
+docker-tests = []
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.40", features = ["rt-multi-thread", "process", "sync", "signal", "time", "io-util", "macros", "fs"] }

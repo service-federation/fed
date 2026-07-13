@@ -1247,7 +1247,7 @@ fn is_docker_available() -> bool {
 /// Test that Docker containers are cleaned up after isolated script completes
 /// This is critical because Docker containers persist outside the process lifecycle
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_isolated_docker_container_cleanup() {
     if !is_docker_available() {
         eprintln!("Skipping test: Docker not available");

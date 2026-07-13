@@ -75,7 +75,7 @@ async fn cleanup_container(name: &str) {
 // ============================================================================
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_basic_lifecycle() {
     require_docker!();
 
@@ -131,7 +131,7 @@ async fn test_docker_service_basic_lifecycle() {
 }
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_start_idempotent() {
     require_docker!();
 
@@ -155,7 +155,7 @@ async fn test_docker_service_start_idempotent() {
 }
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_kill() {
     require_docker!();
 
@@ -188,7 +188,7 @@ async fn test_docker_service_kill() {
 }
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_logs_retrieval() {
     require_docker!();
 
@@ -230,7 +230,7 @@ async fn test_docker_service_logs_retrieval() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_invalid_image() {
     let mut service = create_test_service(
         "test-invalid-image",
@@ -245,7 +245,7 @@ async fn test_docker_service_invalid_image() {
 }
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_invalid_volume() {
     let config = ServiceConfig {
         image: Some("nginx:alpine".to_string()),
@@ -271,7 +271,7 @@ async fn test_docker_service_invalid_volume() {
 }
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_invalid_port() {
     let config = ServiceConfig {
         image: Some("nginx:alpine".to_string()),
@@ -298,7 +298,7 @@ async fn test_docker_service_invalid_port() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_health_check_after_external_removal() {
     require_docker!();
 
@@ -331,7 +331,7 @@ async fn test_docker_service_health_check_after_external_removal() {
 }
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_logs_after_removal() {
     require_docker!();
 
@@ -356,7 +356,7 @@ async fn test_docker_service_logs_after_removal() {
 }
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_orphan_cleanup() {
     require_docker!();
 
@@ -386,7 +386,7 @@ async fn test_docker_service_orphan_cleanup() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_container_name_format() {
     require_docker!();
 
@@ -417,7 +417,7 @@ async fn test_docker_service_container_name_format() {
 }
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_container_labels() {
     require_docker!();
 
@@ -452,7 +452,7 @@ async fn test_docker_service_container_labels() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_environment_variables() {
     require_docker!();
 
@@ -488,7 +488,7 @@ async fn test_docker_service_environment_variables() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_stop_idempotent() {
     require_docker!();
 
@@ -511,7 +511,7 @@ async fn test_docker_service_stop_idempotent() {
 }
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_kill_already_stopped() {
     require_docker!();
 
@@ -538,7 +538,7 @@ async fn test_docker_service_kill_already_stopped() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_stop_succeeds_when_container_removed() {
     require_docker!();
 
@@ -572,7 +572,7 @@ async fn test_stop_succeeds_when_container_removed() {
 }
 
 #[tokio::test]
-#[ignore] // Requires Docker
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_stop_retries_on_transient_failure() {
     require_docker!();
 
