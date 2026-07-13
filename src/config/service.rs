@@ -176,6 +176,53 @@ pub struct Service {
     /// Template string printed after all services start (supports `{{PARAM}}` syntax).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_message: Option<String>,
+
+    /// Unknown keys captured for a non-breaking typo warning at validate/start time.
+    /// fed keeps parsing permissive — an unrecognized service key is a warning (with a
+    /// "did you mean?" hint), never a hard error. serde routes only genuinely-unknown keys
+    /// here, so recognized fields are unaffected; an empty map serializes to nothing.
+    #[serde(flatten)]
+    pub unknown_fields: std::collections::BTreeMap<String, serde_yaml::Value>,
+}
+
+impl Service {
+    /// Recognized YAML keys of a service definition (with serde renames). Used only to
+    /// produce "did you mean?" suggestions for unknown keys — never for parsing.
+    pub const fn known_field_names() -> &'static [&'static str] {
+        &[
+            "extends",
+            "cwd",
+            "install",
+            "migrate",
+            "clean",
+            "build",
+            "process",
+            "run",
+            "image",
+            "command",
+            "volumes",
+            "ports",
+            "dependency",
+            "service",
+            "parameters",
+            "gradleTask",
+            "composeFile",
+            "composeService",
+            "environment",
+            "healthcheck",
+            "depends_on",
+            "restart",
+            "expose",
+            "profiles",
+            "tags",
+            "watch",
+            "resources",
+            "grace_period",
+            "startup_timeout",
+            "circuit_breaker",
+            "startup_message",
+        ]
+    }
 }
 
 fn is_false(b: &bool) -> bool {

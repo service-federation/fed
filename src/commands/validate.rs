@@ -27,6 +27,8 @@ pub fn run_validate(config_path: Option<PathBuf>, out: &dyn UserOutput) -> anyho
 
     out.success("Configuration is valid\n");
 
+    crate::commands::emit_config_warnings(&config, out);
+
     // Show summary
     out.status(&format!("Services: {}", config.services.len()));
     for (name, service) in &config.services {

@@ -71,6 +71,20 @@ pub struct Config {
     /// Prepended to `env_file` at runtime so user env_files can override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_secrets_file: Option<String>,
+
+    /// Unknown top-level keys captured for a non-breaking typo warning (e.g. `service:`
+    /// where `services:` was meant). serde routes only genuinely-unknown keys here, so
+    /// recognized fields — including the `variables`/`run` legacy captures — are unaffected.
+    #[serde(flatten)]
+    pub unknown_fields: std::collections::BTreeMap<String, serde_yaml::Value>,
+}
+
+/// A single unrecognized config key, with the candidate names to suggest. Non-fatal:
+/// surfaced as a warning at validate/start time (fed keeps parsing permissive).
+pub struct UnknownKey {
+    pub location: String,
+    pub key: String,
+    pub candidates: &'static [&'static str],
 }
 
 impl Config {
@@ -82,6 +96,50 @@ impl Config {
     /// Mutable access to the parameters declared for this config.
     pub fn get_effective_parameters_mut(&mut self) -> &mut HashMap<String, Parameter> {
         &mut self.parameters
+    }
+
+    /// Recognized top-level YAML keys, used only for "did you mean?" suggestions.
+    pub const fn known_top_level_keys() -> &'static [&'static str] {
+        &[
+            "parameters",
+            "variables",
+            "services",
+            "templates",
+            "dependencies",
+            "entrypoint",
+            "entrypoints",
+            "scripts",
+            "packages",
+            "metadata",
+            "env_file",
+            "generated_secrets_file",
+        ]
+    }
+
+    /// Non-fatal warnings for unknown keys (typos) at the top level and in each service.
+    /// fed keeps parsing permissive — these are captured, not rejected — so callers surface
+    /// them as warnings at validate/start time. Deterministically ordered.
+    pub fn unknown_key_warnings(&self) -> Vec<UnknownKey> {
+        let mut out = Vec::new();
+        for key in self.unknown_fields.keys() {
+            out.push(UnknownKey {
+                location: "top level".to_string(),
+                key: key.clone(),
+                candidates: Self::known_top_level_keys(),
+            });
+        }
+        let mut services: Vec<_> = self.services.iter().collect();
+        services.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, service) in services {
+            for key in service.unknown_fields.keys() {
+                out.push(UnknownKey {
+                    location: format!("service '{name}'"),
+                    key: key.clone(),
+                    candidates: Service::known_field_names(),
+                });
+            }
+        }
+        out
     }
 
     /// Expand service names and tag references to a list of services.

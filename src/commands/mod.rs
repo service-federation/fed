@@ -50,3 +50,17 @@ pub use top::run_top;
 pub use tui::run_tui;
 pub use validate::run_validate;
 pub use workspace::run_workspace;
+
+/// Emit non-breaking warnings for unknown (typo'd) config keys — used by `fed validate`
+/// and `fed start`. fed keeps parsing permissive: a mistyped key is a warning with a
+/// "did you mean?" hint, not a hard error.
+pub fn emit_config_warnings(config: &fed::Config, out: &dyn crate::output::UserOutput) {
+    for w in config.unknown_key_warnings() {
+        let msg = format!("{}: unknown field '{}'", w.location, w.key);
+        out.warning(&suggest::with_did_you_mean(
+            &msg,
+            &w.key,
+            w.candidates.iter().copied(),
+        ));
+    }
+}

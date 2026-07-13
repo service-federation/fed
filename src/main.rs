@@ -319,6 +319,11 @@ async fn run() -> anyhow::Result<()> {
         (_, Ok(config)) => config,
     };
 
+    // Non-breaking: warn on unknown (typo'd) config keys before starting.
+    if matches!(cli.command, Commands::Start { .. }) {
+        commands::emit_config_warnings(&config, &out);
+    }
+
     let work_dir = resolve_work_dir(cli.workdir.clone(), &config_path)?;
 
     // ── Tier 3: Commands that need orchestrator ─────────────────────
