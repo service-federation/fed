@@ -18,8 +18,14 @@ pub struct SecretAnalysis {
     pub is_gitignored: bool,
     /// Whether we're inside a git repository at all.
     pub in_git_repo: bool,
-    /// Existing values already loaded from .env.
+    /// Existing values already loaded from .env (generated secrets file and
+    /// user env_files — NOT the vault cache).
     pub existing_values: HashMap<String, String>,
+    /// Values from the vault cache (`.fed/secrets.cache.env`), filtered to
+    /// currently-declared secret parameter names. These do NOT count as
+    /// present: when online the vault is authoritative and is re-queried;
+    /// the cache satisfies secrets only when the vault is unreachable.
+    pub cache_values: HashMap<String, String>,
 }
 
 /// Check if a path is gitignored in the enclosing repository.
@@ -84,8 +90,9 @@ pub fn path_git_status(path: &Path) -> (bool, bool) {
 /// `secrets_file` is the absolute path to the file where generated secrets are
 /// stored (the deprecated `generated_secrets_file` if configured, otherwise
 /// `.fed/secrets.generated.env`). `cache_file` is the absolute path to the
-/// vault secrets cache (`.fed/secrets.cache.env`); values cached there count
-/// as present, which is what keeps `--offline` working.
+/// vault secrets cache (`.fed/secrets.cache.env`); its values are reported
+/// separately in `cache_values` and do not count as present — the vault stays
+/// authoritative when reachable, the cache covers `--offline`.
 ///
 /// Returns `None` if no secret parameters exist.
 pub fn analyze_secrets(
@@ -108,14 +115,13 @@ pub fn analyze_secrets(
 
     let env_path = secrets_file.to_path_buf();
 
-    // Load existing values: vault cache first (lowest priority), then the
-    // generated secrets file, then all env_files. Later loads override earlier
-    // ones, matching runtime priority where fed's own files are prepended to
-    // env_file = loaded first = lowest priority.
-    let mut existing_values = load_existing_env(cache_file);
-    for (k, v) in load_existing_env(secrets_file) {
-        existing_values.insert(k, v);
-    }
+    // Load existing values: the generated secrets file, then all env_files.
+    // Later loads override earlier ones, matching runtime priority where fed's
+    // own files are prepended to env_file = loaded first = lowest priority.
+    // The vault cache is deliberately NOT merged here — cached values must not
+    // shadow the vault (rotated secrets would never be re-fetched); it is
+    // loaded separately and only consulted when the vault can't be.
+    let mut existing_values = load_existing_env(secrets_file);
     for env_file in &config.env_file {
         let expanded = super::expand_tilde(Path::new(env_file));
         let ef_path = if expanded.is_absolute() {
@@ -127,6 +133,12 @@ pub fn analyze_secrets(
             existing_values.insert(k, v);
         }
     }
+
+    // Vault cache, filtered to declared secret names — stale keys left over
+    // from config changes are ignored (and pruned on the next cache write).
+    let declared: HashSet<&str> = secret_params.iter().map(|(n, _)| n.as_str()).collect();
+    let mut cache_values = load_existing_env(cache_file);
+    cache_values.retain(|k, _| declared.contains(k.as_str()));
 
     // Git status of the secrets file itself (it may be an absolute path
     // outside this work dir's repository, or outside any repository).
@@ -161,6 +173,7 @@ pub fn analyze_secrets(
         is_gitignored,
         in_git_repo,
         existing_values,
+        cache_values,
     }))
 }
 
@@ -222,25 +235,39 @@ pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Res
         return Ok(());
     }
 
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).truncate(false).read(true).write(true);
+    // 0600 atomically at creation — no window where the file is world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts
         .open(path)
         .map_err(|e| Error::Filesystem(format!("Cannot write '{}': {}", path.display(), e)))?;
 
     file.lock_exclusive()
         .map_err(|e| Error::Filesystem(format!("Cannot lock '{}': {}", path.display(), e)))?;
 
-    // Secrets file is 0600: readable by the owner only.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
+    // Pre-existing files: tighten to 0600 via the held handle (fchmod — no
+    // path race) and surface failures instead of silently leaving it open.
+    ensure_owner_only(&file, path)?;
 
-    let existing = load_existing_env(path);
+    // Read the current contents through the locked handle, never by pathname.
+    let content = {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = &file;
+        f.seek(SeekFrom::Start(0))
+            .map_err(|e| Error::Filesystem(format!("Seek error: {}", e)))?;
+        let mut s = String::new();
+        f.read_to_string(&mut s)
+            .map_err(|e| Error::Filesystem(format!("Read error: {}", e)))?;
+        s
+    };
+    let existing: HashMap<String, String> = dotenvy::from_read_iter(content.as_bytes())
+        .filter_map(|r| r.ok())
+        .collect();
     let generated_map: HashMap<&str, &str> = generated_values
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -253,9 +280,6 @@ pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Res
 
     if needs_rewrite {
         // Rewrite the entire file: update changed values, keep others.
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| Error::Filesystem(format!("Read error: {}", e)))?;
-
         let mut output = String::new();
         let mut written_keys: HashSet<&str> = HashSet::new();
 
@@ -282,8 +306,18 @@ pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Res
             }
         }
 
-        std::fs::write(path, output)
-            .map_err(|e| Error::Filesystem(format!("Write error: {}", e)))?;
+        // Write through the held (locked) handle — reopening by pathname would
+        // race against path swaps/symlinks between lock and write.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = &file;
+            f.seek(SeekFrom::Start(0))
+                .map_err(|e| Error::Filesystem(format!("Seek error: {}", e)))?;
+            file.set_len(0)
+                .map_err(|e| Error::Filesystem(format!("Truncate error: {}", e)))?;
+            f.write_all(output.as_bytes())
+                .map_err(|e| Error::Filesystem(format!("Write error: {}", e)))?;
+        }
     } else {
         // Simple append — no existing keys need updating.
         let new_keys: Vec<&(String, String)> = generated_values
@@ -318,6 +352,65 @@ pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Res
         }
     }
 
+    Ok(())
+}
+
+/// Tighten a secrets file to owner-only permissions via its open handle.
+fn ensure_owner_only(file: &std::fs::File, path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = file
+            .metadata()
+            .map_err(|e| Error::Filesystem(format!("Cannot stat '{}': {}", path.display(), e)))?;
+        if meta.permissions().mode() & 0o177 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| {
+                    Error::Filesystem(format!("Cannot chmod '{}': {}", path.display(), e))
+                })?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (file, path);
+    Ok(())
+}
+
+/// Replace the vault secrets cache wholesale (owner-only, sorted keys).
+///
+/// The cache is fed-managed state, so unlike `write_env_file` this does not
+/// merge: entries absent from `entries` are pruned (stale keys from config
+/// changes, vault misses on rotation). An empty map removes the file.
+pub fn write_cache_file(path: &Path, entries: &HashMap<String, String>) -> Result<()> {
+    if entries.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|e| {
+                Error::Filesystem(format!("Cannot remove '{}': {}", path.display(), e))
+            })?;
+        }
+        return Ok(());
+    }
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(path)
+        .map_err(|e| Error::Filesystem(format!("Cannot write '{}': {}", path.display(), e)))?;
+    ensure_owner_only(&file, path)?;
+
+    let mut out = String::from("# Vault secrets cache — managed by fed, do not commit\n");
+    let mut keys: Vec<&String> = entries.keys().collect();
+    keys.sort();
+    for key in keys {
+        out.push_str(&format!("{key}={}\n", encode_env_value(&entries[key])));
+    }
+    use std::io::Write;
+    file.write_all(out.as_bytes())
+        .map_err(|e| Error::Filesystem(format!("Write error: {}", e)))?;
     Ok(())
 }
 
@@ -556,10 +649,17 @@ mod tests {
     }
 
     #[test]
-    fn analyze_counts_cached_values_as_present() {
+    fn analyze_reports_cache_separately_and_still_missing() {
+        // Cached values must NOT count as present — the vault stays
+        // authoritative when online — but they are surfaced in cache_values
+        // (filtered to declared names) for offline fallback.
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("secrets.cache.env");
-        std::fs::write(&cache, "OPTIONAL_KEY=from_vault_cache\nAPI_KEY=cached\n").unwrap();
+        std::fs::write(
+            &cache,
+            "OPTIONAL_KEY=from_vault_cache\nAPI_KEY=cached\nSTALE_KEY=leftover\n",
+        )
+        .unwrap();
 
         let mut config = Config::default();
         config.parameters.insert(
@@ -584,21 +684,44 @@ mod tests {
         let analysis = analyze_secrets(&config, dir.path(), &secrets_file, &cache)
             .unwrap()
             .unwrap();
-        assert!(
-            analysis.missing_manual.is_empty(),
-            "cache satisfies API_KEY"
-        );
-        assert!(
-            analysis.missing_optional_manual.is_empty(),
-            "cache satisfies OPTIONAL_KEY"
-        );
+        assert_eq!(analysis.missing_manual.len(), 1, "cache must not satisfy");
+        assert_eq!(analysis.missing_optional_manual.len(), 1);
         assert_eq!(
-            analysis
-                .existing_values
-                .get("OPTIONAL_KEY")
-                .map(|s| s.as_str()),
-            Some("from_vault_cache")
+            analysis.cache_values.get("API_KEY").map(String::as_str),
+            Some("cached")
         );
+        assert!(
+            !analysis.cache_values.contains_key("STALE_KEY"),
+            "undeclared keys are filtered out of the loaded cache"
+        );
+        assert!(
+            !analysis.existing_values.contains_key("API_KEY"),
+            "cache values must not leak into existing_values"
+        );
+    }
+
+    #[test]
+    fn write_cache_file_replaces_wholesale_and_removes_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.cache.env");
+        std::fs::write(&path, "OLD=1\nKEEP=old\n").unwrap();
+
+        let entries: HashMap<String, String> = [("KEEP".to_string(), "new".to_string())]
+            .into_iter()
+            .collect();
+        write_cache_file(&path, &entries).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("KEEP=new"));
+        assert!(!content.contains("OLD="), "unlisted entries are pruned");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        write_cache_file(&path, &HashMap::new()).unwrap();
+        assert!(!path.exists(), "empty cache removes the file");
     }
 
     // ========================================================================

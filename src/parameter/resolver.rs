@@ -430,9 +430,11 @@ impl Resolver {
     /// Deprecation warning for a config that still sets `generated_secrets_file`.
     fn gsf_deprecation_warning(gsf: &str) -> String {
         format!(
-            "generated_secrets_file is deprecated — fed now stores generated secrets in {} \
-             (kept out of git automatically). Remove `generated_secrets_file: {}` from your \
-             config to adopt the new default.",
+            "generated_secrets_file is deprecated. To migrate: first move '{}' to {} \
+             (kept out of git automatically), THEN remove the `generated_secrets_file` key — \
+             removing the key without moving the file would make fed generate fresh secret \
+             values. While the key is set, '{}' stays authoritative.",
+            gsf,
             crate::fed_dir::GENERATED_SECRETS_REL,
             gsf
         )
@@ -496,48 +498,34 @@ impl Resolver {
             None => return Ok(()), // No secret parameters at all
         };
 
-        // An explicitly-set generated_secrets_file that sits inside a git
-        // repository without being gitignored is one commit away from leaking
-        // secrets — refuse loudly. Paths outside any git repo are safe by
-        // construction and pass silently.
-        if explicit_gsf.is_some() && analysis.in_git_repo && !analysis.is_gitignored {
-            return Err(Error::Validation(format!(
-                "generated_secrets_file '{}' is inside a git repository but is not gitignored.\n\n\
-                 fed refuses to write secrets to a file that could be committed. Either add it to \
-                 .gitignore, or remove generated_secrets_file from your config to use the default \
-                 {} — fed keeps that location out of git automatically.",
-                explicit_gsf.as_deref().unwrap_or_default(),
-                crate::fed_dir::GENERATED_SECRETS_REL
-            )));
-        }
-
-        // Team vault: try Service Federation Cloud for missing manual secrets —
-        // required AND optional (requires `fed login` + `fed link`; skipped with
-        // --offline). Hits are cached in .fed/secrets.cache.env so later runs
-        // work offline.
+        // Team vault: when online and linked, the vault is authoritative for
+        // manual secrets — query it for every missing (required AND optional)
+        // name, including names the cache could satisfy, so rotated or revoked
+        // values are picked up. Requires `fed login` + `fed link`; skipped
+        // with --offline.
         let mut vault_resolved: Vec<(String, String)> = Vec::new();
-        if (!analysis.missing_manual.is_empty() || !analysis.missing_optional_manual.is_empty())
-            && !self.offline
-        {
-            let names: Vec<String> = analysis
-                .missing_manual
-                .iter()
-                .map(|(name, _)| name.clone())
-                .chain(analysis.missing_optional_manual.iter().cloned())
-                .collect();
+        let mut vault_query_succeeded = false;
+        let queried_names: Vec<String> = analysis
+            .missing_manual
+            .iter()
+            .map(|(name, _)| name.clone())
+            .chain(analysis.missing_optional_manual.iter().cloned())
+            .collect();
+        if !queried_names.is_empty() && !self.offline {
             let fetched = match &self.test_vault_values {
-                Some(stub) => Some(Ok(names
+                Some(stub) => Some(Ok(queried_names
                     .iter()
                     .filter_map(|n| stub.get(n).map(|v| (n.clone(), v.clone())))
                     .collect::<HashMap<String, String>>())),
                 None => crate::cloud::fetch_values_blocking(
                     &work_dir,
                     &self.environment.to_string(),
-                    &names,
+                    &queried_names,
                 ),
             };
             match fetched {
                 Some(Ok(values)) => {
+                    vault_query_succeeded = true;
                     for (name, value) in values {
                         if let Some(param) = config.get_effective_parameters_mut().get_mut(&name) {
                             param.value = Some(value.clone());
@@ -560,25 +548,69 @@ impl Resolver {
                     }
                 }
                 Some(Err(e)) => {
-                    // Network/auth trouble: don't fail here — the cache or env_file
-                    // may still cover it; if not, the error below names what's missing.
+                    // Network/auth trouble: fall back to the cache below.
                     tracing::warn!("team vault lookup failed: {}", e);
                 }
                 None => {} // not logged in or checkout not linked — normal local mode
             }
         }
 
-        // Cache vault hits in .fed/secrets.cache.env — per-checkout internal
-        // state, kept out of git by .fed/.gitignore — so --offline and flaky
-        // networks keep working.
-        if !vault_resolved.is_empty() {
-            if let Err(e) = super::secret::write_env_file(&cache_path, &vault_resolved) {
-                tracing::warn!(
-                    "could not cache vault secrets to {}: {}",
-                    cache_path.display(),
-                    e
-                );
+        if vault_query_succeeded {
+            // The vault answered: rewrite the cache to mirror it. Fresh hits
+            // overwrite stale entries; queried names the vault no longer has
+            // are dropped (rotation/revocation), as are keys for parameters no
+            // longer declared (analyze_secrets already filtered those out).
+            let mut new_cache = analysis.cache_values.clone();
+            for name in &queried_names {
+                new_cache.remove(name);
             }
+            for (name, value) in &vault_resolved {
+                new_cache.insert(name.clone(), value.clone());
+            }
+            if new_cache != analysis.cache_values || !new_cache.is_empty() {
+                // Never write the cache somewhere commit-eligible: with the
+                // self-managed .fed/.gitignore this always passes, but a
+                // user-edited permissive .fed/.gitignore must not turn the
+                // cache into a committable secrets file.
+                let (cache_in_repo, cache_ignored) = super::secret::path_git_status(&cache_path);
+                if cache_in_repo && !cache_ignored {
+                    tracing::warn!(
+                        "not caching vault secrets: {} is not gitignored (was .fed/.gitignore \
+                         edited?) — --offline will not have these values",
+                        cache_path.display()
+                    );
+                } else if let Err(e) = super::secret::write_cache_file(&cache_path, &new_cache) {
+                    tracing::warn!(
+                        "could not cache vault secrets to {}: {}",
+                        cache_path.display(),
+                        e
+                    );
+                }
+            }
+        } else {
+            // Vault unavailable (--offline, unlinked, or lookup failed): the
+            // cache satisfies missing manual secrets, required ones included.
+            let cache = &analysis.cache_values;
+            for (name, _) in &analysis.missing_manual {
+                if let Some(value) = cache.get(name) {
+                    if let Some(param) = config.get_effective_parameters_mut().get_mut(name) {
+                        param.value = Some(value.clone());
+                    }
+                }
+            }
+            for name in &analysis.missing_optional_manual {
+                if let Some(value) = cache.get(name) {
+                    if let Some(param) = config.get_effective_parameters_mut().get_mut(name) {
+                        param.value = Some(value.clone());
+                    }
+                }
+            }
+            analysis
+                .missing_manual
+                .retain(|(name, _)| !cache.contains_key(name));
+            analysis
+                .missing_optional_manual
+                .retain(|name| !cache.contains_key(name));
         }
 
         // Optional manual secrets the vault couldn't supply fall back to an
@@ -613,16 +645,14 @@ impl Resolver {
             )));
         }
 
-        // Prepend fed's own secret files to env_file so they're loaded by
+        // Prepend the generated secrets file to env_file so it's loaded by
         // apply_env_file_to_parameters (lowest priority — user's .env files can
-        // override). Cache goes first (lowest), then the generated secrets file.
-        // Only prepend files that exist — they may not on the very first run.
+        // override). Only when it exists — it may not on the very first run.
+        // The vault cache is deliberately NOT loaded as an env file: its values
+        // are applied directly above, so leftover entries can never trip strict
+        // env loading or shadow the vault.
         if secrets_file_path.exists() && !config.env_file.contains(&gsf_key) {
             config.env_file.insert(0, gsf_key.clone());
-        }
-        let cache_key = crate::fed_dir::SECRETS_CACHE_REL.to_string();
-        if cache_path.exists() && !config.env_file.contains(&cache_key) {
-            config.env_file.insert(0, cache_key);
         }
 
         // Run DAG-based resolution for all secrets with `generate` commands.
@@ -660,8 +690,14 @@ impl Resolver {
         // edited .fed/.gitignore to unignore it.
         if analysis.in_git_repo && !analysis.is_gitignored {
             return Err(Error::Validation(format!(
-                "Refusing to generate secrets: '{}' is not in .gitignore.\n\nAdd '{}' to your .gitignore to prevent committing secrets.",
-                gsf_key, gsf_key
+                "Refusing to write secrets: '{}' is inside a git repository and is not gitignored.\n\n\
+                 Add '{}' to your .gitignore (if the file is already tracked by git, also run \
+                 `git rm --cached {}`), or remove generated_secrets_file from your config to use \
+                 the default {} — fed keeps that location out of git automatically.",
+                gsf_key,
+                gsf_key,
+                gsf_key,
+                crate::fed_dir::GENERATED_SECRETS_REL
             )));
         }
 
@@ -3034,6 +3070,11 @@ mod tests {
             "Should mention .gitignore: {}",
             msg
         );
+        assert!(
+            msg.contains("git rm --cached"),
+            "Should cover tracked files: {}",
+            msg
+        );
     }
 
     #[test]
@@ -3324,6 +3365,11 @@ mod tests {
         assert!(msg.contains("deprecated"));
         assert!(msg.contains(".fed/secrets.generated.env"));
         assert!(msg.contains(".env.secrets"));
+        assert!(
+            msg.contains("move") && msg.contains("THEN remove"),
+            "must instruct migrating the file before removing the key: {}",
+            msg
+        );
 
         let temp_dir = TempDir::new().unwrap();
         git2::Repository::init(temp_dir.path()).unwrap();
@@ -3354,14 +3400,14 @@ mod tests {
     }
 
     #[test]
-    fn explicit_gsf_not_gitignored_errors_even_when_nothing_to_generate() {
+    fn explicit_gsf_unignored_but_populated_does_not_error() {
+        // P2-5: presence of the deprecated key alone must not break a
+        // previously-working setup — the gate fires only on actual writes.
         use crate::config::{Config, Parameter};
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
         git2::Repository::init(temp_dir.path()).unwrap();
-        // File already has the value — under the old behavior this passed with
-        // only a buried warning; now it must refuse loudly.
         std::fs::write(
             temp_dir.path().join(".env.secrets"),
             "SESSION_KEY=already_here\n",
@@ -3381,6 +3427,52 @@ mod tests {
             },
         );
 
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(
+            resolver
+                .get_resolved_parameters()
+                .get("SESSION_KEY")
+                .unwrap(),
+            "already_here"
+        );
+    }
+
+    #[test]
+    fn explicit_gsf_write_attempt_to_unignored_file_errors() {
+        // ...but as soon as fed would WRITE to the unsafe path, it refuses,
+        // and the message covers the tracked-file case (git rm --cached).
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        git2::Repository::init(temp_dir.path()).unwrap();
+        std::fs::write(
+            temp_dir.path().join(".env.secrets"),
+            "SESSION_KEY=already_here\n",
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+
+        let mut config = Config::default();
+        config.generated_secrets_file = Some(".env.secrets".to_string());
+        config.parameters.insert(
+            "SESSION_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                ..Default::default()
+            },
+        );
+        // A second secret that has no value forces a write.
+        config.parameters.insert(
+            "NEW_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                ..Default::default()
+            },
+        );
+
         let err = resolver.resolve_parameters(&mut config).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -3389,8 +3481,8 @@ mod tests {
             msg
         );
         assert!(
-            msg.contains(".env.secrets"),
-            "should name the file: {}",
+            msg.contains("git rm --cached"),
+            "must cover the tracked-file case: {}",
             msg
         );
     }
@@ -3423,6 +3515,173 @@ mod tests {
         assert!(
             content.contains("SESSION_KEY="),
             "Absolute path outside any repo is safe by construction"
+        );
+    }
+
+    #[test]
+    fn vault_refetch_overwrites_stale_cache_when_online() {
+        // P1-2: a cached value must not shadow the vault — online runs
+        // re-query and the fresh value wins, in params and in the cache file.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+        std::fs::write(
+            temp_dir.path().join(".fed/secrets.cache.env"),
+            "API_KEY=stale_value\n",
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_test_vault_values(HashMap::from([(
+            "API_KEY".to_string(),
+            "rotated_value".to_string(),
+        )]));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(
+            resolver.get_resolved_parameters().get("API_KEY").unwrap(),
+            "rotated_value",
+            "vault must win over the cache when online"
+        );
+        let cache =
+            std::fs::read_to_string(temp_dir.path().join(".fed/secrets.cache.env")).unwrap();
+        assert!(cache.contains("API_KEY=rotated_value"));
+        assert!(!cache.contains("stale_value"));
+    }
+
+    #[test]
+    fn stale_cache_keys_filtered_and_pruned() {
+        // P1-3: keys no longer declared must neither break resolution nor
+        // survive the next successful cache write.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+        std::fs::write(
+            temp_dir.path().join(".fed/secrets.cache.env"),
+            "REMOVED_PARAM=leftover\nAPI_KEY=old\n",
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_test_vault_values(HashMap::from([(
+            "API_KEY".to_string(),
+            "fresh".to_string(),
+        )]));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // Strict env loading must not choke on REMOVED_PARAM.
+        resolver.resolve_parameters(&mut config).unwrap();
+
+        let cache =
+            std::fs::read_to_string(temp_dir.path().join(".fed/secrets.cache.env")).unwrap();
+        assert!(cache.contains("API_KEY=fresh"));
+        assert!(
+            !cache.contains("REMOVED_PARAM"),
+            "undeclared keys are pruned on write: {}",
+            cache
+        );
+    }
+
+    #[test]
+    fn stale_cache_key_does_not_break_offline_resolution() {
+        // P1-3 (load side): offline, the filtered cache satisfies declared
+        // secrets and the leftover key is simply ignored.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+        std::fs::write(
+            temp_dir.path().join(".fed/secrets.cache.env"),
+            "REMOVED_PARAM=leftover\nAPI_KEY=cached\n",
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_offline(true);
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(
+            resolver.get_resolved_parameters().get("API_KEY").unwrap(),
+            "cached"
+        );
+    }
+
+    #[test]
+    fn cache_write_declined_when_cache_path_not_gitignored() {
+        // P1-4: a user-edited permissive .fed/.gitignore must not turn the
+        // cache into a committable secrets file — fed declines to cache.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        git2::Repository::init(temp_dir.path()).unwrap();
+        std::fs::create_dir_all(temp_dir.path().join(".fed")).unwrap();
+        // Permissive: nothing ignored.
+        std::fs::write(temp_dir.path().join(".fed/.gitignore"), "").unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_test_vault_values(HashMap::from([(
+            "API_KEY".to_string(),
+            "vault_value".to_string(),
+        )]));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(
+            resolver.get_resolved_parameters().get("API_KEY").unwrap(),
+            "vault_value",
+            "resolution itself still succeeds"
+        );
+        assert!(
+            !temp_dir.path().join(".fed/secrets.cache.env").exists(),
+            "cache must not be written to a commit-eligible path"
         );
     }
 

@@ -52,9 +52,27 @@ pub fn ensure_fed_dir(work_dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .map_err(|e| Error::Filesystem(format!("creating {}: {}", dir.display(), e)))?;
     let gitignore = dir.join(".gitignore");
-    if !gitignore.exists() {
-        std::fs::write(&gitignore, GITIGNORE_CONTENT)
-            .map_err(|e| Error::Filesystem(format!("writing {}: {}", gitignore.display(), e)))?;
+    // create_new is atomic: a concurrent fed (or a user-edited file appearing
+    // between check and write) can never be clobbered.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&gitignore)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(GITIGNORE_CONTENT.as_bytes()).map_err(|e| {
+                Error::Filesystem(format!("writing {}: {}", gitignore.display(), e))
+            })?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(Error::Filesystem(format!(
+                "creating {}: {}",
+                gitignore.display(),
+                e
+            )))
+        }
     }
     Ok(dir)
 }
