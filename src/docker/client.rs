@@ -492,6 +492,31 @@ impl DockerClient {
             .collect())
     }
 
+    /// Reap the dangling volumes of one fed stack (`fed-{scope}-*`).
+    ///
+    /// Used to fully tear down a throwaway isolated-script stack: once its containers are
+    /// removed, its declared named volumes are dangling and belong to nobody else, so they
+    /// are safe to drop. The `fed-{scope}-` prefix is enforced in code (Docker's `name=`
+    /// filter is a substring match). Best-effort — never errors; returns the count removed.
+    pub async fn reap_stack_volumes(&self, scope_id: &str) -> usize {
+        let prefix = format!("fed-{scope_id}-");
+        let name_filter = format!("name={prefix}");
+        let dangling = match self
+            .list_volumes(&["dangling=true", name_filter.as_str()])
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let mut removed = 0;
+        for v in dangling.into_iter().filter(|v| v.starts_with(&prefix)) {
+            if matches!(self.volume_rm(&v).await, Ok(o) if o.status.success()) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     // ========================================================================
     // Daemon health
     // ========================================================================

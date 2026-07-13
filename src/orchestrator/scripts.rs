@@ -430,6 +430,22 @@ impl<'a> ScriptRunner<'a> {
         tracing::debug!("Cleaning up isolated context for script '{}'", script_name);
         child_orchestrator.cleanup().await;
 
+        // Reap this throwaway stack's named volumes. cleanup() removed its containers (and,
+        // via `docker rm -v`, their anonymous volumes), but any declared named volumes
+        // (`fed-{iso}-{name}`) are now dangling. An isolated script owns its whole stack, so
+        // dropping them is safe here — this is the "cleaned up on every exit path" the docs
+        // promise. Non-isolated / keep_services runs never reach `run_script_isolated`.
+        let reaped = crate::docker::DockerClient::new()
+            .reap_stack_volumes(&isolation_id)
+            .await;
+        if reaped > 0 {
+            tracing::debug!(
+                "Reaped {} isolated-script volume(s) for '{}'",
+                reaped,
+                script_name
+            );
+        }
+
         // Remove the ephemeral marker namespace we created under this
         // isolation_id. Each isolated run gets a fresh random id, so without
         // this cleanup `~/.fed/isolated/` would accumulate one orphan
