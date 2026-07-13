@@ -24,13 +24,11 @@ parameters:
   DB_USER:
     default: postgres
 
-  # `type: secret` is generated on the first `fed start` and written to the file below.
+  # `type: secret` is generated on the first `fed start` and stored in
+  # .fed/secrets.generated.env — fed keeps that directory out of git for you.
   # No password in your config, no secret in git.
   DB_PASSWORD:
     type: secret
-
-# Generated secrets land here. Add `.fed/` to .gitignore and they stay out of git.
-generated_secrets_file: .fed/secrets.env
 
 services:
   database:
@@ -105,8 +103,7 @@ pub fn run_init(output: &Path, force: bool, out: &dyn UserOutput) -> anyhow::Res
         "  1. Edit {} to match your services",
         output.display()
     ));
-    out.status("  2. Add .fed/ to .gitignore");
-    out.status("  3. Run: fed start");
+    out.status("  2. Run: fed start");
 
     Ok(())
 }
