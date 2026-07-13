@@ -23,20 +23,9 @@ pub async fn run_prune(force: bool, out: &dyn UserOutput) -> anyhow::Result<()> 
         anyhow::bail!("Docker daemon is not running — nothing to prune.");
     }
 
-    // `dangling=true` is the safety net. A dangling volume is attached to NO container
-    // (running or stopped), so removing it cannot break a live stack or wipe a stopped
-    // stack's data — that container still references its named volume, so it isn't dangling.
-    //
-    // Docker's `name=` filter is an UNANCHORED substring match — `name=fed-` also matches
-    // `notfed-data`, `myfed-cache`, etc. Enforce the real prefix in code so prune only ever
-    // touches volumes fed created (`fed-{scope}-{name}`). Trusting the filter alone deletes
-    // user volumes that merely contain "fed-".
-    let orphans: Vec<String> = docker
-        .list_volumes(&["dangling=true", "name=fed-"])
-        .await?
-        .into_iter()
-        .filter(|v| v.starts_with("fed-"))
-        .collect();
+    // Dangling (referenced by no container) AND prefixed `fed-`. See the helper for why the
+    // prefix is enforced in code rather than left to Docker's substring `name=` filter.
+    let orphans = docker.orphaned_fed_volumes().await?;
 
     if orphans.is_empty() {
         out.success("No orphaned fed volumes to prune.");

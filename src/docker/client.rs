@@ -475,6 +475,23 @@ impl DockerClient {
             .collect())
     }
 
+    /// The fed-managed volumes that are safe to reap: *dangling* (referenced by no
+    /// container, running or stopped — so a live or stopped stack's data is never touched)
+    /// AND actually prefixed `fed-`.
+    ///
+    /// The prefix is enforced here in code, not left to Docker: `docker volume ls
+    /// --filter name=fed-` is an unanchored *substring* match, so it also returns
+    /// `notfed-data`, `myfed-cache`, etc. This is the single source of truth for what
+    /// `fed prune` removes and `fed doctor` reports — keep the two from drifting.
+    pub async fn orphaned_fed_volumes(&self) -> Result<Vec<String>, DockerError> {
+        Ok(self
+            .list_volumes(&["dangling=true", "name=fed-"])
+            .await?
+            .into_iter()
+            .filter(|v| v.starts_with("fed-"))
+            .collect())
+    }
+
     // ========================================================================
     // Daemon health
     // ========================================================================
