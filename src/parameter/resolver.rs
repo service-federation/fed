@@ -488,6 +488,42 @@ impl Resolver {
             .unwrap_or_else(|| crate::fed_dir::GENERATED_SECRETS_REL.to_string());
         let cache_path = crate::fed_dir::secrets_cache_path(&work_dir);
 
+        // Cache safety gate: the cache holds real secret values, so it must
+        // never sit in a commit-eligible location. With the self-managed
+        // .fed/.gitignore this always passes; a user-edited permissive
+        // .fed/.gitignore disables caching entirely — an existing cache file
+        // is DELETED (leaving secrets on disk where git can pick them up is
+        // the unsafe option) and its values are neither read nor rewritten.
+        let cache_usable = {
+            let (in_repo, ignored) = super::secret::path_git_status(&cache_path);
+            if in_repo && !ignored {
+                let existed = cache_path.exists();
+                if existed {
+                    if let Err(e) = std::fs::remove_file(&cache_path) {
+                        tracing::warn!(
+                            "could not remove commit-eligible secrets cache {}: {}",
+                            cache_path.display(),
+                            e
+                        );
+                    }
+                }
+                tracing::warn!(
+                    "vault secret caching disabled: {} is not gitignored (was .fed/.gitignore \
+                     edited?).{} Offline runs won't have vault values until .fed/.gitignore \
+                     ignores it again.",
+                    cache_path.display(),
+                    if existed {
+                        " The existing cache file was removed."
+                    } else {
+                        ""
+                    }
+                );
+                false
+            } else {
+                true
+            }
+        };
+
         let mut analysis = match super::secret::analyze_secrets(
             config,
             &work_dir,
@@ -497,6 +533,9 @@ impl Resolver {
             Some(a) => a,
             None => return Ok(()), // No secret parameters at all
         };
+        if !cache_usable {
+            analysis.cache_values.clear();
+        }
 
         // Team vault: when online and linked, the vault is authoritative for
         // manual secrets — query it for every missing (required AND optional)
@@ -567,19 +606,10 @@ impl Resolver {
             for (name, value) in &vault_resolved {
                 new_cache.insert(name.clone(), value.clone());
             }
-            if new_cache != analysis.cache_values || !new_cache.is_empty() {
-                // Never write the cache somewhere commit-eligible: with the
-                // self-managed .fed/.gitignore this always passes, but a
-                // user-edited permissive .fed/.gitignore must not turn the
-                // cache into a committable secrets file.
-                let (cache_in_repo, cache_ignored) = super::secret::path_git_status(&cache_path);
-                if cache_in_repo && !cache_ignored {
-                    tracing::warn!(
-                        "not caching vault secrets: {} is not gitignored (was .fed/.gitignore \
-                         edited?) — --offline will not have these values",
-                        cache_path.display()
-                    );
-                } else if let Err(e) = super::secret::write_cache_file(&cache_path, &new_cache) {
+            // cache_usable was decided (and warned about) up front; an unsafe
+            // path means no cache writes at all.
+            if cache_usable && (new_cache != analysis.cache_values || !new_cache.is_empty()) {
+                if let Err(e) = super::secret::write_cache_file(&cache_path, &new_cache) {
                     tracing::warn!(
                         "could not cache vault secrets to {}: {}",
                         cache_path.display(),
@@ -3682,6 +3712,94 @@ mod tests {
         assert!(
             !temp_dir.path().join(".fed/secrets.cache.env").exists(),
             "cache must not be written to a commit-eligible path"
+        );
+    }
+
+    #[test]
+    fn unsafe_cache_path_deletes_existing_cache_online() {
+        // P1-4 residual: a pre-existing cache on a commit-eligible path is
+        // removed (not kept and reused), its values are ignored, and online
+        // resolution still succeeds from the vault.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        git2::Repository::init(temp_dir.path()).unwrap();
+        std::fs::create_dir_all(temp_dir.path().join(".fed")).unwrap();
+        // Permissive: nothing ignored → cache is commit-eligible.
+        std::fs::write(temp_dir.path().join(".fed/.gitignore"), "").unwrap();
+        std::fs::write(
+            temp_dir.path().join(".fed/secrets.cache.env"),
+            "API_KEY=stale_committable\n",
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_test_vault_values(HashMap::from([(
+            "API_KEY".to_string(),
+            "vault_value".to_string(),
+        )]));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(
+            resolver.get_resolved_parameters().get("API_KEY").unwrap(),
+            "vault_value",
+            "online resolution still succeeds"
+        );
+        assert!(
+            !temp_dir.path().join(".fed/secrets.cache.env").exists(),
+            "commit-eligible cache must be deleted and never rewritten"
+        );
+    }
+
+    #[test]
+    fn unsafe_cache_path_refuses_cached_values_offline() {
+        // P1-4 residual: on an unsafe path the cache is deleted and its values
+        // are refused — offline, a required secret it used to satisfy is
+        // reported missing rather than served from a commit-eligible file.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        git2::Repository::init(temp_dir.path()).unwrap();
+        std::fs::create_dir_all(temp_dir.path().join(".fed")).unwrap();
+        std::fs::write(temp_dir.path().join(".fed/.gitignore"), "").unwrap();
+        std::fs::write(
+            temp_dir.path().join(".fed/secrets.cache.env"),
+            "API_KEY=stale_committable\n",
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_offline(true);
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        assert!(err.to_string().contains("API_KEY"));
+        assert!(
+            !temp_dir.path().join(".fed/secrets.cache.env").exists(),
+            "unsafe cache file must be deleted"
         );
     }
 

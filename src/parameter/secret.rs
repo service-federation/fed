@@ -380,6 +380,11 @@ fn ensure_owner_only(file: &std::fs::File, path: &Path) -> Result<()> {
 /// The cache is fed-managed state, so unlike `write_env_file` this does not
 /// merge: entries absent from `entries` are pruned (stale keys from config
 /// changes, vault misses on rotation). An empty map removes the file.
+///
+/// The replacement is atomic: contents are written to a 0600 temp file in the
+/// same directory and renamed over the destination, so concurrent readers
+/// (dry-runs, direct resolver calls) see either the old or the new cache,
+/// never a truncated one.
 pub fn write_cache_file(path: &Path, entries: &HashMap<String, String>) -> Result<()> {
     if entries.is_empty() {
         if path.exists() {
@@ -390,6 +395,15 @@ pub fn write_cache_file(path: &Path, entries: &HashMap<String, String>) -> Resul
         return Ok(());
     }
 
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::Filesystem(format!("'{}' has no parent dir", path.display())))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("secrets.cache.env");
+    let tmp_path = dir.join(format!(".{}.tmp.{}", file_name, std::process::id()));
+
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).truncate(true).write(true);
     #[cfg(unix)]
@@ -397,21 +411,32 @@ pub fn write_cache_file(path: &Path, entries: &HashMap<String, String>) -> Resul
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut file = opts
-        .open(path)
-        .map_err(|e| Error::Filesystem(format!("Cannot write '{}': {}", path.display(), e)))?;
-    ensure_owner_only(&file, path)?;
+    let write_result = (|| -> Result<()> {
+        let mut file = opts.open(&tmp_path).map_err(|e| {
+            Error::Filesystem(format!("Cannot write '{}': {}", tmp_path.display(), e))
+        })?;
+        ensure_owner_only(&file, &tmp_path)?;
 
-    let mut out = String::from("# Vault secrets cache — managed by fed, do not commit\n");
-    let mut keys: Vec<&String> = entries.keys().collect();
-    keys.sort();
-    for key in keys {
-        out.push_str(&format!("{key}={}\n", encode_env_value(&entries[key])));
+        let mut out = String::from("# Vault secrets cache — managed by fed, do not commit\n");
+        let mut keys: Vec<&String> = entries.keys().collect();
+        keys.sort();
+        for key in keys {
+            out.push_str(&format!("{key}={}\n", encode_env_value(&entries[key])));
+        }
+        use std::io::Write;
+        file.write_all(out.as_bytes())
+            .map_err(|e| Error::Filesystem(format!("Write error: {}", e)))?;
+        file.sync_all()
+            .map_err(|e| Error::Filesystem(format!("Sync error: {}", e)))?;
+        std::fs::rename(&tmp_path, path).map_err(|e| {
+            Error::Filesystem(format!("Cannot replace '{}': {}", path.display(), e))
+        })?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
     }
-    use std::io::Write;
-    file.write_all(out.as_bytes())
-        .map_err(|e| Error::Filesystem(format!("Write error: {}", e)))?;
-    Ok(())
+    write_result
 }
 
 /// Load key-value pairs from an existing .env file, if it exists.
