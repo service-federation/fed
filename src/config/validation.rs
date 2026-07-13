@@ -266,14 +266,9 @@ impl Config {
                 }
             }
 
-            // Auto-generated secrets require generated_secrets_file
-            if !param.is_manual_secret() && self.generated_secrets_file.is_none() {
-                return Err(Error::Validation(format!(
-                    "Parameter '{}' is type: secret but no generated_secrets_file is configured. \
-                     Either set generated_secrets_file or add source: manual",
-                    name
-                )));
-            }
+            // Auto-generated secrets need no extra configuration: they default
+            // to .fed/secrets.generated.env. The deprecated
+            // generated_secrets_file key is still honored when set.
         }
 
         // Validate external service dependencies
@@ -1859,7 +1854,9 @@ mod tests {
     }
 
     #[test]
-    fn generated_secret_without_generated_secrets_file_is_rejected() {
+    fn generated_secret_without_generated_secrets_file_is_valid() {
+        // No generated_secrets_file needed — fed defaults to
+        // .fed/secrets.generated.env (the key is deprecated).
         let mut config = Config::default();
         config.parameters.insert(
             "SESSION_KEY".to_string(),
@@ -1868,13 +1865,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let err = config.validate().unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("generated_secrets_file"),
-            "Error should mention generated_secrets_file: {}",
-            msg
-        );
+        assert!(config.validate().is_ok());
     }
 
     #[test]

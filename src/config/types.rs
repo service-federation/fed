@@ -66,9 +66,11 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_file: Vec<String>,
 
-    /// Path to the file where auto-generated secrets are written.
-    /// Required when using `type: secret` without `source: manual`.
-    /// Prepended to `env_file` at runtime so user env_files can override.
+    /// Deprecated: path to the file where auto-generated secrets are written.
+    /// When unset, generated secrets default to `.fed/secrets.generated.env`.
+    /// Still honored when set — fed emits a deprecation warning — including
+    /// absolute paths for intentional cross-worktree sharing. Prepended to
+    /// `env_file` at runtime so user env_files can override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_secrets_file: Option<String>,
 

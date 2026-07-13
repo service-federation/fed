@@ -205,6 +205,8 @@ pub struct Resolver {
     /// Whether stdin is a TTY (for interactive secret generation prompts).
     is_interactive: bool,
     offline: bool,
+    /// Test seam: when set, used instead of the real cloud vault lookup.
+    test_vault_values: Option<HashMap<String, String>>,
     /// Active isolation session id, if any. Scopes the built-in
     /// `FED_PROJECT_ID` so parallel isolated stacks get distinct identifiers.
     isolation_id: Option<String>,
@@ -227,6 +229,7 @@ impl Resolver {
             prefer_config_defaults: true,
             is_interactive: false,
             offline: false,
+            test_vault_values: None,
             isolation_id: None,
         }
     }
@@ -248,6 +251,7 @@ impl Resolver {
             prefer_config_defaults: true,
             is_interactive: false,
             offline: false,
+            test_vault_values: None,
             isolation_id: None,
         }
     }
@@ -297,6 +301,12 @@ impl Resolver {
     /// Offline mode: never call the cloud vault for manual secrets.
     pub fn set_offline(&mut self, offline: bool) {
         self.offline = offline;
+    }
+
+    /// Test seam: stub the team-vault lookup with fixed values.
+    #[cfg(test)]
+    pub(crate) fn set_test_vault_values(&mut self, values: HashMap<String, String>) {
+        self.test_vault_values = Some(values);
     }
 
     /// Register ports owned by already-running managed services.
@@ -417,6 +427,17 @@ impl Resolver {
         Ok(resolved)
     }
 
+    /// Deprecation warning for a config that still sets `generated_secrets_file`.
+    fn gsf_deprecation_warning(gsf: &str) -> String {
+        format!(
+            "generated_secrets_file is deprecated — fed now stores generated secrets in {} \
+             (kept out of git automatically). Remove `generated_secrets_file: {}` from your \
+             config to adopt the new default.",
+            crate::fed_dir::GENERATED_SECRETS_REL,
+            gsf
+        )
+    }
+
     /// Resolve secret parameters: generate missing auto-secrets, fail on missing manual secrets.
     ///
     /// This runs before `.env` loading so that newly-generated values are picked up
@@ -427,50 +448,95 @@ impl Resolver {
             None => return Ok(()), // No work dir → skip (unit tests, etc.)
         };
 
-        let secrets_file_path = config.generated_secrets_file.as_ref().map(|gsf| {
-            let expanded = super::expand_tilde(Path::new(gsf));
-            if expanded.is_absolute() {
-                expanded
-            } else {
-                work_dir.join(expanded)
+        // Skip early (and avoid creating .fed/) when there are no secret params.
+        if !config
+            .get_effective_parameters()
+            .values()
+            .any(|p| p.is_secret_type())
+        {
+            return Ok(());
+        }
+
+        // .fed/ holds the vault cache and (by default) generated secrets.
+        // Ensure it exists — with its self-ignoring .gitignore — before any
+        // git-status checks so the default paths analyze as ignored.
+        crate::fed_dir::ensure_fed_dir(&work_dir)?;
+
+        let explicit_gsf = config.generated_secrets_file.clone();
+        if let Some(gsf) = &explicit_gsf {
+            tracing::warn!("{}", Self::gsf_deprecation_warning(gsf));
+        }
+
+        // Where generated secrets live: the explicitly-configured (deprecated)
+        // path if set, otherwise .fed/secrets.generated.env.
+        let secrets_file_path = match &explicit_gsf {
+            Some(gsf) => {
+                let expanded = super::expand_tilde(Path::new(gsf));
+                if expanded.is_absolute() {
+                    expanded
+                } else {
+                    work_dir.join(expanded)
+                }
             }
-        });
+            None => crate::fed_dir::default_generated_secrets_path(&work_dir),
+        };
+        // The env_file key under which the generated secrets file is loaded.
+        let gsf_key = explicit_gsf
+            .clone()
+            .unwrap_or_else(|| crate::fed_dir::GENERATED_SECRETS_REL.to_string());
+        let cache_path = crate::fed_dir::secrets_cache_path(&work_dir);
 
         let mut analysis = match super::secret::analyze_secrets(
             config,
             &work_dir,
-            secrets_file_path.as_deref(),
+            &secrets_file_path,
+            &cache_path,
         )? {
             Some(a) => a,
             None => return Ok(()), // No secret parameters at all
         };
 
-        // Set optional manual secrets to empty string so they resolve without error
-        for (name, param) in config.get_effective_parameters_mut() {
-            if param.is_manual_secret()
-                && param.is_optional()
-                && param.value.is_none()
-                && !analysis.existing_values.contains_key(name.as_str())
-            {
-                param.value = Some(String::new());
-            }
+        // An explicitly-set generated_secrets_file that sits inside a git
+        // repository without being gitignored is one commit away from leaking
+        // secrets — refuse loudly. Paths outside any git repo are safe by
+        // construction and pass silently.
+        if explicit_gsf.is_some() && analysis.in_git_repo && !analysis.is_gitignored {
+            return Err(Error::Validation(format!(
+                "generated_secrets_file '{}' is inside a git repository but is not gitignored.\n\n\
+                 fed refuses to write secrets to a file that could be committed. Either add it to \
+                 .gitignore, or remove generated_secrets_file from your config to use the default \
+                 {} — fed keeps that location out of git automatically.",
+                explicit_gsf.as_deref().unwrap_or_default(),
+                crate::fed_dir::GENERATED_SECRETS_REL
+            )));
         }
 
-        // Team vault: try Service Federation Cloud for missing manual secrets
-        // (requires `fed login` + `fed link`; skipped with --offline). Hits are
-        // cached in generated_secrets_file so later runs work offline.
+        // Team vault: try Service Federation Cloud for missing manual secrets —
+        // required AND optional (requires `fed login` + `fed link`; skipped with
+        // --offline). Hits are cached in .fed/secrets.cache.env so later runs
+        // work offline.
         let mut vault_resolved: Vec<(String, String)> = Vec::new();
-        if !analysis.missing_manual.is_empty() && !self.offline {
+        if (!analysis.missing_manual.is_empty() || !analysis.missing_optional_manual.is_empty())
+            && !self.offline
+        {
             let names: Vec<String> = analysis
                 .missing_manual
                 .iter()
                 .map(|(name, _)| name.clone())
+                .chain(analysis.missing_optional_manual.iter().cloned())
                 .collect();
-            match crate::cloud::fetch_values_blocking(
-                &work_dir,
-                &self.environment.to_string(),
-                &names,
-            ) {
+            let fetched = match &self.test_vault_values {
+                Some(stub) => Some(Ok(names
+                    .iter()
+                    .filter_map(|n| stub.get(n).map(|v| (n.clone(), v.clone())))
+                    .collect::<HashMap<String, String>>())),
+                None => crate::cloud::fetch_values_blocking(
+                    &work_dir,
+                    &self.environment.to_string(),
+                    &names,
+                ),
+            };
+            match fetched {
                 Some(Ok(values)) => {
                     for (name, value) in values {
                         if let Some(param) = config.get_effective_parameters_mut().get_mut(&name) {
@@ -483,6 +549,9 @@ impl Resolver {
                     analysis
                         .missing_manual
                         .retain(|(name, _)| !resolved_names.contains(name.as_str()));
+                    analysis
+                        .missing_optional_manual
+                        .retain(|name| !resolved_names.contains(name.as_str()));
                     if !vault_resolved.is_empty() {
                         tracing::info!(
                             "Resolved {} secret(s) from the team vault",
@@ -499,19 +568,25 @@ impl Resolver {
             }
         }
 
-        // Cache vault values in the generated secrets file (same gitignore gate
-        // as generated secrets) so --offline and flaky networks keep working.
+        // Cache vault hits in .fed/secrets.cache.env — per-checkout internal
+        // state, kept out of git by .fed/.gitignore — so --offline and flaky
+        // networks keep working.
         if !vault_resolved.is_empty() {
-            if let Some(path) = secrets_file_path.as_deref() {
-                if !analysis.in_git_repo || analysis.is_gitignored {
-                    if let Err(e) = super::secret::write_env_file(path, &vault_resolved) {
-                        tracing::warn!("could not cache vault secrets: {}", e);
-                    }
-                } else {
-                    tracing::warn!(
-                        "not caching vault secrets: {} is not gitignored",
-                        path.display()
-                    );
+            if let Err(e) = super::secret::write_env_file(&cache_path, &vault_resolved) {
+                tracing::warn!(
+                    "could not cache vault secrets to {}: {}",
+                    cache_path.display(),
+                    e
+                );
+            }
+        }
+
+        // Optional manual secrets the vault couldn't supply fall back to an
+        // empty string so they resolve without error.
+        for name in &analysis.missing_optional_manual {
+            if let Some(param) = config.get_effective_parameters_mut().get_mut(name) {
+                if param.value.is_none() {
+                    param.value = Some(String::new());
                 }
             }
         }
@@ -538,19 +613,16 @@ impl Resolver {
             )));
         }
 
-        // Prepend generated_secrets_file to env_file so it's loaded by apply_env_file_to_parameters
-        // (lowest priority — user's .env files can override generated values).
-        // Only prepend if the file exists — it may not on the very first run before generation.
-        if let Some(gsf) = config.generated_secrets_file.as_ref() {
-            let gsf_path = super::expand_tilde(Path::new(gsf));
-            let gsf_abs = if gsf_path.is_absolute() {
-                gsf_path
-            } else {
-                work_dir.join(gsf_path)
-            };
-            if gsf_abs.exists() && !config.env_file.contains(gsf) {
-                config.env_file.insert(0, gsf.clone());
-            }
+        // Prepend fed's own secret files to env_file so they're loaded by
+        // apply_env_file_to_parameters (lowest priority — user's .env files can
+        // override). Cache goes first (lowest), then the generated secrets file.
+        // Only prepend files that exist — they may not on the very first run.
+        if secrets_file_path.exists() && !config.env_file.contains(&gsf_key) {
+            config.env_file.insert(0, gsf_key.clone());
+        }
+        let cache_key = crate::fed_dir::SECRETS_CACHE_REL.to_string();
+        if cache_path.exists() && !config.env_file.contains(&cache_key) {
+            config.env_file.insert(0, cache_key);
         }
 
         // Run DAG-based resolution for all secrets with `generate` commands.
@@ -583,15 +655,13 @@ impl Resolver {
             return Ok(());
         }
 
-        let gsf = config.generated_secrets_file.as_ref().expect(
-            "generated_secrets_file must be set when auto-generated secrets exist (validation ensures this)"
-        );
-
-        // Gitignore gate: if we're in a git repo and the secrets file isn't ignored, refuse
+        // Gitignore gate: if the secrets file is in a git repo and not ignored,
+        // refuse. For the default .fed/ location this only trips if the user
+        // edited .fed/.gitignore to unignore it.
         if analysis.in_git_repo && !analysis.is_gitignored {
             return Err(Error::Validation(format!(
                 "Refusing to generate secrets: '{}' is not in .gitignore.\n\nAdd '{}' to your .gitignore to prevent committing secrets.",
-                gsf, gsf
+                gsf_key, gsf_key
             )));
         }
 
@@ -614,9 +684,9 @@ impl Resolver {
 
         super::secret::write_env_file(&analysis.env_path, &generated)?;
 
-        // Ensure generated_secrets_file is in env_file now that the file exists
-        if !config.env_file.contains(gsf) {
-            config.env_file.insert(0, gsf.clone());
+        // Ensure the generated secrets file is in env_file now that it exists
+        if !config.env_file.contains(&gsf_key) {
+            config.env_file.insert(0, gsf_key.clone());
         }
 
         Ok(())
@@ -3041,6 +3111,318 @@ mod tests {
             resolved.get("SESSION_KEY").unwrap(),
             "previously_generated_value",
             "Should load secret from existing .env.secrets on subsequent runs"
+        );
+    }
+
+    #[test]
+    fn generated_secret_defaults_to_fed_dir() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        // Git repo with NO root .gitignore — fed's self-managed .fed/.gitignore
+        // must make the default location safe on its own.
+        git2::Repository::init(temp_dir.path()).unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "SESSION_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+
+        let resolved = resolver.get_resolved_parameters();
+        assert_eq!(resolved.get("SESSION_KEY").unwrap().len(), 32);
+
+        let gsf = temp_dir.path().join(".fed/secrets.generated.env");
+        let content = std::fs::read_to_string(&gsf).unwrap();
+        assert!(content.contains("SESSION_KEY="));
+        assert_eq!(config.env_file[0], ".fed/secrets.generated.env");
+
+        // .fed/.gitignore was self-managed into existence
+        let gi = std::fs::read_to_string(temp_dir.path().join(".fed/.gitignore")).unwrap();
+        assert!(gi.contains("!cloud.yaml"));
+    }
+
+    #[test]
+    fn fed_gitignore_not_clobbered_by_resolution() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp_dir.path().join(".fed")).unwrap();
+        std::fs::write(
+            temp_dir.path().join(".fed/.gitignore"),
+            "*\n!cloud.yaml\n!my-notes.md\n!.gitignore\n",
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "SESSION_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                ..Default::default()
+            },
+        );
+        resolver.resolve_parameters(&mut config).unwrap();
+
+        let gi = std::fs::read_to_string(temp_dir.path().join(".fed/.gitignore")).unwrap();
+        assert!(gi.contains("!my-notes.md"), "user edits must survive");
+    }
+
+    #[test]
+    fn optional_manual_secret_resolved_from_vault() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_test_vault_values(HashMap::from([(
+            "STRIPE_KEY".to_string(),
+            "sk_test_from_vault".to_string(),
+        )]));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "STRIPE_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                optional: Some(true),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+
+        let resolved = resolver.get_resolved_parameters();
+        assert_eq!(
+            resolved.get("STRIPE_KEY").unwrap(),
+            "sk_test_from_vault",
+            "Optional manual secret should take the vault value when available"
+        );
+
+        // Vault hit is cached in .fed/secrets.cache.env, not the generated file
+        let cache = temp_dir.path().join(".fed/secrets.cache.env");
+        let content = std::fs::read_to_string(&cache).unwrap();
+        assert!(content.contains("STRIPE_KEY=sk_test_from_vault"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&cache).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "cache must be owner-only");
+        }
+    }
+
+    #[test]
+    fn optional_manual_secret_vault_miss_falls_back_to_empty() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        // Vault reachable but has no value for this name
+        resolver.set_test_vault_values(HashMap::new());
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "STRIPE_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                optional: Some(true),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(
+            config
+                .parameters
+                .get("STRIPE_KEY")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some(""),
+            "Vault miss on an optional secret must fall back to empty string"
+        );
+        assert!(
+            !temp_dir.path().join(".fed/secrets.cache.env").exists(),
+            "Nothing to cache on a vault miss"
+        );
+    }
+
+    #[test]
+    fn required_manual_secret_cached_then_resolved_offline() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        let make_config = || {
+            let mut config = Config::default();
+            config.parameters.insert(
+                "API_KEY".to_string(),
+                Parameter {
+                    param_type: Some("secret".to_string()),
+                    source: Some("manual".to_string()),
+                    ..Default::default()
+                },
+            );
+            config
+        };
+
+        // First run: online, vault supplies the value → cached.
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_test_vault_values(HashMap::from([(
+            "API_KEY".to_string(),
+            "vault_value".to_string(),
+        )]));
+        let mut config = make_config();
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert!(temp_dir.path().join(".fed/secrets.cache.env").exists());
+
+        // Second run: offline — the cache alone must resolve it.
+        let mut offline_resolver = Resolver::new();
+        offline_resolver.set_work_dir(temp_dir.path());
+        offline_resolver.set_offline(true);
+        let mut config = make_config();
+        offline_resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(
+            offline_resolver
+                .get_resolved_parameters()
+                .get("API_KEY")
+                .unwrap(),
+            "vault_value",
+            "--offline must be served from .fed/secrets.cache.env"
+        );
+    }
+
+    #[test]
+    fn deprecated_gsf_warning_and_back_compat_path_honored() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        // The warning names the deprecated key and the new default location.
+        let msg = Resolver::gsf_deprecation_warning(".env.secrets");
+        assert!(msg.contains("deprecated"));
+        assert!(msg.contains(".fed/secrets.generated.env"));
+        assert!(msg.contains(".env.secrets"));
+
+        let temp_dir = TempDir::new().unwrap();
+        git2::Repository::init(temp_dir.path()).unwrap();
+        std::fs::write(temp_dir.path().join(".gitignore"), ".env.secrets\n").unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+
+        let mut config = Config::default();
+        config.generated_secrets_file = Some(".env.secrets".to_string());
+        config.parameters.insert(
+            "SESSION_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+
+        // Back-compat: the explicitly-configured path is still honored.
+        let content = std::fs::read_to_string(temp_dir.path().join(".env.secrets")).unwrap();
+        assert!(content.contains("SESSION_KEY="));
+        assert!(
+            !temp_dir.path().join(".fed/secrets.generated.env").exists(),
+            "Explicit generated_secrets_file must win over the new default"
+        );
+    }
+
+    #[test]
+    fn explicit_gsf_not_gitignored_errors_even_when_nothing_to_generate() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        git2::Repository::init(temp_dir.path()).unwrap();
+        // File already has the value — under the old behavior this passed with
+        // only a buried warning; now it must refuse loudly.
+        std::fs::write(
+            temp_dir.path().join(".env.secrets"),
+            "SESSION_KEY=already_here\n",
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+
+        let mut config = Config::default();
+        config.generated_secrets_file = Some(".env.secrets".to_string());
+        config.parameters.insert(
+            "SESSION_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not gitignored"),
+            "loud error expected: {}",
+            msg
+        );
+        assert!(
+            msg.contains(".env.secrets"),
+            "should name the file: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn explicit_gsf_outside_any_repo_is_allowed_silently() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let work_dir = TempDir::new().unwrap();
+        git2::Repository::init(work_dir.path()).unwrap();
+        let outside = TempDir::new().unwrap();
+        let gsf_abs = outside.path().join("shared-secrets.env");
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(work_dir.path());
+
+        let mut config = Config::default();
+        config.generated_secrets_file = Some(gsf_abs.to_string_lossy().to_string());
+        config.parameters.insert(
+            "SESSION_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        let content = std::fs::read_to_string(&gsf_abs).unwrap();
+        assert!(
+            content.contains("SESSION_KEY="),
+            "Absolute path outside any repo is safe by construction"
         );
     }
 

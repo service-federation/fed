@@ -7,8 +7,11 @@ use std::path::{Path, PathBuf};
 pub struct SecretAnalysis {
     /// Secret parameter names that need auto-generated values.
     pub needs_generation: Vec<String>,
-    /// Manual secrets missing from .env: (name, description).
+    /// Required manual secrets missing from .env: (name, description).
     pub missing_manual: Vec<(String, Option<String>)>,
+    /// Optional manual secrets with no value anywhere. Eligible for a vault
+    /// lookup; fall back to empty string when the vault can't supply them.
+    pub missing_optional_manual: Vec<String>,
     /// Path to the .env file that holds (or will hold) secrets.
     pub env_path: PathBuf,
     /// Whether the .env file is gitignored.
@@ -32,16 +35,64 @@ pub fn is_gitignored(work_dir: &Path, relative_path: &str) -> (bool, bool) {
     }
 }
 
+/// Git status of an arbitrary (absolute) file path, discovering the enclosing
+/// repository from the path itself rather than from the work dir.
+///
+/// Returns `(in_git_repo, is_ignored)`. Paths outside any git repository are
+/// `(false, false)` — safe by construction, nothing to warn about.
+pub fn path_git_status(path: &Path) -> (bool, bool) {
+    // Discover from the nearest existing ancestor (the file or even its
+    // parent directory may not exist yet on first run).
+    let mut probe = path.parent();
+    let start = loop {
+        match probe {
+            Some(p) if p.exists() => break p,
+            Some(p) => probe = p.parent(),
+            None => return (false, false),
+        }
+    };
+    // Canonicalize so symlinked temp dirs (e.g. /var → /private/var on macOS)
+    // compare correctly against the repository's workdir.
+    let canon_start = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
+    let path = match path.strip_prefix(start) {
+        Ok(suffix) => canon_start.join(suffix),
+        Err(_) => path.to_path_buf(),
+    };
+    let path = path.as_path();
+    match git2::Repository::discover(&canon_start) {
+        Ok(repo) => {
+            let Some(workdir) = repo.workdir() else {
+                return (false, false);
+            };
+            match path.strip_prefix(workdir) {
+                Ok(rel) => {
+                    let ignored = repo
+                        .is_path_ignored(rel.to_string_lossy().as_ref())
+                        .unwrap_or(false);
+                    (true, ignored)
+                }
+                // Discovered repo doesn't actually contain the path.
+                Err(_) => (false, false),
+            }
+        }
+        Err(_) => (false, false),
+    }
+}
+
 /// Scan config for secret parameters and classify what's present vs. missing.
 ///
-/// `secrets_file` is the absolute path to the file where generated secrets are stored,
-/// or `None` if no `generated_secrets_file` is configured (manual-only mode).
+/// `secrets_file` is the absolute path to the file where generated secrets are
+/// stored (the deprecated `generated_secrets_file` if configured, otherwise
+/// `.fed/secrets.generated.env`). `cache_file` is the absolute path to the
+/// vault secrets cache (`.fed/secrets.cache.env`); values cached there count
+/// as present, which is what keeps `--offline` working.
 ///
 /// Returns `None` if no secret parameters exist.
 pub fn analyze_secrets(
     config: &Config,
     work_dir: &Path,
-    secrets_file: Option<&Path>,
+    secrets_file: &Path,
+    cache_file: &Path,
 ) -> Result<Option<SecretAnalysis>> {
     let effective_params = config.get_effective_parameters();
 
@@ -55,18 +106,16 @@ pub fn analyze_secrets(
         return Ok(None);
     }
 
-    let env_path = secrets_file
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| work_dir.join(".env"));
+    let env_path = secrets_file.to_path_buf();
 
-    // Load existing values from the secrets file (if configured) and all env_files.
-    // env_file values override the secrets file (matching runtime priority where
-    // generated_secrets_file is prepended = loaded first = lowest priority).
-    let mut existing_values = if let Some(sf) = secrets_file {
-        load_existing_env(sf)
-    } else {
-        HashMap::new()
-    };
+    // Load existing values: vault cache first (lowest priority), then the
+    // generated secrets file, then all env_files. Later loads override earlier
+    // ones, matching runtime priority where fed's own files are prepended to
+    // env_file = loaded first = lowest priority.
+    let mut existing_values = load_existing_env(cache_file);
+    for (k, v) in load_existing_env(secrets_file) {
+        existing_values.insert(k, v);
+    }
     for env_file in &config.env_file {
         let expanded = super::expand_tilde(Path::new(env_file));
         let ef_path = if expanded.is_absolute() {
@@ -79,19 +128,13 @@ pub fn analyze_secrets(
         }
     }
 
-    // Gitignore check only applies when we have a secrets file to write to
-    let (in_git_repo, is_gitignored) = if let Some(sf) = secrets_file {
-        let relative_path = sf
-            .strip_prefix(work_dir)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| sf.to_string_lossy().to_string());
-        is_gitignored(work_dir, &relative_path)
-    } else {
-        (false, false)
-    };
+    // Git status of the secrets file itself (it may be an absolute path
+    // outside this work dir's repository, or outside any repository).
+    let (in_git_repo, is_gitignored) = path_git_status(&env_path);
 
     let mut needs_generation = Vec::new();
     let mut missing_manual = Vec::new();
+    let mut missing_optional_manual = Vec::new();
 
     for (name, param) in &secret_params {
         // Already resolved (from .env or explicit value)?
@@ -100,7 +143,9 @@ pub fn analyze_secrets(
         }
 
         if param.is_manual_secret() {
-            if !param.is_optional() {
+            if param.is_optional() {
+                missing_optional_manual.push((*name).clone());
+            } else {
                 missing_manual.push(((*name).clone(), param.description.clone()));
             }
         } else {
@@ -111,6 +156,7 @@ pub fn analyze_secrets(
     Ok(Some(SecretAnalysis {
         needs_generation,
         missing_manual,
+        missing_optional_manual,
         env_path,
         is_gitignored,
         in_git_repo,
@@ -401,7 +447,8 @@ mod tests {
         let config = Config::default();
         let dir = tempfile::tempdir().unwrap();
         let secrets_file = dir.path().join(".env.secrets");
-        let result = analyze_secrets(&config, dir.path(), Some(&secrets_file)).unwrap();
+        let cache = dir.path().join(".fed/secrets.cache.env");
+        let result = analyze_secrets(&config, dir.path(), &secrets_file, &cache).unwrap();
         assert!(result.is_none());
     }
 
@@ -428,7 +475,8 @@ mod tests {
         );
 
         let secrets_file = dir.path().join(".env.secrets");
-        let analysis = analyze_secrets(&config, dir.path(), Some(&secrets_file))
+        let cache = dir.path().join(".fed/secrets.cache.env");
+        let analysis = analyze_secrets(&config, dir.path(), &secrets_file, &cache)
             .unwrap()
             .unwrap();
         assert!(
@@ -460,7 +508,8 @@ mod tests {
             },
         );
 
-        let analysis = analyze_secrets(&config, dir.path(), Some(&secrets_file))
+        let cache = dir.path().join(".fed/secrets.cache.env");
+        let analysis = analyze_secrets(&config, dir.path(), &secrets_file, &cache)
             .unwrap()
             .unwrap();
         assert!(
@@ -470,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn analyze_skips_optional_manual_secrets() {
+    fn analyze_separates_optional_manual_secrets() {
         let dir = tempfile::tempdir().unwrap();
 
         let mut config = Config::default();
@@ -493,18 +542,35 @@ mod tests {
         );
 
         let secrets_file = dir.path().join(".env.secrets");
-        let analysis = analyze_secrets(&config, dir.path(), Some(&secrets_file))
+        let cache = dir.path().join(".fed/secrets.cache.env");
+        let analysis = analyze_secrets(&config, dir.path(), &secrets_file, &cache)
             .unwrap()
             .unwrap();
         assert_eq!(analysis.missing_manual.len(), 1);
         assert_eq!(analysis.missing_manual[0].0, "REQUIRED_KEY");
+        assert_eq!(
+            analysis.missing_optional_manual,
+            vec!["OPTIONAL_KEY".to_string()],
+            "Optional manual secrets should be listed for vault lookup"
+        );
     }
 
     #[test]
-    fn analyze_manual_only_without_secrets_file() {
+    fn analyze_counts_cached_values_as_present() {
         let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("secrets.cache.env");
+        std::fs::write(&cache, "OPTIONAL_KEY=from_vault_cache\nAPI_KEY=cached\n").unwrap();
 
         let mut config = Config::default();
+        config.parameters.insert(
+            "OPTIONAL_KEY".to_string(),
+            crate::config::Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                optional: Some(true),
+                ..Default::default()
+            },
+        );
         config.parameters.insert(
             "API_KEY".to_string(),
             crate::config::Parameter {
@@ -514,11 +580,80 @@ mod tests {
             },
         );
 
-        // None = no generated_secrets_file configured
-        let analysis = analyze_secrets(&config, dir.path(), None).unwrap().unwrap();
-        assert!(analysis.needs_generation.is_empty());
-        assert_eq!(analysis.missing_manual.len(), 1);
-        assert_eq!(analysis.missing_manual[0].0, "API_KEY");
+        let secrets_file = dir.path().join(".env.secrets");
+        let analysis = analyze_secrets(&config, dir.path(), &secrets_file, &cache)
+            .unwrap()
+            .unwrap();
+        assert!(
+            analysis.missing_manual.is_empty(),
+            "cache satisfies API_KEY"
+        );
+        assert!(
+            analysis.missing_optional_manual.is_empty(),
+            "cache satisfies OPTIONAL_KEY"
+        );
+        assert_eq!(
+            analysis
+                .existing_values
+                .get("OPTIONAL_KEY")
+                .map(|s| s.as_str()),
+            Some("from_vault_cache")
+        );
+    }
+
+    // ========================================================================
+    // path_git_status
+    // ========================================================================
+
+    #[test]
+    fn path_git_status_outside_any_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let (in_repo, ignored) = path_git_status(&dir.path().join("secrets.env"));
+        assert!(!in_repo);
+        assert!(!ignored);
+    }
+
+    #[test]
+    fn path_git_status_absolute_path_outside_work_repo() {
+        // A gsf pointing outside the repo (e.g. ~/shared/secrets.env) must be
+        // treated as outside-any-repo even though the work dir is a repo.
+        let repo_dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo_dir.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (in_repo, _) = path_git_status(&outside.path().join("secrets.env"));
+        assert!(!in_repo);
+    }
+
+    #[test]
+    fn path_git_status_not_ignored_in_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        let (in_repo, ignored) = path_git_status(&dir.path().join("secrets.env"));
+        assert!(in_repo);
+        assert!(!ignored);
+    }
+
+    #[test]
+    fn path_git_status_ignored_via_nested_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        crate::fed_dir::ensure_fed_dir(dir.path()).unwrap();
+        let (in_repo, ignored) = path_git_status(&dir.path().join(".fed/secrets.generated.env"));
+        assert!(in_repo);
+        assert!(
+            ignored,
+            ".fed/.gitignore should make the default path ignored"
+        );
+    }
+
+    #[test]
+    fn path_git_status_nonexistent_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "deep/\n").unwrap();
+        let (in_repo, ignored) = path_git_status(&dir.path().join("deep/nested/secrets.env"));
+        assert!(in_repo);
+        assert!(ignored);
     }
 }
 
