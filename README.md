@@ -4,6 +4,8 @@ Orchestrate your local dev stack from one config file. Docker containers and nat
 
 Full documentation: **[service-federation.com/docs](https://www.service-federation.com/docs/)** — this README is the short version.
 
+![fed demo: editing the config, starting the stack, and running a second isolated stack from a git worktree](docs/fed-demo.gif)
+
 ## Quick Start
 
 ```bash
