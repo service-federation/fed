@@ -605,3 +605,48 @@ async fn test_stop_retries_on_transient_failure() {
         "Container should be fully removed"
     );
 }
+
+/// Safety regression (codex blocker): fed's volume cleanup keys on the ownership LABEL, not
+/// the `fed-` name prefix. A look-alike `fed-*` volume without the label is a user's and must
+/// never be reaped by prune/doctor.
+#[tokio::test]
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
+async fn prune_reaps_only_labeled_fed_volumes() {
+    require_docker!();
+    use fed::docker::DockerClient;
+
+    let labeled = "fed-labelgatetest-labeled_data";
+    let unlabeled = "fed-labelgatetest-unlabeled_data";
+    let docker = |args: &[&str]| {
+        std::process::Command::new("docker")
+            .args(args)
+            .output()
+            .ok();
+    };
+    // Clean slate, then create one labeled (fed-created) and one bare look-alike.
+    docker(&["volume", "rm", "-f", labeled, unlabeled]);
+    docker(&[
+        "volume",
+        "create",
+        "--label",
+        "com.service-federation.managed=true",
+        labeled,
+    ]);
+    docker(&["volume", "create", unlabeled]);
+
+    let orphans = DockerClient::new()
+        .orphaned_fed_volumes()
+        .await
+        .expect("list orphaned fed volumes");
+
+    assert!(
+        orphans.iter().any(|v| v == labeled),
+        "a labeled, dangling fed volume should be reapable"
+    );
+    assert!(
+        !orphans.iter().any(|v| v == unlabeled),
+        "an UNLABELED fed-* volume must never be reapable (it may be the user's)"
+    );
+
+    docker(&["volume", "rm", "-f", labeled, unlabeled]);
+}

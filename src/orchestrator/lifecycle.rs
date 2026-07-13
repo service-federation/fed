@@ -627,6 +627,28 @@ impl<'a> ServiceLifecycleCommands<'a> {
             return Ok(());
         }
 
+        // Ownership gate: only remove volumes fed actually created (carrying the ownership
+        // label) — the same rule `fed prune` uses. A user volume that merely matches
+        // fed-{scope}-{name} but lacks the label is left alone; volumes from a fed older than
+        // labeling are unlabeled and skipped by design.
+        let labeled: std::collections::HashSet<String> = DockerClient::new()
+            .labeled_fed_volumes()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let fed_volumes: Vec<String> = fed_volumes
+            .into_iter()
+            .filter(|v| labeled.contains(v))
+            .collect();
+        if fed_volumes.is_empty() {
+            tracing::debug!(
+                "No labeled fed volumes to clean for service '{}'",
+                service_name
+            );
+            return Ok(());
+        }
+
         tracing::info!(
             "Removing Docker volumes for service '{}': {:?}",
             service_name,

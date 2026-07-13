@@ -516,6 +516,13 @@ impl DockerClient {
             .collect())
     }
 
+    /// Names of all volumes carrying fed's ownership label ([`FED_MANAGED_LABEL`]) — the
+    /// volumes fed created. Used to gate destructive ops (like `fed clean`) so a user volume
+    /// that merely matches fed's naming but lacks the label is never removed.
+    pub async fn labeled_fed_volumes(&self) -> Result<Vec<String>, DockerError> {
+        self.list_volumes(&[FED_MANAGED_LABEL_FILTER]).await
+    }
+
     /// Reap the dangling volumes of one fed stack (`fed-{scope}-*`).
     ///
     /// Used to fully tear down a throwaway isolated-script stack: once its containers are
