@@ -185,6 +185,9 @@ async fn run() -> anyhow::Result<()> {
         Commands::Doctor => {
             return commands::run_doctor(&out).await;
         }
+        Commands::Prune { force } => {
+            return commands::run_prune(*force, &out).await;
+        }
         Commands::Package(package_cmd) => {
             return commands::run_package(package_cmd, &out).await;
         }
@@ -600,6 +603,7 @@ async fn run() -> anyhow::Result<()> {
         | Commands::Validate
         | Commands::Completions { .. }
         | Commands::Doctor
+        | Commands::Prune { .. }
         | Commands::Package(_)
         | Commands::Ports(_)
         | Commands::Docker(_)

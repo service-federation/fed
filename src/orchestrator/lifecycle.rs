@@ -605,7 +605,14 @@ impl<'a> ServiceLifecycleCommands<'a> {
             return Ok(());
         }
 
-        let scope_id = crate::service::hash_work_dir(self.work_dir);
+        // Scope id MUST mirror the create path (service/docker.rs, `scope_volume_with_session`):
+        // the isolation ID when isolated, else the work-dir hash. Hardcoding the work-dir hash
+        // here made `fed clean` a silent no-op under isolation — it removed `fed-{hash}-{vol}`
+        // while the container's real volume was `fed-{iso}-{vol}`, so the named volume leaked.
+        let scope_id = match &self.isolation_id {
+            Some(id) => id.clone(),
+            None => crate::service::hash_work_dir(self.work_dir),
+        };
 
         let fed_volumes: Vec<String> = all_named_volumes
             .iter()

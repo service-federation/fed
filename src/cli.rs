@@ -165,6 +165,12 @@ pub enum Commands {
     },
     /// Check system requirements (Docker, etc.)
     Doctor,
+    /// Remove orphaned fed-managed Docker volumes (dangling only; dry-run + confirm, --force to delete)
+    Prune {
+        /// Skip the confirmation prompt; required to delete in a non-interactive context
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Show resource usage for all services
     Top {
         /// Refresh interval in seconds

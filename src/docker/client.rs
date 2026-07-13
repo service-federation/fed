@@ -68,8 +68,14 @@ impl DockerClient {
     // ========================================================================
 
     /// Force-remove a container. Returns `Ok(())` if container doesn't exist.
+    ///
+    /// `-v` removes the container's *anonymous* volumes (the throwaway data dirs images
+    /// declare via `VOLUME`, e.g. postgres' /var/lib/postgresql/data when no named volume
+    /// is bound). Without it every stop of such a container orphans one anonymous volume,
+    /// the largest source of fed's volume accumulation. Named volumes are unaffected by
+    /// `-v` — they persist by design and are reaped explicitly via `clean`/`prune`.
     pub async fn rm_force(&self, container: &str, timeout: Duration) -> Result<(), DockerError> {
-        let output = self.run(&["rm", "-f", container], timeout).await?;
+        let output = self.run(&["rm", "-f", "-v", container], timeout).await?;
         if output.status.success() {
             return Ok(());
         }
@@ -81,8 +87,10 @@ impl DockerClient {
     }
 
     /// Force-remove a container (synchronous). Returns `Ok(())` if container doesn't exist.
+    ///
+    /// `-v` reaps anonymous volumes on removal — see [`Self::rm_force`] for why.
     pub fn rm_force_sync(&self, container: &str) -> Result<(), DockerError> {
-        let output = self.run_sync(&["rm", "-f", container])?;
+        let output = self.run_sync(&["rm", "-f", "-v", container])?;
         if output.status.success() {
             return Ok(());
         }
@@ -445,6 +453,26 @@ impl DockerClient {
     pub async fn volume_rm(&self, volume: &str) -> Result<Output, DockerError> {
         self.run(&["volume", "rm", "-f", volume], Duration::from_secs(10))
             .await
+    }
+
+    /// List names of volumes matching the given `docker volume ls --filter` predicates,
+    /// e.g. `["dangling=true", "name=fed-"]`. Returns the `-q` output, one name per line.
+    pub async fn list_volumes(&self, filters: &[&str]) -> Result<Vec<String>, DockerError> {
+        let mut args: Vec<String> = vec!["volume".into(), "ls".into(), "-q".into()];
+        for f in filters {
+            args.push(format!("--filter={f}"));
+        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = self.run(&arg_refs, Duration::from_secs(10)).await?;
+        if !output.status.success() {
+            return Err(DockerError::failed("docker volume ls", &output));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect())
     }
 
     // ========================================================================
