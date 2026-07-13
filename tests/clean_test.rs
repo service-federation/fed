@@ -470,9 +470,16 @@ services:
     let hash = hash_work_dir(temp_dir.path());
     let scoped_volume = format!("fed-{}-{}", hash, raw_volume);
 
-    // Create the scoped volume manually (simulating what fed start would create)
+    // Create the scoped volume with fed's ownership label — that is what `fed start` creates,
+    // and `fed clean` only removes label-owned volumes (never an unlabeled look-alike).
     let _ = Command::new("docker")
-        .args(["volume", "create", &scoped_volume])
+        .args([
+            "volume",
+            "create",
+            "--label",
+            "com.service-federation.managed=true",
+            &scoped_volume,
+        ])
         .output();
 
     // Verify volume exists
@@ -587,9 +594,16 @@ services:
     let hash = hash_work_dir(temp_dir.path());
     let scoped_vol_a = format!("fed-{}-{}", hash, vol_a);
 
-    // Create the scoped volume and an unrelated volume
+    // Create the scoped volume with fed's ownership label (as `fed start` would), plus an
+    // unrelated, UNLABELED volume that clean must leave alone.
     let scoped_create = Command::new("docker")
-        .args(["volume", "create", &scoped_vol_a])
+        .args([
+            "volume",
+            "create",
+            "--label",
+            "com.service-federation.managed=true",
+            &scoped_vol_a,
+        ])
         .output();
     let unrelated_create = Command::new("docker")
         .args(["volume", "create", &unrelated_volume])
