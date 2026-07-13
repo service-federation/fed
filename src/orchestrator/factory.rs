@@ -218,7 +218,10 @@ impl Orchestrator {
         work_dir: String,
     ) -> Box<dyn ServiceManager> {
         let log_file_path = if self.output_mode.is_file() {
-            let logs_dir = self.work_dir().join(".fed").join("logs");
+            let logs_dir = crate::fed_dir::fed_dir(self.work_dir()).join("logs");
+            if let Err(e) = crate::fed_dir::ensure_fed_dir(self.work_dir()) {
+                tracing::warn!("Failed to create .fed directory: {}", e);
+            }
             if let Err(e) = std::fs::create_dir_all(&logs_dir) {
                 tracing::warn!("Failed to create logs directory {:?}: {}", logs_dir, e);
                 None

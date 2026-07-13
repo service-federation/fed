@@ -52,6 +52,7 @@ pub mod config;
 pub mod dependency;
 pub mod docker;
 pub mod error;
+pub mod fed_dir;
 pub mod healthcheck;
 pub mod lock_order;
 pub mod markers;

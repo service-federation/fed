@@ -35,11 +35,13 @@ pub async fn run_link(
 
     let (in_repo, ignored) = is_gitignored(&work_dir, ".fed/cloud.yaml");
     if in_repo && ignored {
+        // fed's own .fed/.gitignore explicitly unignores cloud.yaml, so if it's
+        // still ignored the root .gitignore must be ignoring .fed wholesale.
         out.warning(
-            ".fed/cloud.yaml is gitignored — teammates won't inherit the link. Add `!.fed/cloud.yaml` to .gitignore and commit it.",
+            ".fed/cloud.yaml is gitignored — teammates won't inherit the link. Your root .gitignore likely ignores `.fed/` wholesale; remove that entry (fed's own .fed/.gitignore keeps everything except cloud.yaml out of git), then commit .fed/cloud.yaml.",
         );
     } else if in_repo {
-        out.status("Commit .fed/cloud.yaml so teammates inherit the link.");
+        out.status("Commit .fed/cloud.yaml so teammates inherit the link — it's the only file in .fed/ that fed doesn't gitignore.");
     }
     out.status("Teammates: `fed login`, then `fed start` pulls the team's development secrets.");
     Ok(())

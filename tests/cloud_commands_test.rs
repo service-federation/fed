@@ -53,6 +53,11 @@ fn test_link_writes_cloud_yaml() {
     let written = std::fs::read_to_string(tmp.path().join(".fed/cloud.yaml")).unwrap();
     assert!(written.contains("org: acme"));
     assert!(written.contains("project: web"));
+
+    // fed self-manages .fed/.gitignore: everything ignored except cloud.yaml
+    // (and the .gitignore itself).
+    let gitignore = std::fs::read_to_string(tmp.path().join(".fed/.gitignore")).unwrap();
+    assert_eq!(gitignore, "*\n!cloud.yaml\n!.gitignore\n");
 }
 
 /// link rejects malformed targets.

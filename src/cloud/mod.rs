@@ -96,10 +96,8 @@ pub fn load_link(work_dir: &Path) -> Option<CloudLink> {
 
 pub fn save_link(work_dir: &Path, link: &CloudLink) -> Result<PathBuf> {
     let path = link_path(work_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| Error::Filesystem(format!("creating {}: {}", parent.display(), e)))?;
-    }
+    // Creates .fed/ with its self-ignoring .gitignore (which unignores cloud.yaml).
+    crate::fed_dir::ensure_fed_dir(work_dir)?;
     let yaml = format!(
         "# Binds this checkout to a Service Federation Cloud project.\n# Commit this file — teammates inherit the link.\n{}",
         serde_yaml::to_string(link)

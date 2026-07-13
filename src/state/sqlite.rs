@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use tokio_rusqlite::Connection;
 use tracing::{debug, info, warn};
 
-const FED_DIR: &str = ".fed";
 const DB_FILE_NAME: &str = "lock.db";
 const LOCK_FILE_NAME: &str = ".lock";
 const SCHEMA_VERSION: i32 = 6;
@@ -77,9 +76,8 @@ impl SqliteStateTracker {
     /// modifications from multiple `fed` instances. The lock is held for the
     /// lifetime of this struct and released when dropped.
     pub async fn new(work_dir: PathBuf) -> Result<Self> {
-        // Create .fed directory if it doesn't exist
-        let fed_dir = work_dir.join(FED_DIR);
-        std::fs::create_dir_all(&fed_dir)?;
+        // Create .fed directory (with its self-managed .gitignore) if needed
+        let fed_dir = crate::fed_dir::ensure_fed_dir(&work_dir)?;
 
         // Try to acquire advisory lock for multi-terminal safety
         let lock_path = fed_dir.join(LOCK_FILE_NAME);
