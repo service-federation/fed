@@ -1,35 +1,47 @@
 use crate::output::UserOutput;
 use std::path::Path;
 
-const TEMPLATE: &str = r#"# Service Federation Configuration
-# Documentation: https://github.com/service-federation/fed
+const TEMPLATE: &str = r#"# service-federation.yaml — your repository's runnable dev stack.
+# `fed start` brings the whole thing up in dependency order, waiting on each healthcheck.
+# This is a starting point: rename the services, swap the commands, delete what you don't use.
+# Full reference: https://www.service-federation.com/docs/
 
 parameters:
-  # Port parameters with preferred defaults
+  # `type: port` grabs a free port — it prefers the default and falls back if it's taken,
+  # so two checkouts of this repo never fight over the same port.
   API_PORT:
     type: port
-    default: 8080  # Prefers 8080, falls back if unavailable
-
+    default: 8080
+  FRONTEND_PORT:
+    type: port
+    default: 3000
   DB_PORT:
     type: port
     default: 5432
 
-  # String parameters
   DB_NAME:
     default: myapp_dev
-
   DB_USER:
     default: postgres
 
+  # `type: secret` is generated on the first `fed start` and written to the file below.
+  # No password in your config, no secret in git.
+  DB_PASSWORD:
+    type: secret
+
+# Generated secrets land here. Add `.fed/` to .gitignore and they stay out of git.
+generated_secrets_file: .fed/secrets.env
+
 services:
-  # Core services (always run)
   database:
-    image: postgres:15-alpine
+    image: postgres:16-alpine
     ports: ["{{DB_PORT}}:5432"]
     environment:
       POSTGRES_DB: '{{DB_NAME}}'
       POSTGRES_USER: '{{DB_USER}}'
-      POSTGRES_PASSWORD: 'password'
+      POSTGRES_PASSWORD: '{{DB_PASSWORD}}'
+    # Dependents wait for this to pass, so nothing starts against a database that isn't
+    # accepting connections yet.
     healthcheck:
       command: 'pg_isready -U {{DB_USER}}'
 
@@ -37,9 +49,16 @@ services:
     process: npm start
     cwd: ./backend
     depends_on: [database]
+    # `install:` runs once per checkout — the first `fed start` runs it, later starts skip
+    # it. Re-run it with `fed install`; clear it with `fed clean`. Use it for the slow setup
+    # that only changes when you say so.
+    install: npm install
+    # `migrate:` runs on every `fed start`, after the database is healthy and before the
+    # backend starts — so the schema is always current. Keep it idempotent.
+    migrate: npm run migrate
     environment:
       PORT: '{{API_PORT}}'
-      DATABASE_URL: 'postgres://{{DB_USER}}:password@localhost:{{DB_PORT}}/{{DB_NAME}}'
+      DATABASE_URL: 'postgres://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
     healthcheck:
       httpGet: 'http://localhost:{{API_PORT}}/health'
 
@@ -48,52 +67,17 @@ services:
     cwd: ./frontend
     depends_on: [backend]
     environment:
+      PORT: '{{FRONTEND_PORT}}'
       BACKEND_URL: 'http://localhost:{{API_PORT}}'
+    # Printed once the stack is up. In isolated mode it shows the port this checkout
+    # actually got, so you always know where to open the app.
+    startup_message: 'http://localhost:{{FRONTEND_PORT}}'
 
-  # Development-only services
-  # Start with: fed start --profile development
-  dev-tools:
-    profiles: [development]
-    process: npm run dev-server
-    cwd: ./dev-tools
-    depends_on: [backend]
-
-  # Debugging services
-  # Start with: fed start --profile debug
-  debugger:
-    profiles: [debug, development]
-    process: npm run debug-proxy
-    cwd: ./tools
-    depends_on: [backend]
-
-  # Production-like services
-  # Start with: fed start --profile production
-  monitoring:
-    profiles: [production]
-    image: prom/prometheus:latest
-    ports: ["9090:9090"]
-    depends_on: [backend]
-
-  # Analytics (runs in production OR staging)
-  # Start with: fed start --profile production OR fed start --profile staging
-  analytics:
-    profiles: [production, staging]
-    image: grafana/grafana:latest
-    ports: ["3000:3000"]
-    depends_on: [backend]
-
-# Entrypoint - which service to start by default
+# The service `fed start` brings up by default (its dependencies come along).
 entrypoint: frontend
 
-# Profile usage examples:
-# fed start                           # Minimal: core services only (no profiles)
-# fed start --profile development     # Full dev: core + dev-tools + debugger
-# fed start --profile debug           # Debug: core + debugger
-# fed start --profile production      # Production-like: core + monitoring + analytics
-# fed start --profile staging         # Staging: core + analytics
-# fed start -p development -p debug   # Multiple profiles: core + dev-tools + debugger
-
-# Optional: Scripts for common tasks
+# Scripts run a one-off task against this stack, with the same ports and secrets your
+# services got. Run them with `fed <name>` — e.g. `fed test`.
 scripts:
   test:
     depends_on: [backend]
@@ -102,10 +86,8 @@ scripts:
     script: |
       npm test
 
-  seed:
-    depends_on: [database]
-    script: |
-      psql postgres://{{DB_USER}}:password@localhost:{{DB_PORT}}/{{DB_NAME}} -f seed.sql
+# Profiles switch services on by context: tag one with `profiles: [production]`, then
+# `fed start --profile production`. See https://www.service-federation.com/docs/configuration/
 "#;
 
 pub fn run_init(output: &Path, force: bool, out: &dyn UserOutput) -> anyhow::Result<()> {
