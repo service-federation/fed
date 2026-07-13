@@ -23,11 +23,13 @@ pub fn run_validate(config_path: Option<PathBuf>, out: &dyn UserOutput) -> anyho
     // On failure, return the error and let main print it once (with hints).
     let config = parser.load_config(&config_path)?;
 
+    // Surface typo'd keys before hard validation, so a typo that also breaks validation still
+    // gets its "did you mean?" hint — not just the downstream validation error.
+    crate::commands::emit_config_warnings(&config, out);
+
     config.validate()?;
 
     out.success("Configuration is valid\n");
-
-    crate::commands::emit_config_warnings(&config, out);
 
     // Show summary
     out.status(&format!("Services: {}", config.services.len()));

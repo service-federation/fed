@@ -139,6 +139,17 @@ impl Config {
                 });
             }
         }
+        let mut templates: Vec<_> = self.templates.iter().collect();
+        templates.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, template) in templates {
+            for key in template.unknown_fields.keys() {
+                out.push(UnknownKey {
+                    location: format!("template '{name}'"),
+                    key: key.clone(),
+                    candidates: Service::known_field_names(),
+                });
+            }
+        }
         out
     }
 

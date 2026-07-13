@@ -9,6 +9,12 @@ use std::collections::HashMap;
 use std::process::Output;
 use std::time::Duration;
 
+/// The label fed stamps on every Docker volume it creates. Ownership proof for `fed prune`,
+/// `fed doctor`, and isolated-script reaping: a `fed-`-named volume WITHOUT this label was not
+/// created by this fed (an older fed, or a user's own), so it is never auto-deleted.
+pub const FED_MANAGED_LABEL: &str = "com.service-federation.managed=true";
+const FED_MANAGED_LABEL_FILTER: &str = "label=com.service-federation.managed=true";
+
 /// Centralized client for Docker CLI operations.
 ///
 /// Wraps all `docker` subprocess invocations with consistent timeout handling
@@ -450,9 +456,26 @@ impl DockerClient {
     // ========================================================================
 
     /// Force-remove a Docker volume.
+    ///
+    /// `-f` only suppresses the "no such volume" error. Docker still refuses to remove a
+    /// volume in use by any container, running or stopped — so a volume attached in the race
+    /// window after a dangling check fails to remove here rather than deleting live data.
     pub async fn volume_rm(&self, volume: &str) -> Result<Output, DockerError> {
         self.run(&["volume", "rm", "-f", volume], Duration::from_secs(10))
             .await
+    }
+
+    /// Create `name` (if absent) carrying fed's ownership label ([`FED_MANAGED_LABEL`]).
+    /// Called before `docker run`, which would otherwise auto-create the named volume
+    /// unlabeled. Idempotent: on a volume that already exists this is a no-op and does NOT
+    /// add the label — so volumes from an older fed stay unlabeled and prune leaves them be.
+    pub async fn ensure_labeled_volume(&self, name: &str) -> Result<(), DockerError> {
+        self.run(
+            &["volume", "create", "--label", FED_MANAGED_LABEL, name],
+            Duration::from_secs(10),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// List names of volumes matching the given `docker volume ls --filter` predicates,
@@ -477,15 +500,16 @@ impl DockerClient {
 
     /// The fed-managed volumes that are safe to reap: *dangling* (referenced by no
     /// container, running or stopped — so a live or stopped stack's data is never touched)
-    /// AND actually prefixed `fed-`.
+    /// AND carrying fed's ownership label ([`FED_MANAGED_LABEL`]) — proof fed created the
+    /// volume, not a guess from its name.
     ///
-    /// The prefix is enforced here in code, not left to Docker: `docker volume ls
-    /// --filter name=fed-` is an unanchored *substring* match, so it also returns
-    /// `notfed-data`, `myfed-cache`, etc. This is the single source of truth for what
-    /// `fed prune` removes and `fed doctor` reports — keep the two from drifting.
+    /// Volumes created by a fed older than the labeling change are unlabeled and are left
+    /// alone on purpose: a user-made `fed-backup` must never be deleted. The `fed-` prefix
+    /// filter is kept as belt-and-suspenders (Docker's `name=` filter is an unanchored
+    /// substring match). Single source of truth for `fed prune` and `fed doctor`.
     pub async fn orphaned_fed_volumes(&self) -> Result<Vec<String>, DockerError> {
         Ok(self
-            .list_volumes(&["dangling=true", "name=fed-"])
+            .list_volumes(&["dangling=true", FED_MANAGED_LABEL_FILTER])
             .await?
             .into_iter()
             .filter(|v| v.starts_with("fed-"))
@@ -502,7 +526,11 @@ impl DockerClient {
         let prefix = format!("fed-{scope_id}-");
         let name_filter = format!("name={prefix}");
         let dangling = match self
-            .list_volumes(&["dangling=true", name_filter.as_str()])
+            .list_volumes(&[
+                "dangling=true",
+                FED_MANAGED_LABEL_FILTER,
+                name_filter.as_str(),
+            ])
             .await
         {
             Ok(v) => v,

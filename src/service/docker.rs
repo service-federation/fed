@@ -537,7 +537,10 @@ impl ServiceManager for DockerService {
             }
         }
 
-        // Add volumes with validation and isolation scoping
+        // Add volumes with validation and isolation scoping. Collect the fed-scoped named
+        // volumes so we can stamp them with the ownership label before `docker run`
+        // auto-creates them unlabeled (see ensure_labeled_volume, below).
+        let mut named_volumes: Vec<String> = Vec::new();
         for volume in &self.config.volumes {
             Self::validate_volume_spec(volume).map_err(|e| match e {
                 Error::Config(msg) => Error::Config(format!("Service '{}': {}", self.name, msg)),
@@ -552,6 +555,11 @@ impl ServiceManager for DockerService {
                 let hash = hash_work_dir(Path::new(&base.work_dir));
                 Self::scope_volume_with_session(volume, &hash)
             };
+            if let Some(name) = scoped_volume.split(':').next() {
+                if name.starts_with("fed-") {
+                    named_volumes.push(name.to_string());
+                }
+            }
             args.push(scoped_volume);
         }
 
@@ -588,6 +596,15 @@ impl ServiceManager for DockerService {
             }
         } else {
             tracing::debug!("Image '{}' found locally, skipping pull", image);
+        }
+
+        // Stamp fed's named volumes with the ownership label BEFORE `docker run` auto-creates
+        // them (unlabeled). This is what lets prune / doctor / isolated-script reaping prove a
+        // volume is fed-created. Best-effort: a labeling failure must never block the start.
+        for vol in &named_volumes {
+            if let Err(e) = self.client.ensure_labeled_volume(vol).await {
+                tracing::debug!("Could not label volume '{}': {}", vol, e);
+            }
         }
 
         // Run docker command with timeout
