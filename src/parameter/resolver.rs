@@ -1005,10 +1005,26 @@ impl Resolver {
             .filter(|(name, _)| !self.deferred_params.contains(*name))
             .map(|(name, param)| (name.clone(), param.clone()))
             .collect();
+        // Seed the DAG with values a generated secret may interpolate: manual
+        // secrets already resolved for this run (env files and the secrets file
+        // via `existing_values`, plus vault/cache/explicit values now on
+        // `param.value`). Without this a generated secret could never reference a
+        // manual secret — `printf %s {{SEED}}` would fail with ParameterNotFound.
+        // Deferred names are omitted: their value is out of scope this run, and a
+        // generate depending on one is itself deferred and dropped above.
+        let mut resolved_inputs = analysis.existing_values.clone();
+        for (name, param) in config.get_effective_parameters() {
+            if self.deferred_params.contains(name) {
+                continue;
+            }
+            if let Some(v) = &param.value {
+                resolved_inputs.insert(name.clone(), v.clone());
+            }
+        }
         let generate_results = super::generate::resolve_generate_params(
             &effective_params,
             &analysis.existing_values,
-            &HashMap::new(),
+            &resolved_inputs,
         )?;
 
         let dag_generated: HashSet<String> =
@@ -1021,10 +1037,26 @@ impl Resolver {
             .collect();
 
         // Simple secrets (no generate command) — use random alphanumeric.
+        //
+        // Two kinds of name must never reach this random fallback:
+        //   - deferred names: a scoped run persists nothing for a parameter it
+        //     defers (its value is out of scope this run); writing a random value
+        //     would be an out-of-scope side effect.
+        //   - anything carrying a `generate` command: if its generator did not run
+        //     in the DAG above (it was deferred, or a dependency was), the fix is
+        //     to run that generator on a later in-scope run — never to substitute
+        //     randomness. A random value here would be persisted and then kept by
+        //     the next run (generate.rs preserves existing secret values),
+        //     permanently poisoning the derived secret.
+        let effective = config.get_effective_parameters();
         for name in &analysis.needs_generation {
-            if !dag_generated.contains(name) {
-                generated.push((name.clone(), super::secret::generate_secret()));
+            if dag_generated.contains(name) || self.deferred_params.contains(name) {
+                continue;
             }
+            if effective.get(name).is_some_and(|p| p.has_generate()) {
+                continue;
+            }
+            generated.push((name.clone(), super::secret::generate_secret()));
         }
 
         // Nothing to write? We're done.
@@ -4871,5 +4903,84 @@ mod tests {
             .resolve_parameters(&mut config)
             .expect_err("malformed env file should still error");
         assert!(err.to_string().contains("bad.env"));
+    }
+
+    // ── RB-1: deferred generated secrets must not be randomly generated ──────
+
+    #[test]
+    fn scoped_run_defers_generated_secret_persists_nothing_then_generates_correct_value() {
+        // The reviewer's exact repro. SEED (manual) + DERIVED_SECRET (secret with
+        // a generator over SEED). A scoped run that defers DERIVED_SECRET must
+        // persist NOTHING for it — never a random value that a later run would
+        // keep (generate.rs preserves existing secret values, poisoning it). A
+        // subsequent in-scope run with SEED available must then generate the
+        // correct derived value.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let gen_path = temp.path().join(crate::fed_dir::GENERATED_SECRETS_REL);
+
+        let make_config = |with_env: bool| {
+            let mut config = Config::default();
+            if with_env {
+                config.env_file = vec!["seed.env".to_string()];
+            }
+            config.parameters.insert(
+                "SEED".to_string(),
+                Parameter {
+                    param_type: Some("secret".to_string()),
+                    source: Some("manual".to_string()),
+                    ..Default::default()
+                },
+            );
+            config.parameters.insert(
+                "DERIVED_SECRET".to_string(),
+                Parameter {
+                    param_type: Some("secret".to_string()),
+                    generate: Some("printf %s {{SEED}}".to_string()),
+                    ..Default::default()
+                },
+            );
+            config
+        };
+
+        // Run 1: scoped, SEED out of scope → DERIVED_SECRET is deferred.
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp.path());
+        resolver.set_offline(true);
+        resolver.set_required_names(Some(HashSet::new()));
+        let mut config = make_config(false);
+        resolver
+            .resolve_parameters(&mut config)
+            .expect("a scoped run must defer the generated secret, not fail");
+        assert!(
+            !gen_path.exists(),
+            "a deferred generated secret must persist nothing — no random value written"
+        );
+
+        // Run 2: in scope with SEED available via env file.
+        std::fs::write(temp.path().join("seed.env"), "SEED=myseed\n").unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp.path());
+        resolver.set_offline(true);
+        resolver.set_required_names(Some(HashSet::from([
+            "SEED".to_string(),
+            "DERIVED_SECRET".to_string(),
+        ])));
+        let mut config = make_config(true);
+        resolver
+            .resolve_parameters(&mut config)
+            .expect("an in-scope run with SEED available must resolve");
+        assert_eq!(
+            resolver.get_resolved_parameters().get("DERIVED_SECRET"),
+            Some(&"myseed".to_string()),
+            "the subsequent run must generate the correct derived value, not a kept random one"
+        );
+        let persisted = std::fs::read_to_string(&gen_path).expect("generated secrets file");
+        assert!(
+            persisted.contains("DERIVED_SECRET=myseed"),
+            "the correct derived value must be persisted, got: {persisted:?}"
+        );
     }
 }
