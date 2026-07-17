@@ -95,8 +95,10 @@ shell-escape = "0.1"
 # Environment file parsing
 dotenvy = "0.15"
 
-# No-echo terminal reader for interactive secret entry
-rpassword = "7.3"
+# No-echo terminal reader for interactive secret entry.
+# Pinned exactly: rpassword 7.5.0+ raised its MSRV to 1.85, which breaks our
+# declared rust-version = "1.80". 7.4.0 is the newest release still on MSRV 1.60.
+rpassword = "=7.4.0"
 
 # TUI dependencies
 ratatui = "0.28"
