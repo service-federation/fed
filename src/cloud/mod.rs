@@ -37,29 +37,38 @@ pub fn load_credentials() -> Option<Credentials> {
             });
         }
     }
-    let path = credentials_path()?;
+    load_credentials_from(&credentials_path()?)
+}
+
+fn load_credentials_from(path: &Path) -> Option<Credentials> {
     let raw = std::fs::read_to_string(path).ok()?;
-    serde_yaml::from_str(&raw).ok()
+    let creds = serde_yaml::from_str(&raw).ok()?;
+    // Tighten a pre-existing over-permissive credentials file (e.g. one written
+    // by an older fed that chmodded after the fact, or copied in by hand) the
+    // next time we touch it. Best-effort: a chmod failure must not block login.
+    crate::fsutil::tighten_path_to_owner_only(path);
+    Some(creds)
 }
 
 pub fn save_credentials(creds: &Credentials) -> Result<()> {
     let path = credentials_path()
         .ok_or_else(|| Error::Validation("cannot determine home directory".into()))?;
+    save_credentials_to(&path, creds)
+}
+
+fn save_credentials_to(path: &Path, creds: &Credentials) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::Filesystem(format!("creating {}: {}", parent.display(), e)))?;
     }
     let yaml = serde_yaml::to_string(creds)
         .map_err(|e| Error::Validation(format!("serializing credentials: {}", e)))?;
-    std::fs::write(&path, yaml)
-        .map_err(|e| Error::Filesystem(format!("writing {}: {}", path.display(), e)))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| Error::Filesystem(format!("chmod {}: {}", path.display(), e)))?;
-    }
-    Ok(())
+    // Credentials hold a bearer token, so write via the shared atomic 0600
+    // helper: never a world-readable window on first creation (unlike the old
+    // write-then-chmod), and crash-atomic. sync=true — the write happens only on
+    // `fed login`, so the one fsync is free, and a token silently lost to a
+    // crash would force an out-of-band re-login.
+    crate::fsutil::write_owner_only_atomic(path, yaml.as_bytes(), true)
 }
 
 pub fn delete_credentials() -> Result<bool> {
@@ -465,6 +474,99 @@ pub async fn put_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_creds() -> Credentials {
+        Credentials {
+            url: "https://app.example.com".to_string(),
+            token: "super-secret-token".to_string(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Credentials are written 0600 on first creation — never a broader window.
+    #[test]
+    fn save_credentials_creates_owner_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".fed").join("credentials");
+        save_credentials_to(&path, &sample_creds()).unwrap();
+        assert!(path.exists());
+        #[cfg(unix)]
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    /// Overwriting existing credentials keeps them at 0600.
+    #[test]
+    fn overwrite_credentials_keeps_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        save_credentials_to(&path, &sample_creds()).unwrap();
+        let mut updated = sample_creds();
+        updated.token = "rotated-token".to_string();
+        save_credentials_to(&path, &updated).unwrap();
+        let loaded = load_credentials_from(&path).unwrap();
+        assert_eq!(loaded.token, "rotated-token");
+        #[cfg(unix)]
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    /// A failed save leaves the previously valid credentials intact — no partial
+    /// destination. The failure is injected by pre-creating a directory where
+    /// the atomic writer would place its temp file.
+    #[test]
+    fn failed_save_preserves_previous_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        save_credentials_to(&path, &sample_creds()).unwrap();
+
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        let tmp = dir
+            .path()
+            .join(format!(".{}.tmp.{}", file_name, std::process::id()));
+        std::fs::create_dir(&tmp).unwrap();
+
+        let mut updated = sample_creds();
+        updated.token = "would-be-lost".to_string();
+        assert!(save_credentials_to(&path, &updated).is_err());
+
+        let loaded = load_credentials_from(&path).unwrap();
+        assert_eq!(
+            loaded.token, "super-secret-token",
+            "the previous valid credentials must survive a failed save"
+        );
+    }
+
+    /// Save then reload round-trips the credentials.
+    #[test]
+    fn save_then_reload_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        save_credentials_to(&path, &sample_creds()).unwrap();
+        let loaded = load_credentials_from(&path).unwrap();
+        assert_eq!(loaded.url, "https://app.example.com");
+        assert_eq!(loaded.token, "super-secret-token");
+    }
+
+    /// Loading an over-permissive credentials file tightens it to 0600.
+    #[cfg(unix)]
+    #[test]
+    fn load_tightens_overpermissive_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let yaml = serde_yaml::to_string(&sample_creds()).unwrap();
+        std::fs::write(&path, yaml).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&path), 0o644);
+
+        let loaded = load_credentials_from(&path).unwrap();
+        assert_eq!(loaded.token, "super-secret-token");
+        assert_eq!(mode_of(&path), 0o600, "load must tighten a loose file");
+    }
 
     /// A `reqwest` error from connecting to a port with nothing listening must
     /// classify as `Unreachable` — waiting is pointless.

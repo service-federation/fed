@@ -267,7 +267,7 @@ pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Res
 
     // Pre-existing files: tighten to 0600 via the held handle (fchmod — no
     // path race) and surface failures instead of silently leaving it open.
-    ensure_owner_only(&file, path)?;
+    crate::fsutil::tighten_to_owner_only(&file, path)?;
 
     // Read the current contents through the locked handle, never by pathname.
     let content = {
@@ -370,26 +370,6 @@ pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Res
     Ok(())
 }
 
-/// Tighten a secrets file to owner-only permissions via its open handle.
-fn ensure_owner_only(file: &std::fs::File, path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = file
-            .metadata()
-            .map_err(|e| Error::Filesystem(format!("Cannot stat '{}': {}", path.display(), e)))?;
-        if meta.permissions().mode() & 0o177 != 0 {
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| {
-                    Error::Filesystem(format!("Cannot chmod '{}': {}", path.display(), e))
-                })?;
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = (file, path);
-    Ok(())
-}
-
 /// Replace the vault secrets cache wholesale (owner-only, sorted keys).
 ///
 /// The cache is fed-managed state, so unlike `write_env_file` this does not
@@ -410,55 +390,24 @@ pub fn write_cache_file(path: &Path, entries: &HashMap<String, CacheEntry>) -> R
         return Ok(());
     }
 
-    let dir = path
-        .parent()
-        .ok_or_else(|| Error::Filesystem(format!("'{}' has no parent dir", path.display())))?;
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("secrets.cache.env");
-    let tmp_path = dir.join(format!(".{}.tmp.{}", file_name, std::process::id()));
-
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let write_result = (|| -> Result<()> {
-        let mut file = opts.open(&tmp_path).map_err(|e| {
-            Error::Filesystem(format!("Cannot write '{}': {}", tmp_path.display(), e))
-        })?;
-        ensure_owner_only(&file, &tmp_path)?;
-
-        let mut out = String::from("# Vault secrets cache — managed by fed, do not commit\n");
-        let mut keys: Vec<&String> = entries.keys().collect();
-        keys.sort();
-        for key in keys {
-            let entry = &entries[key];
-            // Stamp lives in an adjacent comment so the value lines stay a plain
-            // KEY=VALUE .env that dotenvy (and offline resolution) reads as-is;
-            // the freshness bound reads the stamps separately.
-            if let Some(ts) = entry.fetched_at {
-                out.push_str(&format!("# fetched-at {key} {ts}\n"));
-            }
-            out.push_str(&format!("{key}={}\n", encode_env_value(&entry.value)));
+    let mut out = String::from("# Vault secrets cache — managed by fed, do not commit\n");
+    let mut keys: Vec<&String> = entries.keys().collect();
+    keys.sort();
+    for key in keys {
+        let entry = &entries[key];
+        // Stamp lives in an adjacent comment so the value lines stay a plain
+        // KEY=VALUE .env that dotenvy (and offline resolution) reads as-is;
+        // the freshness bound reads the stamps separately.
+        if let Some(ts) = entry.fetched_at {
+            out.push_str(&format!("# fetched-at {key} {ts}\n"));
         }
-        use std::io::Write;
-        file.write_all(out.as_bytes())
-            .map_err(|e| Error::Filesystem(format!("Write error: {}", e)))?;
-        file.sync_all()
-            .map_err(|e| Error::Filesystem(format!("Sync error: {}", e)))?;
-        std::fs::rename(&tmp_path, path).map_err(|e| {
-            Error::Filesystem(format!("Cannot replace '{}': {}", path.display(), e))
-        })?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
+        out.push_str(&format!("{key}={}\n", encode_env_value(&entry.value)));
     }
-    write_result
+    // Atomic 0600 replacement (shared helper): concurrent readers (dry-runs,
+    // direct resolver calls) see either the old or the new cache, never a
+    // truncated one. sync=true so a freshly fetched cache survives a crash —
+    // cheap, since the cache is rewritten at most once per run.
+    crate::fsutil::write_owner_only_atomic(path, out.as_bytes(), true)
 }
 
 /// Parse per-entry fetched-at stamps from the vault cache's comment lines.
