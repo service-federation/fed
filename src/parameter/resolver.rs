@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 /// Global template regex compiled once
 static TEMPLATE_REGEX: OnceLock<Regex> = OnceLock::new();
 
-fn get_template_regex() -> &'static Regex {
+pub(crate) fn get_template_regex() -> &'static Regex {
     TEMPLATE_REGEX
         .get_or_init(|| Regex::new(r"\{\{([^}]+)\}\}").expect("static regex pattern is valid"))
 }
@@ -214,6 +214,12 @@ pub struct Resolver {
     /// Active isolation session id, if any. Scopes the built-in
     /// `FED_PROJECT_ID` so parallel isolated stacks get distinct identifiers.
     isolation_id: Option<String>,
+    /// Manual-secret names the current target (script + transitive deps) may
+    /// reference. `None` = no scoping (fetch every missing manual secret) — the
+    /// safe default for interactive `fed`, unknown commands, and the deprecated
+    /// `generated_secrets_file` case. `Some(set)` scopes the vault query and the
+    /// missing-secret failure to names the run actually needs.
+    required_names: Option<HashSet<String>>,
 }
 
 impl Resolver {
@@ -235,6 +241,7 @@ impl Resolver {
             offline: false,
             test_vault_values: None,
             test_vault_failure: None,
+            required_names: None,
             isolation_id: None,
         }
     }
@@ -258,6 +265,7 @@ impl Resolver {
             offline: false,
             test_vault_values: None,
             test_vault_failure: None,
+            required_names: None,
             isolation_id: None,
         }
     }
@@ -352,6 +360,27 @@ impl Resolver {
     /// each get a distinct, stable identifier.
     pub fn set_isolation_id(&mut self, isolation_id: Option<String>) {
         self.isolation_id = isolation_id;
+    }
+
+    /// Scope the vault query to the manual-secret names the target actually
+    /// references (see [`crate::parameter::scanner`]).
+    ///
+    /// `None` (the default) fetches every missing manual secret — the safe
+    /// behavior for interactive `fed`, unknown commands, and the deprecated
+    /// `generated_secrets_file` config. `Some(set)` restricts both the vault
+    /// query and the missing-secret failure to `set`, so a script never blocks
+    /// on (or fails for) a secret it doesn't use.
+    pub fn set_required_names(&mut self, names: Option<HashSet<String>>) {
+        self.required_names = names;
+    }
+
+    /// Whether a manual-secret name is in scope for this run. Names outside the
+    /// scope are neither queried from the vault nor treated as required.
+    fn name_in_scope(&self, name: &str) -> bool {
+        match &self.required_names {
+            Some(required) => required.contains(name),
+            None => true,
+        }
     }
 
     /// Resolve template placeholders {{VAR}} with their values
@@ -560,11 +589,17 @@ impl Resolver {
         // missing-secret error can name the real cause instead of blaming the
         // user's env_file for an unreachable cloud.
         let mut vault_failure: Option<String> = None;
+        // Scope the vault query to names this run actually references. The
+        // analysis itself stays project-wide (D2): its `cache_values` feed the
+        // cache rewrite below, and scoping them would prune other scripts'
+        // cached secrets on every run. Only what we *fetch* — and, at the end,
+        // what we *fail on* — is scoped.
         let queried_names: Vec<String> = analysis
             .missing_manual
             .iter()
             .map(|(name, _)| name.clone())
             .chain(analysis.missing_optional_manual.iter().cloned())
+            .filter(|name| self.name_in_scope(name))
             .collect();
         if !queried_names.is_empty() && !self.offline {
             let fetched = if let Some(msg) = &self.test_vault_failure {
@@ -676,10 +711,19 @@ impl Resolver {
             }
         }
 
-        // Fail on missing manual secrets — user must provide these
-        if !analysis.missing_manual.is_empty() {
-            let details: Vec<String> = analysis
-                .missing_manual
+        // Fail on missing manual secrets — user must provide these. Only
+        // names in scope for this run count: a script must not fail on a
+        // project-wide secret it never references (that is the whole point of
+        // scoping — see 01-secret-scoping.md). Unscoped names stay in the
+        // analysis (so the cache logic above is unaffected) but are excluded
+        // from the failure here.
+        let unmet: Vec<&(String, Option<String>)> = analysis
+            .missing_manual
+            .iter()
+            .filter(|(name, _)| self.name_in_scope(name))
+            .collect();
+        if !unmet.is_empty() {
+            let details: Vec<String> = unmet
                 .iter()
                 .map(|(name, desc)| match desc {
                     Some(d) => format!("  - {} ({})", name, d),
@@ -3579,6 +3623,161 @@ mod tests {
         assert!(
             content.contains("SESSION_KEY="),
             "Absolute path outside any repo is safe by construction"
+        );
+    }
+
+    #[test]
+    fn scoped_run_ignores_out_of_scope_secret_with_vault_down() {
+        // 01 done-when: a run scoped to names it references makes zero cloud
+        // requests for an unreferenced STRIPE_SECRET and succeeds even with the
+        // vault unreachable.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        // Scope excludes STRIPE_SECRET entirely.
+        resolver.set_required_names(Some(HashSet::new()));
+        // If anything were queried, this failure would surface — it must not.
+        resolver.set_test_vault_failure("cloud: cannot reach vault");
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "STRIPE_SECRET".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // Must not error despite the required manual secret being unresolved:
+        // it is out of scope for this run.
+        resolver
+            .resolve_parameters(&mut config)
+            .expect("out-of-scope required secret must not fail the run");
+        assert!(
+            !temp_dir.path().join(".fed/secrets.cache.env").exists(),
+            "no vault query means nothing cached"
+        );
+    }
+
+    #[test]
+    fn unscoped_run_still_fails_on_missing_required_secret() {
+        // Control for the test above: with no scoping (None), the same missing
+        // required manual secret still fails — scoping is what changes it.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_offline(true); // no vault, no cache → genuinely missing
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "STRIPE_SECRET".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            resolver.resolve_parameters(&mut config).is_err(),
+            "unscoped run must still fail on a missing required secret"
+        );
+    }
+
+    #[test]
+    fn scoped_run_queries_only_in_scope_secret() {
+        // A run scoped to API_KEY resolves it from the vault while leaving an
+        // out-of-scope STRIPE_SECRET untouched (not queried, not failed).
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_required_names(Some(HashSet::from(["API_KEY".to_string()])));
+        resolver.set_test_vault_values(HashMap::from([
+            ("API_KEY".to_string(), "from_vault".to_string()),
+            (
+                "STRIPE_SECRET".to_string(),
+                "should_not_be_used".to_string(),
+            ),
+        ]));
+
+        let mut config = Config::default();
+        for name in ["API_KEY", "STRIPE_SECRET"] {
+            config.parameters.insert(
+                name.to_string(),
+                Parameter {
+                    param_type: Some("secret".to_string()),
+                    source: Some("manual".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(
+            resolver.get_resolved_parameters().get("API_KEY").unwrap(),
+            "from_vault"
+        );
+        let cache =
+            std::fs::read_to_string(temp_dir.path().join(".fed/secrets.cache.env")).unwrap();
+        assert!(cache.contains("API_KEY=from_vault"));
+        assert!(
+            !cache.contains("STRIPE_SECRET"),
+            "out-of-scope secret must not be queried or cached: {cache}"
+        );
+    }
+
+    #[test]
+    fn scoped_run_preserves_cache_entries_for_unqueried_secrets() {
+        // 01 done-when: cache entries for secrets NOT queried this run survive.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+        std::fs::write(
+            temp_dir.path().join(".fed/secrets.cache.env"),
+            "API_KEY=old\nSTRIPE_SECRET=cached_stripe\n",
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_required_names(Some(HashSet::from(["API_KEY".to_string()])));
+        resolver.set_test_vault_values(HashMap::from([(
+            "API_KEY".to_string(),
+            "rotated".to_string(),
+        )]));
+
+        let mut config = Config::default();
+        for name in ["API_KEY", "STRIPE_SECRET"] {
+            config.parameters.insert(
+                name.to_string(),
+                Parameter {
+                    param_type: Some("secret".to_string()),
+                    source: Some("manual".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        let cache =
+            std::fs::read_to_string(temp_dir.path().join(".fed/secrets.cache.env")).unwrap();
+        assert!(cache.contains("API_KEY=rotated"), "queried name refreshed");
+        assert!(
+            cache.contains("STRIPE_SECRET=cached_stripe"),
+            "unqueried cache entry must survive the scoped run: {cache}"
         );
     }
 

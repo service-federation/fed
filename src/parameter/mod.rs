@@ -1,6 +1,7 @@
 pub mod generate;
 mod port;
 mod resolver;
+pub mod scanner;
 pub mod secret;
 
 pub use port::*;

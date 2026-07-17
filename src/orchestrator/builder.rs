@@ -46,6 +46,7 @@ pub struct OrchestratorBuilder {
     profiles: Vec<String>,
     startup_timeout: Option<Duration>,
     stop_timeout: Option<Duration>,
+    required_secret_names: Option<std::collections::HashSet<String>>,
 }
 
 impl OrchestratorBuilder {
@@ -65,6 +66,7 @@ impl OrchestratorBuilder {
             profiles: Vec::new(),
             startup_timeout: None,
             stop_timeout: None,
+            required_secret_names: None,
         }
     }
 
@@ -167,6 +169,22 @@ impl OrchestratorBuilder {
         self
     }
 
+    /// Scope the vault query to the manual-secret names the target script
+    /// transitively references.
+    ///
+    /// `None` (the default) fetches every missing manual secret — used for
+    /// interactive `fed`, `fed start`, unknown commands, and the deprecated
+    /// `generated_secrets_file` config. Pass `Some(set)` (derived by
+    /// [`crate::parameter::scanner::required_parameter_names`]) for a specific
+    /// script run so it never blocks on secrets it doesn't use.
+    pub fn required_secret_names(
+        mut self,
+        names: Option<std::collections::HashSet<String>>,
+    ) -> Self {
+        self.required_secret_names = names;
+        self
+    }
+
     /// Enable readonly initialization.
     ///
     /// When enabled, `build()` calls `initialize_readonly()` instead of
@@ -229,6 +247,10 @@ impl OrchestratorBuilder {
         if self.offline {
             orchestrator.set_offline(true);
         }
+
+        // Scope the vault query before initialize() runs secret resolution.
+        // None keeps today's fetch-everything behavior.
+        orchestrator.set_required_secret_names(self.required_secret_names);
 
         if let Some(timeout) = self.startup_timeout {
             orchestrator.startup_timeout = timeout;

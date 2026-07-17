@@ -424,6 +424,30 @@ async fn run() -> anyhow::Result<()> {
         _ => false,
     };
 
+    // Scope the vault query to what the target script transitively references.
+    // Only script-running commands are scoped; interactive `fed`, `fed start`,
+    // and unknown commands fetch every missing manual secret (None). When the
+    // deprecated `generated_secrets_file` is set, degrade to the full fetch —
+    // an app may dotenv-load that file directly, so references can hide from
+    // fed's config (see 01-secret-scoping.md).
+    let required_secret_names: Option<std::collections::HashSet<String>> = if config
+        .generated_secrets_file
+        .is_some()
+    {
+        None
+    } else {
+        let scoped_script = match &cli.command {
+            Commands::Run { name, .. } if config.scripts.contains_key(name) => Some(name.clone()),
+            Commands::External(args)
+                if !args.is_empty() && config.scripts.contains_key(&args[0]) =>
+            {
+                Some(args[0].clone())
+            }
+            _ => None,
+        };
+        scoped_script.map(|name| fed::parameter::scanner::required_parameter_names(&config, &name))
+    };
+
     // If --isolate flag is used (and not dry-run), persist isolation mode before building orchestrator
     if isolate && !dry_run {
         let work_dir_for_isolation = resolve_work_dir(cli.workdir.clone(), &config_path)?;
@@ -449,6 +473,7 @@ async fn run() -> anyhow::Result<()> {
         .readonly(readonly)
         .is_interactive(is_interactive)
         .offline(cli.offline)
+        .required_secret_names(required_secret_names)
         .build()
         .await?;
 

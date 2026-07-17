@@ -320,6 +320,14 @@ impl Orchestrator {
         self.resolver.set_offline(offline);
     }
 
+    /// Scope the vault query to the manual-secret names the target script
+    /// transitively references. `None` fetches every missing manual secret (the
+    /// safe default). Must be set before [`Orchestrator::initialize`], which
+    /// runs secret resolution.
+    pub fn set_required_secret_names(&mut self, names: Option<std::collections::HashSet<String>>) {
+        self.resolver.set_required_names(names);
+    }
+
     /// Enable randomized port allocation.
     ///
     /// Skips persisted ports and allocates fresh random ports for all
