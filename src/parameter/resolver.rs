@@ -1054,11 +1054,16 @@ impl Resolver {
                 resolved_inputs.insert(name.clone(), v.clone());
             }
         }
+        // Names the user supplied via an env_file are authoritative: their
+        // derived secrets must never be regenerated, even though they carry no
+        // fed `# fp` stamp (which would otherwise read as a pre-upgrade entry).
+        let authoritative: HashSet<String> = analysis.env_file_values.keys().cloned().collect();
         let generate_results = super::generate::resolve_generate_params(
             &effective_params,
             &analysis.existing_values,
             &resolved_inputs,
             &analysis.existing_fingerprints,
+            &authoritative,
         )?;
 
         let dag_generated: HashSet<String> =
@@ -1452,6 +1457,7 @@ impl Resolver {
                 &HashMap::new(), // Non-secrets have no persisted values.
                 &parameters,     // Already-resolved params (ports, secrets, defaults).
                 &HashMap::new(), // …and therefore no persisted fingerprints.
+                &HashSet::new(), // …and no authoritative env_file values to guard.
             )?;
             for result in generate_results {
                 if result.was_generated {

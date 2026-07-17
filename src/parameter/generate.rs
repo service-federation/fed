@@ -99,7 +99,19 @@ pub fn topological_sort(params: &HashMap<String, Parameter>) -> Result<Vec<Strin
 
 /// Execute a generate command, interpolating `{{PARAM}}` references
 /// from already-resolved values.
-pub fn run_generate_command(command: &str, resolved: &HashMap<String, String>) -> Result<String> {
+///
+/// `redact_stderr` must be set whenever the command could put a secret on its
+/// stderr — either because it generates a secret itself or because it
+/// interpolates a secret input. In that case a failing command's captured
+/// stderr is dropped from the error (a `set -x` trace or an `echo $SEED >&2`
+/// would otherwise leak the value to logs/CI); only a fixed redaction note is
+/// shown. Non-secret commands with no secret inputs keep their stderr, which is
+/// genuinely useful for debugging and cannot be sensitive.
+pub fn run_generate_command(
+    command: &str,
+    resolved: &HashMap<String, String>,
+    redact_stderr: bool,
+) -> Result<String> {
     // Interpolate {{PARAM}} references.
     let interpolated = crate::parameter::Resolver::resolve_template_static(command, resolved)?;
 
@@ -111,15 +123,20 @@ pub fn run_generate_command(command: &str, resolved: &HashMap<String, String>) -
         .map_err(|e| Error::TemplateResolution(format!("Failed to run generate command: {e}")))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Report the ORIGINAL template, never `interpolated`: the interpolated
-        // command embeds resolved input values (e.g. a manual/vault seed) that
-        // must not reach stderr or CI logs. `command` is the pre-interpolation
-        // `{{...}}` form, so no resolved secret can leak through this message.
+        // A failing secret generator's stderr can carry the resolved secret
+        // (a `set -x` trace, or an explicit `echo {{SEED}} >&2`), so it is never
+        // included for secret / secret-interpolating commands — only a fixed
+        // note is shown. `command` is always the pre-interpolation `{{...}}`
+        // template, so no resolved value leaks through it either.
+        let stderr_part = if redact_stderr {
+            "stderr suppressed because this command generates a secret".to_string()
+        } else {
+            String::from_utf8_lossy(&output.stderr).trim().to_string()
+        };
         return Err(Error::TemplateResolution(format!(
             "Generate command failed (exit {}): {}\nCommand: {}",
             output.status.code().unwrap_or(-1),
-            stderr.trim(),
+            stderr_part,
             command,
         )));
     }
@@ -159,7 +176,8 @@ pub fn input_fingerprint(deps: &[String], resolved: &HashMap<String, String>) ->
 
 /// Resolve all `generate` parameters in DAG order with invalidation.
 ///
-/// `existing_values`: values already persisted (from .env.secrets).
+/// `existing_values`: values already persisted (fed's generated-secrets file)
+/// AND authoritative user-supplied values (env_files), merged.
 /// `stored_fingerprints`: the per-name input fingerprints persisted next to
 /// those values on the last run (empty for non-persisting callers). A stored
 /// fingerprint that no longer matches the generator's current inputs — including
@@ -168,6 +186,13 @@ pub fn input_fingerprint(deps: &[String], resolved: &HashMap<String, String>) ->
 /// generator. Reference-less generators and random secrets carry no fingerprint
 /// and keep the existing preserve-on-rerun behavior.
 ///
+/// `authoritative`: names whose value came from a user env_file (NOT fed's
+/// generated-secrets file). Those values are authoritative and must NEVER be
+/// regenerated regardless of fingerprint — the fingerprint-missing-means-
+/// invalidate rule applies ONLY to fed-generated-file values. Fed never writes
+/// `# fp` stamps for env_file values, so without this a user's derived secret in
+/// an ordinary env_file would look like a pre-upgrade entry and be regenerated.
+///
 /// Returns: list of (name, value, was_generated, fingerprint) for all generate
 /// params.
 pub fn resolve_generate_params(
@@ -175,6 +200,7 @@ pub fn resolve_generate_params(
     existing_values: &HashMap<String, String>,
     resolved_so_far: &HashMap<String, String>,
     stored_fingerprints: &HashMap<String, String>,
+    authoritative: &HashSet<String>,
 ) -> Result<Vec<GenerateResult>> {
     let order = topological_sort(params)?;
 
@@ -213,6 +239,11 @@ pub fn resolve_generate_params(
         let should_generate = if !is_secret {
             // Non-secret: always recompute.
             true
+        } else if authoritative.contains(name) {
+            // Authoritative user env_file value: the user owns it. Never
+            // regenerate, regardless of dependency changes or a missing
+            // fingerprint (env_file values never carry a fed `# fp` stamp).
+            false
         } else if any_dep_invalidated {
             // Secret with invalidated dependency: regenerate.
             true
@@ -234,7 +265,15 @@ pub fn resolve_generate_params(
         };
 
         if should_generate {
-            let value = run_generate_command(cmd, &resolved)?;
+            // Suppress child stderr on failure when a secret could ride it: the
+            // generator is itself a secret, or it interpolates a declared secret
+            // input. A `set -x` trace or an `echo {{SEED}} >&2` would otherwise
+            // leak the resolved value into the error text and CI logs.
+            let interpolates_secret = deps
+                .iter()
+                .any(|d| params.get(d).is_some_and(|p| p.is_secret_type()));
+            let redact_stderr = is_secret || interpolates_secret;
+            let value = run_generate_command(cmd, &resolved, redact_stderr)?;
             resolved.insert(name.clone(), value.clone());
             invalidated.insert(name.clone());
             results.push(GenerateResult {
@@ -443,7 +482,7 @@ mod tests {
     #[test]
     fn run_simple_command() {
         let resolved = HashMap::new();
-        let value = run_generate_command("echo hello", &resolved).unwrap();
+        let value = run_generate_command("echo hello", &resolved, false).unwrap();
         assert_eq!(value, "hello");
     }
 
@@ -451,21 +490,21 @@ mod tests {
     fn run_command_with_interpolation() {
         let mut resolved = HashMap::new();
         resolved.insert("NAME".to_string(), "world".to_string());
-        let value = run_generate_command("echo hello-{{NAME}}", &resolved).unwrap();
+        let value = run_generate_command("echo hello-{{NAME}}", &resolved, false).unwrap();
         assert_eq!(value, "hello-world");
     }
 
     #[test]
     fn run_failing_command_returns_error() {
         let resolved = HashMap::new();
-        let result = run_generate_command("false", &resolved);
+        let result = run_generate_command("false", &resolved, false);
         assert!(result.is_err());
     }
 
     #[test]
     fn run_command_captures_only_stdout() {
         let resolved = HashMap::new();
-        let value = run_generate_command("echo stdout; echo stderr >&2", &resolved).unwrap();
+        let value = run_generate_command("echo stdout; echo stderr >&2", &resolved, false).unwrap();
         assert_eq!(value, "stdout");
     }
 
@@ -483,8 +522,14 @@ mod tests {
         let existing = HashMap::new(); // Fresh install.
         let resolved = HashMap::new();
 
-        let results =
-            resolve_generate_params(&params, &existing, &resolved, &HashMap::new()).unwrap();
+        let results = resolve_generate_params(
+            &params,
+            &existing,
+            &resolved,
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
 
         assert_eq!(results.len(), 2);
         assert!(results[0].was_generated);
@@ -520,7 +565,9 @@ mod tests {
         .into_iter()
         .collect();
 
-        let results = resolve_generate_params(&params, &existing, &resolved, &stored_fps).unwrap();
+        let results =
+            resolve_generate_params(&params, &existing, &resolved, &stored_fps, &HashSet::new())
+                .unwrap();
 
         assert!(!results[0].was_generated); // A kept.
         assert_eq!(results[0].value, "old-a");
@@ -542,8 +589,14 @@ mod tests {
         existing.insert("B".to_string(), "stale-b".to_string());
         let resolved = HashMap::new();
 
-        let results =
-            resolve_generate_params(&params, &existing, &resolved, &HashMap::new()).unwrap();
+        let results = resolve_generate_params(
+            &params,
+            &existing,
+            &resolved,
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
 
         assert!(results[0].was_generated); // A generated.
         assert_eq!(results[0].value, "new-a");
@@ -560,8 +613,14 @@ mod tests {
         existing.insert("HASH".to_string(), "old-hash".to_string());
         let resolved = HashMap::new();
 
-        let results =
-            resolve_generate_params(&params, &existing, &resolved, &HashMap::new()).unwrap();
+        let results = resolve_generate_params(
+            &params,
+            &existing,
+            &resolved,
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
 
         assert!(results[0].was_generated); // Non-secret always recomputes.
         assert_eq!(results[0].value, "abc123");
@@ -581,8 +640,14 @@ mod tests {
         let mut resolved = HashMap::new();
         resolved.insert("DB_PORT".to_string(), "5432".to_string());
 
-        let results =
-            resolve_generate_params(&params, &existing, &resolved, &HashMap::new()).unwrap();
+        let results = resolve_generate_params(
+            &params,
+            &existing,
+            &resolved,
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
 
         assert_eq!(results[0].value, "postgres://localhost:5432/db");
     }
@@ -689,7 +754,9 @@ mod tests {
         .into_iter()
         .collect();
 
-        let results = resolve_generate_params(&params, &existing, &resolved, &stored).unwrap();
+        let results =
+            resolve_generate_params(&params, &existing, &resolved, &stored, &HashSet::new())
+                .unwrap();
         assert!(results[0].was_generated, "rotated seed must regenerate");
         assert_eq!(results[0].value, "rotated");
         assert_eq!(
@@ -717,8 +784,14 @@ mod tests {
             .into_iter()
             .collect();
 
-        let results =
-            resolve_generate_params(&params, &existing, &resolved, &HashMap::new()).unwrap();
+        let results = resolve_generate_params(
+            &params,
+            &existing,
+            &resolved,
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
         assert!(results[0].was_generated, "missing fingerprint regenerates");
         assert_eq!(results[0].value, "seed");
         assert!(results[0].fingerprint.is_some(), "and then stamps one");
@@ -739,8 +812,14 @@ mod tests {
             .collect();
         let resolved = HashMap::new();
 
-        let results =
-            resolve_generate_params(&params, &existing, &resolved, &HashMap::new()).unwrap();
+        let results = resolve_generate_params(
+            &params,
+            &existing,
+            &resolved,
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
         assert!(!results[0].was_generated);
         assert_eq!(results[0].value, "kept");
         assert!(results[0].fingerprint.is_none());
@@ -754,7 +833,7 @@ mod tests {
             [("SEED".to_string(), "round3-supersecret".to_string())]
                 .into_iter()
                 .collect();
-        let err = run_generate_command("false {{SEED}}", &resolved)
+        let err = run_generate_command("false {{SEED}}", &resolved, false)
             .expect_err("a failing generator must error");
         let msg = err.to_string();
         assert!(
@@ -764,6 +843,83 @@ mod tests {
         assert!(
             !msg.contains("round3-supersecret"),
             "error must NOT contain the resolved secret value, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn failing_secret_generator_suppresses_child_stderr() {
+        // A secret generator that writes its RESOLVED secret to stderr (the exact
+        // leak the round-4 command-redaction missed) and exits non-zero must
+        // surface neither the secret value nor the raw child stderr — only a
+        // fixed redaction note. The `{{SEED}}` template itself is still shown
+        // (it is the pre-interpolation form and carries no resolved value).
+        let mut params = HashMap::new();
+        params.insert(
+            "DERIVED".to_string(),
+            secret_with_generate("echo {{SEED}} >&2; exit 1"),
+        );
+
+        let existing = HashMap::new(); // fresh install → generator runs
+        let resolved: HashMap<String, String> =
+            [("SEED".to_string(), "round4-supersecret".to_string())]
+                .into_iter()
+                .collect();
+
+        let err = resolve_generate_params(
+            &params,
+            &existing,
+            &resolved,
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .expect_err("a failing secret generator must error");
+        let msg = err.to_string();
+        // The resolved secret appears ONLY on the child's stderr (the template
+        // shows `{{SEED}}`), so its absence proves the stderr was suppressed.
+        assert!(
+            !msg.contains("round4-supersecret"),
+            "error must contain neither the resolved secret value nor the stderr, got: {msg}"
+        );
+        assert!(
+            msg.contains("stderr suppressed"),
+            "error must carry the fixed redaction note, got: {msg}"
+        );
+    }
+
+    // ── RB-2: env_file-supplied derived secrets are authoritative ───
+
+    #[test]
+    fn resolve_env_file_authoritative_secret_never_regenerates() {
+        // A DERIVED_SECRET supplied via a user env_file (so no `# fp` stamp) must
+        // be preserved untouched: its generator (which would FAIL if run) is
+        // never executed, even though the stored fingerprint is missing.
+        let mut params = HashMap::new();
+        params.insert(
+            "DERIVED_SECRET".to_string(),
+            secret_with_generate("exit 1 # would fail if ever run"),
+        );
+
+        // Present in existing_values (env_files are merged in) AND flagged as
+        // authoritative (came from an env_file, not fed's generated file).
+        let existing: HashMap<String, String> =
+            [("DERIVED_SECRET".to_string(), "user-authored".to_string())]
+                .into_iter()
+                .collect();
+        let resolved = HashMap::new();
+        let authoritative: HashSet<String> = ["DERIVED_SECRET".to_string()].into_iter().collect();
+
+        let results = resolve_generate_params(
+            &params,
+            &existing,
+            &resolved,
+            &HashMap::new(), // no stored fingerprint (env_files never carry one)
+            &authoritative,
+        )
+        .expect("must succeed: the failing generator is never run");
+        assert!(!results[0].was_generated, "generator must not run");
+        assert_eq!(
+            results[0].value, "user-authored",
+            "value preserved verbatim"
         );
     }
 }
