@@ -333,9 +333,27 @@ impl<'a> ScriptRunner<'a> {
         // drops the block still leaves `child_orchestrator` intact for the
         // cleanup that follows — keeping isolated teardown symmetric with the
         // shared path, whose cleanup likewise runs after the guard.
+        // Scope the child's vault query the same way the parent scoped it for
+        // this script. Without this the ephemeral orchestrator does a full-
+        // project fetch — failing on manual secrets this script never uses and
+        // issuing a second, unscoped vault request. Re-derive from the same
+        // config + script (rather than reaching into the parent) so the
+        // deprecated `generated_secrets_file` fallback (None = fetch all) is
+        // honored exactly as it is at top level.
+        let child_required_secret_names = if child_config.generated_secrets_file.is_some() {
+            None
+        } else {
+            Some(crate::parameter::scanner::required_parameter_names(
+                &child_config,
+                script_name,
+            ))
+        };
+
         let mut child_orchestrator =
             Orchestrator::new_ephemeral(child_config, self.orchestrator.work_dir.clone()).await?;
         child_orchestrator.output_mode = self.orchestrator.output_mode;
+        // Must be set before initialize() runs the child's secret resolution.
+        child_orchestrator.set_required_secret_names(child_required_secret_names);
 
         // Give the child its own container namespace so Docker containers don't
         // collide with (or kill) the parent's running containers.

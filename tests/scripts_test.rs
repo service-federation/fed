@@ -1823,3 +1823,50 @@ services:
 
     orchestrator.cleanup().await;
 }
+
+/// RB-3: an isolated script scoped to the names it references must not fail on
+/// an unused missing manual secret. The ephemeral child orchestrator used by
+/// the isolated path used to initialize without the parent's scope, doing a
+/// full-project fetch and failing on secrets the script never touches.
+#[tokio::test]
+async fn isolated_script_passes_with_unused_missing_secret() {
+    let yaml = r#"
+parameters:
+  UNUSED_SECRET:
+    type: secret
+    source: manual
+
+scripts:
+  iso:
+    isolated: true
+    script: "echo isolated-ok"
+"#;
+    let parser = Parser::new();
+    let config = parser.parse_config(yaml).expect("Failed to parse");
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut orchestrator = Orchestrator::new(config.clone(), temp.path().to_path_buf())
+        .await
+        .unwrap();
+    orchestrator.set_auto_resolve_conflicts(true);
+
+    // Scope the parent exactly as the CLI does for a script run: `iso` references
+    // no secrets, so UNUSED_SECRET is out of scope.
+    let scope = fed::parameter::scanner::required_parameter_names(&config, "iso");
+    assert!(scope.is_empty(), "iso references no secrets");
+    orchestrator.set_required_secret_names(Some(scope));
+
+    orchestrator
+        .initialize()
+        .await
+        .expect("parent init must pass — UNUSED_SECRET is out of scope");
+
+    // The isolated child must inherit the same scope and likewise not fail.
+    let status = orchestrator
+        .run_script_interactive("iso", &[])
+        .await
+        .expect("isolated scoped run must not fail on an unused missing secret");
+    assert!(status.success(), "isolated script should exit 0");
+
+    orchestrator.cleanup().await;
+}
