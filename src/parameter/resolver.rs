@@ -207,6 +207,10 @@ pub struct Resolver {
     offline: bool,
     /// Test seam: when set, used instead of the real cloud vault lookup.
     test_vault_values: Option<HashMap<String, String>>,
+    /// Test seam: when set, the vault lookup is simulated as failing with this
+    /// message (an unreachable cloud / revoked token). Takes precedence over
+    /// `test_vault_values`.
+    test_vault_failure: Option<String>,
     /// Active isolation session id, if any. Scopes the built-in
     /// `FED_PROJECT_ID` so parallel isolated stacks get distinct identifiers.
     isolation_id: Option<String>,
@@ -230,6 +234,7 @@ impl Resolver {
             is_interactive: false,
             offline: false,
             test_vault_values: None,
+            test_vault_failure: None,
             isolation_id: None,
         }
     }
@@ -252,6 +257,7 @@ impl Resolver {
             is_interactive: false,
             offline: false,
             test_vault_values: None,
+            test_vault_failure: None,
             isolation_id: None,
         }
     }
@@ -307,6 +313,12 @@ impl Resolver {
     #[cfg(test)]
     pub(crate) fn set_test_vault_values(&mut self, values: HashMap<String, String>) {
         self.test_vault_values = Some(values);
+    }
+
+    /// Test seam: stub the team-vault lookup as failing (unreachable cloud).
+    #[cfg(test)]
+    pub(crate) fn set_test_vault_failure(&mut self, message: &str) {
+        self.test_vault_failure = Some(message.to_string());
     }
 
     /// Register ports owned by already-running managed services.
@@ -544,6 +556,10 @@ impl Resolver {
         // with --offline.
         let mut vault_resolved: Vec<(String, String)> = Vec::new();
         let mut vault_query_succeeded = false;
+        // Captures why the vault lookup failed (network/auth), so a later
+        // missing-secret error can name the real cause instead of blaming the
+        // user's env_file for an unreachable cloud.
+        let mut vault_failure: Option<String> = None;
         let queried_names: Vec<String> = analysis
             .missing_manual
             .iter()
@@ -551,16 +567,20 @@ impl Resolver {
             .chain(analysis.missing_optional_manual.iter().cloned())
             .collect();
         if !queried_names.is_empty() && !self.offline {
-            let fetched = match &self.test_vault_values {
-                Some(stub) => Some(Ok(queried_names
-                    .iter()
-                    .filter_map(|n| stub.get(n).map(|v| (n.clone(), v.clone())))
-                    .collect::<HashMap<String, String>>())),
-                None => crate::cloud::fetch_values_blocking(
-                    &work_dir,
-                    &self.environment.to_string(),
-                    &queried_names,
-                ),
+            let fetched = if let Some(msg) = &self.test_vault_failure {
+                Some(Err(Error::Validation(msg.clone())))
+            } else {
+                match &self.test_vault_values {
+                    Some(stub) => Some(Ok(queried_names
+                        .iter()
+                        .filter_map(|n| stub.get(n).map(|v| (n.clone(), v.clone())))
+                        .collect::<HashMap<String, String>>())),
+                    None => crate::cloud::fetch_values_blocking(
+                        &work_dir,
+                        &self.environment.to_string(),
+                        &queried_names,
+                    ),
+                }
             };
             match fetched {
                 Some(Ok(values)) => {
@@ -587,8 +607,11 @@ impl Resolver {
                     }
                 }
                 Some(Err(e)) => {
-                    // Network/auth trouble: fall back to the cache below.
+                    // Network/auth trouble: fall back to the cache below, and
+                    // remember the reason so a missing-secret failure can name
+                    // the unreachable cloud rather than the user's env_file.
                     tracing::warn!("team vault lookup failed: {}", e);
+                    vault_failure = Some(e.to_string());
                 }
                 None => {} // not logged in or checkout not linked — normal local mode
             }
@@ -668,6 +691,17 @@ impl Resolver {
             } else {
                 config.env_file.join(", ")
             };
+            // When the vault lookup itself failed (unreachable cloud, revoked
+            // token), name that cause — otherwise the user is told to "add it to
+            // your env_file" for a secret that was actually sitting in the vault.
+            if let Some(reason) = &vault_failure {
+                return Err(Error::Validation(format!(
+                    "Missing secret values — the team vault could not be reached, so these could not be fetched ({}):\n{}\n\nOnce the vault is reachable again fed will fetch them; or add them to your env_file ({}) to proceed offline. These secrets have source: manual, so fed won't generate them.",
+                    reason,
+                    details.join("\n"),
+                    env_files_hint
+                )));
+            }
             return Err(Error::Validation(format!(
                 "Missing secret values — add them to your env_file ({}), or put them in your team vault (fed login, fed link, fed secrets set NAME):\n{}\n\nThese secrets have source: manual, so fed won't generate them.",
                 env_files_hint,
@@ -3545,6 +3579,80 @@ mod tests {
         assert!(
             content.contains("SESSION_KEY="),
             "Absolute path outside any repo is safe by construction"
+        );
+    }
+
+    #[test]
+    fn missing_secret_with_unreachable_vault_names_the_cloud() {
+        // Step 0: a required secret that the vault could not supply because the
+        // cloud was unreachable must produce an error naming that cause — not
+        // "add it to your env_file", which misdirects the user away from the
+        // real problem.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_test_vault_failure(
+            "cloud: cannot reach https://app.service-federation.com: error sending request",
+        );
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("team vault could not be reached"),
+            "error must name the unreachable cloud as the cause: {msg}"
+        );
+        assert!(
+            msg.contains("app.service-federation.com"),
+            "error should carry the underlying reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_secret_without_vault_keeps_env_file_hint() {
+        // With no vault failure (simply not provided anywhere), the classic
+        // "add them to your env_file" guidance still applies.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_offline(true);
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("add them to your env_file"),
+            "offline missing secret keeps the env_file guidance: {msg}"
+        );
+        assert!(
+            !msg.contains("team vault could not be reached"),
+            "no vault failure means no unreachable-cloud message: {msg}"
         );
     }
 
