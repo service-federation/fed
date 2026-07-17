@@ -42,6 +42,11 @@ fn unix_now() -> u64 {
 /// Whether the cache can cover every queried name *freshly*: each name is
 /// cached and its stamp is younger than `max_age`. A missing name or a missing
 /// stamp (pre-upgrade entry) counts as not-fresh, forcing an honest refresh.
+///
+/// A stamp in the future (`stamped > now`) is also not fresh: `saturating_sub`
+/// would report age 0 and treat it as fresh until wall time caught up, so a
+/// clock skew or a tampered stamp could pin a rotated value as "fresh" for
+/// hours. Requiring `stamped <= now` closes that.
 pub(crate) fn cache_covers_fresh(
     names: &[String],
     cache_values: &HashMap<String, String>,
@@ -53,7 +58,7 @@ pub(crate) fn cache_covers_fresh(
         cache_values.contains_key(name)
             && cache_stamps
                 .get(name)
-                .is_some_and(|stamped| now.saturating_sub(*stamped) < max_age_secs)
+                .is_some_and(|stamped| *stamped <= now && now - *stamped < max_age_secs)
     })
 }
 
@@ -3787,6 +3792,30 @@ mod tests {
         stamps.insert("B".to_string(), now);
         values.remove("B");
         assert!(!cache_covers_fresh(&names, &values, &stamps, now, max_age));
+    }
+
+    #[test]
+    fn cache_covers_fresh_rejects_future_stamps() {
+        // A stamp in the future must NOT count as fresh: saturating_sub would
+        // report age 0 and pin a rotated value as fresh until wall time caught
+        // up. Requiring stamped <= now closes that (clock skew / tampering).
+        let now = 1_000_000u64;
+        let max_age = 3600u64;
+        let names = vec!["A".to_string()];
+        let mut values = HashMap::new();
+        values.insert("A".to_string(), "va".to_string());
+
+        let mut stamps = HashMap::new();
+        // Stamped one hour into the future.
+        stamps.insert("A".to_string(), now + 3600);
+        assert!(
+            !cache_covers_fresh(&names, &values, &stamps, now, max_age),
+            "a future-dated stamp must not be treated as fresh"
+        );
+
+        // Stamped exactly now → fresh (boundary).
+        stamps.insert("A".to_string(), now);
+        assert!(cache_covers_fresh(&names, &values, &stamps, now, max_age));
     }
 
     #[test]
