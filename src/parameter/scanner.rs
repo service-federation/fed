@@ -83,14 +83,23 @@ pub fn required_parameter_names(config: &Config, script_name: &str) -> HashSet<S
         }
     }
 
-    // Close over generate dependencies: a referenced parameter that is
-    // *generated from* `{{SECRET}}` needs SECRET too, even though SECRET never
-    // appears in the script/service subtree directly.
+    // Close over parameter-to-parameter references. A referenced parameter can
+    // pull in another via ANY of its interpolating fields, not just `generate`:
+    //   - `generate: "derive --from {{SECRET}}"`
+    //   - `default: "prefix-{{SECRET}}"`
+    //   - environment-specific values (`development`/`develop`/`staging`/
+    //     `production`: "{{SECRET}}")
+    // Whole-struct scanning each referenced Parameter (the same regex sweep used
+    // for scripts/services) catches all of them and subsumes the generate-only
+    // closure — enumerating fields here would re-introduce the drift hazard the
+    // struct-level scan exists to avoid. Recurse over newly discovered names.
     let params = config.get_effective_parameters();
     let mut param_work: Vec<String> = referenced.iter().cloned().collect();
     while let Some(name) = param_work.pop() {
         if let Some(param) = params.get(&name) {
-            for dep in param.generate_dependencies() {
+            let mut found = HashSet::new();
+            scan_serializable(param, &mut found);
+            for dep in found {
                 if referenced.insert(dep.clone()) {
                     param_work.push(dep);
                 }
@@ -335,6 +344,115 @@ mod tests {
             names.contains("SECRET"),
             "generate dependency must be pulled in: {names:?}"
         );
+    }
+
+    #[test]
+    fn closes_over_default_interpolation() {
+        // Script references {{DERIVED}}; DERIVED has no generate, but its
+        // `default` interpolates {{SECRET}}. SECRET must still be pulled in —
+        // the generate-only closure missed this.
+        let mut config = Config::default();
+        config.scripts.insert(
+            "run".to_string(),
+            Script {
+                script: "app {{DERIVED}}".to_string(),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "DERIVED".to_string(),
+            Parameter {
+                default: Some(serde_yaml::Value::String("prefix-{{SECRET}}".to_string())),
+                ..Default::default()
+            },
+        );
+        config
+            .parameters
+            .insert("SECRET".to_string(), secret_param());
+        let names = required_parameter_names(&config, "run");
+        assert!(
+            names.contains("SECRET"),
+            "a default that interpolates a secret must pull it in: {names:?}"
+        );
+    }
+
+    #[test]
+    fn closes_over_environment_specific_values() {
+        // DERIVED's value comes from environment-specific fields, each of which
+        // can interpolate a distinct secret. All must be pulled in (the scanner
+        // is environment-agnostic — it can't know which env will run).
+        let mut config = Config::default();
+        config.scripts.insert(
+            "run".to_string(),
+            Script {
+                script: "app {{DERIVED}}".to_string(),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "DERIVED".to_string(),
+            Parameter {
+                development: Some(serde_yaml::Value::String("{{DEV_SECRET}}".to_string())),
+                develop: Some(serde_yaml::Value::String("{{DEVELOP_SECRET}}".to_string())),
+                staging: Some(serde_yaml::Value::String("{{STAGING_SECRET}}".to_string())),
+                production: Some(serde_yaml::Value::String("{{PROD_SECRET}}".to_string())),
+                ..Default::default()
+            },
+        );
+        for s in [
+            "DEV_SECRET",
+            "DEVELOP_SECRET",
+            "STAGING_SECRET",
+            "PROD_SECRET",
+        ] {
+            config.parameters.insert(s.to_string(), secret_param());
+        }
+        let names = required_parameter_names(&config, "run");
+        for s in [
+            "DEV_SECRET",
+            "DEVELOP_SECRET",
+            "STAGING_SECRET",
+            "PROD_SECRET",
+        ] {
+            assert!(
+                names.contains(s),
+                "env-specific value referencing {s} must pull it in: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn closes_over_chained_default_and_generate() {
+        // script → A, A.default → {{B}}, B.generate → {{C}}. All of A, B, C must
+        // be in the set — the closure recurses over newly discovered names and
+        // mixes default- and generate-based references.
+        let mut config = Config::default();
+        config.scripts.insert(
+            "run".to_string(),
+            Script {
+                script: "app {{A}}".to_string(),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "A".to_string(),
+            Parameter {
+                default: Some(serde_yaml::Value::String("{{B}}".to_string())),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "B".to_string(),
+            Parameter {
+                generate: Some("gen --from {{C}}".to_string()),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert("C".to_string(), secret_param());
+        let names = required_parameter_names(&config, "run");
+        assert!(names.contains("A"), "{names:?}");
+        assert!(names.contains("B"), "{names:?}");
+        assert!(names.contains("C"), "chained ref must reach C: {names:?}");
     }
 
     #[test]
