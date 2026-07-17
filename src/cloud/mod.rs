@@ -41,12 +41,20 @@ pub fn load_credentials() -> Option<Credentials> {
 }
 
 fn load_credentials_from(path: &Path) -> Option<Credentials> {
-    let raw = std::fs::read_to_string(path).ok()?;
+    use std::io::Read;
+    // Open the file ONCE and operate on the handle: reading the bytes and
+    // tightening the permissions must target the same file. Reading by path and
+    // then chmodding by path is a TOCTOU — a swap between the two operations
+    // would chmod a different file than the one we read. fchmod through the held
+    // handle can't be redirected by a path swap.
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw).ok()?;
     let creds = serde_yaml::from_str(&raw).ok()?;
     // Tighten a pre-existing over-permissive credentials file (e.g. one written
-    // by an older fed that chmodded after the fact, or copied in by hand) the
-    // next time we touch it. Best-effort: a chmod failure must not block login.
-    crate::fsutil::tighten_path_to_owner_only(path);
+    // by an older fed that chmodded after the fact, or copied in by hand).
+    // Best-effort: a chmod failure must not block login.
+    let _ = crate::fsutil::tighten_to_owner_only(&file, path);
     Some(creds)
 }
 
@@ -515,23 +523,32 @@ mod tests {
     }
 
     /// A failed save leaves the previously valid credentials intact — no partial
-    /// destination. The failure is injected by pre-creating a directory where
-    /// the atomic writer would place its temp file.
+    /// destination. The failure is injected by making the destination directory
+    /// read-only so the atomic writer cannot create its (randomly-named) temp
+    /// sibling. Skipped under root, which bypasses directory permissions.
+    #[cfg(unix)]
     #[test]
     fn failed_save_preserves_previous_credentials() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials");
         save_credentials_to(&path, &sample_creds()).unwrap();
 
-        let file_name = path.file_name().unwrap().to_str().unwrap();
-        let tmp = dir
-            .path()
-            .join(format!(".{}.tmp.{}", file_name, std::process::id()));
-        std::fs::create_dir(&tmp).unwrap();
+        // Probe: can we still create files in a 0500 dir (i.e. are we root)?
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let probe = dir.path().join(".probe");
+        let blocked = std::fs::File::create(&probe).is_err();
+        let _ = std::fs::remove_file(&probe);
+        if !blocked {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            return; // running as root — injection can't work; skip.
+        }
 
         let mut updated = sample_creds();
         updated.token = "would-be-lost".to_string();
-        assert!(save_credentials_to(&path, &updated).is_err());
+        let result = save_credentials_to(&path, &updated);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
 
         let loaded = load_credentials_from(&path).unwrap();
         assert_eq!(
