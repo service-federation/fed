@@ -110,6 +110,55 @@ pub fn required_parameter_names(config: &Config, script_name: &str) -> HashSet<S
     referenced
 }
 
+/// Given `poison` — parameter names that cannot be resolved this run (in a
+/// scoped run: manual secrets outside the scanned closure that were never
+/// fetched) — return every OTHER parameter that transitively references one of
+/// them through any interpolating field (`default`, `generate`,
+/// environment-specific values, …).
+///
+/// In a scoped run these tainted parameters must be *deferred* — neither failed
+/// for having unresolved templates nor executed (for `generate`) — because
+/// their value depends on a secret this run deliberately never fetches. The
+/// traversal reuses the same whole-struct `{{NAME}}` sweep the forward scanner
+/// uses, so it stays field-drift-proof, and iterates to a fixpoint so chains
+/// (`A` ← `B` ← poison) are fully closed. Poison names themselves are not
+/// returned; the caller unions them in.
+pub fn parameters_tainted_by(config: &Config, poison: &HashSet<String>) -> HashSet<String> {
+    let params = config.get_effective_parameters();
+
+    // Precompute each parameter's direct `{{NAME}}` references once.
+    let direct: Vec<(String, HashSet<String>)> = params
+        .iter()
+        .map(|(name, param)| {
+            let mut refs = HashSet::new();
+            scan_serializable(param, &mut refs);
+            (name.clone(), refs)
+        })
+        .collect();
+
+    let mut tainted: HashSet<String> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (name, refs) in &direct {
+            if tainted.contains(name) || poison.contains(name) {
+                continue;
+            }
+            if refs
+                .iter()
+                .any(|r| poison.contains(r) || tainted.contains(r))
+            {
+                tainted.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    tainted
+}
+
 /// Enqueue a dependency name as a service and/or a script node. A name may
 /// resolve to either (or neither, if it's dangling — harmless, it's skipped on
 /// visit). Whole-struct scanning happens when the node is popped.
@@ -477,6 +526,67 @@ mod tests {
         let names = required_parameter_names(&config, "a");
         assert!(names.contains("A_SECRET"));
         assert!(names.contains("B_SECRET"));
+    }
+
+    #[test]
+    fn taint_closes_over_default_and_generate_chains() {
+        // poison = {SECRET}. A.default → {{B}}, B.generate → {{SECRET}}.
+        // Both A and B are tainted; an unrelated CLEAN param is not.
+        let mut config = Config::default();
+        config.parameters.insert(
+            "A".to_string(),
+            Parameter {
+                default: Some(serde_yaml::Value::String("{{B}}".to_string())),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "B".to_string(),
+            Parameter {
+                generate: Some("gen --from {{SECRET}}".to_string()),
+                ..Default::default()
+            },
+        );
+        config
+            .parameters
+            .insert("SECRET".to_string(), secret_param());
+        config.parameters.insert(
+            "CLEAN".to_string(),
+            Parameter {
+                default: Some(serde_yaml::Value::String("literal".to_string())),
+                ..Default::default()
+            },
+        );
+
+        let poison = HashSet::from(["SECRET".to_string()]);
+        let tainted = parameters_tainted_by(&config, &poison);
+        assert!(tainted.contains("A"), "chained default taint: {tainted:?}");
+        assert!(tainted.contains("B"), "direct generate taint: {tainted:?}");
+        assert!(
+            !tainted.contains("CLEAN"),
+            "unrelated param must not be tainted: {tainted:?}"
+        );
+        assert!(
+            !tainted.contains("SECRET"),
+            "poison names are not returned; the caller unions them: {tainted:?}"
+        );
+    }
+
+    #[test]
+    fn taint_empty_when_no_poison() {
+        let mut config = Config::default();
+        config.parameters.insert(
+            "A".to_string(),
+            Parameter {
+                default: Some(serde_yaml::Value::String("{{B}}".to_string())),
+                ..Default::default()
+            },
+        );
+        let tainted = parameters_tainted_by(&config, &HashSet::new());
+        assert!(
+            tainted.is_empty(),
+            "no poison → nothing tainted: {tainted:?}"
+        );
     }
 
     #[test]

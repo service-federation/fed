@@ -51,6 +51,21 @@ impl<'a> ExternalServiceExpander<'a> {
 
         // Expand each external service
         for (service_name, service_config) in external_services {
+            // In a scoped run, an external service whose parameter mapping
+            // references a deferred parameter (an out-of-scope missing manual
+            // secret, or a value derived from one) is outside the scanned
+            // closure and will never be spawned. Skip expansion — otherwise
+            // `build_parameter_mapping` resolves its templates eagerly and
+            // hard-fails on a value this run never fetches. The unexpanded
+            // placeholder stays in the config and is dropped by the same
+            // deferral check in `resolve_config`. Unscoped runs defer nothing.
+            if self.resolver.service_should_defer(&service_config) {
+                tracing::debug!(
+                    "deferring out-of-scope external service '{}': its parameter mapping references a deferred parameter",
+                    service_name
+                );
+                continue;
+            }
             self.expand_single_service(&mut config, &service_name, &service_config)
                 .await?;
         }

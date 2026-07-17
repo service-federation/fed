@@ -267,6 +267,13 @@ pub struct Resolver {
     /// `generated_secrets_file` case. `Some(set)` scopes the vault query and the
     /// missing-secret failure to names the run actually needs.
     required_names: Option<HashSet<String>>,
+    /// Parameter names deferred this run: out-of-scope missing manual secrets
+    /// plus every parameter that transitively references one. Computed during
+    /// `resolve_parameters` (empty for unscoped runs). A deferred parameter is
+    /// neither failed for unresolved templates nor executed (`generate`), and
+    /// any service or external service referencing one is dropped from the
+    /// resolved config. See `compute_deferred_params` and `service_should_defer`.
+    deferred_params: HashSet<String>,
 }
 
 impl Resolver {
@@ -290,6 +297,7 @@ impl Resolver {
             test_vault_failure: None,
             required_names: None,
             isolation_id: None,
+            deferred_params: HashSet::new(),
         }
     }
 
@@ -314,6 +322,7 @@ impl Resolver {
             test_vault_failure: None,
             required_names: None,
             isolation_id: None,
+            deferred_params: HashSet::new(),
         }
     }
 
@@ -421,6 +430,15 @@ impl Resolver {
         self.required_names = names;
     }
 
+    /// The scope actually stored on this resolver (`None` = unscoped). Used to
+    /// propagate a parent run's scope verbatim into an ephemeral isolated-child
+    /// orchestrator, instead of re-deriving it — see
+    /// `run_script_isolated`. Re-derivation is provably identical for CLI runs
+    /// but diverges for a public-API caller who set a custom scope (or `None`).
+    pub fn required_names(&self) -> Option<HashSet<String>> {
+        self.required_names.clone()
+    }
+
     /// Whether a manual-secret name is in scope for this run. Names outside the
     /// scope are neither queried from the vault nor treated as required.
     fn name_in_scope(&self, name: &str) -> bool {
@@ -430,46 +448,76 @@ impl Resolver {
         }
     }
 
-    /// Whether a service references a manual secret that is out of this run's
-    /// scope and still unresolved — meaning the service is itself outside the
-    /// scanned closure and will not be spawned this run.
+    /// Compute the set of parameters deferred this run.
     ///
-    /// Scoping (`fed <script>`) only fetches the manual secrets the target
-    /// script transitively references, so a secret outside that closure is
-    /// never resolved. An *in-scope* service can't reference such a secret: the
-    /// scanner walks every in-scope service whole-struct, so any secret it names
-    /// is in scope by construction. Therefore a reference to an out-of-scope
-    /// manual secret can only appear in an out-of-scope service — one this run
-    /// will never spawn. Such services are deferred (dropped from the resolved
-    /// config) instead of hard-failing the whole run on a secret it doesn't
-    /// need; if one is somehow spawned anyway it fails loudly with
-    /// `ServiceNotFound` rather than running with an unresolved value.
+    /// The base set ("poison") is the manual secrets that are out of this run's
+    /// scope: scoping (`fed <script>`) only fetches the secrets the target
+    /// script transitively references, so anything outside that closure is never
+    /// fetched and cannot be resolved. On top of that, any parameter whose value
+    /// transitively depends on a poison name (via `default`, `generate`, or
+    /// environment-specific interpolation) cannot be resolved either. The union
+    /// is what must be deferred rather than failed.
     ///
-    /// Returns `false` for unscoped runs (`required_names == None`), so
-    /// `fed start` and interactive `fed` stay exactly as strict as before.
-    fn service_defers_on_out_of_scope_secret(
-        &self,
-        config: &Config,
-        service: &crate::config::Service,
-        parameters: &HashMap<String, String>,
-    ) -> bool {
+    /// Determined from scope alone — it must be computed *before* secret
+    /// resolution (whose `generate` DAG would otherwise execute a deferred
+    /// generate over a secret it never fetches). Every deferred name is provably
+    /// outside the scanned closure (an in-scope reference would put the secret
+    /// in scope), so any over-deferral is confined to things this run never
+    /// spawns, exactly like the service-deferral rule.
+    ///
+    /// Returns an empty set for unscoped runs (`required_names == None`), so
+    /// `fed start` and interactive `fed` stay exactly as strict as before: with
+    /// nothing deferred, every unresolved template and every `generate` runs
+    /// (and fails) as it does today.
+    fn compute_deferred_params(&self, config: &Config) -> HashSet<String> {
         if self.required_names.is_none() {
+            return HashSet::new();
+        }
+        let poison: HashSet<String> = config
+            .get_effective_parameters()
+            .iter()
+            .filter(|(name, param)| param.is_manual_secret() && !self.name_in_scope(name))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if poison.is_empty() {
+            return HashSet::new();
+        }
+        // Close over parameters that transitively reference a poison name, then
+        // union the poison names themselves.
+        let mut deferred = super::scanner::parameters_tainted_by(config, &poison);
+        deferred.extend(poison);
+        deferred
+    }
+
+    /// Whether a service must be deferred (dropped from the resolved config)
+    /// this run because it references a deferred parameter — an out-of-scope
+    /// missing manual secret, or a parameter that transitively depends on one.
+    ///
+    /// Scoping (`fed <script>`) only fetches the secrets the target script
+    /// transitively references, so a deferred name is provably outside the
+    /// scanned closure: the scanner walks every in-scope service whole-struct,
+    /// so any name an in-scope service references is in scope (and not deferred)
+    /// by construction. A reference to a deferred name can therefore only appear
+    /// in a service this run will never spawn. Such services are dropped instead
+    /// of hard-failing the whole run on a value it doesn't need; if one is
+    /// somehow spawned anyway it fails loudly with `ServiceNotFound` rather than
+    /// running with an unresolved value.
+    ///
+    /// Returns `false` for unscoped runs (`deferred_params` is empty), so
+    /// `fed start` and interactive `fed` stay exactly as strict as before.
+    pub(crate) fn service_should_defer(&self, service: &crate::config::Service) -> bool {
+        if self.deferred_params.is_empty() {
             return false;
         }
         // Serialize the whole service and sweep every {{NAME}} out of it (the
-        // same over-approximation the scanner uses). A name defers the service
-        // only if it is a declared manual secret, out of scope, and not already
-        // resolved — a typo'd/undefined param still errors normally.
+        // same over-approximation the scanner uses), deferring on any reference
+        // to a deferred parameter.
         let Ok(yaml) = serde_yaml::to_string(service) else {
             return false;
         };
-        let params = config.get_effective_parameters();
-        get_template_regex().captures_iter(&yaml).any(|cap| {
-            let name = cap[1].trim();
-            !self.name_in_scope(name)
-                && !parameters.contains_key(name)
-                && params.get(name).is_some_and(|p| p.is_manual_secret())
-        })
+        get_template_regex()
+            .captures_iter(&yaml)
+            .any(|cap| self.deferred_params.contains(cap[1].trim()))
     }
 
     /// Resolve template placeholders {{VAR}} with their values
@@ -945,7 +993,18 @@ impl Resolver {
 
         // Run DAG-based resolution for all secrets with `generate` commands.
         // This handles invalidation cascading even for secrets that have existing values.
-        let effective_params = config.get_effective_parameters().clone();
+        //
+        // Deferred params are dropped from the DAG input: a deferred `generate`
+        // references an out-of-scope missing manual secret this run never
+        // fetches, so executing it here would hard-fail on a value the run
+        // doesn't need. Every deferred name is provably outside the scanned
+        // closure, so this can't drop a generate the target actually uses.
+        let effective_params: HashMap<String, crate::config::Parameter> = config
+            .get_effective_parameters()
+            .iter()
+            .filter(|(name, _)| !self.deferred_params.contains(*name))
+            .map(|(name, param)| (name.clone(), param.clone()))
+            .collect();
         let generate_results = super::generate::resolve_generate_params(
             &effective_params,
             &analysis.existing_values,
@@ -1097,6 +1156,13 @@ impl Resolver {
         // Clear any stale resolutions from a previous call (e.g. dry-run then real start)
         self.port_resolutions.clear();
 
+        // Determine which parameters are deferred this run BEFORE anything is
+        // resolved — secret resolution's `generate` DAG (below), default
+        // resolution, and non-secret generates all consult this set to skip a
+        // value that (transitively) depends on an out-of-scope missing manual
+        // secret. Empty for unscoped runs, so nothing below changes there.
+        self.deferred_params = self.compute_deferred_params(config);
+
         // Resolve secrets first — may generate .env entries and add ".env" to config.env_file
         self.resolve_secrets(config)?;
 
@@ -1244,6 +1310,12 @@ impl Resolver {
 
         // Check for unresolved templates (circular references or missing parameters)
         for (name, param) in &effective_params {
+            // A deferred parameter's unresolved references are (transitively)
+            // out-of-scope missing manual secrets this run never fetches — not a
+            // failure. In-scope failures are not in the set and still error.
+            if self.deferred_params.contains(name) {
+                continue;
+            }
             if let Some(env_value) = param.get_value_for_environment(&self.environment) {
                 let default_str = Self::value_to_string(env_value);
                 if default_str.contains("{{") {
@@ -1272,9 +1344,15 @@ impl Resolver {
 
         // Resolve non-secret `generate` parameters (recompute every start).
         // Secret generate params were already handled in resolve_secrets.
+        // A deferred generate references an out-of-scope missing manual secret
+        // (directly or transitively); executing it would fail on a value this
+        // run never fetches — and running an unrelated generate in a scoped run
+        // is wasteful anyway. Skip them; unscoped runs defer nothing.
         let non_secret_generate: HashMap<String, crate::config::Parameter> = effective_params
             .iter()
-            .filter(|(_, p)| p.has_generate() && !p.is_secret_type())
+            .filter(|(name, p)| {
+                p.has_generate() && !p.is_secret_type() && !self.deferred_params.contains(*name)
+            })
             .map(|(name, p)| (name.clone(), p.clone()))
             .collect();
 
@@ -1336,16 +1414,16 @@ impl Resolver {
         // Resolve services - environment variables now only come from inline config
         // (.env files are applied to parameters, not directly to service environments)
         //
-        // Under scoping, a service that references a manual secret outside this
-        // run's scope is out of the scanned closure and will never be spawned;
-        // defer it (collect here, drop after the loop) rather than hard-failing
-        // the whole run on a secret it doesn't need. See
-        // `service_defers_on_out_of_scope_secret`.
+        // Under scoping, a service that references a deferred parameter (an
+        // out-of-scope missing manual secret, or a value derived from one) is
+        // out of the scanned closure and will never be spawned; defer it
+        // (collect here, drop after the loop) rather than hard-failing the whole
+        // run on a value it doesn't need. See `service_should_defer`.
         let mut deferred_services: Vec<String> = Vec::new();
         for (name, service) in &mut resolved.services {
-            if self.service_defers_on_out_of_scope_secret(config, service, &parameters) {
+            if self.service_should_defer(service) {
                 tracing::debug!(
-                    "deferring out-of-scope service '{}': it references a manual secret not in this run's scope",
+                    "deferring out-of-scope service '{}': it references a deferred parameter (out-of-scope missing secret or a value derived from one)",
                     name
                 );
                 deferred_services.push(name.clone());
@@ -4041,6 +4119,158 @@ mod tests {
         assert!(
             !resolved.services.contains_key("unrelated"),
             "the out-of-scope service must be dropped from the resolved config"
+        );
+    }
+
+    #[test]
+    fn scoped_run_defers_derived_default_on_out_of_scope_secret() {
+        // RB: a parameter whose default interpolates an out-of-scope missing
+        // manual secret must be deferred, not fail the scoped run.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp.path());
+        resolver.set_required_names(Some(HashSet::new())); // nothing in scope
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "UNUSED_SECRET".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "UNUSED_DERIVED".to_string(),
+            Parameter {
+                default: Some(serde_yaml::Value::String(
+                    "prefix-{{UNUSED_SECRET}}".to_string(),
+                )),
+                ..Default::default()
+            },
+        );
+
+        resolver
+            .resolve_parameters(&mut config)
+            .expect("a derived default over an out-of-scope secret must be deferred, not fatal");
+    }
+
+    #[test]
+    fn scoped_run_defers_generate_referencing_out_of_scope_secret() {
+        // RB (a): a non-secret generate that references an out-of-scope missing
+        // manual secret must be deferred (its command not executed), not fatal.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp.path());
+        resolver.set_required_names(Some(HashSet::new()));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "UNUSED_SECRET".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "UNUSED_GEN".to_string(),
+            Parameter {
+                // Would fail if executed — `false` exits non-zero — but must be
+                // deferred (skipped) entirely because it references a secret out
+                // of scope.
+                generate: Some("false {{UNUSED_SECRET}}".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver
+            .resolve_parameters(&mut config)
+            .expect("a generate over an out-of-scope secret must be deferred, not executed");
+        assert!(
+            !resolver
+                .get_resolved_parameters()
+                .contains_key("UNUSED_GEN"),
+            "a deferred generate must not produce a value"
+        );
+    }
+
+    #[test]
+    fn unscoped_run_still_fails_on_generate_referencing_missing_secret() {
+        // Control for the test above: with no scoping the same generate runs and
+        // fails on the missing secret — unscoped behavior is unchanged.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp.path());
+        resolver.set_offline(true); // secret genuinely missing
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "UNUSED_SECRET".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "UNUSED_GEN".to_string(),
+            Parameter {
+                generate: Some("false {{UNUSED_SECRET}}".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            resolver.resolve_parameters(&mut config).is_err(),
+            "unscoped run must still fail on the generate's missing secret"
+        );
+    }
+
+    #[test]
+    fn scoped_run_still_fails_on_in_scope_derived_missing_secret() {
+        // Strictness preserved: a derived default over an IN-scope secret that is
+        // missing must still fail — only out-of-scope dependencies are deferred.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp.path());
+        resolver.set_offline(true); // in-scope secret is genuinely missing
+        resolver.set_required_names(Some(HashSet::from(["IN_SCOPE_SECRET".to_string()])));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "IN_SCOPE_SECRET".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "DERIVED".to_string(),
+            Parameter {
+                default: Some(serde_yaml::Value::String(
+                    "prefix-{{IN_SCOPE_SECRET}}".to_string(),
+                )),
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            resolver.resolve_parameters(&mut config).is_err(),
+            "an in-scope missing secret must still fail the run"
         );
     }
 
