@@ -175,21 +175,71 @@ pub async fn run_login(
     Ok(())
 }
 
-pub async fn run_logout(out: &dyn UserOutput) -> Result<()> {
-    match cloud::load_credentials() {
-        Some(creds) if std::env::var("FED_TOKEN").is_err() => {
-            // Best-effort server-side revocation is not possible without the token id;
-            // deleting the local token is the contract. (Server tokens expire in a year
-            // and are revocable from the dashboard.)
-            let _ = creds;
-        }
-        _ => {}
-    }
-    if cloud::delete_credentials()? {
-        out.success("Signed out — local credentials removed.");
-        out.status("Tip: also revoke the token in the dashboard under API tokens.");
+/// What `logout_flow` did, so the caller can report it honestly. Kept separate
+/// from the printing so the flow (revoke classification + always-delete-local)
+/// is unit-testable without touching `~/.fed`.
+enum LogoutReport {
+    /// No stored credential and nothing on disk to remove.
+    NotSignedIn,
+    /// No parseable stored credential, but a local file existed and was removed.
+    RemovedLocalOnly,
+    /// Server confirmed the token is dead and the local credential was removed.
+    RevokedAndRemoved,
+    /// Local credential removed, but server revocation did not take effect
+    /// (network/offline/429/…); carries the short reason.
+    RemovedRevokeFailed(String),
+}
+
+/// Core of `fed logout`: attempt server-side revocation of the stored token,
+/// then ALWAYS remove the local credential — even when revocation failed (the
+/// plan is explicit: remove locally regardless). `delete` returns whether a
+/// local file was actually removed. `offline` (or an empty cloud URL) skips the
+/// network attempt entirely and reports it as a failed revoke, reason "offline".
+async fn logout_flow(
+    stored: Option<cloud::Credentials>,
+    offline: bool,
+    delete: impl FnOnce() -> Result<bool>,
+) -> Result<LogoutReport> {
+    let Some(creds) = stored else {
+        // No credential we own. Preserve today's behavior: clean up a file if one
+        // somehow exists, otherwise report not signed in.
+        return Ok(if delete()? {
+            LogoutReport::RemovedLocalOnly
+        } else {
+            LogoutReport::NotSignedIn
+        });
+    };
+
+    let revocation = if offline || creds.url.is_empty() {
+        cloud::Revocation::Failed("offline".to_string())
     } else {
-        out.status("Not signed in.");
+        cloud::revoke_current_token(&creds).await
+    };
+
+    // Always remove the local credential, regardless of the revoke result.
+    delete()?;
+
+    Ok(match revocation {
+        cloud::Revocation::Revoked => LogoutReport::RevokedAndRemoved,
+        cloud::Revocation::Failed(reason) => LogoutReport::RemovedRevokeFailed(reason),
+    })
+}
+
+pub async fn run_logout(offline: bool, out: &dyn UserOutput) -> Result<()> {
+    let stored = cloud::load_stored_credentials();
+    let delete = || cloud::delete_credentials().map_err(anyhow::Error::from);
+    match logout_flow(stored, offline, delete).await? {
+        LogoutReport::NotSignedIn => out.status("Not signed in."),
+        LogoutReport::RemovedLocalOnly => {
+            out.success("Logged out — local credentials removed.")
+        }
+        LogoutReport::RevokedAndRemoved => {
+            out.success("Logged out (token revoked server-side).")
+        }
+        LogoutReport::RemovedRevokeFailed(reason) => out.warning(&format!(
+            "Logged out locally; server revocation failed ({}) — the token may remain valid until expiry.",
+            reason
+        )),
     }
     Ok(())
 }
@@ -222,4 +272,146 @@ fn urlencoding_encode(s: &str) -> String {
             _ => format!("%{:02X}", b),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// One-shot HTTP server: replies to the first request with `status_line`
+    /// (e.g. "200 OK") and `body`, then closes. Returns the base URL.
+    fn spawn_one_shot(status_line: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    fn creds_at(url: String) -> cloud::Credentials {
+        cloud::Credentials {
+            url,
+            token: "super-secret-token".to_string(),
+        }
+    }
+
+    /// No stored credential and nothing on disk: unchanged "not signed in"
+    /// behavior, and delete is never expected to have removed anything.
+    #[tokio::test]
+    async fn logout_no_credentials_is_not_signed_in() {
+        let report = logout_flow(None, false, || Ok(false)).await.unwrap();
+        assert!(matches!(report, LogoutReport::NotSignedIn));
+    }
+
+    /// 200 revoked:true → the success ("revoked server-side") path, and the
+    /// local credential is deleted.
+    #[tokio::test]
+    async fn logout_200_revokes_and_removes_local() {
+        let url = spawn_one_shot("200 OK", "{\"revoked\":true}");
+        let deleted = std::cell::Cell::new(false);
+        let report = logout_flow(Some(creds_at(url)), false, || {
+            deleted.set(true);
+            Ok(true)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(report, LogoutReport::RevokedAndRemoved));
+        assert!(deleted.get(), "local credential must be removed");
+    }
+
+    /// 429 → the failed-revoke path, and the local file is STILL deleted. Proven
+    /// against a real temp file so the delete is genuinely exercised.
+    #[tokio::test]
+    async fn logout_429_fails_revoke_but_still_deletes_local() {
+        let url = spawn_one_shot("429 Too Many Requests", "{\"error\":\"rate_limited\"}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        std::fs::write(&path, "url: x\ntoken: y\n").unwrap();
+        let report = logout_flow(Some(creds_at(url)), false, || {
+            Ok(std::fs::remove_file(&path).is_ok())
+        })
+        .await
+        .unwrap();
+        match report {
+            LogoutReport::RemovedRevokeFailed(reason) => {
+                assert!(
+                    !reason.contains("super-secret-token"),
+                    "reason leaked the token"
+                );
+            }
+            _ => panic!("429 must classify as a failed revoke"),
+        }
+        assert!(
+            !path.exists(),
+            "local credential must be deleted even when revoke fails"
+        );
+    }
+
+    /// Connection refused → failed-revoke path, fast, local still deleted.
+    #[tokio::test]
+    async fn logout_connection_refused_fails_fast_and_deletes_local() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let deleted = std::cell::Cell::new(false);
+        let start = Instant::now();
+        let report = logout_flow(
+            Some(creds_at(format!("http://127.0.0.1:{}", port))),
+            false,
+            || {
+                deleted.set(true);
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(report, LogoutReport::RemovedRevokeFailed(_)));
+        assert!(deleted.get(), "local credential must be removed");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "connect-refused must fail fast, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// --offline skips the network entirely (reason "offline") yet still removes
+    /// the local credential. The URL points at TEST-NET-1, which would hang if
+    /// contacted — so completing quickly proves no request was made.
+    #[tokio::test]
+    async fn logout_offline_skips_network_and_deletes_local() {
+        let deleted = std::cell::Cell::new(false);
+        let start = Instant::now();
+        let report = logout_flow(
+            Some(creds_at("http://192.0.2.1:9".to_string())),
+            true,
+            || {
+                deleted.set(true);
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+        match report {
+            LogoutReport::RemovedRevokeFailed(reason) => assert_eq!(reason, "offline"),
+            _ => panic!("offline must be a failed revoke with reason 'offline'"),
+        }
+        assert!(deleted.get(), "local credential must be removed");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "offline must not make a network attempt"
+        );
+    }
 }

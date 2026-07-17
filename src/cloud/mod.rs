@@ -40,6 +40,14 @@ pub fn load_credentials() -> Option<Credentials> {
     load_credentials_from(&credentials_path()?)
 }
 
+/// Load the on-disk credential (`~/.fed/credentials`) only, ignoring the
+/// `FED_TOKEN` CI override. `fed logout` acts on the credential it wrote at
+/// login — the environment token is the caller's to manage, not ours to revoke
+/// or claim to remove.
+pub fn load_stored_credentials() -> Option<Credentials> {
+    load_credentials_from(&credentials_path()?)
+}
+
 fn load_credentials_from(path: &Path) -> Option<Credentials> {
     use std::io::Read;
     // Open the file ONCE and operate on the handle: reading the bytes and
@@ -479,6 +487,57 @@ pub async fn put_secret(
     Ok(())
 }
 
+// ── Logout revocation (05-token-scope.md "Logout revocation") ───────────
+
+/// Outcome of asking the server to revoke the presented bearer token via
+/// `DELETE /api/v1/cli/session`. The endpoint is idempotent: it revokes the
+/// token identified by the bearer's hash, so the CLI never needs a token UUID.
+pub enum Revocation {
+    /// The token is dead server-side. Emitted for 200 — whether the body says
+    /// `revoked:true` (a live token was just killed) or `revoked:false` (already
+    /// dead / unknown), the token no longer authenticates — and defensively for
+    /// 401, which this endpoint does not emit today but would only ever mean the
+    /// token was already unusable.
+    Revoked,
+    /// Revocation did not take effect — the token may remain valid until it
+    /// expires. Carries a short human reason for the honest logout message
+    /// (never the token itself). Emitted for 429 (the IP rate limiter refused
+    /// the revoke), any other non-2xx, and network/timeout errors.
+    Failed(String),
+}
+
+/// Revoke the currently-presented bearer token. A single, bounded attempt with
+/// no retry: `fed logout` removes the local credential regardless of the result,
+/// so a booting backend is not worth the vault budget here — a modest ~10s cap,
+/// and connect failures (`is_connect`) fail fast rather than waiting it out.
+pub async fn revoke_current_token(creds: &Credentials) -> Revocation {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => return Revocation::Failed(format!("cloud client: {}", e)),
+    };
+    let res = match client
+        .delete(format!("{}/api/v1/cli/session", creds.url))
+        .bearer_auth(&creds.token)
+        .send()
+        .await
+    {
+        Ok(res) => res,
+        // Reuse the classified send-error handling: connect/DNS fails fast,
+        // timeouts and other transport errors are likewise a failed revoke.
+        Err(e) => {
+            return Revocation::Failed(classify_send_error(&creds.url, &e).message().to_string());
+        }
+    };
+    match res.status().as_u16() {
+        200 | 401 => Revocation::Revoked,
+        429 => Revocation::Failed("rate limited".to_string()),
+        _ => Revocation::Failed(format!("server returned {}", res.status())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,6 +698,102 @@ mod tests {
             failure
         );
         assert!(err.is_timeout(), "sanity: the error should be a timeout");
+    }
+
+    /// One-shot HTTP server: replies to the first request with `status_line`
+    /// (e.g. "200 OK") and `body`, then closes. Returns the base URL. Used to
+    /// exercise the logout revocation status classification against real HTTP.
+    fn spawn_one_shot(status_line: &'static str, body: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    fn creds_at(url: String) -> Credentials {
+        Credentials {
+            url,
+            token: "super-secret-token".to_string(),
+        }
+    }
+
+    /// 200 with `revoked:true` — a live token was killed — is a clean revoke.
+    #[tokio::test]
+    async fn revoke_200_revoked_true_is_revoked() {
+        let url = spawn_one_shot("200 OK", "{\"revoked\":true}");
+        assert!(matches!(
+            revoke_current_token(&creds_at(url)).await,
+            Revocation::Revoked
+        ));
+    }
+
+    /// 200 with `revoked:false` (already dead / unknown token) is still a
+    /// success: the endpoint is idempotent and the token is not live.
+    #[tokio::test]
+    async fn revoke_200_revoked_false_is_revoked() {
+        let url = spawn_one_shot("200 OK", "{\"revoked\":false}");
+        assert!(matches!(
+            revoke_current_token(&creds_at(url)).await,
+            Revocation::Revoked
+        ));
+    }
+
+    /// 401 is not emitted by this endpoint today; treat it defensively as
+    /// token-already-dead (a success), not a failure.
+    #[tokio::test]
+    async fn revoke_401_is_defensively_revoked() {
+        let url = spawn_one_shot("401 Unauthorized", "{}");
+        assert!(matches!(
+            revoke_current_token(&creds_at(url)).await,
+            Revocation::Revoked
+        ));
+    }
+
+    /// 429 means the server's revoke FAILED behind the IP limiter — never a
+    /// success — and the reason must not leak the token.
+    #[tokio::test]
+    async fn revoke_429_is_failed_without_leaking_token() {
+        let url = spawn_one_shot("429 Too Many Requests", "{\"error\":\"rate_limited\"}");
+        match revoke_current_token(&creds_at(url)).await {
+            Revocation::Failed(reason) => {
+                assert!(
+                    !reason.contains("super-secret-token"),
+                    "reason leaked the token"
+                );
+            }
+            Revocation::Revoked => panic!("429 must not classify as revoked"),
+        }
+    }
+
+    /// Connection refused (nothing listening) is a failed revoke, and it must
+    /// fail fast — well inside the 10s cap — because `is_connect` short-circuits.
+    #[tokio::test]
+    async fn revoke_connection_refused_is_failed_fast() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let creds = creds_at(format!("http://127.0.0.1:{}", port));
+        let start = std::time::Instant::now();
+        let outcome = revoke_current_token(&creds).await;
+        assert!(matches!(outcome, Revocation::Failed(_)));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "connect-refused must fail fast, took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

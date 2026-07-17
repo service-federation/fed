@@ -202,7 +202,7 @@ async fn run() -> anyhow::Result<()> {
             return commands::run_login(*no_browser, url.clone(), &out).await;
         }
         Commands::Logout => {
-            return commands::run_logout(&out).await;
+            return commands::run_logout(cli.offline, &out).await;
         }
         Commands::Whoami => {
             return commands::run_whoami(&out).await;
