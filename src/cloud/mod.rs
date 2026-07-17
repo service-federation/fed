@@ -493,16 +493,17 @@ pub async fn put_secret(
 /// `DELETE /api/v1/cli/session`. The endpoint is idempotent: it revokes the
 /// token identified by the bearer's hash, so the CLI never needs a token UUID.
 pub enum Revocation {
-    /// The token is dead server-side. Emitted for 200 — whether the body says
-    /// `revoked:true` (a live token was just killed) or `revoked:false` (already
-    /// dead / unknown), the token no longer authenticates — and defensively for
-    /// 401, which this endpoint does not emit today but would only ever mean the
-    /// token was already unusable.
+    /// The token is dead server-side. Emitted ONLY for 200 — whether the body
+    /// says `revoked:true` (a live token was just killed) or `revoked:false`
+    /// (already dead / unknown), the token no longer authenticates. Nothing else
+    /// proves the revoke handler ran, so no other status maps here.
     Revoked,
     /// Revocation did not take effect — the token may remain valid until it
     /// expires. Carries a short human reason for the honest logout message
-    /// (never the token itself). Emitted for 429 (the IP rate limiter refused
-    /// the revoke), any other non-2xx, and network/timeout errors.
+    /// (never the token itself). Emitted for 401 (the deployed endpoint never
+    /// emits 401, so it now means an unexpected intermediary or auth failure —
+    /// NOT a confirmed revoke), 429 (the IP rate limiter refused the revoke),
+    /// any other non-2xx, and network/timeout errors.
     Failed(String),
 }
 
@@ -532,7 +533,11 @@ pub async fn revoke_current_token(creds: &Credentials) -> Revocation {
         }
     };
     match res.status().as_u16() {
-        200 | 401 => Revocation::Revoked,
+        // Only a 200 proves the server-side revoke handler ran. The endpoint
+        // never emits 401, so a 401 means an unexpected intermediary or auth
+        // failure — reporting it as a confirmed revocation would be unsafe.
+        200 => Revocation::Revoked,
+        401 => Revocation::Failed("server rejected the token (401)".to_string()),
         429 => Revocation::Failed("rate limited".to_string()),
         _ => Revocation::Failed(format!("server returned {}", res.status())),
     }
@@ -751,15 +756,19 @@ mod tests {
         ));
     }
 
-    /// 401 is not emitted by this endpoint today; treat it defensively as
-    /// token-already-dead (a success), not a failure.
+    /// 401 is not emitted by this endpoint today; it now means an unexpected
+    /// intermediary or auth failure — never a proof that the revoke handler ran.
+    /// It must classify as a FAILED revoke (honest), not a success.
     #[tokio::test]
-    async fn revoke_401_is_defensively_revoked() {
+    async fn revoke_401_is_failed_not_revoked() {
         let url = spawn_one_shot("401 Unauthorized", "{}");
-        assert!(matches!(
-            revoke_current_token(&creds_at(url)).await,
-            Revocation::Revoked
-        ));
+        match revoke_current_token(&creds_at(url)).await {
+            Revocation::Failed(reason) => assert!(
+                !reason.contains("super-secret-token"),
+                "reason leaked the token"
+            ),
+            Revocation::Revoked => panic!("401 must not classify as a confirmed revoke"),
+        }
     }
 
     /// 429 means the server's revoke FAILED behind the IP limiter — never a

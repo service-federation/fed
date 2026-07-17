@@ -332,6 +332,32 @@ mod tests {
         assert!(deleted.get(), "local credential must be removed");
     }
 
+    /// 401 → the failed-revoke path (the endpoint never emits 401, so it no
+    /// longer proves the server revoked the token), yet the local credential is
+    /// STILL deleted. The reported reason must not leak the token.
+    #[tokio::test]
+    async fn logout_401_fails_revoke_but_still_deletes_local() {
+        let url = spawn_one_shot("401 Unauthorized", "{}");
+        let deleted = std::cell::Cell::new(false);
+        let report = logout_flow(Some(creds_at(url)), false, || {
+            deleted.set(true);
+            Ok(true)
+        })
+        .await
+        .unwrap();
+        match report {
+            LogoutReport::RemovedRevokeFailed(reason) => assert!(
+                !reason.contains("super-secret-token"),
+                "reason leaked the token"
+            ),
+            _ => panic!("401 must classify as a failed revoke, not a confirmed revocation"),
+        }
+        assert!(
+            deleted.get(),
+            "local credential must be removed even on a failed revoke"
+        );
+    }
+
     /// 429 → the failed-revoke path, and the local file is STILL deleted. Proven
     /// against a real temp file so the delete is genuinely exercised.
     #[tokio::test]
