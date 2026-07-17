@@ -999,15 +999,34 @@ impl Resolver {
         // Run DAG-based resolution for all secrets with `generate` commands.
         // This handles invalidation cascading even for secrets that have existing values.
         //
+        // The set of names actually declared as parameters this run. The DAG
+        // must only ever see these: undeclared env-file keys (which
+        // `analysis.existing_values` still carries) must be rejected by strict
+        // validation in `apply_env_file_to_parameters`, NOT silently seeded into
+        // a generator that would then interpolate, execute, and persist before
+        // that validation runs (P2).
+        let declared: HashSet<String> = config.get_effective_parameters().keys().cloned().collect();
+
         // Deferred params are dropped from the DAG input: a deferred `generate`
         // references an out-of-scope missing manual secret this run never
         // fetches, so executing it here would hard-fail on a value the run
         // doesn't need. Every deferred name is provably outside the scanned
         // closure, so this can't drop a generate the target actually uses.
+        //
+        // A generator that references an UNDECLARED name is also dropped: seeding
+        // it is filtered out below, so it could only fail with ParameterNotFound;
+        // instead we leave it un-run so `apply_env_file_to_parameters` aborts the
+        // run with the precise UndeclaredEnvVariable, having persisted nothing.
         let effective_params: HashMap<String, crate::config::Parameter> = config
             .get_effective_parameters()
             .iter()
-            .filter(|(name, _)| !self.deferred_params.contains(*name))
+            .filter(|(name, param)| {
+                !self.deferred_params.contains(*name)
+                    && param
+                        .generate_dependencies()
+                        .iter()
+                        .all(|d| declared.contains(d))
+            })
             .map(|(name, param)| (name.clone(), param.clone()))
             .collect();
         // Seed the DAG with values a generated secret may interpolate: manual
@@ -1015,9 +1034,18 @@ impl Resolver {
         // via `existing_values`, plus vault/cache/explicit values now on
         // `param.value`). Without this a generated secret could never reference a
         // manual secret — `printf %s {{SEED}}` would fail with ParameterNotFound.
-        // Deferred names are omitted: their value is out of scope this run, and a
-        // generate depending on one is itself deferred and dropped above.
-        let mut resolved_inputs = analysis.existing_values.clone();
+        // The seed is filtered to declared, non-deferred names: undeclared keys
+        // must not reach a generator ahead of strict validation (P2), and a
+        // deferred name's value is out of scope this run (a generate depending on
+        // one is itself deferred and dropped above).
+        let mut resolved_inputs: HashMap<String, String> = analysis
+            .existing_values
+            .iter()
+            .filter(|(name, _)| {
+                declared.contains(name.as_str()) && !self.deferred_params.contains(name.as_str())
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         for (name, param) in config.get_effective_parameters() {
             if self.deferred_params.contains(name) {
                 continue;
@@ -5342,6 +5370,57 @@ mod tests {
             generator_run_count(&marker),
             1,
             "once stamped, an unchanged seed must not rerun"
+        );
+    }
+
+    // ── P2: undeclared env keys must not seed the DAG before validation ───────
+
+    #[test]
+    fn undeclared_env_key_fails_before_generator_runs_or_persists() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let marker = temp.path().join("gen-runs.log");
+        let gen_path = temp.path().join(crate::fed_dir::GENERATED_SECRETS_REL);
+
+        // An env file declares a key that is NOT a parameter, referenced by a
+        // generator. The generator records any execution via `marker`.
+        std::fs::write(temp.path().join("bad.env"), "UNDECLARED=leak\n").unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp.path());
+        resolver.set_offline(true);
+
+        let mut config = Config::default();
+        config.env_file = vec!["bad.env".to_string()];
+        config.parameters.insert(
+            "DERIVED_SECRET".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                generate: Some(format!(
+                    "printf x >> '{}'; printf %s {{{{UNDECLARED}}}}",
+                    marker.display()
+                )),
+                ..Default::default()
+            },
+        );
+
+        let err = resolver
+            .resolve_parameters(&mut config)
+            .expect_err("an undeclared env key must fail the run");
+        assert!(
+            matches!(err, Error::UndeclaredEnvVariable { .. }),
+            "must fail with UndeclaredEnvVariable, got: {err}"
+        );
+        assert_eq!(
+            generator_run_count(&marker),
+            0,
+            "the generator must not execute before strict validation"
+        );
+        assert!(
+            !gen_path.exists(),
+            "nothing must be persisted for the undeclared-referencing generator"
         );
     }
 }
