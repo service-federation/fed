@@ -462,8 +462,13 @@ impl Resolver {
     /// resolution (whose `generate` DAG would otherwise execute a deferred
     /// generate over a secret it never fetches). Every deferred name is provably
     /// outside the scanned closure (an in-scope reference would put the secret
-    /// in scope), so any over-deferral is confined to things this run never
-    /// spawns, exactly like the service-deferral rule.
+    /// in scope). A deferred name is therefore inert for this run: every
+    /// downstream stage skips it, so it is never validated (port, `either`, or
+    /// unresolved-template), never allocated a port, and never persisted — the
+    /// secret-generate fallback writes nothing for it, so no random value can be
+    /// stored and later mistaken for a real one. Over-approximation only ever
+    /// touches things this run never spawns, exactly like the service-deferral
+    /// rule.
     ///
     /// Returns an empty set for unscoped runs (`required_names == None`), so
     /// `fed start` and interactive `fed` stay exactly as strict as before: with
@@ -1218,6 +1223,16 @@ impl Resolver {
         let effective_params = config.get_effective_parameters().clone();
 
         for (name, param) in &effective_params {
+            // A deferred parameter's value (transitively) depends on an
+            // out-of-scope missing manual secret this run never fetches. Skip it
+            // whole: no port validation/allocation (a deferred port must allocate
+            // nothing), no `either`/default handling, no resolved-value side
+            // effect. In-scope names are never deferred, so this changes nothing
+            // for them; unscoped runs defer nothing at all.
+            if self.deferred_params.contains(name) {
+                continue;
+            }
+
             // Track port-type parameters
             if param.is_port_type() {
                 self.port_parameter_names.push(name.clone());
@@ -1312,6 +1327,12 @@ impl Resolver {
             let mut any_resolved = false;
 
             for (name, param) in &effective_params {
+                // Deferred params are left untouched everywhere (see the first
+                // pass): their template references an out-of-scope secret and
+                // could only ever partially resolve into a value nothing uses.
+                if self.deferred_params.contains(name) {
+                    continue;
+                }
                 // Port parameters were already resolved by the allocator above;
                 // re-resolving their default here would overwrite the allocated
                 // port with an unchecked value.
@@ -1404,6 +1425,12 @@ impl Resolver {
 
         // Validate 'either' constraints
         for (name, param) in &effective_params {
+            // A deferred param's value is (transitively) an out-of-scope secret
+            // this run never resolves — validating it against `either` would fail
+            // on the raw `{{...}}` placeholder. In-scope names are never deferred.
+            if self.deferred_params.contains(name) {
+                continue;
+            }
             if !param.either.is_empty() {
                 if let Some(resolved_value) = parameters.get(name) {
                     if !param.either.contains(resolved_value) {
@@ -4981,6 +5008,181 @@ mod tests {
         assert!(
             persisted.contains("DERIVED_SECRET=myseed"),
             "the correct derived value must be persisted, got: {persisted:?}"
+        );
+    }
+
+    // ── RB-2: deferred params must skip port and `either` validation ─────────
+
+    #[test]
+    fn scoped_run_skips_port_validation_and_allocation_for_deferred_param() {
+        // A deferred port parameter (its default interpolates an out-of-scope
+        // secret) must not be validated or allocated a port.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp.path());
+        resolver.set_offline(true);
+        resolver.set_required_names(Some(HashSet::new()));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "UNUSED_SECRET".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "UNUSED_PORT".to_string(),
+            Parameter {
+                param_type: Some("port".to_string()),
+                default: Some(serde_yaml::Value::String("{{UNUSED_SECRET}}".to_string())),
+                ..Default::default()
+            },
+        );
+
+        resolver
+            .resolve_parameters(&mut config)
+            .expect("a deferred port param must not be validated or allocated");
+        assert!(
+            !resolver
+                .get_port_parameter_names()
+                .contains(&"UNUSED_PORT".to_string()),
+            "a deferred port param must not be tracked for allocation"
+        );
+        assert!(
+            resolver
+                .get_port_resolutions()
+                .iter()
+                .all(|r| r.param_name != "UNUSED_PORT"),
+            "a deferred port param must allocate no port"
+        );
+        assert!(
+            !resolver
+                .get_resolved_parameters()
+                .contains_key("UNUSED_PORT"),
+            "a deferred port param must produce no resolved value"
+        );
+    }
+
+    #[test]
+    fn unscoped_run_still_fails_on_invalid_port_default() {
+        // Control: with no scoping the same template port default is validated
+        // and rejected — port strictness is unchanged.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("seed.env"), "UNUSED_SECRET=whatever\n").unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp.path());
+        resolver.set_offline(true);
+
+        let mut config = Config::default();
+        config.env_file = vec!["seed.env".to_string()];
+        config.parameters.insert(
+            "UNUSED_SECRET".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "UNUSED_PORT".to_string(),
+            Parameter {
+                param_type: Some("port".to_string()),
+                default: Some(serde_yaml::Value::String("{{UNUSED_SECRET}}".to_string())),
+                ..Default::default()
+            },
+        );
+
+        let err = resolver
+            .resolve_parameters(&mut config)
+            .expect_err("an unscoped run must still reject the invalid port default");
+        assert!(
+            err.to_string().contains("invalid port default"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn scoped_run_skips_either_validation_for_deferred_param() {
+        // A deferred `either`-constrained param (its default interpolates an
+        // out-of-scope secret) must not be validated against its allowed values.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp.path());
+        resolver.set_offline(true);
+        resolver.set_required_names(Some(HashSet::new()));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "UNUSED_SECRET".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "UNUSED_CHOICE".to_string(),
+            Parameter {
+                either: vec!["a".to_string(), "b".to_string()],
+                default: Some(serde_yaml::Value::String("{{UNUSED_SECRET}}".to_string())),
+                ..Default::default()
+            },
+        );
+
+        resolver
+            .resolve_parameters(&mut config)
+            .expect("a deferred either-constrained param must not be validated");
+    }
+
+    #[test]
+    fn unscoped_run_still_fails_on_either_constraint() {
+        // Control: with no scoping the resolved value is validated against the
+        // allowed set and rejected — `either` strictness is unchanged.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("seed.env"), "UNUSED_SECRET=zzz\n").unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp.path());
+        resolver.set_offline(true);
+
+        let mut config = Config::default();
+        config.env_file = vec!["seed.env".to_string()];
+        config.parameters.insert(
+            "UNUSED_SECRET".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "UNUSED_CHOICE".to_string(),
+            Parameter {
+                either: vec!["a".to_string(), "b".to_string()],
+                default: Some(serde_yaml::Value::String("{{UNUSED_SECRET}}".to_string())),
+                ..Default::default()
+            },
+        );
+
+        let err = resolver
+            .resolve_parameters(&mut config)
+            .expect_err("an unscoped run must still reject the out-of-set value");
+        assert!(
+            err.to_string().contains("not in the allowed values"),
+            "got: {err}"
         );
     }
 }
