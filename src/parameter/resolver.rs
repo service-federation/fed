@@ -999,83 +999,30 @@ impl Resolver {
         // Run DAG-based resolution for all secrets with `generate` commands.
         // This handles invalidation cascading even for secrets that have existing values.
         //
-        // The set of names actually declared as parameters this run. The DAG
-        // must only ever see these: undeclared env-file keys (which
-        // `analysis.existing_values` still carries) must be rejected by strict
-        // validation in `apply_env_file_to_parameters`, NOT silently seeded into
-        // a generator that would then interpolate, execute, and persist before
-        // that validation runs (P2).
-        let declared: HashSet<String> = config.get_effective_parameters().keys().cloned().collect();
-
         // Deferred params are dropped from the DAG input: a deferred `generate`
         // references an out-of-scope missing manual secret this run never
         // fetches, so executing it here would hard-fail on a value the run
         // doesn't need. Every deferred name is provably outside the scanned
         // closure, so this can't drop a generate the target actually uses.
         //
-        // A generator that references an UNDECLARED name is also dropped: seeding
-        // it is filtered out below, so it could only fail with ParameterNotFound;
-        // instead we leave it un-run so `apply_env_file_to_parameters` aborts the
-        // run with the precise UndeclaredEnvVariable, having persisted nothing.
+        // The DAG is seeded with an EMPTY resolved map: a secret generator that
+        // references any parameter (`printf %s {{SEED}}`) fails with
+        // ParameterNotFound, exactly as before. A reference-less generator
+        // (`openssl rand -hex 32`, `uuidgen`) still generates and persists.
         let effective_params: HashMap<String, crate::config::Parameter> = config
             .get_effective_parameters()
             .iter()
-            .filter(|(name, param)| {
-                !self.deferred_params.contains(*name)
-                    && param
-                        .generate_dependencies()
-                        .iter()
-                        .all(|d| declared.contains(d))
-            })
+            .filter(|(name, _param)| !self.deferred_params.contains(*name))
             .map(|(name, param)| (name.clone(), param.clone()))
             .collect();
-        // Seed the DAG with values a generated secret may interpolate: manual
-        // secrets already resolved for this run (env files and the secrets file
-        // via `existing_values`, plus vault/cache/explicit values now on
-        // `param.value`). Without this a generated secret could never reference a
-        // manual secret — `printf %s {{SEED}}` would fail with ParameterNotFound.
-        // The seed is filtered to declared, non-deferred names: undeclared keys
-        // must not reach a generator ahead of strict validation (P2), and a
-        // deferred name's value is out of scope this run (a generate depending on
-        // one is itself deferred and dropped above).
-        let mut resolved_inputs: HashMap<String, String> = analysis
-            .existing_values
-            .iter()
-            .filter(|(name, _)| {
-                declared.contains(name.as_str()) && !self.deferred_params.contains(name.as_str())
-            })
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (name, param) in config.get_effective_parameters() {
-            if self.deferred_params.contains(name) {
-                continue;
-            }
-            if let Some(v) = &param.value {
-                resolved_inputs.insert(name.clone(), v.clone());
-            }
-        }
-        // Names the user supplied via an env_file are authoritative: their
-        // derived secrets must never be regenerated, even though they carry no
-        // fed `# fp` stamp (which would otherwise read as a pre-upgrade entry).
-        let authoritative: HashSet<String> = analysis.env_file_values.keys().cloned().collect();
         let generate_results = super::generate::resolve_generate_params(
             &effective_params,
             &analysis.existing_values,
-            &resolved_inputs,
-            &analysis.existing_fingerprints,
-            &authoritative,
+            &HashMap::new(),
         )?;
 
         let dag_generated: HashSet<String> =
             generate_results.iter().map(|r| r.name.clone()).collect();
-
-        // Input fingerprints to persist next to each derived secret (both freshly
-        // generated and preserved-with-matching-fingerprint entries carry one, so
-        // a rewrite never drops a still-valid stamp).
-        let fingerprints: HashMap<String, String> = generate_results
-            .iter()
-            .filter_map(|r| r.fingerprint.clone().map(|fp| (r.name.clone(), fp)))
-            .collect();
 
         let mut generated: Vec<(String, String)> = generate_results
             .into_iter()
@@ -1144,7 +1091,7 @@ impl Resolver {
             tracing::info!("Generating secret values → {}", analysis.env_path.display());
         }
 
-        super::secret::write_env_file(&analysis.env_path, &generated, &fingerprints)?;
+        super::secret::write_env_file(&analysis.env_path, &generated)?;
 
         // Ensure the generated secrets file is in env_file now that it exists
         if !config.env_file.contains(&gsf_key) {
@@ -1456,8 +1403,6 @@ impl Resolver {
                 &non_secret_generate,
                 &HashMap::new(), // Non-secrets have no persisted values.
                 &parameters,     // Already-resolved params (ports, secrets, defaults).
-                &HashMap::new(), // …and therefore no persisted fingerprints.
-                &HashSet::new(), // …and no authoritative env_file values to guard.
             )?;
             for result in generate_results {
                 if result.was_generated {
@@ -4976,16 +4921,13 @@ mod tests {
         assert!(err.to_string().contains("bad.env"));
     }
 
-    // ── RB-1: deferred generated secrets must not be randomly generated ──────
+    // ── The round-3 rule: a deferred OR generatable secret is NEVER randomly
+    //    generated (it must not fall through to the random-alphanumeric
+    //    fallback and be persisted, where a later run would keep it). ─────────
 
     #[test]
-    fn scoped_run_defers_generated_secret_persists_nothing_then_generates_correct_value() {
-        // The reviewer's exact repro. SEED (manual) + DERIVED_SECRET (secret with
-        // a generator over SEED). A scoped run that defers DERIVED_SECRET must
-        // persist NOTHING for it — never a random value that a later run would
-        // keep (generate.rs preserves existing secret values, poisoning it). A
-        // subsequent in-scope run with SEED available must then generate the
-        // correct derived value.
+    fn deferred_or_generatable_secret_is_never_randomly_generated() {
+        // SEED (manual) + DERIVED_SECRET (secret with a generator over SEED).
         use crate::config::{Config, Parameter};
         use tempfile::TempDir;
 
@@ -5016,7 +4958,9 @@ mod tests {
             config
         };
 
-        // Run 1: scoped, SEED out of scope → DERIVED_SECRET is deferred.
+        // Scoped run: SEED out of scope → DERIVED_SECRET is deferred. It must
+        // persist NOTHING — never a random value that a later run would keep
+        // (generate.rs preserves existing secret values, which would poison it).
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp.path());
         resolver.set_offline(true);
@@ -5030,28 +4974,24 @@ mod tests {
             "a deferred generated secret must persist nothing — no random value written"
         );
 
-        // Run 2: in scope with SEED available via env file.
+        // Unscoped run with SEED available: the generator runs but references
+        // another secret, which under v6.2 semantics fails with ParameterNotFound.
+        // It must surface that error, NOT silently fall back to a random value.
         std::fs::write(temp.path().join("seed.env"), "SEED=myseed\n").unwrap();
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp.path());
         resolver.set_offline(true);
-        resolver.set_required_names(Some(HashSet::from([
-            "SEED".to_string(),
-            "DERIVED_SECRET".to_string(),
-        ])));
         let mut config = make_config(true);
-        resolver
-            .resolve_parameters(&mut config)
-            .expect("an in-scope run with SEED available must resolve");
-        assert_eq!(
-            resolver.get_resolved_parameters().get("DERIVED_SECRET"),
-            Some(&"myseed".to_string()),
-            "the subsequent run must generate the correct derived value, not a kept random one"
+        let err = resolver.resolve_parameters(&mut config).expect_err(
+            "a generatable secret referencing another secret must fail, not be randomized",
         );
-        let persisted = std::fs::read_to_string(&gen_path).expect("generated secrets file");
         assert!(
-            persisted.contains("DERIVED_SECRET=myseed"),
-            "the correct derived value must be persisted, got: {persisted:?}"
+            matches!(err, Error::ParameterNotFound(ref n) if n == "SEED"),
+            "must fail with ParameterNotFound(SEED), got: {err}"
+        );
+        assert!(
+            !gen_path.exists(),
+            "no random value must be persisted for the generatable secret"
         );
     }
 
@@ -5230,17 +5170,90 @@ mod tests {
         );
     }
 
-    // ── RB-2: a rotated input regenerates the persisted derived secret ────────
+    // ── Generated-secret interpolation semantics (v6.2) ───────────────────────
+    // The secret-generate DAG runs with an EMPTY resolved map: a reference-less
+    // generator still generates and is preserved across runs; a generator that
+    // references any parameter fails with ParameterNotFound. (A generator that
+    // interpolates another secret — `derive {{SEED}}` — is a deferred follow-up.)
 
-    /// A secret generator over a manual seed. The generator both records each
-    /// run (appends to `marker`, so we can prove it ran or didn't) and derives
-    /// its value from `{{SEED}}`.
-    fn seed_derived_config(marker: &std::path::Path, with_env: bool) -> crate::config::Config {
+    fn generator_run_count(marker: &std::path::Path) -> usize {
+        std::fs::read_to_string(marker)
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn referenceless_generated_secret_persists_and_is_preserved() {
         use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let marker = temp.path().join("gen-runs.log");
+        let gen_path = temp.path().join(crate::fed_dir::GENERATED_SECRETS_REL);
+
+        // A reference-less secret generator that records each execution via
+        // `marker` and always prints the same value.
+        let make_config = || {
+            let mut config = Config::default();
+            config.parameters.insert(
+                "SECRET".to_string(),
+                Parameter {
+                    param_type: Some("secret".to_string()),
+                    generate: Some(format!(
+                        "printf x >> '{}'; printf %s fixedvalue",
+                        marker.display()
+                    )),
+                    ..Default::default()
+                },
+            );
+            config
+        };
+
+        // First run: generates and persists.
+        let mut r1 = Resolver::new();
+        r1.set_work_dir(temp.path());
+        r1.set_offline(true);
+        let mut c1 = make_config();
+        r1.resolve_parameters(&mut c1)
+            .expect("first run must succeed");
+        assert_eq!(generator_run_count(&marker), 1, "first run generates");
+        let persisted = std::fs::read_to_string(&gen_path).unwrap();
+        assert!(
+            persisted.contains("SECRET=fixedvalue"),
+            "the reference-less secret must persist: {persisted}"
+        );
+
+        // Second run: the persisted value is preserved, the generator does NOT
+        // rerun.
+        let mut r2 = Resolver::new();
+        r2.set_work_dir(temp.path());
+        r2.set_offline(true);
+        let mut c2 = make_config();
+        r2.resolve_parameters(&mut c2)
+            .expect("second run must succeed");
+        assert_eq!(
+            generator_run_count(&marker),
+            1,
+            "a reference-less generated secret must be preserved, not regenerated"
+        );
+    }
+
+    #[test]
+    fn secret_generator_referencing_param_fails_with_parameter_not_found() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("seed.env"), "SEED=abc\n").unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp.path());
+        resolver.set_offline(true);
+
+        // DERIVED interpolates the manual secret SEED. With the empty DAG seed
+        // (v6.2 semantics) it can never see SEED's value and must fail.
         let mut config = Config::default();
-        if with_env {
-            config.env_file = vec!["seed.env".to_string()];
-        }
+        config.env_file = vec!["seed.env".to_string()];
         config.parameters.insert(
             "SEED".to_string(),
             Parameter {
@@ -5250,183 +5263,20 @@ mod tests {
             },
         );
         config.parameters.insert(
-            "DERIVED_SECRET".to_string(),
+            "DERIVED".to_string(),
             Parameter {
                 param_type: Some("secret".to_string()),
-                generate: Some(format!(
-                    "printf x >> '{}'; printf %s {{{{SEED}}}}",
-                    marker.display()
-                )),
-                ..Default::default()
-            },
-        );
-        config
-    }
-
-    fn run_seed_derived(work_dir: &std::path::Path, marker: &std::path::Path, seed: &str) {
-        std::fs::write(work_dir.join("seed.env"), format!("SEED={seed}\n")).unwrap();
-        let mut resolver = Resolver::new();
-        resolver.set_work_dir(work_dir);
-        resolver.set_offline(true);
-        let mut config = seed_derived_config(marker, true);
-        resolver
-            .resolve_parameters(&mut config)
-            .expect("resolution must succeed");
-    }
-
-    fn generator_run_count(marker: &std::path::Path) -> usize {
-        std::fs::read_to_string(marker)
-            .map(|s| s.len())
-            .unwrap_or(0)
-    }
-
-    #[test]
-    fn rotating_seed_regenerates_persisted_derived_secret() {
-        use tempfile::TempDir;
-        let temp = TempDir::new().unwrap();
-        let marker = temp.path().join("gen-runs.log");
-        let gen_path = temp.path().join(crate::fed_dir::GENERATED_SECRETS_REL);
-
-        // First seed → generates.
-        run_seed_derived(temp.path(), &marker, "first-seed");
-        assert_eq!(generator_run_count(&marker), 1, "first run generates");
-        let persisted = std::fs::read_to_string(&gen_path).unwrap();
-        assert!(
-            persisted.contains("DERIVED_SECRET=first-seed"),
-            "got: {persisted}"
-        );
-        assert!(
-            persisted.contains("# fp DERIVED_SECRET "),
-            "the derived secret must be stamped with an input fingerprint: {persisted}"
-        );
-
-        // Rotated seed → REGENERATES (no longer stale).
-        run_seed_derived(temp.path(), &marker, "rotated-seed");
-        assert_eq!(
-            generator_run_count(&marker),
-            2,
-            "a rotated seed must rerun the generator"
-        );
-        let persisted = std::fs::read_to_string(&gen_path).unwrap();
-        assert!(
-            persisted.contains("DERIVED_SECRET=rotated-seed"),
-            "the persisted derived secret must follow the rotated seed: {persisted}"
-        );
-        assert!(
-            !persisted.contains("DERIVED_SECRET=first-seed"),
-            "the stale derived value must be gone: {persisted}"
-        );
-    }
-
-    #[test]
-    fn unchanged_seed_preserves_derived_secret_without_rerun() {
-        use tempfile::TempDir;
-        let temp = TempDir::new().unwrap();
-        let marker = temp.path().join("gen-runs.log");
-        let gen_path = temp.path().join(crate::fed_dir::GENERATED_SECRETS_REL);
-
-        run_seed_derived(temp.path(), &marker, "steady-seed");
-        assert_eq!(generator_run_count(&marker), 1);
-
-        // Same seed again → fingerprint matches → generator must NOT rerun.
-        run_seed_derived(temp.path(), &marker, "steady-seed");
-        assert_eq!(
-            generator_run_count(&marker),
-            1,
-            "an unchanged seed must preserve the derived secret (no rerun)"
-        );
-        let persisted = std::fs::read_to_string(&gen_path).unwrap();
-        assert!(persisted.contains("DERIVED_SECRET=steady-seed"));
-    }
-
-    #[test]
-    fn pre_upgrade_entry_without_fingerprint_regenerates_once_then_stamps() {
-        use tempfile::TempDir;
-        let temp = TempDir::new().unwrap();
-        let marker = temp.path().join("gen-runs.log");
-        let gen_path = temp.path().join(crate::fed_dir::GENERATED_SECRETS_REL);
-
-        // Simulate a pre-upgrade generated-secrets file: a derived value with NO
-        // `# fp` stamp. `resolve_secrets` creates .fed/, so seed the file into it.
-        crate::fed_dir::ensure_fed_dir(temp.path()).unwrap();
-        std::fs::write(
-            &gen_path,
-            "# Auto-generated by fed — do not commit this file\nDERIVED_SECRET=steady-seed\n",
-        )
-        .unwrap();
-
-        // Same seed value as the stale entry: only the missing fingerprint forces
-        // the one-time regeneration.
-        run_seed_derived(temp.path(), &marker, "steady-seed");
-        assert_eq!(
-            generator_run_count(&marker),
-            1,
-            "a missing fingerprint must trigger exactly one regeneration"
-        );
-        let persisted = std::fs::read_to_string(&gen_path).unwrap();
-        assert!(persisted.contains("DERIVED_SECRET=steady-seed"));
-        assert!(
-            persisted.contains("# fp DERIVED_SECRET "),
-            "the regenerated entry must now carry a fingerprint: {persisted}"
-        );
-
-        // A subsequent run with the fingerprint present must NOT rerun.
-        run_seed_derived(temp.path(), &marker, "steady-seed");
-        assert_eq!(
-            generator_run_count(&marker),
-            1,
-            "once stamped, an unchanged seed must not rerun"
-        );
-    }
-
-    // ── P2: undeclared env keys must not seed the DAG before validation ───────
-
-    #[test]
-    fn undeclared_env_key_fails_before_generator_runs_or_persists() {
-        use crate::config::{Config, Parameter};
-        use tempfile::TempDir;
-
-        let temp = TempDir::new().unwrap();
-        let marker = temp.path().join("gen-runs.log");
-        let gen_path = temp.path().join(crate::fed_dir::GENERATED_SECRETS_REL);
-
-        // An env file declares a key that is NOT a parameter, referenced by a
-        // generator. The generator records any execution via `marker`.
-        std::fs::write(temp.path().join("bad.env"), "UNDECLARED=leak\n").unwrap();
-
-        let mut resolver = Resolver::new();
-        resolver.set_work_dir(temp.path());
-        resolver.set_offline(true);
-
-        let mut config = Config::default();
-        config.env_file = vec!["bad.env".to_string()];
-        config.parameters.insert(
-            "DERIVED_SECRET".to_string(),
-            Parameter {
-                param_type: Some("secret".to_string()),
-                generate: Some(format!(
-                    "printf x >> '{}'; printf %s {{{{UNDECLARED}}}}",
-                    marker.display()
-                )),
+                generate: Some("printf %s {{SEED}}".to_string()),
                 ..Default::default()
             },
         );
 
         let err = resolver
             .resolve_parameters(&mut config)
-            .expect_err("an undeclared env key must fail the run");
+            .expect_err("a secret generator referencing a parameter must fail (v6.2)");
         assert!(
-            matches!(err, Error::UndeclaredEnvVariable { .. }),
-            "must fail with UndeclaredEnvVariable, got: {err}"
-        );
-        assert_eq!(
-            generator_run_count(&marker),
-            0,
-            "the generator must not execute before strict validation"
-        );
-        assert!(
-            !gen_path.exists(),
-            "nothing must be persisted for the undeclared-referencing generator"
+            matches!(err, Error::ParameterNotFound(ref n) if n == "SEED"),
+            "must fail with ParameterNotFound(SEED), got: {err}"
         );
     }
 }

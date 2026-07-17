@@ -21,19 +21,6 @@ pub struct SecretAnalysis {
     /// Existing values already loaded from .env (generated secrets file and
     /// user env_files merged — NOT the vault cache).
     pub existing_values: HashMap<String, String>,
-    /// The subset of `existing_values` that came from user env_files (NOT fed's
-    /// generated-secrets file). These are authoritative user-supplied values: a
-    /// derived secret present here must NEVER be regenerated, since fed does not
-    /// stamp `# fp` fingerprints for env_file values and a missing fingerprint
-    /// would otherwise be read as a pre-upgrade entry needing regeneration.
-    pub env_file_values: HashMap<String, String>,
-    /// Per-entry input fingerprints parsed from the generated-secrets file's
-    /// `# fp <NAME> <HEX>` comment lines. Only fed writes these, so they are
-    /// read exclusively from the generated-secrets file (never user env_files).
-    /// A derived secret whose current inputs no longer match its stored
-    /// fingerprint is regenerated; a missing entry (pre-upgrade) counts as a
-    /// mismatch for a generator that references parameters.
-    pub existing_fingerprints: HashMap<String, String>,
     /// Values from the vault cache (`.fed/secrets.cache.env`), filtered to
     /// currently-declared secret parameter names. These do NOT count as
     /// present: when online the vault is authoritative and is re-queried;
@@ -146,17 +133,7 @@ pub fn analyze_secrets(
     // The vault cache is deliberately NOT merged here — cached values must not
     // shadow the vault (rotated secrets would never be re-fetched); it is
     // loaded separately and only consulted when the vault can't be.
-    // Values AND fingerprints come from ONE coherent read of the generated
-    // secrets file (single locked buffer), so a concurrent atomic rewrite can
-    // never pair an OLD value with its NEW fingerprint. Fingerprints come ONLY
-    // from this fed-managed file — env_files never carry `# fp` comments, and
-    // their keys must not be treated as fed-stamped.
-    let (mut existing_values, existing_fingerprints) =
-        load_generated_values_and_fingerprints(secrets_file);
-    // User env_files are merged in on top (later loads override earlier ones),
-    // and their keys are tracked SEPARATELY as authoritative: fed must never
-    // regenerate a derived secret the user supplied here, fingerprint or not.
-    let mut env_file_values: HashMap<String, String> = HashMap::new();
+    let mut existing_values = load_existing_env(secrets_file);
     for env_file in &config.env_file {
         let expanded = super::expand_tilde(Path::new(env_file));
         let ef_path = if expanded.is_absolute() {
@@ -165,7 +142,6 @@ pub fn analyze_secrets(
             work_dir.join(expanded)
         };
         for (k, v) in load_existing_env(&ef_path) {
-            env_file_values.insert(k.clone(), v.clone());
             existing_values.insert(k, v);
         }
     }
@@ -213,8 +189,6 @@ pub fn analyze_secrets(
         is_gitignored,
         in_git_repo,
         existing_values,
-        env_file_values,
-        existing_fingerprints,
         cache_values,
         cache_stamps,
     }))
@@ -265,31 +239,15 @@ pub fn generate_secret() -> String {
 
 /// Write generated secret values to an env file.
 ///
-/// Creates the file if it doesn't exist. The rewrite is SURGICAL: every raw line
-/// already on disk is preserved byte-for-byte (comments, blank lines, and any
-/// `KEY=value` line — including a `export OTHER=value` fed does not own) except
-/// the value line of a name in `generated_values`, whose value (and `# fp`
-/// stamp) is replaced in place. Truly-new managed keys are appended. This never
-/// round-trips the file through a parsed map, so hand-edited or deprecated
-/// generated-secrets files keep their comments and their `export`-prefixed keys.
+/// Creates the file if it doesn't exist. For new keys, appends them. For
+/// existing keys with new values (invalidated secrets), the value line is
+/// rewritten in place while every other line — comments, blanks, other keys —
+/// is preserved verbatim. The result is written atomically (temp + rename,
+/// 0600) so a concurrent single-read reader never observes a torn file.
 ///
-/// `fingerprints` maps a subset of the written names to their input fingerprint;
-/// each is stamped as a `# fp <NAME> <HEX>` comment on the line above its value,
-/// following the vault cache's per-entry comment precedent. Names absent from
-/// `fingerprints` keep any fingerprint already on disk (unchanged derived
-/// secrets) or none (random secrets). Only the hash is stored — never the raw
-/// inputs — and the derived value sharing the same 0600 file means the hash adds
-/// no marginal exposure.
-///
-/// Serializes concurrent writers with an exclusive advisory lock, reads the
-/// current contents through that locked handle, then replaces the file
-/// atomically (temp + rename, 0600) so a concurrent single-read reader never
-/// observes a torn file.
-pub fn write_env_file(
-    path: &Path,
-    generated_values: &[(String, String)],
-    fingerprints: &HashMap<String, String>,
-) -> Result<()> {
+/// Serializes concurrent writers with an exclusive advisory lock and reads the
+/// current contents through that locked handle before rewriting.
+pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Result<()> {
     use fs2::FileExt;
 
     if generated_values.is_empty() {
@@ -326,29 +284,17 @@ pub fn write_env_file(
             .map_err(|e| Error::Filesystem(format!("Read error: {}", e)))?;
         s
     };
-    let existing_fps = parse_generated_fingerprints(&content);
+    let existing: HashMap<String, String> = dotenvy::from_read_iter(content.as_bytes())
+        .filter_map(|r| r.ok())
+        .collect();
     let generated_map: HashMap<&str, &str> = generated_values
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    // Fingerprint to stamp above a fed-managed value: a freshly-supplied one
-    // wins, else keep whatever was already on disk (unchanged derived secret),
-    // else none (random secret).
-    let fp_for = |key: &str| -> Option<String> {
-        fingerprints
-            .get(key)
-            .or_else(|| existing_fps.get(key))
-            .cloned()
-    };
-
-    // SURGICAL rewrite: every raw line is preserved byte-for-byte EXCEPT the
-    // value line of a name fed actually manages this run (and its `# fp` line,
-    // which is re-emitted directly above the value so the two stay paired).
-    // Comments, blank lines, and lines fed does not own — including a valid
-    // `export OTHER=value` whose dotenvy key is `OTHER` but whose text is not —
-    // pass through untouched. Round-tripping through a parsed map (the old
-    // approach) dropped comments and rewrote `export OTHER=` as an empty value.
+    // Rebuild the file: update changed value lines, keep every other line
+    // (comments, blanks, keys fed does not own) verbatim, then append truly-new
+    // managed keys.
     let mut output = String::new();
     // Header only on a brand-new (empty) file; an existing header is a comment
     // line and survives verbatim, so we must not re-add it.
@@ -356,53 +302,29 @@ pub fn write_env_file(
         output.push_str("# Auto-generated by fed — do not commit this file\n");
     }
 
-    let mut written: HashSet<&str> = HashSet::new();
+    let mut written_keys: HashSet<&str> = HashSet::new();
     for line in content.lines() {
-        let trimmed = line.trim_start();
-        // Drop existing `# fp <NAME>` lines for managed names — re-emitted next
-        // to the value line below. Every other comment survives verbatim.
-        if let Some(rest) = trimmed.strip_prefix("# fp ") {
-            if let Some(name) = rest.split_whitespace().next() {
-                if generated_map.contains_key(name) {
-                    continue;
-                }
-            }
-            output.push_str(line);
-            output.push('\n');
-            continue;
-        }
-        // A value line whose key fed manages this run: replace value + fp stamp.
-        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-            if let Some(eq) = line.find('=') {
-                let key = line[..eq].trim();
-                if let Some(value) = generated_map.get(key) {
-                    if let Some(fp) = fp_for(key) {
-                        output.push_str(&format!("# fp {key} {fp}\n"));
-                    }
-                    output.push_str(&format!("{key}={}\n", encode_env_value(value)));
-                    written.insert(key);
-                    continue;
-                }
+        if let Some(eq_pos) = line.find('=') {
+            let key = &line[..eq_pos];
+            if let Some(new_value) = generated_map.get(key) {
+                output.push_str(&format!("{key}={}\n", encode_env_value(new_value)));
+                written_keys.insert(key);
+                continue;
             }
         }
-        // Everything else (comments, blanks, `export OTHER=`, other keys): raw.
         output.push_str(line);
         output.push('\n');
     }
-    // Append truly-new managed keys that weren't already present in the file.
+
+    // Append any truly new keys.
     for (key, value) in generated_values {
-        if written.contains(key.as_str()) {
-            continue;
+        if !written_keys.contains(key.as_str()) && !existing.contains_key(key) {
+            output.push_str(&format!("{key}={}\n", encode_env_value(value)));
         }
-        if let Some(fp) = fp_for(key) {
-            output.push_str(&format!("# fp {key} {fp}\n"));
-        }
-        output.push_str(&format!("{key}={}\n", encode_env_value(value)));
-        written.insert(key.as_str());
     }
 
-    // Nothing to change (values, fingerprints and header all already on disk):
-    // leave the file — and its mtime — untouched.
+    // Nothing to change (values and header all already on disk): leave the file
+    // — and its mtime — untouched.
     if output == content {
         return Ok(());
     }
@@ -509,69 +431,6 @@ fn parse_cache_stamps(content: &str) -> HashMap<String, u64> {
     out
 }
 
-/// Parse per-entry input fingerprints from the generated-secrets file's
-/// `# fp <NAME> <HEX>` comment lines. Mirrors the vault cache's `# fetched-at`
-/// stamp precedent: the fingerprint lives in a comment so the value lines stay a
-/// plain `KEY=VALUE` .env that dotenvy reads unchanged. A hand-written or
-/// pre-upgrade file simply has no such lines and yields an empty map.
-pub fn load_generated_fingerprints(path: &Path) -> HashMap<String, String> {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return HashMap::new();
-    };
-    parse_generated_fingerprints(&content)
-}
-
-/// Load the generated-secrets file's values AND their input fingerprints from a
-/// **single** read of the file, taken under a shared advisory lock.
-///
-/// Reading values and fingerprints in two separate `read_to_string` calls opens
-/// a race: `write_env_file` replaces this file atomically under an exclusive
-/// advisory lock, so a rewrite landing between the two reads could pair an OLD
-/// derived value with its NEW fingerprint — making a stale value look fresh and
-/// feeding it downstream. Taking the writer's advisory lock (shared) and reading
-/// once means values and fingerprints always come from the same on-disk
-/// snapshot. A missing file yields two empty maps, never a panic.
-pub fn load_generated_values_and_fingerprints(
-    path: &Path,
-) -> (HashMap<String, String>, HashMap<String, String>) {
-    use fs2::FileExt;
-    use std::io::Read;
-
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return (HashMap::new(), HashMap::new());
-    };
-    // Shared lock: block only against the writer's exclusive lock, never against
-    // other readers. Best-effort — a lock failure must not stop resolution.
-    // Fully-qualified so it resolves to fs2's trait method (the inherent
-    // `std::fs::File::lock_shared` is newer than this crate's MSRV).
-    let _ = FileExt::lock_shared(&file);
-    let mut content = String::new();
-    let read = file.read_to_string(&mut content);
-    let _ = FileExt::unlock(&file);
-    if read.is_err() {
-        return (HashMap::new(), HashMap::new());
-    }
-    let values: HashMap<String, String> = dotenvy::from_read_iter(content.as_bytes())
-        .filter_map(|r| r.ok())
-        .collect();
-    let fingerprints = parse_generated_fingerprints(&content);
-    (values, fingerprints)
-}
-
-/// Parse `# fp <NAME> <HEX>` comment lines from an already-read secrets buffer.
-fn parse_generated_fingerprints(content: &str) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("# fp ") {
-            let mut parts = rest.split_whitespace();
-            if let (Some(name), Some(fp)) = (parts.next(), parts.next()) {
-                out.insert(name.to_string(), fp.to_string());
-            }
-        }
-    }
-    out
-}
-
 /// Load key-value pairs from an existing .env file, if it exists.
 fn load_existing_env(path: &Path) -> HashMap<String, String> {
     if !path.exists() {
@@ -628,7 +487,6 @@ mod tests {
         write_env_file(
             &env_path,
             &[("SECRET_KEY".to_string(), "abc123".to_string())],
-            &HashMap::new(),
         )
         .unwrap();
 
@@ -646,7 +504,6 @@ mod tests {
         write_env_file(
             &env_path,
             &[("NEW_KEY".to_string(), "new_value".to_string())],
-            &HashMap::new(),
         )
         .unwrap();
 
@@ -658,61 +515,11 @@ mod tests {
     }
 
     #[test]
-    fn write_env_stamps_fingerprint_and_updates_on_rewrite() {
-        let dir = tempfile::tempdir().unwrap();
-        let env_path = dir.path().join(".env");
-
-        let fps: HashMap<String, String> = [("DERIVED".to_string(), "hash-one".to_string())]
-            .into_iter()
-            .collect();
-        write_env_file(
-            &env_path,
-            &[("DERIVED".to_string(), "first".to_string())],
-            &fps,
-        )
-        .unwrap();
-
-        // The value stays a plain KEY=VALUE line; the fingerprint rides a comment.
-        let content = std::fs::read_to_string(&env_path).unwrap();
-        assert!(content.contains("# fp DERIVED hash-one"), "got: {content}");
-        assert!(content.contains("DERIVED=first"));
-        assert_eq!(
-            load_existing_env(&env_path)
-                .get("DERIVED")
-                .map(String::as_str),
-            Some("first"),
-            "fingerprint comment must not disturb dotenvy parsing"
-        );
-        assert_eq!(
-            load_generated_fingerprints(&env_path)
-                .get("DERIVED")
-                .map(String::as_str),
-            Some("hash-one")
-        );
-
-        // Regenerating rewrites both the value and its fingerprint in place.
-        let fps2: HashMap<String, String> = [("DERIVED".to_string(), "hash-two".to_string())]
-            .into_iter()
-            .collect();
-        write_env_file(
-            &env_path,
-            &[("DERIVED".to_string(), "second".to_string())],
-            &fps2,
-        )
-        .unwrap();
-        let content = std::fs::read_to_string(&env_path).unwrap();
-        assert!(content.contains("DERIVED=second"));
-        assert!(content.contains("# fp DERIVED hash-two"));
-        assert!(!content.contains("hash-one"), "stale fingerprint pruned");
-        assert!(!content.contains("DERIVED=first"), "stale value replaced");
-    }
-
-    #[test]
-    fn write_env_surgical_preserves_comments_blanks_and_export_lines() {
-        // RB-3: a hand-edited / deprecated generated-secrets file with a user
-        // comment, a blank line, and a valid `export OTHER=value` line must
-        // survive a fed rewrite that updates ONE managed secret — verbatim — and
-        // `OTHER` must still parse.
+    fn write_env_preserves_comments_blanks_and_export_lines() {
+        // A hand-edited / deprecated generated-secrets file with a user comment,
+        // a blank line, and a valid `export OTHER=value` line must survive a fed
+        // rewrite that updates ONE managed secret — verbatim — and `OTHER` must
+        // still parse.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secrets.generated.env");
         std::fs::write(
@@ -725,12 +532,7 @@ mod tests {
         )
         .unwrap();
 
-        write_env_file(
-            &path,
-            &[("MANAGED".to_string(), "new".to_string())],
-            &HashMap::new(),
-        )
-        .unwrap();
+        write_env_file(&path, &[("MANAGED".to_string(), "new".to_string())]).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -755,32 +557,6 @@ mod tests {
         let loaded = load_existing_env(&path);
         assert_eq!(loaded.get("OTHER").map(String::as_str), Some("value"));
         assert_eq!(loaded.get("MANAGED").map(String::as_str), Some("new"));
-    }
-
-    #[test]
-    fn load_generated_values_and_fingerprints_come_from_one_read() {
-        // RB-4: values AND fingerprints must be parsed from ONE snapshot of the
-        // generated-secrets file, so a concurrent atomic rewrite can never pair
-        // an old value with a new fingerprint. A split read (values via one
-        // read_to_string, fingerprints via another) is exactly what this single
-        // helper replaces.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("secrets.generated.env");
-        let fps: HashMap<String, String> = [("DERIVED".to_string(), "hash-xyz".to_string())]
-            .into_iter()
-            .collect();
-        write_env_file(&path, &[("DERIVED".to_string(), "v1".to_string())], &fps).unwrap();
-
-        let (values, fingerprints) = load_generated_values_and_fingerprints(&path);
-        assert_eq!(values.get("DERIVED").map(String::as_str), Some("v1"));
-        assert_eq!(
-            fingerprints.get("DERIVED").map(String::as_str),
-            Some("hash-xyz"),
-            "value and its fingerprint come from the same coherent read"
-        );
-        // A missing file yields two empty maps, never a panic.
-        let (v, f) = load_generated_values_and_fingerprints(&dir.path().join("nope"));
-        assert!(v.is_empty() && f.is_empty());
     }
 
     // ========================================================================
@@ -894,80 +670,6 @@ mod tests {
         assert!(
             analysis.needs_generation.is_empty(),
             "Should not need to generate an already-present secret"
-        );
-    }
-
-    #[test]
-    fn analyze_tracks_env_file_values_as_authoritative() {
-        // RB-2: a derived secret supplied via a user env_file lands in BOTH the
-        // merged `existing_values` and the separate `env_file_values`, and must
-        // NOT be treated as fed-stamped (no fingerprint attributed to it).
-        let dir = tempfile::tempdir().unwrap();
-        let secrets_file = dir.path().join(".env.secrets");
-        // Fed's own generated file carries a stamped derived secret.
-        std::fs::write(&secrets_file, "# fp FED_SECRET abc\nFED_SECRET=fedval\n").unwrap();
-        // The user's env_file supplies DERIVED_SECRET (no fingerprint).
-        let user_env = dir.path().join("user.env");
-        std::fs::write(&user_env, "DERIVED_SECRET=user-authored\n").unwrap();
-
-        let mut config = Config {
-            env_file: vec![user_env.to_string_lossy().to_string()],
-            ..Default::default()
-        };
-        config.parameters.insert(
-            "DERIVED_SECRET".to_string(),
-            crate::config::Parameter {
-                param_type: Some("secret".to_string()),
-                generate: Some("exit 1".to_string()),
-                ..Default::default()
-            },
-        );
-        config.parameters.insert(
-            "FED_SECRET".to_string(),
-            crate::config::Parameter {
-                param_type: Some("secret".to_string()),
-                ..Default::default()
-            },
-        );
-
-        let cache = dir.path().join(".fed/secrets.cache.env");
-        let analysis = analyze_secrets(&config, dir.path(), &secrets_file, &cache)
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(
-            analysis
-                .env_file_values
-                .get("DERIVED_SECRET")
-                .map(String::as_str),
-            Some("user-authored"),
-            "env_file value must be tracked as authoritative"
-        );
-        assert_eq!(
-            analysis
-                .existing_values
-                .get("DERIVED_SECRET")
-                .map(String::as_str),
-            Some("user-authored"),
-            "env_file value is also merged into existing_values"
-        );
-        assert!(
-            !analysis.env_file_values.contains_key("FED_SECRET"),
-            "a fed-generated-file value is NOT an authoritative env_file value"
-        );
-        assert!(
-            !analysis
-                .existing_fingerprints
-                .contains_key("DERIVED_SECRET"),
-            "an env_file value must never be attributed a fed fingerprint"
-        );
-        assert_eq!(
-            analysis
-                .existing_fingerprints
-                .get("FED_SECRET")
-                .map(String::as_str),
-            Some("abc"),
-            "fingerprints still come from the fed-managed generated file"
         );
     }
 
@@ -1260,7 +962,7 @@ mod env_encoding_tests {
             .enumerate()
             .map(|(i, v)| (format!("K{i}"), v.to_string()))
             .collect();
-        write_env_file(&path, &pairs, &HashMap::new()).unwrap();
+        write_env_file(&path, &pairs).unwrap();
 
         let loaded = load_existing_env(&path);
         for (k, v) in &pairs {
