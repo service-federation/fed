@@ -26,6 +26,18 @@ pub struct SecretAnalysis {
     /// present: when online the vault is authoritative and is re-queried;
     /// the cache satisfies secrets only when the vault is unreachable.
     pub cache_values: HashMap<String, String>,
+    /// Per-entry fetched-at stamps (unix seconds) parsed from the cache's
+    /// comment lines, filtered to declared names. Drives the freshness bound:
+    /// an entry with no stamp (pre-upgrade cache) counts as too old.
+    pub cache_stamps: HashMap<String, u64>,
+}
+
+/// A vault-cache entry: the value plus when it was fetched (unix seconds).
+/// `fetched_at` is `None` for values carried forward from a pre-stamp cache.
+#[derive(Debug, Clone)]
+pub struct CacheEntry {
+    pub value: String,
+    pub fetched_at: Option<u64>,
 }
 
 /// Check if a path is gitignored in the enclosing repository.
@@ -139,6 +151,8 @@ pub fn analyze_secrets(
     let declared: HashSet<&str> = secret_params.iter().map(|(n, _)| n.as_str()).collect();
     let mut cache_values = load_existing_env(cache_file);
     cache_values.retain(|k, _| declared.contains(k.as_str()));
+    let mut cache_stamps = load_cache_stamps(cache_file);
+    cache_stamps.retain(|k, _| declared.contains(k.as_str()));
 
     // Git status of the secrets file itself (it may be an absolute path
     // outside this work dir's repository, or outside any repository).
@@ -174,6 +188,7 @@ pub fn analyze_secrets(
         in_git_repo,
         existing_values,
         cache_values,
+        cache_stamps,
     }))
 }
 
@@ -385,7 +400,7 @@ fn ensure_owner_only(file: &std::fs::File, path: &Path) -> Result<()> {
 /// same directory and renamed over the destination, so concurrent readers
 /// (dry-runs, direct resolver calls) see either the old or the new cache,
 /// never a truncated one.
-pub fn write_cache_file(path: &Path, entries: &HashMap<String, String>) -> Result<()> {
+pub fn write_cache_file(path: &Path, entries: &HashMap<String, CacheEntry>) -> Result<()> {
     if entries.is_empty() {
         if path.exists() {
             std::fs::remove_file(path).map_err(|e| {
@@ -421,7 +436,14 @@ pub fn write_cache_file(path: &Path, entries: &HashMap<String, String>) -> Resul
         let mut keys: Vec<&String> = entries.keys().collect();
         keys.sort();
         for key in keys {
-            out.push_str(&format!("{key}={}\n", encode_env_value(&entries[key])));
+            let entry = &entries[key];
+            // Stamp lives in an adjacent comment so the value lines stay a plain
+            // KEY=VALUE .env that dotenvy (and offline resolution) reads as-is;
+            // the freshness bound reads the stamps separately.
+            if let Some(ts) = entry.fetched_at {
+                out.push_str(&format!("# fetched-at {key} {ts}\n"));
+            }
+            out.push_str(&format!("{key}={}\n", encode_env_value(&entry.value)));
         }
         use std::io::Write;
         file.write_all(out.as_bytes())
@@ -437,6 +459,30 @@ pub fn write_cache_file(path: &Path, entries: &HashMap<String, String>) -> Resul
         let _ = std::fs::remove_file(&tmp_path);
     }
     write_result
+}
+
+/// Parse per-entry fetched-at stamps from the vault cache's comment lines.
+///
+/// Lines have the shape `# fetched-at <NAME> <unix-seconds>`. Entries without a
+/// stamp (a pre-upgrade cache, or a hand-written file) simply don't appear —
+/// the freshness bound then treats them as too old, costing one announced
+/// refresh after upgrading.
+pub fn load_cache_stamps(path: &Path) -> HashMap<String, u64> {
+    let mut out = HashMap::new();
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("# fetched-at ") {
+            let mut parts = rest.split_whitespace();
+            if let (Some(name), Some(ts)) = (parts.next(), parts.next()) {
+                if let Ok(t) = ts.parse::<u64>() {
+                    out.insert(name.to_string(), t);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Load key-value pairs from an existing .env file, if it exists.
@@ -725,15 +771,23 @@ mod tests {
         );
     }
 
+    fn entry(value: &str, fetched_at: Option<u64>) -> CacheEntry {
+        CacheEntry {
+            value: value.to_string(),
+            fetched_at,
+        }
+    }
+
     #[test]
     fn write_cache_file_replaces_wholesale_and_removes_when_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secrets.cache.env");
         std::fs::write(&path, "OLD=1\nKEEP=old\n").unwrap();
 
-        let entries: HashMap<String, String> = [("KEEP".to_string(), "new".to_string())]
-            .into_iter()
-            .collect();
+        let entries: HashMap<String, CacheEntry> =
+            [("KEEP".to_string(), entry("new", Some(1_721_000_000)))]
+                .into_iter()
+                .collect();
         write_cache_file(&path, &entries).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("KEEP=new"));
@@ -747,6 +801,61 @@ mod tests {
 
         write_cache_file(&path, &HashMap::new()).unwrap();
         assert!(!path.exists(), "empty cache removes the file");
+    }
+
+    #[test]
+    fn cache_stamps_round_trip_and_values_stay_dotenv_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.cache.env");
+        let entries: HashMap<String, CacheEntry> = [
+            ("A".to_string(), entry("va", Some(1_700_000_000))),
+            ("B".to_string(), entry("vb", Some(1_700_000_500))),
+        ]
+        .into_iter()
+        .collect();
+        write_cache_file(&path, &entries).unwrap();
+
+        // Values still parse as a plain .env (offline resolution reads these).
+        let loaded = load_existing_env(&path);
+        assert_eq!(loaded.get("A").map(String::as_str), Some("va"));
+        assert_eq!(loaded.get("B").map(String::as_str), Some("vb"));
+
+        // Stamps parse back from the comment lines.
+        let stamps = load_cache_stamps(&path);
+        assert_eq!(stamps.get("A"), Some(&1_700_000_000));
+        assert_eq!(stamps.get("B"), Some(&1_700_000_500));
+    }
+
+    #[test]
+    fn unstamped_entries_have_no_stamp() {
+        // A pre-upgrade cache (plain KEY=VALUE, no comments) yields values but
+        // no stamps — the freshness bound then treats them as too old.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.cache.env");
+        std::fs::write(&path, "# header\nAPI_KEY=cached\n").unwrap();
+        assert_eq!(
+            load_existing_env(&path).get("API_KEY").map(String::as_str),
+            Some("cached")
+        );
+        assert!(
+            load_cache_stamps(&path).is_empty(),
+            "no stamp comments means no stamps"
+        );
+    }
+
+    #[test]
+    fn entry_without_stamp_writes_bare_value_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.cache.env");
+        let entries: HashMap<String, CacheEntry> =
+            [("K".to_string(), entry("v", None))].into_iter().collect();
+        write_cache_file(&path, &entries).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("K=v"));
+        assert!(
+            !content.contains("fetched-at"),
+            "a stampless entry writes no stamp comment: {content}"
+        );
     }
 
     // ========================================================================

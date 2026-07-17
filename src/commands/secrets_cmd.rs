@@ -28,7 +28,10 @@ pub async fn run_secrets(
     match cmd {
         SecretsCommands::Ls { env } => {
             let (creds, link) = context(workdir)?;
-            let secrets = cloud::list_secrets(&creds, &link, env).await?;
+            // Cloud-first and blocking: the user is deliberately asking the
+            // cloud, so correctness wins — generous budget + waking hint, never
+            // a cache fallback (D5).
+            let secrets = cloud::with_waking_hint(cloud::list_secrets(&creds, &link, env)).await?;
             if secrets.is_empty() {
                 out.status(&format!(
                     "No {} secrets in {}/{} yet — `fed secrets set NAME` adds one.",
@@ -64,7 +67,7 @@ pub async fn run_secrets(
             if value.is_empty() {
                 bail!("empty value");
             }
-            cloud::put_secret(&creds, &link, env, name, &value).await?;
+            cloud::with_waking_hint(cloud::put_secret(&creds, &link, env, name, &value)).await?;
             out.success(&format!(
                 "{} set in {}/{} ({})",
                 name, link.org, link.project, env

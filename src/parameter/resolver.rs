@@ -15,6 +15,48 @@ pub(crate) fn get_template_regex() -> &'static Regex {
         .get_or_init(|| Regex::new(r"\{\{([^}]+)\}\}").expect("static regex pattern is valid"))
 }
 
+/// Outcome of consulting the team vault for a set of queried names, after the
+/// grace window / freshness policy has been applied (see 02-cold-vault.md).
+enum VaultOutcome {
+    /// The vault answered with values (within grace, or after an honest block).
+    /// Authoritative — the cache is rewritten with fresh stamps.
+    Values(HashMap<String, String>),
+    /// Grace expired but the cache covers every queried name freshly. Proceed on
+    /// the cache; the abandoned request is left to warm the backend.
+    CacheFresh,
+    /// The vault could not be reached or used. Fall back to the cache regardless
+    /// of age (with a warning); the reason names the cloud in any missing error.
+    Failed(String),
+    /// Not logged in / checkout not linked — ordinary local mode.
+    Local,
+}
+
+/// Current unix time in whole seconds (0 if the clock predates the epoch).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether the cache can cover every queried name *freshly*: each name is
+/// cached and its stamp is younger than `max_age`. A missing name or a missing
+/// stamp (pre-upgrade entry) counts as not-fresh, forcing an honest refresh.
+pub(crate) fn cache_covers_fresh(
+    names: &[String],
+    cache_values: &HashMap<String, String>,
+    cache_stamps: &HashMap<String, u64>,
+    now: u64,
+    max_age_secs: u64,
+) -> bool {
+    names.iter().all(|name| {
+        cache_values.contains_key(name)
+            && cache_stamps
+                .get(name)
+                .is_some_and(|stamped| now.saturating_sub(*stamped) < max_age_secs)
+    })
+}
+
 /// Escape a string for safe use in shell commands.
 /// Wraps the string in single quotes and escapes any single quotes within.
 pub(crate) fn shell_escape(s: &str) -> String {
@@ -481,6 +523,82 @@ impl Resolver {
         )
     }
 
+    /// Consult the team vault for `queried_names`, applying the grace-window +
+    /// freshness policy (see 02-cold-vault.md).
+    ///
+    /// The single async fetch is fired here and joined with a short grace: a
+    /// warm vault (~0.17s) answers well inside it, so values are fresh every
+    /// run. If grace expires, a fresh cache short-circuits the wait (and the
+    /// abandoned request warms the backend); otherwise we block honestly on a
+    /// cold start, announced on stderr, up to the generous budget. Connect/DNS
+    /// failures never burn the budget — nothing is listening.
+    fn obtain_vault_outcome(
+        &self,
+        work_dir: &Path,
+        queried_names: &[String],
+        analysis: &super::secret::SecretAnalysis,
+    ) -> VaultOutcome {
+        // Test seams bypass the timing machinery with a fixed outcome.
+        if let Some(msg) = &self.test_vault_failure {
+            return VaultOutcome::Failed(msg.clone());
+        }
+        if let Some(stub) = &self.test_vault_values {
+            let values: HashMap<String, String> = queried_names
+                .iter()
+                .filter_map(|n| stub.get(n).map(|v| (n.clone(), v.clone())))
+                .collect();
+            return VaultOutcome::Values(values);
+        }
+
+        let Some(handle) = crate::cloud::spawn_fetch_values(
+            work_dir,
+            &self.environment.to_string(),
+            queried_names,
+        ) else {
+            return VaultOutcome::Local;
+        };
+
+        let classify = |join: crate::cloud::VaultJoin, url: &str| -> Option<VaultOutcome> {
+            match join {
+                crate::cloud::VaultJoin::Answered(Ok(values)) => Some(VaultOutcome::Values(values)),
+                crate::cloud::VaultJoin::Answered(Err(f)) => {
+                    // Both unreachable and reached-but-failed fall back to the
+                    // cache; carry a message that names the cloud.
+                    Some(VaultOutcome::Failed(format!("{} ({})", f.message(), url)))
+                }
+                crate::cloud::VaultJoin::Pending => None,
+            }
+        };
+
+        // Phase 1: the short grace wait.
+        if let Some(outcome) = classify(handle.join(crate::cloud::vault_grace()), &handle.url) {
+            return outcome;
+        }
+
+        // Grace expired. If the cache can cover every queried name freshly,
+        // proceed on it and abandon the request (it warms the backend).
+        if cache_covers_fresh(
+            queried_names,
+            &analysis.cache_values,
+            &analysis.cache_stamps,
+            unix_now(),
+            crate::cloud::vault_max_age().as_secs(),
+        ) {
+            return VaultOutcome::CacheFresh;
+        }
+
+        // Phase 2: the cache can't cover it — block honestly on the cold start.
+        eprintln!("waking vault… (cold start can take ~20s)");
+        match classify(handle.join(crate::cloud::vault_timeout()), &handle.url) {
+            Some(outcome) => outcome,
+            None => VaultOutcome::Failed(format!(
+                "cloud: no response within {}s ({})",
+                crate::cloud::vault_timeout().as_secs(),
+                handle.url
+            )),
+        }
+    }
+
     /// Resolve secret parameters: generate missing auto-secrets, fail on missing manual secrets.
     ///
     /// This runs before `.env` loading so that newly-generated values are picked up
@@ -602,23 +720,8 @@ impl Resolver {
             .filter(|name| self.name_in_scope(name))
             .collect();
         if !queried_names.is_empty() && !self.offline {
-            let fetched = if let Some(msg) = &self.test_vault_failure {
-                Some(Err(Error::Validation(msg.clone())))
-            } else {
-                match &self.test_vault_values {
-                    Some(stub) => Some(Ok(queried_names
-                        .iter()
-                        .filter_map(|n| stub.get(n).map(|v| (n.clone(), v.clone())))
-                        .collect::<HashMap<String, String>>())),
-                    None => crate::cloud::fetch_values_blocking(
-                        &work_dir,
-                        &self.environment.to_string(),
-                        &queried_names,
-                    ),
-                }
-            };
-            match fetched {
-                Some(Ok(values)) => {
+            match self.obtain_vault_outcome(&work_dir, &queried_names, &analysis) {
+                VaultOutcome::Values(values) => {
                     vault_query_succeeded = true;
                     for (name, value) in values {
                         if let Some(param) = config.get_effective_parameters_mut().get_mut(&name) {
@@ -641,32 +744,62 @@ impl Resolver {
                         );
                     }
                 }
-                Some(Err(e)) => {
-                    // Network/auth trouble: fall back to the cache below, and
-                    // remember the reason so a missing-secret failure can name
-                    // the unreachable cloud rather than the user's env_file.
-                    tracing::warn!("team vault lookup failed: {}", e);
-                    vault_failure = Some(e.to_string());
+                VaultOutcome::CacheFresh => {
+                    // Grace expired but the cache covers every queried name
+                    // freshly — proceed on it, no warning. The abandoned
+                    // in-flight request has already warmed the backend.
+                    tracing::debug!("team vault slow to answer; proceeding on fresh cached values");
                 }
-                None => {} // not logged in or checkout not linked — normal local mode
+                VaultOutcome::Local => {} // not logged in / not linked — local mode
+                VaultOutcome::Failed(reason) => {
+                    // Reached-but-unusable or unreachable: fall back to the
+                    // cache regardless of age (offline work must keep working),
+                    // and remember the reason so a missing-secret failure names
+                    // the cloud instead of the user's env_file.
+                    tracing::warn!(
+                        "team vault unavailable ({}); proceeding on cached secret values where available",
+                        reason
+                    );
+                    vault_failure = Some(reason);
+                }
             }
         }
 
         if vault_query_succeeded {
-            // The vault answered: rewrite the cache to mirror it. Fresh hits
-            // overwrite stale entries; queried names the vault no longer has
-            // are dropped (rotation/revocation), as are keys for parameters no
-            // longer declared (analyze_secrets already filtered those out).
-            let mut new_cache = analysis.cache_values.clone();
+            // The vault answered: rewrite the cache to mirror it, stamping the
+            // freshly-fetched names with the current time. Non-queried entries
+            // are carried forward with their existing stamps; queried names the
+            // vault no longer has are dropped (rotation/revocation), as are keys
+            // for parameters no longer declared (analyze_secrets filtered those).
+            let now = unix_now();
+            let mut new_cache: HashMap<String, super::secret::CacheEntry> = analysis
+                .cache_values
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        super::secret::CacheEntry {
+                            value: v.clone(),
+                            fetched_at: analysis.cache_stamps.get(k).copied(),
+                        },
+                    )
+                })
+                .collect();
             for name in &queried_names {
                 new_cache.remove(name);
             }
             for (name, value) in &vault_resolved {
-                new_cache.insert(name.clone(), value.clone());
+                new_cache.insert(
+                    name.clone(),
+                    super::secret::CacheEntry {
+                        value: value.clone(),
+                        fetched_at: Some(now),
+                    },
+                );
             }
             // cache_usable was decided (and warned about) up front; an unsafe
             // path means no cache writes at all.
-            if cache_usable && (new_cache != analysis.cache_values || !new_cache.is_empty()) {
+            if cache_usable {
                 if let Err(e) = super::secret::write_cache_file(&cache_path, &new_cache) {
                     tracing::warn!(
                         "could not cache vault secrets to {}: {}",
@@ -3623,6 +3756,115 @@ mod tests {
         assert!(
             content.contains("SESSION_KEY="),
             "Absolute path outside any repo is safe by construction"
+        );
+    }
+
+    #[test]
+    fn cache_covers_fresh_requires_present_stamped_and_young() {
+        let now = 1_000_000u64;
+        let max_age = 3600u64; // 1h
+        let names = vec!["A".to_string(), "B".to_string()];
+
+        let mut values = HashMap::new();
+        values.insert("A".to_string(), "va".to_string());
+        values.insert("B".to_string(), "vb".to_string());
+
+        // Both present, both fresh → covered.
+        let mut stamps = HashMap::new();
+        stamps.insert("A".to_string(), now - 10);
+        stamps.insert("B".to_string(), now - 20);
+        assert!(cache_covers_fresh(&names, &values, &stamps, now, max_age));
+
+        // B too old → not covered.
+        stamps.insert("B".to_string(), now - max_age - 1);
+        assert!(!cache_covers_fresh(&names, &values, &stamps, now, max_age));
+
+        // B present but unstamped (pre-upgrade) → treated as too old.
+        stamps.remove("B");
+        assert!(!cache_covers_fresh(&names, &values, &stamps, now, max_age));
+
+        // B value missing entirely → not covered.
+        stamps.insert("B".to_string(), now);
+        values.remove("B");
+        assert!(!cache_covers_fresh(&names, &values, &stamps, now, max_age));
+    }
+
+    #[test]
+    fn vault_failure_proceeds_on_cached_value_regardless_of_age() {
+        // 02 done-when (airplane mode + cached values): when the vault is
+        // unreachable, a required secret already in the cache resolves from it
+        // regardless of the entry's age — offline work must keep working.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+        // Ancient, unstamped cache entry (would be "too old" for a refresh
+        // decision) — but with the vault down we proceed on it anyway.
+        std::fs::write(
+            temp_dir.path().join(".fed/secrets.cache.env"),
+            "API_KEY=cached_old\n",
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_test_vault_failure("cloud: cannot reach https://app.service-federation.com");
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver
+            .resolve_parameters(&mut config)
+            .expect("cached value must satisfy the run when the vault is down");
+        assert_eq!(
+            resolver.get_resolved_parameters().get("API_KEY").unwrap(),
+            "cached_old"
+        );
+        // The cache is NOT rewritten on failure — the value survives.
+        let cache =
+            std::fs::read_to_string(temp_dir.path().join(".fed/secrets.cache.env")).unwrap();
+        assert!(cache.contains("API_KEY=cached_old"));
+    }
+
+    #[test]
+    fn successful_vault_run_stamps_the_cache() {
+        // A successful online run writes a fetched-at stamp, so a later run can
+        // apply the freshness bound.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_test_vault_values(HashMap::from([(
+            "API_KEY".to_string(),
+            "fresh".to_string(),
+        )]));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        let cache_path = temp_dir.path().join(".fed/secrets.cache.env");
+        let stamps = super::super::secret::load_cache_stamps(&cache_path);
+        assert!(
+            stamps.contains_key("API_KEY"),
+            "a vault hit must be stamped with its fetched-at time"
         );
     }
 
