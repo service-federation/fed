@@ -1030,10 +1030,19 @@ impl Resolver {
             &effective_params,
             &analysis.existing_values,
             &resolved_inputs,
+            &analysis.existing_fingerprints,
         )?;
 
         let dag_generated: HashSet<String> =
             generate_results.iter().map(|r| r.name.clone()).collect();
+
+        // Input fingerprints to persist next to each derived secret (both freshly
+        // generated and preserved-with-matching-fingerprint entries carry one, so
+        // a rewrite never drops a still-valid stamp).
+        let fingerprints: HashMap<String, String> = generate_results
+            .iter()
+            .filter_map(|r| r.fingerprint.clone().map(|fp| (r.name.clone(), fp)))
+            .collect();
 
         let mut generated: Vec<(String, String)> = generate_results
             .into_iter()
@@ -1102,7 +1111,7 @@ impl Resolver {
             tracing::info!("Generating secret values → {}", analysis.env_path.display());
         }
 
-        super::secret::write_env_file(&analysis.env_path, &generated)?;
+        super::secret::write_env_file(&analysis.env_path, &generated, &fingerprints)?;
 
         // Ensure the generated secrets file is in env_file now that it exists
         if !config.env_file.contains(&gsf_key) {
@@ -1414,6 +1423,7 @@ impl Resolver {
                 &non_secret_generate,
                 &HashMap::new(), // Non-secrets have no persisted values.
                 &parameters,     // Already-resolved params (ports, secrets, defaults).
+                &HashMap::new(), // …and therefore no persisted fingerprints.
             )?;
             for result in generate_results {
                 if result.was_generated {
@@ -5183,6 +5193,155 @@ mod tests {
         assert!(
             err.to_string().contains("not in the allowed values"),
             "got: {err}"
+        );
+    }
+
+    // ── RB-2: a rotated input regenerates the persisted derived secret ────────
+
+    /// A secret generator over a manual seed. The generator both records each
+    /// run (appends to `marker`, so we can prove it ran or didn't) and derives
+    /// its value from `{{SEED}}`.
+    fn seed_derived_config(marker: &std::path::Path, with_env: bool) -> crate::config::Config {
+        use crate::config::{Config, Parameter};
+        let mut config = Config::default();
+        if with_env {
+            config.env_file = vec!["seed.env".to_string()];
+        }
+        config.parameters.insert(
+            "SEED".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "DERIVED_SECRET".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                generate: Some(format!(
+                    "printf x >> '{}'; printf %s {{{{SEED}}}}",
+                    marker.display()
+                )),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    fn run_seed_derived(work_dir: &std::path::Path, marker: &std::path::Path, seed: &str) {
+        std::fs::write(work_dir.join("seed.env"), format!("SEED={seed}\n")).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(work_dir);
+        resolver.set_offline(true);
+        let mut config = seed_derived_config(marker, true);
+        resolver
+            .resolve_parameters(&mut config)
+            .expect("resolution must succeed");
+    }
+
+    fn generator_run_count(marker: &std::path::Path) -> usize {
+        std::fs::read_to_string(marker)
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn rotating_seed_regenerates_persisted_derived_secret() {
+        use tempfile::TempDir;
+        let temp = TempDir::new().unwrap();
+        let marker = temp.path().join("gen-runs.log");
+        let gen_path = temp.path().join(crate::fed_dir::GENERATED_SECRETS_REL);
+
+        // First seed → generates.
+        run_seed_derived(temp.path(), &marker, "first-seed");
+        assert_eq!(generator_run_count(&marker), 1, "first run generates");
+        let persisted = std::fs::read_to_string(&gen_path).unwrap();
+        assert!(
+            persisted.contains("DERIVED_SECRET=first-seed"),
+            "got: {persisted}"
+        );
+        assert!(
+            persisted.contains("# fp DERIVED_SECRET "),
+            "the derived secret must be stamped with an input fingerprint: {persisted}"
+        );
+
+        // Rotated seed → REGENERATES (no longer stale).
+        run_seed_derived(temp.path(), &marker, "rotated-seed");
+        assert_eq!(
+            generator_run_count(&marker),
+            2,
+            "a rotated seed must rerun the generator"
+        );
+        let persisted = std::fs::read_to_string(&gen_path).unwrap();
+        assert!(
+            persisted.contains("DERIVED_SECRET=rotated-seed"),
+            "the persisted derived secret must follow the rotated seed: {persisted}"
+        );
+        assert!(
+            !persisted.contains("DERIVED_SECRET=first-seed"),
+            "the stale derived value must be gone: {persisted}"
+        );
+    }
+
+    #[test]
+    fn unchanged_seed_preserves_derived_secret_without_rerun() {
+        use tempfile::TempDir;
+        let temp = TempDir::new().unwrap();
+        let marker = temp.path().join("gen-runs.log");
+        let gen_path = temp.path().join(crate::fed_dir::GENERATED_SECRETS_REL);
+
+        run_seed_derived(temp.path(), &marker, "steady-seed");
+        assert_eq!(generator_run_count(&marker), 1);
+
+        // Same seed again → fingerprint matches → generator must NOT rerun.
+        run_seed_derived(temp.path(), &marker, "steady-seed");
+        assert_eq!(
+            generator_run_count(&marker),
+            1,
+            "an unchanged seed must preserve the derived secret (no rerun)"
+        );
+        let persisted = std::fs::read_to_string(&gen_path).unwrap();
+        assert!(persisted.contains("DERIVED_SECRET=steady-seed"));
+    }
+
+    #[test]
+    fn pre_upgrade_entry_without_fingerprint_regenerates_once_then_stamps() {
+        use tempfile::TempDir;
+        let temp = TempDir::new().unwrap();
+        let marker = temp.path().join("gen-runs.log");
+        let gen_path = temp.path().join(crate::fed_dir::GENERATED_SECRETS_REL);
+
+        // Simulate a pre-upgrade generated-secrets file: a derived value with NO
+        // `# fp` stamp. `resolve_secrets` creates .fed/, so seed the file into it.
+        crate::fed_dir::ensure_fed_dir(temp.path()).unwrap();
+        std::fs::write(
+            &gen_path,
+            "# Auto-generated by fed — do not commit this file\nDERIVED_SECRET=steady-seed\n",
+        )
+        .unwrap();
+
+        // Same seed value as the stale entry: only the missing fingerprint forces
+        // the one-time regeneration.
+        run_seed_derived(temp.path(), &marker, "steady-seed");
+        assert_eq!(
+            generator_run_count(&marker),
+            1,
+            "a missing fingerprint must trigger exactly one regeneration"
+        );
+        let persisted = std::fs::read_to_string(&gen_path).unwrap();
+        assert!(persisted.contains("DERIVED_SECRET=steady-seed"));
+        assert!(
+            persisted.contains("# fp DERIVED_SECRET "),
+            "the regenerated entry must now carry a fingerprint: {persisted}"
+        );
+
+        // A subsequent run with the fingerprint present must NOT rerun.
+        run_seed_derived(temp.path(), &marker, "steady-seed");
+        assert_eq!(
+            generator_run_count(&marker),
+            1,
+            "once stamped, an unchanged seed must not rerun"
         );
     }
 }

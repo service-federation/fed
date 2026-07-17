@@ -21,6 +21,13 @@ pub struct SecretAnalysis {
     /// Existing values already loaded from .env (generated secrets file and
     /// user env_files — NOT the vault cache).
     pub existing_values: HashMap<String, String>,
+    /// Per-entry input fingerprints parsed from the generated-secrets file's
+    /// `# fp <NAME> <HEX>` comment lines. Only fed writes these, so they are
+    /// read exclusively from the generated-secrets file (never user env_files).
+    /// A derived secret whose current inputs no longer match its stored
+    /// fingerprint is regenerated; a missing entry (pre-upgrade) counts as a
+    /// mismatch for a generator that references parameters.
+    pub existing_fingerprints: HashMap<String, String>,
     /// Values from the vault cache (`.fed/secrets.cache.env`), filtered to
     /// currently-declared secret parameter names. These do NOT count as
     /// present: when online the vault is authoritative and is re-queried;
@@ -134,6 +141,10 @@ pub fn analyze_secrets(
     // shadow the vault (rotated secrets would never be re-fetched); it is
     // loaded separately and only consulted when the vault can't be.
     let mut existing_values = load_existing_env(secrets_file);
+    // Input fingerprints come only from the fed-managed generated-secrets file —
+    // load them before env_files are merged in (env_files never carry `# fp`
+    // comments, and their keys must not be treated as fed-stamped).
+    let existing_fingerprints = load_generated_fingerprints(secrets_file);
     for env_file in &config.env_file {
         let expanded = super::expand_tilde(Path::new(env_file));
         let ef_path = if expanded.is_absolute() {
@@ -189,6 +200,7 @@ pub fn analyze_secrets(
         is_gitignored,
         in_git_repo,
         existing_values,
+        existing_fingerprints,
         cache_values,
         cache_stamps,
     }))
@@ -239,14 +251,23 @@ pub fn generate_secret() -> String {
 
 /// Write generated secret values to an env file.
 ///
-/// Creates the file if it doesn't exist. For new keys, appends them.
-/// For existing keys with new values (invalidated secrets), rewrites
-/// the file to update them in place.
+/// Creates the file if it doesn't exist, preserving keys already present that
+/// aren't in `generated_values` and updating those that are (invalidated
+/// secrets). `fingerprints` maps a subset of the written names to their input
+/// fingerprint; each is stamped as a `# fp <NAME> <HEX>` comment on the line
+/// above its value, following the vault cache's per-entry comment precedent.
+/// Names absent from `fingerprints` keep any fingerprint already on disk
+/// (unchanged derived secrets) or none (random secrets). Only the hash is
+/// stored — never the raw inputs — and the derived value sharing the same 0600
+/// file means the hash adds no marginal exposure.
 ///
 /// Uses an exclusive file lock to prevent concurrent write conflicts.
-pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Result<()> {
+pub fn write_env_file(
+    path: &Path,
+    generated_values: &[(String, String)],
+    fingerprints: &HashMap<String, String>,
+) -> Result<()> {
     use fs2::FileExt;
-    use std::io::Write;
 
     if generated_values.is_empty() {
         return Ok(());
@@ -285,88 +306,80 @@ pub fn write_env_file(path: &Path, generated_values: &[(String, String)]) -> Res
     let existing: HashMap<String, String> = dotenvy::from_read_iter(content.as_bytes())
         .filter_map(|r| r.ok())
         .collect();
+    let existing_fps = parse_generated_fingerprints(&content);
     let generated_map: HashMap<&str, &str> = generated_values
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    // Check if any existing key needs updating.
-    let needs_rewrite = generated_values
-        .iter()
-        .any(|(k, v)| existing.get(k).is_some_and(|ev| ev != v));
-
-    if needs_rewrite {
-        // Rewrite the entire file: update changed values, keep others.
-        let mut output = String::new();
-        let mut written_keys: HashSet<&str> = HashSet::new();
-
-        for line in content.lines() {
-            if let Some(eq_pos) = line.find('=') {
-                let key = &line[..eq_pos];
-                if let Some(new_value) = generated_map.get(key) {
-                    output.push_str(&format!("{key}={}\n", encode_env_value(new_value)));
-                    written_keys.insert(key);
-                } else {
-                    output.push_str(line);
-                    output.push('\n');
-                }
-            } else {
-                output.push_str(line);
-                output.push('\n');
+    // Preserve the on-disk key order; append truly-new keys in the order given.
+    // Every entry fed writes is a single `KEY=value` line (values with newlines
+    // are escaped by `encode_env_value`), so a line scan recovers the order
+    // exactly. Comment and blank lines are skipped — the header and fingerprint
+    // comments are re-emitted from the model below, never carried through raw.
+    let mut ordered_keys: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(eq) = line.find('=') {
+            let key = line[..eq].trim().to_string();
+            if !key.is_empty() && seen.insert(key.clone()) {
+                ordered_keys.push(key);
             }
         }
-
-        // Append any truly new keys.
-        for (key, value) in generated_values {
-            if !written_keys.contains(key.as_str()) && !existing.contains_key(key) {
-                output.push_str(&format!("{key}={}\n", encode_env_value(value)));
-            }
+    }
+    for (key, _) in generated_values {
+        if seen.insert(key.clone()) {
+            ordered_keys.push(key.clone());
         }
+    }
 
-        // Write through the held (locked) handle — reopening by pathname would
-        // race against path swaps/symlinks between lock and write.
-        {
-            use std::io::{Seek, SeekFrom, Write};
-            let mut f = &file;
-            f.seek(SeekFrom::Start(0))
-                .map_err(|e| Error::Filesystem(format!("Seek error: {}", e)))?;
-            file.set_len(0)
-                .map_err(|e| Error::Filesystem(format!("Truncate error: {}", e)))?;
-            f.write_all(output.as_bytes())
-                .map_err(|e| Error::Filesystem(format!("Write error: {}", e)))?;
+    // Keep the header on a file that already had it, and add it to a brand-new
+    // (empty) file — but never introduce it to a pre-existing headerless file
+    // (e.g. a user-managed env_file target).
+    let had_header = content
+        .lines()
+        .any(|l| l.trim_start().starts_with("# Auto-generated by fed"));
+    let emit_header = content.trim().is_empty() || had_header;
+
+    let mut output = String::new();
+    if emit_header {
+        output.push_str("# Auto-generated by fed — do not commit this file\n");
+    }
+    for key in &ordered_keys {
+        let value = generated_map
+            .get(key.as_str())
+            .map(|v| v.to_string())
+            .or_else(|| existing.get(key).cloned())
+            .unwrap_or_default();
+        // A freshly-supplied fingerprint wins; otherwise keep whatever was
+        // already stamped (unchanged derived secret), or none (random secret).
+        if let Some(fp) = fingerprints.get(key).or_else(|| existing_fps.get(key)) {
+            output.push_str(&format!("# fp {key} {fp}\n"));
         }
-    } else {
-        // Simple append — no existing keys need updating.
-        let new_keys: Vec<&(String, String)> = generated_values
-            .iter()
-            .filter(|(k, _)| !existing.contains_key(k))
-            .collect();
+        output.push_str(&format!("{key}={}\n", encode_env_value(&value)));
+    }
 
-        if new_keys.is_empty() {
-            return Ok(());
-        }
+    // Nothing to change (values, fingerprints and header all already on disk):
+    // leave the file — and its mtime — untouched.
+    if output == content {
+        return Ok(());
+    }
 
-        let metadata = file
-            .metadata()
-            .map_err(|e| Error::Filesystem(format!("Cannot stat '{}': {}", path.display(), e)))?;
-
-        let mut writer = std::io::BufWriter::new(&file);
-
-        if metadata.len() == 0 {
-            writeln!(writer, "# Auto-generated by fed — do not commit this file")
-                .map_err(|e| Error::Filesystem(format!("Write error: {}", e)))?;
-        }
-
-        // Seek to end for append.
-        use std::io::Seek;
-        writer
-            .seek(std::io::SeekFrom::End(0))
+    // Write through the held (locked) handle — reopening by pathname would race
+    // against path swaps/symlinks between lock and write.
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = &file;
+        f.seek(SeekFrom::Start(0))
             .map_err(|e| Error::Filesystem(format!("Seek error: {}", e)))?;
-
-        for (key, value) in &new_keys {
-            writeln!(writer, "{}={}", key, encode_env_value(value))
-                .map_err(|e| Error::Filesystem(format!("Write error: {}", e)))?;
-        }
+        file.set_len(0)
+            .map_err(|e| Error::Filesystem(format!("Truncate error: {}", e)))?;
+        f.write_all(output.as_bytes())
+            .map_err(|e| Error::Filesystem(format!("Write error: {}", e)))?;
     }
 
     Ok(())
@@ -464,6 +477,32 @@ fn parse_cache_stamps(content: &str) -> HashMap<String, u64> {
     out
 }
 
+/// Parse per-entry input fingerprints from the generated-secrets file's
+/// `# fp <NAME> <HEX>` comment lines. Mirrors the vault cache's `# fetched-at`
+/// stamp precedent: the fingerprint lives in a comment so the value lines stay a
+/// plain `KEY=VALUE` .env that dotenvy reads unchanged. A hand-written or
+/// pre-upgrade file simply has no such lines and yields an empty map.
+pub fn load_generated_fingerprints(path: &Path) -> HashMap<String, String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    parse_generated_fingerprints(&content)
+}
+
+/// Parse `# fp <NAME> <HEX>` comment lines from an already-read secrets buffer.
+fn parse_generated_fingerprints(content: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("# fp ") {
+            let mut parts = rest.split_whitespace();
+            if let (Some(name), Some(fp)) = (parts.next(), parts.next()) {
+                out.insert(name.to_string(), fp.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Load key-value pairs from an existing .env file, if it exists.
 fn load_existing_env(path: &Path) -> HashMap<String, String> {
     if !path.exists() {
@@ -520,6 +559,7 @@ mod tests {
         write_env_file(
             &env_path,
             &[("SECRET_KEY".to_string(), "abc123".to_string())],
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -537,6 +577,7 @@ mod tests {
         write_env_file(
             &env_path,
             &[("NEW_KEY".to_string(), "new_value".to_string())],
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -545,6 +586,56 @@ mod tests {
         assert!(content.contains("NEW_KEY=new_value"));
         // Should NOT have the header since file already existed
         assert!(!content.contains("Auto-generated"));
+    }
+
+    #[test]
+    fn write_env_stamps_fingerprint_and_updates_on_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+
+        let fps: HashMap<String, String> = [("DERIVED".to_string(), "hash-one".to_string())]
+            .into_iter()
+            .collect();
+        write_env_file(
+            &env_path,
+            &[("DERIVED".to_string(), "first".to_string())],
+            &fps,
+        )
+        .unwrap();
+
+        // The value stays a plain KEY=VALUE line; the fingerprint rides a comment.
+        let content = std::fs::read_to_string(&env_path).unwrap();
+        assert!(content.contains("# fp DERIVED hash-one"), "got: {content}");
+        assert!(content.contains("DERIVED=first"));
+        assert_eq!(
+            load_existing_env(&env_path)
+                .get("DERIVED")
+                .map(String::as_str),
+            Some("first"),
+            "fingerprint comment must not disturb dotenvy parsing"
+        );
+        assert_eq!(
+            load_generated_fingerprints(&env_path)
+                .get("DERIVED")
+                .map(String::as_str),
+            Some("hash-one")
+        );
+
+        // Regenerating rewrites both the value and its fingerprint in place.
+        let fps2: HashMap<String, String> = [("DERIVED".to_string(), "hash-two".to_string())]
+            .into_iter()
+            .collect();
+        write_env_file(
+            &env_path,
+            &[("DERIVED".to_string(), "second".to_string())],
+            &fps2,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&env_path).unwrap();
+        assert!(content.contains("DERIVED=second"));
+        assert!(content.contains("# fp DERIVED hash-two"));
+        assert!(!content.contains("hash-one"), "stale fingerprint pruned");
+        assert!(!content.contains("DERIVED=first"), "stale value replaced");
     }
 
     // ========================================================================
@@ -950,7 +1041,7 @@ mod env_encoding_tests {
             .enumerate()
             .map(|(i, v)| (format!("K{i}"), v.to_string()))
             .collect();
-        write_env_file(&path, &pairs).unwrap();
+        write_env_file(&path, &pairs, &HashMap::new()).unwrap();
 
         let loaded = load_existing_env(&path);
         for (k, v) in &pairs {
