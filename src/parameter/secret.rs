@@ -148,10 +148,12 @@ pub fn analyze_secrets(
 
     // Vault cache, filtered to declared secret names — stale keys left over
     // from config changes are ignored (and pruned on the next cache write).
+    // Values and stamps are parsed from a SINGLE read of the file: reading it
+    // twice would let a concurrent atomic cache replacement between the reads
+    // pair an old value with a new stamp (making a rotated value look fresh).
     let declared: HashSet<&str> = secret_params.iter().map(|(n, _)| n.as_str()).collect();
-    let mut cache_values = load_existing_env(cache_file);
+    let (mut cache_values, mut cache_stamps) = load_cache_values_and_stamps(cache_file);
     cache_values.retain(|k, _| declared.contains(k.as_str()));
-    let mut cache_stamps = load_cache_stamps(cache_file);
     cache_stamps.retain(|k, _| declared.contains(k.as_str()));
 
     // Git status of the secrets file itself (it may be an absolute path
@@ -417,10 +419,38 @@ pub fn write_cache_file(path: &Path, entries: &HashMap<String, CacheEntry>) -> R
 /// the freshness bound then treats them as too old, costing one announced
 /// refresh after upgrading.
 pub fn load_cache_stamps(path: &Path) -> HashMap<String, u64> {
-    let mut out = HashMap::new();
     let Ok(content) = std::fs::read_to_string(path) else {
-        return out;
+        return HashMap::new();
     };
+    parse_cache_stamps(&content)
+}
+
+/// Load both the cached values and their fetched-at stamps from a **single**
+/// read of the cache file.
+///
+/// Reading values and stamps in two separate `read_to_string` calls opens a
+/// race: the cache is replaced atomically (temp file + rename), so a rotation
+/// landing between the two reads would pair an *old* value with the *new*
+/// stamp — making a rotated value look freshly fetched and bypassing the
+/// freshness bound. One read means values and stamps always come from the same
+/// on-disk snapshot.
+pub fn load_cache_values_and_stamps(
+    path: &Path,
+) -> (HashMap<String, String>, HashMap<String, u64>) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return (HashMap::new(), HashMap::new());
+    };
+    let values: HashMap<String, String> = dotenvy::from_read_iter(content.as_bytes())
+        .filter_map(|r| r.ok())
+        .collect();
+    let stamps = parse_cache_stamps(&content);
+    (values, stamps)
+}
+
+/// Parse `# fetched-at <NAME> <unix-seconds>` comment lines from an already-read
+/// cache buffer.
+fn parse_cache_stamps(content: &str) -> HashMap<String, u64> {
+    let mut out = HashMap::new();
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("# fetched-at ") {
             let mut parts = rest.split_whitespace();
@@ -773,6 +803,33 @@ mod tests {
         let stamps = load_cache_stamps(&path);
         assert_eq!(stamps.get("A"), Some(&1_700_000_000));
         assert_eq!(stamps.get("B"), Some(&1_700_000_500));
+    }
+
+    #[test]
+    fn load_values_and_stamps_come_from_one_read() {
+        // Values and stamps must be parsed from the same buffer so a concurrent
+        // atomic replacement can never pair an old value with a new stamp.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.cache.env");
+        let entries: HashMap<String, CacheEntry> = [
+            ("A".to_string(), entry("va", Some(1_700_000_000))),
+            ("B".to_string(), entry("vb", None)),
+        ]
+        .into_iter()
+        .collect();
+        write_cache_file(&path, &entries).unwrap();
+
+        let (values, stamps) = load_cache_values_and_stamps(&path);
+        assert_eq!(values.get("A").map(String::as_str), Some("va"));
+        assert_eq!(values.get("B").map(String::as_str), Some("vb"));
+        assert_eq!(stamps.get("A"), Some(&1_700_000_000));
+        assert!(
+            !stamps.contains_key("B"),
+            "an unstamped entry yields a value but no stamp"
+        );
+        // A missing file yields two empty maps, never a panic.
+        let (v, s) = load_cache_values_and_stamps(&dir.path().join("nope"));
+        assert!(v.is_empty() && s.is_empty());
     }
 
     #[test]
