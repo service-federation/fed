@@ -95,6 +95,9 @@ shell-escape = "0.1"
 # Environment file parsing
 dotenvy = "0.15"
 
+# No-echo terminal reader for interactive secret entry
+rpassword = "7.3"
+
 # TUI dependencies
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }

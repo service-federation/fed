@@ -55,11 +55,19 @@ pub async fn run_secrets(
             // Value comes from stdin, never argv — argv leaks into shell history
             // and process lists.
             let value = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                eprint!("Value for {} (input hidden is not supported; typed value is not echoed to logs): ", name);
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                input.trim_end_matches(['\r', '\n']).to_string()
+                // Real TTY: read without echoing the secret to the screen.
+                // rpassword puts the terminal into no-echo raw mode and restores
+                // it on return via a Drop guard on success, error, and EOF. On
+                // Ctrl+C it reads the raw ^C, re-raises SIGINT, and returns an
+                // Interrupted error; the shell resets the terminal on its next
+                // prompt. The prompt goes to /dev/tty, not stdout/stderr, so it
+                // never contaminates piped output. The error carries no value
+                // (there is none yet), so nothing secret can leak into it.
+                rpassword::prompt_password(format!("Value for {name} (hidden): "))
+                    .map_err(|e| anyhow::anyhow!("reading secret value: {e}"))?
             } else {
+                // Piped stdin (automation): read the bytes exactly as before so
+                // `printf ... | fed secrets set NAME` is unchanged.
                 let mut input = String::new();
                 std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
                 input.trim_end_matches(['\r', '\n']).to_string()
