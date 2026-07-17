@@ -430,6 +430,48 @@ impl Resolver {
         }
     }
 
+    /// Whether a service references a manual secret that is out of this run's
+    /// scope and still unresolved — meaning the service is itself outside the
+    /// scanned closure and will not be spawned this run.
+    ///
+    /// Scoping (`fed <script>`) only fetches the manual secrets the target
+    /// script transitively references, so a secret outside that closure is
+    /// never resolved. An *in-scope* service can't reference such a secret: the
+    /// scanner walks every in-scope service whole-struct, so any secret it names
+    /// is in scope by construction. Therefore a reference to an out-of-scope
+    /// manual secret can only appear in an out-of-scope service — one this run
+    /// will never spawn. Such services are deferred (dropped from the resolved
+    /// config) instead of hard-failing the whole run on a secret it doesn't
+    /// need; if one is somehow spawned anyway it fails loudly with
+    /// `ServiceNotFound` rather than running with an unresolved value.
+    ///
+    /// Returns `false` for unscoped runs (`required_names == None`), so
+    /// `fed start` and interactive `fed` stay exactly as strict as before.
+    fn service_defers_on_out_of_scope_secret(
+        &self,
+        config: &Config,
+        service: &crate::config::Service,
+        parameters: &HashMap<String, String>,
+    ) -> bool {
+        if self.required_names.is_none() {
+            return false;
+        }
+        // Serialize the whole service and sweep every {{NAME}} out of it (the
+        // same over-approximation the scanner uses). A name defers the service
+        // only if it is a declared manual secret, out of scope, and not already
+        // resolved — a typo'd/undefined param still errors normally.
+        let Ok(yaml) = serde_yaml::to_string(service) else {
+            return false;
+        };
+        let params = config.get_effective_parameters();
+        get_template_regex().captures_iter(&yaml).any(|cap| {
+            let name = cap[1].trim();
+            !self.name_in_scope(name)
+                && !parameters.contains_key(name)
+                && params.get(name).is_some_and(|p| p.is_manual_secret())
+        })
+    }
+
     /// Resolve template placeholders {{VAR}} with their values
     pub fn resolve_template(
         &self,
@@ -1293,7 +1335,22 @@ impl Resolver {
 
         // Resolve services - environment variables now only come from inline config
         // (.env files are applied to parameters, not directly to service environments)
+        //
+        // Under scoping, a service that references a manual secret outside this
+        // run's scope is out of the scanned closure and will never be spawned;
+        // defer it (collect here, drop after the loop) rather than hard-failing
+        // the whole run on a secret it doesn't need. See
+        // `service_defers_on_out_of_scope_secret`.
+        let mut deferred_services: Vec<String> = Vec::new();
         for (name, service) in &mut resolved.services {
+            if self.service_defers_on_out_of_scope_secret(config, service, &parameters) {
+                tracing::debug!(
+                    "deferring out-of-scope service '{}': it references a manual secret not in this run's scope",
+                    name
+                );
+                deferred_services.push(name.clone());
+                continue;
+            }
             // Resolve templates in service environment
             service.environment = self
                 .resolve_environment(&service.environment, &parameters)
@@ -1430,6 +1487,14 @@ impl Resolver {
                         ))
                     })?);
             }
+        }
+
+        // Drop the deferred out-of-scope services from the resolved config so
+        // they are never created or started. A stray spawn attempt then fails
+        // loudly with `ServiceNotFound` instead of silently running with an
+        // unresolved secret value.
+        for name in deferred_services {
+            resolved.services.remove(&name);
         }
 
         // NOTE: Scripts are NOT resolved here. Script environments and commands are
@@ -3932,6 +3997,87 @@ mod tests {
         assert!(
             !temp_dir.path().join(".fed/secrets.cache.env").exists(),
             "no vault query means nothing cached"
+        );
+    }
+
+    #[test]
+    fn scoped_run_defers_out_of_scope_service_referencing_missing_secret() {
+        // RB-1: a scoped run must not hard-fail during resolution because an
+        // *unrelated* service references a manual secret this run never uses.
+        // The service is out of the scanned closure, so it is dropped from the
+        // resolved config rather than failing the run.
+        use crate::config::{Config, Parameter, Service};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp.path());
+        // Secret-free target → nothing in scope.
+        resolver.set_required_names(Some(HashSet::new()));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "UNRELATED_SECRET".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        config.services.insert(
+            "unrelated".to_string(),
+            Service {
+                process: Some("serve {{UNRELATED_SECRET}}".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver
+            .resolve_parameters(&mut config)
+            .expect("scoped parameter resolution must not fail");
+        let resolved = resolver
+            .resolve_config(&config)
+            .expect("an out-of-scope service must not hard-fail the scoped run");
+        assert!(
+            !resolved.services.contains_key("unrelated"),
+            "the out-of-scope service must be dropped from the resolved config"
+        );
+    }
+
+    #[test]
+    fn unscoped_run_still_fails_on_service_referencing_missing_secret() {
+        // Control: with no scoping, the same missing manual secret still fails —
+        // fed start stays exactly as strict as before.
+        use crate::config::{Config, Parameter, Service};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp.path());
+        resolver.set_offline(true); // no vault, no cache → genuinely missing
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "UNRELATED_SECRET".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        config.services.insert(
+            "unrelated".to_string(),
+            Service {
+                process: Some("serve {{UNRELATED_SECRET}}".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // Fails during secret resolution (the required secret is missing);
+        // the service is never dropped because nothing is scoped.
+        assert!(
+            resolver.resolve_parameters(&mut config).is_err(),
+            "unscoped run must still fail on the missing required secret"
         );
     }
 
