@@ -106,11 +106,15 @@ pub fn run_generate_command(command: &str, resolved: &HashMap<String, String>) -
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // Report the ORIGINAL template, never `interpolated`: the interpolated
+        // command embeds resolved input values (e.g. a manual/vault seed) that
+        // must not reach stderr or CI logs. `command` is the pre-interpolation
+        // `{{...}}` form, so no resolved secret can leak through this message.
         return Err(Error::TemplateResolution(format!(
             "Generate command failed (exit {}): {}\nCommand: {}",
             output.status.code().unwrap_or(-1),
             stderr.trim(),
-            interpolated,
+            command,
         )));
     }
 
@@ -397,5 +401,26 @@ mod tests {
         let results = resolve_generate_params(&params, &existing, &resolved).unwrap();
 
         assert_eq!(results[0].value, "postgres://localhost:5432/db");
+    }
+
+    // ── RB-1: failure messages must not leak resolved secrets ───
+
+    #[test]
+    fn failing_generate_error_shows_template_not_interpolated_secret() {
+        let resolved: HashMap<String, String> =
+            [("SEED".to_string(), "round3-supersecret".to_string())]
+                .into_iter()
+                .collect();
+        let err = run_generate_command("false {{SEED}}", &resolved)
+            .expect_err("a failing generator must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("false {{SEED}}"),
+            "error must show the original template, got: {msg}"
+        );
+        assert!(
+            !msg.contains("round3-supersecret"),
+            "error must NOT contain the resolved secret value, got: {msg}"
+        );
     }
 }
