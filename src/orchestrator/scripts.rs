@@ -333,21 +333,14 @@ impl<'a> ScriptRunner<'a> {
         // drops the block still leaves `child_orchestrator` intact for the
         // cleanup that follows — keeping isolated teardown symmetric with the
         // shared path, whose cleanup likewise runs after the guard.
-        // Scope the child's vault query the same way the parent scoped it for
-        // this script. Without this the ephemeral orchestrator does a full-
-        // project fetch — failing on manual secrets this script never uses and
-        // issuing a second, unscoped vault request. Re-derive from the same
-        // config + script (rather than reaching into the parent) so the
-        // deprecated `generated_secrets_file` fallback (None = fetch all) is
-        // honored exactly as it is at top level.
-        let child_required_secret_names = if child_config.generated_secrets_file.is_some() {
-            None
-        } else {
-            Some(crate::parameter::scanner::required_parameter_names(
-                &child_config,
-                script_name,
-            ))
-        };
+        // Scope the child's vault query the same way the parent scoped it.
+        // Inherit the parent's *actual* stored scope rather than re-deriving:
+        // for CLI runs the re-derivation is provably identical, but a public-API
+        // caller who set a custom scope (or `None`) must get a child that honors
+        // it, not one that computes its own. This also carries the deprecated
+        // `generated_secrets_file` fallback (parent scope is `None` = fetch all)
+        // through unchanged.
+        let child_required_secret_names = self.orchestrator.get_required_secret_names();
 
         let mut child_orchestrator =
             Orchestrator::new_ephemeral(child_config, self.orchestrator.work_dir.clone()).await?;

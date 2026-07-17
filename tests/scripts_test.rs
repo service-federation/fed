@@ -1870,3 +1870,78 @@ scripts:
 
     orchestrator.cleanup().await;
 }
+
+/// P2: the ephemeral isolated child must inherit the parent's *stored* scope
+/// verbatim rather than re-deriving its own — a public-API caller who set a
+/// custom scope must see the child honor it.
+///
+/// Here the caller sets a custom scope (empty) that is deliberately *narrower*
+/// than what re-deriving `iso` would produce: `iso` depends on `db`, which
+/// references `DB_PW`, so re-derivation would put `DB_PW` in scope and keep the
+/// service. Because the child inherits the parent's empty scope instead, it
+/// defers `db`; iso's attempt to start its now-dropped dependency fails loudly
+/// with `ServiceNotFound` — the design's stray-use guarantee — proving the
+/// child used the parent's scope, not a re-derived one.
+#[tokio::test]
+async fn isolated_child_inherits_custom_parent_scope() {
+    use std::collections::HashSet;
+
+    let yaml = r#"
+env_file: [.env]
+parameters:
+  DB_PW:
+    type: secret
+    source: manual
+
+services:
+  db:
+    process: "echo db {{DB_PW}}"
+
+scripts:
+  iso:
+    isolated: true
+    depends_on: [db]
+    script: "echo iso-ran"
+"#;
+    let parser = Parser::new();
+    let config = parser.parse_config(yaml).expect("Failed to parse");
+
+    // Sanity: re-deriving iso's scope WOULD include DB_PW (via depends_on db),
+    // so a child that re-derived would keep the service — the failure below is
+    // attributable to the inherited custom scope, nothing else.
+    let rederived = fed::parameter::scanner::required_parameter_names(&config, "iso");
+    assert!(
+        rederived.contains("DB_PW"),
+        "re-derivation follows depends_on into db and would keep DB_PW in scope: {rederived:?}"
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    // DB_PW is resolvable from .env, so the service would start fine if kept.
+    std::fs::write(temp.path().join(".env"), "DB_PW=from_env\n").unwrap();
+
+    let mut orchestrator = Orchestrator::new(config.clone(), temp.path().to_path_buf())
+        .await
+        .unwrap();
+    orchestrator.set_auto_resolve_conflicts(true);
+    // Custom, narrower-than-re-derivation scope set by the (public-API) caller.
+    orchestrator.set_required_secret_names(Some(HashSet::new()));
+
+    orchestrator
+        .initialize()
+        .await
+        .expect("parent init defers the out-of-scope db and must not fail");
+
+    // The child inherits the empty scope, defers db, and fails loudly when iso
+    // tries to start its dropped dependency.
+    let err = orchestrator
+        .run_script_interactive("iso", &[])
+        .await
+        .expect_err("child must honor the custom empty scope and defer db");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("db") && msg.to_lowercase().contains("not found"),
+        "the dropped dependency must surface as a loud ServiceNotFound: {msg}"
+    );
+
+    orchestrator.cleanup().await;
+}

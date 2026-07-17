@@ -328,6 +328,14 @@ impl Orchestrator {
         self.resolver.set_required_names(names);
     }
 
+    /// The secret scope actually stored on this orchestrator's resolver. Used to
+    /// propagate a parent run's scope verbatim into an ephemeral isolated-child
+    /// orchestrator, so a public-API caller who set a custom scope (or `None`)
+    /// gets a child that inherits it instead of re-deriving its own.
+    pub fn get_required_secret_names(&self) -> Option<std::collections::HashSet<String>> {
+        self.resolver.required_names()
+    }
+
     /// Enable randomized port allocation.
     ///
     /// Skips persisted ports and allocates fresh random ports for all
