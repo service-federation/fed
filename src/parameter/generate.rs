@@ -109,8 +109,11 @@ pub fn run_generate_command(command: &str, resolved: &HashMap<String, String>) -
         // value on its stderr (a `set -x` trace, an `echo {{SEED}} >&2`) or in
         // the interpolated command text. Never surface either for such a command:
         // report the pre-interpolation template and drop child stderr. Commands
-        // with no interpolation can't carry a resolved value, so keep their
-        // stderr — it's genuinely useful and cannot be sensitive.
+        // with no interpolation can't carry a value supplied through fed's
+        // parameter interpolation, so keep their stderr — it's useful for
+        // debugging and can't leak a resolved secret this way. (A child could
+        // still print inherited env like FED_TOKEN of its own accord; that's
+        // not something this substitution path introduces.)
         let interpolates = command.contains("{{");
         let stderr_part = if interpolates {
             "<suppressed: this command interpolates a value>".to_string()
