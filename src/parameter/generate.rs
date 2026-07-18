@@ -105,12 +105,23 @@ pub fn run_generate_command(command: &str, resolved: &HashMap<String, String>) -
         .map_err(|e| Error::TemplateResolution(format!("Failed to run generate command: {e}")))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // A generator that interpolates a `{{PARAM}}` may have a resolved secret
+        // value on its stderr (a `set -x` trace, an `echo {{SEED}} >&2`) or in
+        // the interpolated command text. Never surface either for such a command:
+        // report the pre-interpolation template and drop child stderr. Commands
+        // with no interpolation can't carry a resolved value, so keep their
+        // stderr — it's genuinely useful and cannot be sensitive.
+        let interpolates = command.contains("{{");
+        let stderr_part = if interpolates {
+            "<suppressed: this command interpolates a value>".to_string()
+        } else {
+            String::from_utf8_lossy(&output.stderr).trim().to_string()
+        };
         return Err(Error::TemplateResolution(format!(
             "Generate command failed (exit {}): {}\nCommand: {}",
             output.status.code().unwrap_or(-1),
-            stderr.trim(),
-            interpolated,
+            stderr_part,
+            command,
         )));
     }
 
@@ -296,6 +307,34 @@ mod tests {
         let resolved = HashMap::new();
         let value = run_generate_command("echo stdout; echo stderr >&2", &resolved).unwrap();
         assert_eq!(value, "stdout");
+    }
+
+    #[test]
+    fn failing_interpolating_command_never_leaks_resolved_value() {
+        // A failing generator that interpolates a value must not surface that
+        // value — not through the (interpolated) command echoed in the error,
+        // nor through the child's stderr.
+        let mut resolved = HashMap::new();
+        resolved.insert("SEED".to_string(), "supersecret".to_string());
+        let err = run_generate_command("echo {{SEED}} >&2; false {{SEED}}", &resolved)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("supersecret"),
+            "resolved value leaked into error: {err}"
+        );
+        // The pre-interpolation template is what gets reported instead.
+        assert!(err.contains("{{SEED}}"), "template not reported: {err}");
+    }
+
+    #[test]
+    fn failing_non_interpolating_command_keeps_stderr() {
+        // No interpolation → stderr can't carry a resolved secret, so keep it.
+        let resolved = HashMap::new();
+        let err = run_generate_command("echo diagnostic >&2; false", &resolved)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("diagnostic"), "stderr wrongly dropped: {err}");
     }
 
     // ── DAG Resolution with Invalidation ────────────────────
