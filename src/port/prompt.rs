@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::port::PortConflict;
-use std::io::{stdin, stdout, Write};
+use std::io::{Write, stdin, stdout};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PortConflictAction {
@@ -88,7 +88,7 @@ fn prompt_user(
     stdout().flush().ok();
 
     loop {
-        use crossterm::event::{read, Event, KeyCode, KeyEvent};
+        use crossterm::event::{Event, KeyCode, KeyEvent, read};
 
         if let Ok(Event::Key(KeyEvent { code, .. })) = read() {
             match code {

@@ -97,7 +97,7 @@ impl Graph {
         // Find all nodes with no dependencies
         let mut queue: VecDeque<String> = in_degree
             .iter()
-            .filter(|(_, &degree)| degree == 0)
+            .filter(|&(_, &degree)| degree == 0)
             .map(|(node, _)| node.clone())
             .collect();
 

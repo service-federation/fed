@@ -1,6 +1,6 @@
 use crate::cli::WorkspaceCommands;
 use crate::output::UserOutput;
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
@@ -437,7 +437,11 @@ fn detect_shell_rc() -> anyhow::Result<(PathBuf, &'static str)> {
     } else {
         bail!(
             "Unsupported shell: {}. Manually add `eval \"$(fed ws init-shell)\"` to your shell rc file.",
-            if shell.is_empty() { "(unknown)" } else { &shell }
+            if shell.is_empty() {
+                "(unknown)"
+            } else {
+                &shell
+            }
         );
     }
 }

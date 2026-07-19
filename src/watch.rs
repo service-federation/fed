@@ -31,9 +31,8 @@
 use crate::config::Config;
 use crate::error::Result;
 use notify_debouncer_full::{
-    new_debouncer,
+    DebounceEventResult, Debouncer, FileIdMap, new_debouncer,
     notify::{RecursiveMode, Watcher},
-    DebounceEventResult, Debouncer, FileIdMap,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

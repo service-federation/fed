@@ -50,7 +50,7 @@ fn create_temp_sibling(dir: &Path, file_name: &str) -> Result<(std::fs::File, Pa
                     "Cannot write '{}': {}",
                     tmp_path.display(),
                     e
-                )))
+                )));
             }
         }
     }
@@ -270,10 +270,12 @@ mod tests {
             "the symlink target must be left untouched"
         );
         // The destination is now a regular file (not a symlink) with our bytes.
-        assert!(!std::fs::symlink_metadata(&path)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new-token\n");
         assert_eq!(mode_of(&path), 0o600);
     }

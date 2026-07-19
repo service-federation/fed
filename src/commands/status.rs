@@ -1,5 +1,5 @@
 use crate::output::UserOutput;
-use fed::{config::Config, Orchestrator};
+use fed::{Orchestrator, config::Config};
 
 pub async fn run_status(
     orchestrator: &Orchestrator,

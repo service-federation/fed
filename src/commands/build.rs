@@ -1,7 +1,7 @@
 use crate::output::UserOutput;
 use fed::{
-    config::{BuildConfig, Config, DockerBuildResult},
     Orchestrator,
+    config::{BuildConfig, Config, DockerBuildResult},
 };
 
 pub async fn run_build(

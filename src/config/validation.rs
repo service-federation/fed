@@ -1,4 +1,4 @@
-use super::{parse_duration_string, Config, HealthCheck, ServiceType};
+use super::{Config, HealthCheck, ServiceType, parse_duration_string};
 use crate::error::{Error, Result};
 use std::collections::HashSet;
 
@@ -68,8 +68,9 @@ impl Config {
                     eprintln!(
                         "Warning: Entrypoint service '{}' has no startup_message.\n\
                                   Without this, isolated mode won't show where to access the application.\n\
-                                  Add: startup_message: \"http://localhost:{{{{PORT}}}}\""
-                        , ep_name);
+                                  Add: startup_message: \"http://localhost:{{{{PORT}}}}\"",
+                        ep_name
+                    );
                 }
             }
         }
@@ -1197,10 +1198,12 @@ mod tests {
 
         let result = validate_resource_limits("test-service", &resources);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid memory limit"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid memory limit")
+        );
     }
 
     #[test]
@@ -1240,10 +1243,12 @@ mod tests {
 
         let result = validate_resource_limits("test-service", &resources);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("cpu_shares must be greater than 0"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cpu_shares must be greater than 0")
+        );
     }
 
     #[test]
@@ -1263,10 +1268,12 @@ mod tests {
 
         let result = validate_resource_limits("test-service", &resources);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("pids limit must be greater than 0"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("pids limit must be greater than 0")
+        );
     }
 
     #[test]
@@ -1802,9 +1809,10 @@ mod tests {
             },
         );
         let err = config.validate().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("must not have environment-specific"));
+        assert!(
+            err.to_string()
+                .contains("must not have environment-specific")
+        );
     }
 
     #[test]

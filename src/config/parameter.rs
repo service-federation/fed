@@ -225,9 +225,11 @@ mod tests {
     #[test]
     fn dev_returns_none_when_nothing_set() {
         let param = param_empty();
-        assert!(param
-            .get_value_for_environment(&Environment::Development)
-            .is_none());
+        assert!(
+            param
+                .get_value_for_environment(&Environment::Development)
+                .is_none()
+        );
     }
 
     #[test]
@@ -251,9 +253,11 @@ mod tests {
     #[test]
     fn staging_returns_none_when_nothing_set() {
         let param = param_empty();
-        assert!(param
-            .get_value_for_environment(&Environment::Staging)
-            .is_none());
+        assert!(
+            param
+                .get_value_for_environment(&Environment::Staging)
+                .is_none()
+        );
     }
 
     #[test]
@@ -277,9 +281,11 @@ mod tests {
     #[test]
     fn production_returns_none_when_nothing_set() {
         let param = param_empty();
-        assert!(param
-            .get_value_for_environment(&Environment::Production)
-            .is_none());
+        assert!(
+            param
+                .get_value_for_environment(&Environment::Production)
+                .is_none()
+        );
     }
 
     #[test]
@@ -290,9 +296,11 @@ mod tests {
             ..param_empty()
         };
         // Staging should not see development/develop values
-        assert!(param
-            .get_value_for_environment(&Environment::Staging)
-            .is_none());
+        assert!(
+            param
+                .get_value_for_environment(&Environment::Staging)
+                .is_none()
+        );
     }
 
     #[test]
@@ -301,9 +309,11 @@ mod tests {
             staging: Some(serde_yaml::Value::String("stage-only".into())),
             ..param_empty()
         };
-        assert!(param
-            .get_value_for_environment(&Environment::Production)
-            .is_none());
+        assert!(
+            param
+                .get_value_for_environment(&Environment::Production)
+                .is_none()
+        );
     }
 
     #[test]

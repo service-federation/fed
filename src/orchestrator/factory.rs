@@ -7,7 +7,7 @@
 //! - Docker container validation
 
 use crate::config::ServiceType;
-use crate::error::{validate_pid_for_check, Error, Result};
+use crate::error::{Error, Result, validate_pid_for_check};
 use crate::service::{
     DockerComposeService, DockerService, ExternalService, GradleService, OneshotService,
     ProcessService, ServiceManager,

@@ -1,7 +1,7 @@
 use super::PortAllocator;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::port::{handle_port_conflict, PortConflict, PortConflictAction};
+use crate::port::{PortConflict, PortConflictAction, handle_port_conflict};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -2215,7 +2215,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_prefer_config_defaults(false); // isolated-mode behavior
-                                                    // No cached port in the store — this is a fresh allocation.
+        // No cached port in the store — this is a fresh allocation.
         resolver.set_port_store(Box::new(crate::port::SqlitePortStore::new(HashMap::new())));
 
         // Hold the default port open so allocating it would succeed if tried.
@@ -2425,10 +2425,12 @@ mod tests {
 
         let result = resolver.resolve_parameters(&mut config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid port value"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid port value")
+        );
     }
 
     #[test]
@@ -2458,10 +2460,12 @@ mod tests {
 
         let result = resolver.resolve_parameters(&mut config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid port value '0'"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid port value '0'")
+        );
     }
 
     #[test]
@@ -2491,10 +2495,12 @@ mod tests {
 
         let result = resolver.resolve_parameters(&mut config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid port value"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid port value")
+        );
     }
 
     #[test]

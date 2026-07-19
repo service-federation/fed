@@ -49,7 +49,9 @@ pub enum Error {
     #[error("Parameter not found: {0}")]
     #[diagnostic(
         code(fed::parameter::not_found),
-        help("Declare the parameter in your service-federation.yaml:\n\nparameters:\n  {0}:\n    default: \"value\"")
+        help(
+            "Declare the parameter in your service-federation.yaml:\n\nparameters:\n  {0}:\n    default: \"value\""
+        )
     )]
     ParameterNotFound(String),
 
@@ -77,14 +79,18 @@ pub enum Error {
     #[error("Service '{0}' failed to start: {1}")]
     #[diagnostic(
         code(fed::service::start_failed),
-        help("Check the service logs with `fed logs {0}`\nVerify the command exists and is executable")
+        help(
+            "Check the service logs with `fed logs {0}`\nVerify the command exists and is executable"
+        )
     )]
     ServiceStartFailed(String, String),
 
     #[error("Service '{0}' health check failed: {1}")]
     #[diagnostic(
         code(fed::service::health_check_failed),
-        help("Check the service logs with `fed logs {0}`\nVerify the healthcheck URL/command is correct in your config")
+        help(
+            "Check the service logs with `fed logs {0}`\nVerify the healthcheck URL/command is correct in your config"
+        )
     )]
     HealthCheckFailed(String, String),
 
@@ -98,14 +104,18 @@ pub enum Error {
     #[error("{service} – port {port} already allocated")]
     #[diagnostic(
         code(fed::docker::port_conflict),
-        help("If another checkout of this project owns the port (worktree, parallel agent):\n\n    fed isolate enable      # give this directory its own ports\n\nIf a stray external process holds it:\n\n    fed start --replace     # kills whatever holds the port — including\n                            # other checkouts' fed services")
+        help(
+            "If another checkout of this project owns the port (worktree, parallel agent):\n\n    fed isolate enable      # give this directory its own ports\n\nIf a stray external process holds it:\n\n    fed start --replace     # kills whatever holds the port — including\n                            # other checkouts' fed services"
+        )
     )]
     DockerPortConflict { service: String, port: u16 },
 
     #[error("{service} – port {port} is held by another fed stack ({container})")]
     #[diagnostic(
         code(fed::docker::port_conflict_other_stack),
-        help("Container '{container}' belongs to another checkout or worktree of this project.\nGive this directory its own ports instead (persisted, applies to every later fed command):\n\n    fed isolate enable\n\nDo not use `fed start --replace` here — it would kill the other checkout's services.")
+        help(
+            "Container '{container}' belongs to another checkout or worktree of this project.\nGive this directory its own ports instead (persisted, applies to every later fed command):\n\n    fed isolate enable\n\nDo not use `fed start --replace` here — it would kill the other checkout's services."
+        )
     )]
     DockerPortConflictOtherStack {
         service: String,
@@ -173,7 +183,9 @@ pub enum Error {
     #[error("Diamond dependency detected for package '{identity}':\n{conflicts_formatted}")]
     #[diagnostic(
         code(fed::package::diamond_dependency),
-        help("Pin all packages to use the same version of '{identity}', or restructure your dependencies to avoid the conflict")
+        help(
+            "Pin all packages to use the same version of '{identity}', or restructure your dependencies to avoid the conflict"
+        )
     )]
     DiamondDependency {
         identity: String,
@@ -207,7 +219,9 @@ pub enum Error {
     )]
     ScriptNotFound(String),
 
-    #[error("Environment file '{env_file}' sets undeclared parameter '{name}': declare it in service-federation.yaml or remove from .env")]
+    #[error(
+        "Environment file '{env_file}' sets undeclared parameter '{name}': declare it in service-federation.yaml or remove from .env"
+    )]
     #[diagnostic(
         code(fed::env::undeclared),
         help("Add parameter declaration:\n\nparameters:\n  {name}:\n    default: \"\"")
@@ -260,7 +274,7 @@ impl Error {
             Error::Parse(_) | Error::Yaml(_) => Some(
                 "Check the YAML syntax at the line/column mentioned above — indentation errors are the most common cause. YAML requires consistent spaces (no tabs).".to_string()
             ),
-            Error::Docker(ref docker_err) => match docker_err {
+            Error::Docker(docker_err) => match docker_err {
                 DockerError::Timeout { command, timeout } => Some(format!(
                     "'{}' timed out after {}s. Check Docker daemon responsiveness: docker ps",
                     command,

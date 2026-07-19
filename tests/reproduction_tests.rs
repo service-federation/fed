@@ -169,7 +169,9 @@ async fn repro_state_tracker_concurrent_failure_increments() {
             num_increments - final_count as usize
         );
     } else {
-        println!("✓ Counter is correct (but only because of sequential lock - real code path is different)");
+        println!(
+            "✓ Counter is correct (but only because of sequential lock - real code path is different)"
+        );
     }
 }
 
@@ -673,7 +675,9 @@ services:
         Err(_) => {
             println!("❌ DEADLOCK DETECTED!");
             println!("   Tasks timeout after 3 seconds");
-            println!("   Lock order: services.read() vs state_tracker.write() acquiring in different orders");
+            println!(
+                "   Lock order: services.read() vs state_tracker.write() acquiring in different orders"
+            );
         }
     }
 }

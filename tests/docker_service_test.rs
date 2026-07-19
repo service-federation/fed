@@ -5,7 +5,7 @@
 use fed::config::Service as ServiceConfig;
 use fed::service::{DockerService, ServiceManager, Status};
 use std::collections::HashMap;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 // Check if Docker is available
 fn is_docker_available() -> bool {
@@ -291,10 +291,12 @@ async fn test_docker_service_invalid_volume() {
     // Should fail validation before even trying to start container
     let result = service.start().await;
     assert!(result.is_err(), "Should reject absolute volume paths");
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Absolute host paths"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Absolute host paths")
+    );
 }
 
 #[tokio::test]

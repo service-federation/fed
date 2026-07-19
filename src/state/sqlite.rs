@@ -1,6 +1,6 @@
 use super::types::{LockFile, RegistrationOutcome, ServiceState};
 use crate::config::ServiceType;
-use crate::error::{validate_pid_for_check, Error, Result};
+use crate::error::{Error, Result, validate_pid_for_check};
 use crate::service::Status;
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
@@ -2020,7 +2020,9 @@ impl SqliteStateTracker {
         // so we skip container cleanup to avoid removing healthy containers.
         let daemon_healthy = crate::docker::check_daemon_with_retry().await;
         if !daemon_healthy {
-            warn!("Docker daemon unhealthy after retries - skipping container cleanup to avoid data loss");
+            warn!(
+                "Docker daemon unhealthy after retries - skipping container cleanup to avoid data loss"
+            );
         }
 
         for (service_id, service_state) in &services {
@@ -2354,7 +2356,7 @@ mod tests {
     use {
         fs2::FileExt,
         nix::sys::wait::waitpid,
-        nix::unistd::{fork, pipe, read, write, ForkResult, Pid},
+        nix::unistd::{ForkResult, Pid, fork, pipe, read, write},
         std::fs::OpenOptions,
         std::os::fd::AsRawFd,
         std::path::Path,
@@ -3630,18 +3632,22 @@ mod tests {
         );
 
         // An empty scope falls back to nothing (caller then uses config defaults).
-        assert!(tracker
-            .get_global_port_allocations(Some("iso-other"))
-            .await
-            .is_empty());
+        assert!(
+            tracker
+                .get_global_port_allocations(Some("iso-other"))
+                .await
+                .is_empty()
+        );
 
         // clear_port_resolutions wipes every scope.
         tracker.clear_port_resolutions().await.unwrap();
         assert!(tracker.get_global_port_allocations(None).await.is_empty());
-        assert!(tracker
-            .get_global_port_allocations(Some("iso-cafebabe"))
-            .await
-            .is_empty());
+        assert!(
+            tracker
+                .get_global_port_allocations(Some("iso-cafebabe"))
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

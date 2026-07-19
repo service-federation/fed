@@ -16,7 +16,9 @@ pub fn warn_if_dirty_tree() {
         .output()
     {
         if !output.status.success() {
-            eprintln!("Warning: Git working tree has uncommitted changes. Docker images will be tagged with the current commit hash, which may not reflect the actual contents.");
+            eprintln!(
+                "Warning: Git working tree has uncommitted changes. Docker images will be tagged with the current commit hash, which may not reflect the actual contents."
+            );
         }
     }
     if let Ok(output) = std::process::Command::new("git")
@@ -24,7 +26,9 @@ pub fn warn_if_dirty_tree() {
         .output()
     {
         if !output.status.success() {
-            eprintln!("Warning: Git index has staged but uncommitted changes. Docker images will be tagged with the current commit hash, which may not reflect the actual contents.");
+            eprintln!(
+                "Warning: Git index has staged but uncommitted changes. Docker images will be tagged with the current commit hash, which may not reflect the actual contents."
+            );
         }
     }
 }

@@ -87,7 +87,7 @@ impl ExternalDependencyResolver {
 
     /// Resolve the target branch based on current branch and strategy
     fn resolve_branch(&self, current_branch: &str, strategy: &Option<BranchStrategy>) -> String {
-        if let Some(ref strategy) = strategy {
+        if let Some(strategy) = strategy {
             strategy.resolve_branch(current_branch)
         } else {
             // Default strategy: use same branch name
@@ -331,7 +331,7 @@ impl ExternalDependencyResolver {
         metadata: &'a Option<Metadata>,
         service_name: &str,
     ) -> Option<&'a ExternalDependency> {
-        if let Some(ref meta) = metadata {
+        if let Some(meta) = metadata {
             for ext_dep in &meta.external_dependencies {
                 for service_info in &ext_dep.services {
                     if service_info.name == service_name {

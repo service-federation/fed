@@ -131,18 +131,26 @@ services:
 
     // Should have 3 volumes: 2 local + 1 base (non-conflicting)
     assert_eq!(database.volumes.len(), 3);
-    assert!(database
-        .volumes
-        .contains(&"./local-data:/var/lib/postgresql/data".to_string())); // Local
-    assert!(database
-        .volumes
-        .contains(&"./local-logs:/var/log/postgresql".to_string())); // Local
-    assert!(database
-        .volumes
-        .contains(&"./base-config:/etc/postgresql".to_string())); // Base (no conflict)
-    assert!(!database
-        .volumes
-        .contains(&"postgres-data:/var/lib/postgresql/data".to_string())); // Base conflicted
+    assert!(
+        database
+            .volumes
+            .contains(&"./local-data:/var/lib/postgresql/data".to_string())
+    ); // Local
+    assert!(
+        database
+            .volumes
+            .contains(&"./local-logs:/var/log/postgresql".to_string())
+    ); // Local
+    assert!(
+        database
+            .volumes
+            .contains(&"./base-config:/etc/postgresql".to_string())
+    ); // Base (no conflict)
+    assert!(
+        !database
+            .volumes
+            .contains(&"postgres-data:/var/lib/postgresql/data".to_string())
+    ); // Base conflicted
 }
 
 #[tokio::test]
@@ -250,14 +258,18 @@ services:
 
     // Should have 2 unique dependencies (cache appears in both, elasticsearch is new)
     assert_eq!(my_api.depends_on.len(), 2);
-    assert!(my_api
-        .depends_on
-        .iter()
-        .any(|d| d.service_name() == "cache"));
-    assert!(my_api
-        .depends_on
-        .iter()
-        .any(|d| d.service_name() == "elasticsearch"));
+    assert!(
+        my_api
+            .depends_on
+            .iter()
+            .any(|d| d.service_name() == "cache")
+    );
+    assert!(
+        my_api
+            .depends_on
+            .iter()
+            .any(|d| d.service_name() == "elasticsearch")
+    );
 }
 
 #[tokio::test]
@@ -516,9 +528,10 @@ services:
 
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("Template 'nonexistent-template' not found"));
+    assert!(
+        err.to_string()
+            .contains("Template 'nonexistent-template' not found")
+    );
 }
 
 #[tokio::test]
@@ -804,9 +817,11 @@ services:
     assert_eq!(service.volumes.len(), 3); // 2 local + 1 base (non-conflicting)
     assert!(service.volumes.contains(&"./local-data:/data".to_string()));
     assert!(service.volumes.contains(&"./local-logs:/logs".to_string()));
-    assert!(service
-        .volumes
-        .contains(&"./base-config:/config".to_string()));
+    assert!(
+        service
+            .volumes
+            .contains(&"./base-config:/config".to_string())
+    );
 
     // Ports merged
     assert_eq!(service.ports.len(), 2);
@@ -814,10 +829,12 @@ services:
     // Dependencies merged (db appears in both, redis is new)
     assert_eq!(service.depends_on.len(), 2);
     assert!(service.depends_on.iter().any(|d| d.service_name() == "db"));
-    assert!(service
-        .depends_on
-        .iter()
-        .any(|d| d.service_name() == "redis"));
+    assert!(
+        service
+            .depends_on
+            .iter()
+            .any(|d| d.service_name() == "redis")
+    );
 
     // Healthcheck overridden
     assert!(service.healthcheck.is_some());

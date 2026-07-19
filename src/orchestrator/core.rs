@@ -11,8 +11,8 @@ use tracing::Instrument;
 // to avoid blocking tokio threads across .await points.
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use super::health::SharedHealthCheckerRegistry;

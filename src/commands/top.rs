@@ -1,7 +1,7 @@
 use crate::output::UserOutput;
 use fed::Orchestrator;
 use std::collections::HashMap;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 pub async fn run_top(
     orchestrator: &Orchestrator,

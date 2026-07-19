@@ -1,5 +1,5 @@
-use fed::config::ServiceType;
 use fed::Parser;
+use fed::config::ServiceType;
 
 #[test]
 fn test_parse_gradle_example() {

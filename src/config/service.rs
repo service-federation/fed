@@ -4,8 +4,8 @@
 //! configuring services in the federation config.
 
 use super::{
-    parse_duration_string, CircuitBreakerConfig, DependsOn, HealthCheck, ResourceLimits,
-    RestartPolicy,
+    CircuitBreakerConfig, DependsOn, HealthCheck, ResourceLimits, RestartPolicy,
+    parse_duration_string,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

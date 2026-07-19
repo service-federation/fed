@@ -1,6 +1,6 @@
 use super::{BaseService, ServiceManager, Status};
 use crate::config::Service as ServiceConfig;
-use crate::error::{validate_pid, Error, Result};
+use crate::error::{Error, Result, validate_pid};
 use async_trait::async_trait;
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;

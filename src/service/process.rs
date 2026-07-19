@@ -1,9 +1,9 @@
 use super::{BaseService, LogCapture, OutputMode, ServiceManager, Status};
 use crate::config::Service as ServiceConfig;
-use crate::error::{validate_pid, validate_pid_for_check, Error, Result};
+use crate::error::{Error, Result, validate_pid, validate_pid_for_check};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use nix::sys::signal::{self, killpg, Signal};
+use nix::sys::signal::{self, Signal, killpg};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -281,7 +281,9 @@ impl ProcessService {
             {
                 tracing::warn!(
                     "Service '{}': Requested nofile limit {} exceeds system hard limit {}, capping to hard limit",
-                    service_name, requested, hard_limit
+                    service_name,
+                    requested,
+                    hard_limit
                 );
             }
 
@@ -293,7 +295,9 @@ impl ProcessService {
             {
                 tracing::warn!(
                     "Service '{}': Requested pids limit {} exceeds system hard limit {}, capping to hard limit",
-                    service_name, requested, hard_limit
+                    service_name,
+                    requested,
+                    hard_limit
                 );
             }
 
@@ -875,7 +879,7 @@ impl ProcessService {
     /// may differ from the PID if the process was reparented or started without setsid.
     #[cfg(unix)]
     fn get_process_group(pid: u32) -> Option<nix::unistd::Pid> {
-        use nix::unistd::{getpgid, Pid};
+        use nix::unistd::{Pid, getpgid};
 
         // Validate PID can be converted to i32 safely
         if pid == 0 || pid > i32::MAX as u32 {
@@ -914,7 +918,7 @@ impl ProcessService {
 /// Helper functions for setting process resource limits on Unix systems
 pub mod resource_limits {
     use crate::config::ResourceLimits;
-    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
 
     /// Result of validating a single resource limit against system hard limits.
     #[derive(Debug, Clone, PartialEq, Eq)]

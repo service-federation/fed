@@ -1,8 +1,8 @@
 use crate::cli::{IsolateCommands, PortsCommands};
 use crate::output::UserOutput;
+use fed::Parser as ConfigParser;
 use fed::service::Status;
 use fed::state::StateTracker;
-use fed::Parser as ConfigParser;
 use std::path::PathBuf;
 
 pub async fn run_ports(

@@ -29,13 +29,13 @@ pub fn credentials_path() -> Option<PathBuf> {
 /// Load credentials. `FED_TOKEN` (+ optional `FED_CLOUD_URL`) override the
 /// credentials file — that's the CI path.
 pub fn load_credentials() -> Option<Credentials> {
-    if let Ok(token) = std::env::var("FED_TOKEN") {
-        if !token.is_empty() {
-            return Some(Credentials {
-                url: std::env::var("FED_CLOUD_URL").unwrap_or_else(|_| DEFAULT_URL.to_string()),
-                token,
-            });
-        }
+    if let Ok(token) = std::env::var("FED_TOKEN")
+        && !token.is_empty()
+    {
+        return Some(Credentials {
+            url: std::env::var("FED_CLOUD_URL").unwrap_or_else(|_| DEFAULT_URL.to_string()),
+            token,
+        });
     }
     load_credentials_from(&credentials_path()?)
 }

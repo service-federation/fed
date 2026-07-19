@@ -191,11 +191,11 @@ async fn run() -> anyhow::Result<()> {
         Commands::Package(package_cmd) => {
             return commands::run_package(package_cmd, &out).await;
         }
-        Commands::Ports(ref ports_cmd) => {
+        Commands::Ports(ports_cmd) => {
             return commands::run_ports(ports_cmd, cli.workdir.clone(), cli.config.clone(), &out)
                 .await;
         }
-        Commands::Workspace(ref ws_cmd) => {
+        Commands::Workspace(ws_cmd) => {
             return commands::run_workspace(ws_cmd, &out).await;
         }
         Commands::Login { no_browser, url } => {
@@ -210,10 +210,10 @@ async fn run() -> anyhow::Result<()> {
         Commands::Link { target } => {
             return commands::run_link(target.clone(), cli.workdir.clone(), &out).await;
         }
-        Commands::Secrets(ref secrets_cmd) => {
+        Commands::Secrets(secrets_cmd) => {
             return commands::run_secrets(secrets_cmd, cli.workdir.clone(), &out).await;
         }
-        Commands::Isolate(ref isolate_cmd) => {
+        Commands::Isolate(isolate_cmd) => {
             return commands::run_isolate(
                 isolate_cmd,
                 cli.workdir.clone(),

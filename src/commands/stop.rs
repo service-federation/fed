@@ -1,8 +1,8 @@
 use crate::output::UserOutput;
-use fed::{config::Config, service::Status, state::StateTracker, Orchestrator};
+use fed::{Orchestrator, config::Config, service::Status, state::StateTracker};
 use std::path::Path;
 
-use super::lifecycle::{remove_orphan_containers_for_workdir, stop_service_by_state, StopResult};
+use super::lifecycle::{StopResult, remove_orphan_containers_for_workdir, stop_service_by_state};
 
 pub async fn run_stop(
     orchestrator: &mut Orchestrator,

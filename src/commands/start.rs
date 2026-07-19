@@ -1,13 +1,13 @@
 use crate::output::UserOutput;
 use fed::{
+    Error as FedError, Orchestrator, WatchMode,
     config::{Config, ServiceType},
     parameter::PortResolutionReason,
     port::PortConflict,
     service::Status,
-    Error as FedError, Orchestrator, WatchMode,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::lifecycle::{graceful_docker_stop, graceful_process_kill, validate_pid_start_time};
 
@@ -575,7 +575,7 @@ async fn run_watch_mode(
     // Signal handler runs in a spawned task — uses println! directly since
     // the `out` reference can't be easily passed to a 'static future.
     tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         // Set up signal handlers, logging warnings if they fail
         let mut sigint = match signal(SignalKind::interrupt()) {

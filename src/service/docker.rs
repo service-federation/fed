@@ -985,10 +985,12 @@ mod tests {
         // SECURITY: Reject absolute Unix paths
         let result = DockerService::validate_volume_spec("/etc/passwd:/etc/passwd");
         assert!(result.is_err(), "Absolute Unix paths should be rejected");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Absolute host paths"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Absolute host paths")
+        );
     }
 
     #[test]
@@ -996,10 +998,12 @@ mod tests {
         // SECURITY: Reject root filesystem mount
         let result = DockerService::validate_volume_spec("/:/host");
         assert!(result.is_err(), "Root mount should be rejected");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Absolute host paths"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Absolute host paths")
+        );
     }
 
     #[test]
@@ -1010,10 +1014,12 @@ mod tests {
             result.is_err(),
             "Windows paths with backslash should be rejected"
         );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Absolute host paths"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Absolute host paths")
+        );
     }
 
     #[test]
@@ -1024,10 +1030,12 @@ mod tests {
             result.is_err(),
             "Windows paths with forward slash should be rejected"
         );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Absolute host paths"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Absolute host paths")
+        );
     }
 
     #[test]
@@ -1444,9 +1452,13 @@ mod tests {
         // Attribution relies on this invariant: every container of a stack
         // starts with that stack's prefix, with or without isolation.
         let dir = Path::new("/tmp/project");
-        assert!(docker_container_name("db", None, dir).starts_with(&docker_stack_prefix(None, dir)));
-        assert!(docker_container_name("db", Some("iso-abc123"), dir)
-            .starts_with(&docker_stack_prefix(Some("iso-abc123"), dir)));
+        assert!(
+            docker_container_name("db", None, dir).starts_with(&docker_stack_prefix(None, dir))
+        );
+        assert!(
+            docker_container_name("db", Some("iso-abc123"), dir)
+                .starts_with(&docker_stack_prefix(Some("iso-abc123"), dir))
+        );
     }
 
     #[test]
