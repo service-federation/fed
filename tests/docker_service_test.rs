@@ -70,6 +70,33 @@ async fn cleanup_container(name: &str) {
         .await;
 }
 
+/// Resolve the actual container name fed generates for a service.
+///
+/// The name is `fed-{work_dir_hash}-{service}` (or `fed-{session_id}-{service}`),
+/// not `fed-{service}` — the stack prefix can't be computed from a test because
+/// `docker_container_name` is `pub(crate)`. We look it up by filtering running
+/// containers on the service-name substring (unique per test here).
+async fn resolve_container_name(service_substr: &str) -> String {
+    let out = tokio::process::Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("name={service_substr}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .await
+        .expect("docker ps");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
 // ============================================================================
 // Lifecycle Tests
 // ============================================================================
@@ -312,8 +339,9 @@ async fn test_docker_service_health_check_after_external_removal() {
     sleep(Duration::from_millis(500)).await;
 
     // Externally remove the container (simulating TOCTOU)
+    let real_name = resolve_container_name("test-toctou").await;
     tokio::process::Command::new("docker")
-        .args(["rm", "-f", container_name])
+        .args(["rm", "-f", &real_name])
         .output()
         .await
         .expect("external remove");
@@ -399,8 +427,9 @@ async fn test_docker_service_container_name_format() {
     sleep(Duration::from_millis(500)).await;
 
     // Verify container exists with expected name
+    let real_name = resolve_container_name("test-naming").await;
     let output = tokio::process::Command::new("docker")
-        .args(["inspect", "--format={{.Name}}", container_name])
+        .args(["inspect", "--format={{.Name}}", &real_name])
         .output()
         .await
         .expect("inspect command");
@@ -430,8 +459,9 @@ async fn test_docker_service_container_labels() {
     sleep(Duration::from_millis(500)).await;
 
     // Check for our labels
+    let real_name = resolve_container_name("test-labels").await;
     let output = tokio::process::Command::new("docker")
-        .args(["inspect", "--format={{.Config.Labels}}", container_name])
+        .args(["inspect", "--format={{.Config.Labels}}", &real_name])
         .output()
         .await
         .expect("inspect labels");
@@ -469,8 +499,9 @@ async fn test_docker_service_environment_variables() {
     sleep(Duration::from_millis(500)).await;
 
     // Verify environment variables are set
+    let real_name = resolve_container_name("test-env").await;
     let output = tokio::process::Command::new("docker")
-        .args(["exec", container_name, "env"])
+        .args(["exec", &real_name, "env"])
         .output()
         .await
         .expect("exec env");
