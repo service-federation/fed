@@ -91,8 +91,11 @@ jobs:
 
       # ubuntu-latest ships a working Docker daemon; the 32 container-backed tests are
       # #[ignore]d without this feature (kept off local `cargo test`) and run here.
+      # --test-threads=1: the compose tests share one Docker Compose project (derived
+      # from the fixture path), so they must not run concurrently or they tear down
+      # each other's containers.
       - name: Run Docker-backed integration tests
-        run: cargo test --features docker-tests
+        run: cargo test --features docker-tests -- --test-threads=1
 
   clippy:
     name: Clippy

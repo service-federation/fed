@@ -3,6 +3,17 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::time::sleep;
 
+/// Absolute path to the shared compose fixture.
+///
+/// These tests construct the orchestrator with a temp dir as its work_dir, and
+/// a service's `composeFile` is resolved against that work_dir. A repo-relative
+/// path would therefore be looked up under the temp dir and not found, so the
+/// fixtures use this absolute path (built from the crate root at compile time).
+const COMPOSE_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/compose/test-services.yml"
+);
+
 /// Compute the compose project name from a compose file path (same logic as DockerComposeService).
 fn compose_project_name(compose_file: &Path) -> String {
     let canonical =
@@ -97,7 +108,9 @@ services:
 "#;
 
     let parser = Parser::new();
-    let config = parser.parse_config(yaml).expect("Failed to parse");
+    let config = parser
+        .parse_config(&yaml.replace("tests/fixtures/compose/test-services.yml", COMPOSE_FIXTURE))
+        .expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
     let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
@@ -128,7 +141,9 @@ services:
 "#;
 
     let parser = Parser::new();
-    let config = parser.parse_config(yaml).expect("Failed to parse");
+    let config = parser
+        .parse_config(&yaml.replace("tests/fixtures/compose/test-services.yml", COMPOSE_FIXTURE))
+        .expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
     let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
@@ -157,7 +172,7 @@ async fn test_compose_basic_lifecycle() {
         return;
     }
 
-    let compose_file = Path::new("tests/fixtures/compose/test-services.yml");
+    let compose_file = Path::new(COMPOSE_FIXTURE);
     cleanup_compose_project_by_path(compose_file).await;
 
     let yaml = r#"
@@ -168,7 +183,9 @@ services:
 "#;
 
     let parser = Parser::new();
-    let config = parser.parse_config(yaml).expect("Failed to parse");
+    let config = parser
+        .parse_config(&yaml.replace("tests/fixtures/compose/test-services.yml", COMPOSE_FIXTURE))
+        .expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
     let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
@@ -215,7 +232,7 @@ async fn test_compose_environment_override() {
         return;
     }
 
-    let compose_file = Path::new("tests/fixtures/compose/test-services.yml");
+    let compose_file = Path::new(COMPOSE_FIXTURE);
     cleanup_compose_project_by_path(compose_file).await;
 
     let yaml = r#"
@@ -232,7 +249,9 @@ services:
 "#;
 
     let parser = Parser::new();
-    let config = parser.parse_config(yaml).expect("Failed to parse");
+    let config = parser
+        .parse_config(&yaml.replace("tests/fixtures/compose/test-services.yml", COMPOSE_FIXTURE))
+        .expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
     let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
@@ -270,7 +289,7 @@ async fn test_compose_with_process_dependency() {
         return;
     }
 
-    let compose_file = Path::new("tests/fixtures/compose/test-services.yml");
+    let compose_file = Path::new(COMPOSE_FIXTURE);
     cleanup_compose_project_by_path(compose_file).await;
 
     let yaml = r#"
@@ -290,7 +309,9 @@ services:
 "#;
 
     let parser = Parser::new();
-    let config = parser.parse_config(yaml).expect("Failed to parse");
+    let config = parser
+        .parse_config(&yaml.replace("tests/fixtures/compose/test-services.yml", COMPOSE_FIXTURE))
+        .expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
     let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
@@ -427,7 +448,7 @@ async fn test_compose_idempotent_start() {
         return;
     }
 
-    let compose_file = Path::new("tests/fixtures/compose/test-services.yml");
+    let compose_file = Path::new(COMPOSE_FIXTURE);
     cleanup_compose_project_by_path(compose_file).await;
 
     let yaml = r#"
@@ -438,7 +459,9 @@ services:
 "#;
 
     let parser = Parser::new();
-    let config = parser.parse_config(yaml).expect("Failed to parse");
+    let config = parser
+        .parse_config(&yaml.replace("tests/fixtures/compose/test-services.yml", COMPOSE_FIXTURE))
+        .expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
     let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
@@ -470,7 +493,7 @@ async fn test_compose_health_check() {
         return;
     }
 
-    let compose_file = Path::new("tests/fixtures/compose/test-services.yml");
+    let compose_file = Path::new(COMPOSE_FIXTURE);
     cleanup_compose_project_by_path(compose_file).await;
 
     let yaml = r#"
@@ -481,7 +504,9 @@ services:
 "#;
 
     let parser = Parser::new();
-    let config = parser.parse_config(yaml).expect("Failed to parse");
+    let config = parser
+        .parse_config(&yaml.replace("tests/fixtures/compose/test-services.yml", COMPOSE_FIXTURE))
+        .expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
     let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
@@ -519,7 +544,7 @@ async fn test_compose_port_conflict() {
         return;
     }
 
-    let compose_file = Path::new("tests/fixtures/compose/test-services.yml");
+    let compose_file = Path::new(COMPOSE_FIXTURE);
     cleanup_compose_project_by_path(compose_file).await;
 
     // Start a service on port 18080
@@ -531,7 +556,9 @@ services:
 "#;
 
     let parser = Parser::new();
-    let config1 = parser.parse_config(yaml1).expect("Failed to parse");
+    let config1 = parser
+        .parse_config(&yaml1.replace("tests/fixtures/compose/test-services.yml", COMPOSE_FIXTURE))
+        .expect("Failed to parse");
 
     let orch1_temp = tempfile::tempdir().unwrap();
     let mut orch1 = Orchestrator::new(config1, orch1_temp.path().to_path_buf())
@@ -544,7 +571,9 @@ services:
     sleep(Duration::from_secs(2)).await;
 
     // Try to start another service on the same port
-    let config2 = parser.parse_config(yaml1).expect("Failed to parse");
+    let config2 = parser
+        .parse_config(&yaml1.replace("tests/fixtures/compose/test-services.yml", COMPOSE_FIXTURE))
+        .expect("Failed to parse");
     let orch2_temp = tempfile::tempdir().unwrap();
     let mut orch2 = Orchestrator::new(config2, orch2_temp.path().to_path_buf())
         .await
@@ -601,7 +630,7 @@ services:
 services:
   compose-process:
     cwd: {}
-    process: docker-compose up
+    process: docker compose up
 "#,
         temp_dir.path().display()
     );

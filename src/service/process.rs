@@ -202,8 +202,16 @@ impl ProcessService {
                 "nohup bash -c 'echo $$; exec 1{} 2>&1; {}' &",
                 redirect_target, process_cmd
             )
+        } else if process_cmd.contains('\n') {
+            // Non-detached, multi-line script: `exec` would replace the shell with
+            // only the FIRST command (the rest of the script would never run, and
+            // when that command exited the process would look like it crashed on
+            // startup). Run the script directly instead. stop() kills the whole
+            // process group (set via process_group(0) below), so children still go.
+            process_cmd.to_string()
         } else {
-            // Non-detached mode: pass command directly to bash -c
+            // Non-detached, single-line: exec replaces the shell so the process's
+            // PID is the real command rather than a wrapper bash.
             format!("exec {}", process_cmd)
         };
 
