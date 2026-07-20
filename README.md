@@ -1,8 +1,8 @@
 # fed
 
-Orchestrate your local dev stack from one config file. Docker containers and native processes with dependency-aware startup, healthchecks, and directory-scoped isolation.
+fed runs your app as a native process and your dependencies as Docker containers, in one dependency graph with healthcheck-gated startup. Each git worktree can get its own ports, containers, and volumes (`fed isolate enable`), so parallel checkouts and coding agents never collide.
 
-Full documentation: **[service-federation.com/docs](https://www.service-federation.com/docs/)** — this README is the short version.
+Full documentation: **[service-federation.com/docs](https://www.service-federation.com/docs/)**. This README is the short version.
 
 ![fed demo: editing the config, starting the stack, and running a second isolated stack from a git worktree](docs/fed-demo.gif)
 
