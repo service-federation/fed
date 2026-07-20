@@ -94,7 +94,7 @@ pub async fn graceful_process_kill(pid: u32) -> bool {
     #[cfg(unix)]
     {
         use nix::sys::signal::{self, Signal};
-        use nix::unistd::{getpgid, Pid};
+        use nix::unistd::{Pid, getpgid};
 
         let nix_pid = Pid::from_raw(pid as i32);
 

@@ -2,7 +2,7 @@
 
 use crate::cli::SecretsCommands;
 use crate::output::UserOutput;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use fed::cloud;
 use std::path::PathBuf;
 

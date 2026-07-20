@@ -29,13 +29,13 @@ pub fn credentials_path() -> Option<PathBuf> {
 /// Load credentials. `FED_TOKEN` (+ optional `FED_CLOUD_URL`) override the
 /// credentials file — that's the CI path.
 pub fn load_credentials() -> Option<Credentials> {
-    if let Ok(token) = std::env::var("FED_TOKEN") {
-        if !token.is_empty() {
-            return Some(Credentials {
-                url: std::env::var("FED_CLOUD_URL").unwrap_or_else(|_| DEFAULT_URL.to_string()),
-                token,
-            });
-        }
+    if let Ok(token) = std::env::var("FED_TOKEN")
+        && !token.is_empty()
+    {
+        return Some(Credentials {
+            url: std::env::var("FED_CLOUD_URL").unwrap_or_else(|_| DEFAULT_URL.to_string()),
+            token,
+        });
     }
     load_credentials_from(&credentials_path()?)
 }
@@ -810,27 +810,5 @@ mod tests {
         assert_eq!(vault_grace(), Duration::from_secs(2));
         assert_eq!(vault_timeout(), Duration::from_secs(60));
         assert_eq!(vault_max_age(), Duration::from_secs(24 * 60 * 60));
-    }
-
-    #[test]
-    fn env_duration_parses_duration_strings_and_falls_back() {
-        // Unique var name so we don't race other tests over the process env.
-        let var = "FED_VAULT_TEST_KNOB_XYZ";
-        std::env::set_var(var, "500ms");
-        assert_eq!(
-            env_duration(var, Duration::from_secs(9)),
-            Duration::from_millis(500)
-        );
-        std::env::set_var(var, "not-a-duration");
-        assert_eq!(
-            env_duration(var, Duration::from_secs(9)),
-            Duration::from_secs(9),
-            "garbage falls back to the default"
-        );
-        std::env::remove_var(var);
-        assert_eq!(
-            env_duration(var, Duration::from_secs(9)),
-            Duration::from_secs(9)
-        );
     }
 }

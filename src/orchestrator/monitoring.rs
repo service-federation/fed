@@ -26,8 +26,8 @@ use crate::error::{Error, Result};
 use crate::service::{ServiceManager, Status};
 use crate::state::StateTracker;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -283,22 +283,21 @@ async fn restart_single_service(
             let mut tracker = state_tracker.write().await;
             {
                 let manager = manager_arc.lock().await;
-                if let Some(pid) = manager.get_pid() {
-                    if let Err(e) = tracker.update_service_pid(name, pid).await {
-                        tracing::warn!("Failed to update PID for restarted '{}': {}", name, e);
-                    }
+                if let Some(pid) = manager.get_pid()
+                    && let Err(e) = tracker.update_service_pid(name, pid).await
+                {
+                    tracing::warn!("Failed to update PID for restarted '{}': {}", name, e);
                 }
-                if let Some(container_id) = manager.get_container_id() {
-                    if let Err(e) = tracker
+                if let Some(container_id) = manager.get_container_id()
+                    && let Err(e) = tracker
                         .update_service_container_id(name, container_id)
                         .await
-                    {
-                        tracing::warn!(
-                            "Failed to update container ID for restarted '{}': {}",
-                            name,
-                            e
-                        );
-                    }
+                {
+                    tracing::warn!(
+                        "Failed to update container ID for restarted '{}': {}",
+                        name,
+                        e
+                    );
                 }
             }
             if let Err(e) = tracker.save().await {

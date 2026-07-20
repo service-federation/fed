@@ -724,9 +724,11 @@ mod tests {
         let transition = StateTransition::running();
         let result = transition.validate(Status::Stopped);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid state transition"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid state transition")
+        );
     }
 }

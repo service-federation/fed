@@ -12,7 +12,7 @@
 use std::fs;
 
 use fed::config::{Config, Parameter};
-use fed::parameter::{compute_project_id, Resolver};
+use fed::parameter::{Resolver, compute_project_id};
 use fed::service::hash_work_dir;
 use tempfile::tempdir;
 

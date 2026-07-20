@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::port::PortConflict;
-use std::io::{stdin, stdout, Write};
+use std::io::{Write, stdin, stdout};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PortConflictAction {
@@ -32,12 +32,11 @@ fn is_interactive() -> bool {
         return false;
     }
     // Cargo test binaries run from target/*/deps/ — never interactive
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(path) = exe.to_str() {
-            if path.contains("/deps/") || path.contains("\\deps\\") {
-                return false;
-            }
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(path) = exe.to_str()
+        && (path.contains("/deps/") || path.contains("\\deps\\"))
+    {
+        return false;
     }
     stdin().is_terminal() && stdout().is_terminal()
 }
@@ -88,7 +87,7 @@ fn prompt_user(
     stdout().flush().ok();
 
     loop {
-        use crossterm::event::{read, Event, KeyCode, KeyEvent};
+        use crossterm::event::{Event, KeyCode, KeyEvent, read};
 
         if let Ok(Event::Key(KeyEvent { code, .. })) = read() {
             match code {

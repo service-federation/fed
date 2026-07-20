@@ -1,10 +1,10 @@
 use crate::tui::app::{App, LogLevel};
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
-    Frame,
 };
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect, service_name: &str) {

@@ -44,9 +44,11 @@ async fn test_service_merging_example() {
 
     // Volumes: merged (1 from package + 1 local)
     assert_eq!(database.volumes.len(), 2);
-    assert!(database
-        .volumes
-        .contains(&"postgres-data:/var/lib/postgresql/data".to_string()));
+    assert!(
+        database
+            .volumes
+            .contains(&"postgres-data:/var/lib/postgresql/data".to_string())
+    );
     assert!(database.volumes.contains(&"./backups:/backups".to_string()));
 
     // Ports: local has different host port, but since target is same, only local is kept
@@ -75,9 +77,11 @@ async fn test_service_merging_example() {
     // Volumes: merged (1 from package + 1 local)
     assert_eq!(cache.volumes.len(), 2);
     assert!(cache.volumes.contains(&"redis-data:/data".to_string()));
-    assert!(cache
-        .volumes
-        .contains(&"./redis.conf:/usr/local/etc/redis/redis.conf".to_string()));
+    assert!(
+        cache
+            .volumes
+            .contains(&"./redis.conf:/usr/local/etc/redis/redis.conf".to_string())
+    );
 
     // Ports: merged
     assert!(!cache.ports.is_empty());
@@ -96,10 +100,11 @@ async fn test_service_merging_example() {
     assert_eq!(web.image.as_deref(), Some("node:18"));
     assert!(web.extends.is_none());
     assert_eq!(web.depends_on.len(), 2);
-    assert!(web
-        .depends_on
-        .iter()
-        .any(|d| d.service_name() == "database"));
+    assert!(
+        web.depends_on
+            .iter()
+            .any(|d| d.service_name() == "database")
+    );
     assert!(web.depends_on.iter().any(|d| d.service_name() == "cache"));
 
     // Verify entrypoint

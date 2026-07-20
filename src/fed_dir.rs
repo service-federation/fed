@@ -71,7 +71,7 @@ pub fn ensure_fed_dir(work_dir: &Path) -> Result<PathBuf> {
                 "creating {}: {}",
                 gitignore.display(),
                 e
-            )))
+            )));
         }
     }
     Ok(dir)

@@ -1,6 +1,6 @@
 use super::types::{LockFile, RegistrationOutcome, ServiceState};
 use crate::config::ServiceType;
-use crate::error::{validate_pid_for_check, Error, Result};
+use crate::error::{Error, Result, validate_pid_for_check};
 use crate::service::Status;
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
@@ -55,14 +55,13 @@ fn is_fed_process(pid: u32) -> bool {
         .args(["-o", "comm=", "-p", &pid.to_string()])
         .env("LC_ALL", "C")
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let comm = String::from_utf8_lossy(&output.stdout);
-            let name = comm.trim();
-            // ps may return the full path (e.g. /usr/local/bin/fed) or just "fed"
-            let basename = name.rsplit('/').next().unwrap_or(name);
-            return basename.starts_with("fed");
-        }
+        let comm = String::from_utf8_lossy(&output.stdout);
+        let name = comm.trim();
+        // ps may return the full path (e.g. /usr/local/bin/fed) or just "fed"
+        let basename = name.rsplit('/').next().unwrap_or(name);
+        return basename.starts_with("fed");
     }
 
     // Can't determine — assume it's fed to be safe
@@ -287,15 +286,14 @@ impl SqliteStateTracker {
 
                 // Validate PIDs - filter out invalid ones (don't delete, just skip)
                 services.retain(|service_id, service_state| {
-                    if let Some(pid) = service_state.pid {
-                        if pid > i32::MAX as u32 || pid == 0 {
+                    if let Some(pid) = service_state.pid
+                        && (pid > i32::MAX as u32 || pid == 0) {
                             warn!(
                                 "Service '{}' has invalid PID {} (exceeds i32::MAX or is 0), skipping",
                                 service_id, pid
                             );
                             return false;
                         }
-                    }
                     true
                 });
 
@@ -1837,8 +1835,8 @@ impl SqliteStateTracker {
             // Validate and remove services with invalid PIDs
             let mut invalid_service_ids = Vec::new();
             services.retain(|service_id, service_state| {
-                if let Some(pid) = service_state.pid {
-                    if pid > i32::MAX as u32 || pid == 0 {
+                if let Some(pid) = service_state.pid
+                    && (pid > i32::MAX as u32 || pid == 0) {
                         warn!(
                             "Service '{}' has invalid PID {} (exceeds i32::MAX or is 0), removing from state",
                             service_id, pid
@@ -1846,7 +1844,6 @@ impl SqliteStateTracker {
                         invalid_service_ids.push(service_id.clone());
                         return false;
                     }
-                }
                 true
             });
 
@@ -2020,7 +2017,9 @@ impl SqliteStateTracker {
         // so we skip container cleanup to avoid removing healthy containers.
         let daemon_healthy = crate::docker::check_daemon_with_retry().await;
         if !daemon_healthy {
-            warn!("Docker daemon unhealthy after retries - skipping container cleanup to avoid data loss");
+            warn!(
+                "Docker daemon unhealthy after retries - skipping container cleanup to avoid data loss"
+            );
         }
 
         for (service_id, service_state) in &services {
@@ -2354,7 +2353,7 @@ mod tests {
     use {
         fs2::FileExt,
         nix::sys::wait::waitpid,
-        nix::unistd::{fork, pipe, read, write, ForkResult, Pid},
+        nix::unistd::{ForkResult, Pid, fork, pipe, read, write},
         std::fs::OpenOptions,
         std::os::fd::AsRawFd,
         std::path::Path,
@@ -3630,18 +3629,22 @@ mod tests {
         );
 
         // An empty scope falls back to nothing (caller then uses config defaults).
-        assert!(tracker
-            .get_global_port_allocations(Some("iso-other"))
-            .await
-            .is_empty());
+        assert!(
+            tracker
+                .get_global_port_allocations(Some("iso-other"))
+                .await
+                .is_empty()
+        );
 
         // clear_port_resolutions wipes every scope.
         tracker.clear_port_resolutions().await.unwrap();
         assert!(tracker.get_global_port_allocations(None).await.is_empty());
-        assert!(tracker
-            .get_global_port_allocations(Some("iso-cafebabe"))
-            .await
-            .is_empty());
+        assert!(
+            tracker
+                .get_global_port_allocations(Some("iso-cafebabe"))
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -55,10 +55,10 @@ impl<'a> ScriptRunner<'a> {
             .get(script_name)
             .is_some_and(|s| s.keep_services);
 
-        if let Some(before) = before {
-            if !keep_services {
-                self.stop_services_started_since(&before).await;
-            }
+        if let Some(before) = before
+            && !keep_services
+        {
+            self.stop_services_started_since(&before).await;
         }
 
         result
@@ -214,10 +214,10 @@ impl<'a> ScriptRunner<'a> {
         // it started are left running (like `fed start`) for the caller to use
         // and later tear down with `fed stop`. Nested runs never reach here
         // (`before` is None), so only the invoked script's flag is consulted.
-        if let Some(before) = before {
-            if !script.keep_services {
-                self.stop_services_started_since(&before).await;
-            }
+        if let Some(before) = before
+            && !script.keep_services
+        {
+            self.stop_services_started_since(&before).await;
         }
 
         result
@@ -498,14 +498,15 @@ impl<'a> ScriptRunner<'a> {
         let now = self.orchestrator.get_status_passive().await;
         for (name, status) in now {
             let running = matches!(status, Status::Running | Status::Healthy);
-            if running && !before.contains(&name) {
-                if let Err(e) = self.orchestrator.stop(&name).await {
-                    tracing::warn!(
-                        "borrow-or-own cleanup: failed to stop service '{}': {}",
-                        name,
-                        e
-                    );
-                }
+            if running
+                && !before.contains(&name)
+                && let Err(e) = self.orchestrator.stop(&name).await
+            {
+                tracing::warn!(
+                    "borrow-or-own cleanup: failed to stop service '{}': {}",
+                    name,
+                    e
+                );
             }
         }
     }
@@ -709,12 +710,12 @@ pub(super) fn script_uses_positional_params(script: &str) -> bool {
     // Simple check: look for ${ followed by a digit
     let bytes = script.as_bytes();
     for i in 0..bytes.len().saturating_sub(2) {
-        if bytes[i] == b'$' && bytes[i + 1] == b'{' {
-            if let Some(&next) = bytes.get(i + 2) {
-                if next.is_ascii_digit() {
-                    return true;
-                }
-            }
+        if bytes[i] == b'$'
+            && bytes[i + 1] == b'{'
+            && let Some(&next) = bytes.get(i + 2)
+            && next.is_ascii_digit()
+        {
+            return true;
         }
     }
 

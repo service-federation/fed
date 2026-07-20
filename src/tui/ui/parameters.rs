@@ -1,10 +1,10 @@
 use crate::tui::app::App;
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
-    Frame,
 };
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {

@@ -1248,10 +1248,10 @@ fn parse_resolved_param(stdout: &str, param_name: &str) -> u16 {
         };
         if let Some(idx) = line.find("resolved to ") {
             let rest = &line[idx + "resolved to ".len()..];
-            if let Some(word) = rest.split_whitespace().next() {
-                if let Ok(port) = word.parse::<u16>() {
-                    return port;
-                }
+            if let Some(word) = rest.split_whitespace().next()
+                && let Ok(port) = word.parse::<u16>()
+            {
+                return port;
             }
         }
         for word in line[..marker_idx].split_whitespace().rev() {

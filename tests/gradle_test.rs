@@ -1,5 +1,5 @@
-use fed::config::ServiceType;
 use fed::Parser;
+use fed::config::ServiceType;
 
 #[test]
 fn test_parse_gradle_example() {
@@ -57,10 +57,9 @@ fn test_parse_gradle_example() {
 
 #[test]
 fn test_gradle_task_environment_resolution() {
-    // Prevent interactive port conflict prompt from blocking the test
-    // when a default port happens to be occupied on the host machine
-    std::env::set_var("FED_NON_INTERACTIVE", "1");
-
+    // No need to force non-interactive mode: `port::prompt::is_interactive`
+    // already returns false for binaries running out of target/*/deps/, so a
+    // busy default port falls back to dynamic allocation instead of prompting.
     let parser = Parser::new();
     let mut config = parser
         .load_config("examples/gradle-example.yaml")

@@ -1,13 +1,13 @@
 use crate::output::UserOutput;
 use fed::{
+    Error as FedError, Orchestrator, WatchMode,
     config::{Config, ServiceType},
     parameter::PortResolutionReason,
     port::PortConflict,
     service::Status,
-    Error as FedError, Orchestrator, WatchMode,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::lifecycle::{graceful_docker_stop, graceful_process_kill, validate_pid_start_time};
 
@@ -446,12 +446,12 @@ pub async fn run_start(
                     for line in error.lines() {
                         out.status(&format!("    {}", line));
                     }
-                } else if let Ok(logs) = orchestrator.get_logs(name, Some(5)).await {
-                    if !logs.is_empty() {
-                        out.status("    Recent logs:");
-                        for line in &logs {
-                            out.status(&format!("      {}", line));
-                        }
+                } else if let Ok(logs) = orchestrator.get_logs(name, Some(5)).await
+                    && !logs.is_empty()
+                {
+                    out.status("    Recent logs:");
+                    for line in &logs {
+                        out.status(&format!("      {}", line));
                     }
                 }
             }
@@ -483,10 +483,10 @@ fn print_startup_messages(
     // Collect (service_name, message) pairs for started services
     let mut messages: Vec<(&str, &str)> = Vec::new();
     for (name, service) in &config.services {
-        if started.contains(name) {
-            if let Some(ref msg) = service.startup_message {
-                messages.push((name, msg));
-            }
+        if started.contains(name)
+            && let Some(ref msg) = service.startup_message
+        {
+            messages.push((name, msg));
         }
     }
 
@@ -575,7 +575,7 @@ async fn run_watch_mode(
     // Signal handler runs in a spawned task — uses println! directly since
     // the `out` reference can't be easily passed to a 'static future.
     tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         // Set up signal handlers, logging warnings if they fail
         let mut sigint = match signal(SignalKind::interrupt()) {
@@ -901,22 +901,22 @@ async fn run_dry_run(
     out.status("\nResource limits:");
     let mut any_limits = false;
     for service_name in &all_services {
-        if let Some(service_config) = config.services.get(service_name) {
-            if let Some(ref resources) = service_config.resources {
-                any_limits = true;
-                out.status(&format!("  {}:", service_name));
-                if let Some(ref mem) = resources.memory {
-                    out.status(&format!("    memory: {}", mem));
-                }
-                if let Some(ref cpus) = resources.cpus {
-                    out.status(&format!("    cpus: {}", cpus));
-                }
-                if let Some(nofile) = resources.nofile {
-                    out.status(&format!("    nofile: {}", nofile));
-                }
-                if let Some(pids) = resources.pids {
-                    out.status(&format!("    pids: {}", pids));
-                }
+        if let Some(service_config) = config.services.get(service_name)
+            && let Some(ref resources) = service_config.resources
+        {
+            any_limits = true;
+            out.status(&format!("  {}:", service_name));
+            if let Some(ref mem) = resources.memory {
+                out.status(&format!("    memory: {}", mem));
+            }
+            if let Some(ref cpus) = resources.cpus {
+                out.status(&format!("    cpus: {}", cpus));
+            }
+            if let Some(nofile) = resources.nofile {
+                out.status(&format!("    nofile: {}", nofile));
+            }
+            if let Some(pids) = resources.pids {
+                out.status(&format!("    pids: {}", pids));
             }
         }
     }

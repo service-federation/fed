@@ -17,8 +17,8 @@ use crate::parameter::Resolver;
 use crate::service::Status;
 use crate::state::StateTracker;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 
 /// Collect ports owned by running managed services so the resolver can

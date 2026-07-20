@@ -30,10 +30,10 @@ impl ComposeCommand {
             .output()
             .await;
 
-        if let Ok(output) = v2_check {
-            if output.status.success() {
-                return Ok(ComposeCommand::V2);
-            }
+        if let Ok(output) = v2_check
+            && output.status.success()
+        {
+            return Ok(ComposeCommand::V2);
         }
 
         // Try docker-compose (v1) as fallback
@@ -42,10 +42,10 @@ impl ComposeCommand {
             .output()
             .await;
 
-        if let Ok(output) = v1_check {
-            if output.status.success() {
-                return Ok(ComposeCommand::V1);
-            }
+        if let Ok(output) = v1_check
+            && output.status.success()
+        {
+            return Ok(ComposeCommand::V1);
         }
 
         Err(Error::Config(
@@ -302,15 +302,15 @@ impl ServiceManager for DockerComposeService {
         let output = command.output().await;
 
         // Log warnings but don't fail the stop operation
-        if let Ok(out) = output {
-            if !out.status.success() {
-                let error = String::from_utf8_lossy(&out.stderr);
-                tracing::warn!(
-                    "Compose down for project '{}' had warnings: {}",
-                    self.project_name,
-                    error
-                );
-            }
+        if let Ok(out) = output
+            && !out.status.success()
+        {
+            let error = String::from_utf8_lossy(&out.stderr);
+            tracing::warn!(
+                "Compose down for project '{}' had warnings: {}",
+                self.project_name,
+                error
+            );
         }
 
         {
@@ -363,12 +363,12 @@ impl ServiceManager for DockerComposeService {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(container) = serde_json::from_str::<serde_json::Value>(line) {
-                if let Some(state) = container.get("State").and_then(|s| s.as_str()) {
-                    let state_lower = state.to_lowercase();
-                    if state_lower == "running" || state_lower.starts_with("up") {
-                        return Ok(true);
-                    }
+            if let Ok(container) = serde_json::from_str::<serde_json::Value>(line)
+                && let Some(state) = container.get("State").and_then(|s| s.as_str())
+            {
+                let state_lower = state.to_lowercase();
+                if state_lower == "running" || state_lower.starts_with("up") {
+                    return Ok(true);
                 }
             }
         }

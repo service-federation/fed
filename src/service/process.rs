@@ -1,9 +1,9 @@
 use super::{BaseService, LogCapture, OutputMode, ServiceManager, Status};
 use crate::config::Service as ServiceConfig;
-use crate::error::{validate_pid, validate_pid_for_check, Error, Result};
+use crate::error::{Error, Result, validate_pid, validate_pid_for_check};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use nix::sys::signal::{self, killpg, Signal};
+use nix::sys::signal::{self, Signal, killpg};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -281,7 +281,9 @@ impl ProcessService {
             {
                 tracing::warn!(
                     "Service '{}': Requested nofile limit {} exceeds system hard limit {}, capping to hard limit",
-                    service_name, requested, hard_limit
+                    service_name,
+                    requested,
+                    hard_limit
                 );
             }
 
@@ -293,7 +295,9 @@ impl ProcessService {
             {
                 tracing::warn!(
                     "Service '{}': Requested pids limit {} exceeds system hard limit {}, capping to hard limit",
-                    service_name, requested, hard_limit
+                    service_name,
+                    requested,
+                    hard_limit
                 );
             }
 
@@ -465,10 +469,10 @@ impl ServiceManager for ProcessService {
         } else {
             // In interactive mode: Store Child for log capture and proper cleanup
             // Also store PID
-            if let Some(pid) = child.id() {
-                if let Err(e) = self.validate_and_store_pid(pid) {
-                    tracing::error!("Invalid PID {} for '{}': {}", pid, self.name, e);
-                }
+            if let Some(pid) = child.id()
+                && let Err(e) = self.validate_and_store_pid(pid)
+            {
+                tracing::error!("Invalid PID {} for '{}': {}", pid, self.name, e);
             }
             *self.process.lock().await = Some(child);
         }
@@ -576,23 +580,23 @@ impl ServiceManager for ProcessService {
 
                 // Check for PID reuse before sending signals to avoid killing the wrong process
                 let started_at = *self.started_at.lock();
-                if let Some(expected_start) = started_at {
-                    if !crate::error::validate_pid_start_time(pid_val, expected_start) {
-                        tracing::warn!(
-                            "PID {} for service '{}' was reused by another process, skipping kill",
-                            pid_val,
-                            self.name
-                        );
-                        *self.pid.lock() = None;
+                if let Some(expected_start) = started_at
+                    && !crate::error::validate_pid_start_time(pid_val, expected_start)
+                {
+                    tracing::warn!(
+                        "PID {} for service '{}' was reused by another process, skipping kill",
+                        pid_val,
+                        self.name
+                    );
+                    *self.pid.lock() = None;
 
-                        // Shutdown log capture tasks
-                        self.log_capture.shutdown().await;
-                        *self.health_cache.lock().await = (None, Instant::now());
+                    // Shutdown log capture tasks
+                    self.log_capture.shutdown().await;
+                    *self.health_cache.lock().await = (None, Instant::now());
 
-                        let mut base = self.base.write();
-                        base.set_status(Status::Stopped);
-                        return Ok(());
-                    }
+                    let mut base = self.base.write();
+                    base.set_status(Status::Stopped);
+                    return Ok(());
                 }
 
                 // Try to get the actual process group ID (PGID) of the process.
@@ -720,10 +724,10 @@ impl ServiceManager for ProcessService {
         let mut cache = self.health_cache.lock().await;
 
         // Check if cached result is still valid
-        if let (Some(result), timestamp) = *cache {
-            if timestamp.elapsed() < HEALTH_CACHE_TTL {
-                return Ok(result);
-            }
+        if let (Some(result), timestamp) = *cache
+            && timestamp.elapsed() < HEALTH_CACHE_TTL
+        {
+            return Ok(result);
         }
 
         // Cache expired or empty - perform actual health check while holding lock.
@@ -850,15 +854,15 @@ impl ProcessService {
                     .output()
                     .await;
 
-                if let Ok(output) = output {
-                    if output.status.success() {
-                        let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        // Process state codes: Z = zombie, T = stopped
-                        if stat.starts_with('Z') || stat.starts_with('T') {
-                            return Ok(false); // Defunct/zombie or stopped
-                        }
-                        return Ok(true); // Process is alive and running
+                if let Ok(output) = output
+                    && output.status.success()
+                {
+                    let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    // Process state codes: Z = zombie, T = stopped
+                    if stat.starts_with('Z') || stat.starts_with('T') {
+                        return Ok(false); // Defunct/zombie or stopped
                     }
+                    return Ok(true); // Process is alive and running
                 }
             }
 
@@ -875,7 +879,7 @@ impl ProcessService {
     /// may differ from the PID if the process was reparented or started without setsid.
     #[cfg(unix)]
     fn get_process_group(pid: u32) -> Option<nix::unistd::Pid> {
-        use nix::unistd::{getpgid, Pid};
+        use nix::unistd::{Pid, getpgid};
 
         // Validate PID can be converted to i32 safely
         if pid == 0 || pid > i32::MAX as u32 {
@@ -914,7 +918,7 @@ impl ProcessService {
 /// Helper functions for setting process resource limits on Unix systems
 pub mod resource_limits {
     use crate::config::ResourceLimits;
-    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
 
     /// Result of validating a single resource limit against system hard limits.
     #[derive(Debug, Clone, PartialEq, Eq)]

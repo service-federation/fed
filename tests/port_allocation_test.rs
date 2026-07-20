@@ -82,12 +82,12 @@ fn test_multiple_services_get_different_ports() {
             ])
             .output();
 
-        if let Ok(output) = port_output {
-            if output.status.success() {
-                let port_str = String::from_utf8_lossy(&output.stdout);
-                if let Ok(port) = port_str.trim().parse::<u16>() {
-                    ports.push(port);
-                }
+        if let Ok(output) = port_output
+            && output.status.success()
+        {
+            let port_str = String::from_utf8_lossy(&output.stdout);
+            if let Ok(port) = port_str.trim().parse::<u16>() {
+                ports.push(port);
             }
         }
     }
@@ -139,15 +139,15 @@ fn test_preferred_port_allocation() {
         ])
         .output();
 
-    if let Ok(output) = api_port_output {
-        if output.status.success() {
-            let port_str = String::from_utf8_lossy(&output.stdout);
-            if let Ok(port) = port_str.trim().parse::<u16>() {
-                println!("API allocated port: {}", port);
-                // If 8080 was available, it should get it
-                // But we can't guarantee it, so just check it's valid
-                assert!(port > 1024, "Port should be valid");
-            }
+    if let Ok(output) = api_port_output
+        && output.status.success()
+    {
+        let port_str = String::from_utf8_lossy(&output.stdout);
+        if let Ok(port) = port_str.trim().parse::<u16>() {
+            println!("API allocated port: {}", port);
+            // If 8080 was available, it should get it
+            // But we can't guarantee it, so just check it's valid
+            assert!(port > 1024, "Port should be valid");
         }
     }
 

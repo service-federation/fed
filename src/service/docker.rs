@@ -291,15 +291,15 @@ impl DockerService {
         let mut chars = spec.chars();
         if let (Some(first_char), Some(second_char)) = (chars.next(), chars.next()) {
             // Check for Windows drive pattern: X:\ or X:/
-            if first_char.is_ascii_alphabetic() && second_char == ':' {
-                if let Some(third_char) = chars.next() {
-                    if third_char == '\\' || third_char == '/' {
-                        return Err(Error::Config(format!(
-                            "Absolute host paths not allowed in volumes for security: '{}'",
-                            spec
-                        )));
-                    }
-                }
+            if first_char.is_ascii_alphabetic()
+                && second_char == ':'
+                && let Some(third_char) = chars.next()
+                && (third_char == '\\' || third_char == '/')
+            {
+                return Err(Error::Config(format!(
+                    "Absolute host paths not allowed in volumes for security: '{}'",
+                    spec
+                )));
             }
         }
 
@@ -394,13 +394,13 @@ impl DockerService {
                 }
             } else {
                 // Try to parse as single port number
-                if let Ok(port) = component.parse::<u16>() {
-                    if port == 0 {
-                        return Err(Error::Config(format!(
-                            "Port 0 not allowed in port specification: '{}'",
-                            spec
-                        )));
-                    }
+                if let Ok(port) = component.parse::<u16>()
+                    && port == 0
+                {
+                    return Err(Error::Config(format!(
+                        "Port 0 not allowed in port specification: '{}'",
+                        spec
+                    )));
                 }
             }
         }
@@ -555,10 +555,10 @@ impl ServiceManager for DockerService {
                 let hash = hash_work_dir(Path::new(&base.work_dir));
                 Self::scope_volume_with_session(volume, &hash)
             };
-            if let Some(name) = scoped_volume.split(':').next() {
-                if name.starts_with("fed-") {
-                    named_volumes.push(name.to_string());
-                }
+            if let Some(name) = scoped_volume.split(':').next()
+                && name.starts_with("fed-")
+            {
+                named_volumes.push(name.to_string());
             }
             args.push(scoped_volume);
         }
@@ -791,64 +791,60 @@ impl ServiceManager for DockerService {
             }
 
             // If a healthcheck command is configured, run it inside the container
-            if let Some(ref healthcheck) = self.config.healthcheck {
-                if let Some(cmd) = healthcheck.get_command() {
-                    tracing::debug!(
-                        "Running healthcheck for {}: docker exec {} /bin/sh -c '{}'",
-                        self.name,
-                        id,
-                        cmd
-                    );
+            if let Some(ref healthcheck) = self.config.healthcheck
+                && let Some(cmd) = healthcheck.get_command()
+            {
+                tracing::debug!(
+                    "Running healthcheck for {}: docker exec {} /bin/sh -c '{}'",
+                    self.name,
+                    id,
+                    cmd
+                );
 
-                    let output = match self
-                        .client
-                        .exec_sh(id, cmd, DOCKER_HEALTHCHECK_TIMEOUT)
-                        .await
-                    {
-                        Ok(out) => out,
-                        Err(e) => {
-                            tracing::debug!(
-                                "Healthcheck command failed for {}: {:?}",
-                                self.name,
-                                e
-                            );
-                            return Ok(false); // Container doesn't exist or docker error
-                        }
-                    };
-
-                    // Healthcheck passes if command exits with status 0
-                    let success = output.status.success();
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-
-                    if success {
-                        tracing::debug!("Healthcheck passed for {}", self.name);
-                    } else {
-                        // Log at warn level with actual error output for better debugging
-                        let stderr_trimmed = stderr.trim();
-                        let stdout_trimmed = stdout.trim();
-                        if !stderr_trimmed.is_empty() {
-                            tracing::warn!(
-                                "Healthcheck failed for '{}': {}",
-                                self.name,
-                                stderr_trimmed
-                            );
-                        } else if !stdout_trimmed.is_empty() {
-                            tracing::warn!(
-                                "Healthcheck failed for '{}': {}",
-                                self.name,
-                                stdout_trimmed
-                            );
-                        } else {
-                            tracing::warn!(
-                                "Healthcheck failed for '{}' (exit code {})",
-                                self.name,
-                                output.status.code().unwrap_or(-1)
-                            );
-                        }
+                let output = match self
+                    .client
+                    .exec_sh(id, cmd, DOCKER_HEALTHCHECK_TIMEOUT)
+                    .await
+                {
+                    Ok(out) => out,
+                    Err(e) => {
+                        tracing::debug!("Healthcheck command failed for {}: {:?}", self.name, e);
+                        return Ok(false); // Container doesn't exist or docker error
                     }
-                    return Ok(success);
+                };
+
+                // Healthcheck passes if command exits with status 0
+                let success = output.status.success();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                if success {
+                    tracing::debug!("Healthcheck passed for {}", self.name);
+                } else {
+                    // Log at warn level with actual error output for better debugging
+                    let stderr_trimmed = stderr.trim();
+                    let stdout_trimmed = stdout.trim();
+                    if !stderr_trimmed.is_empty() {
+                        tracing::warn!(
+                            "Healthcheck failed for '{}': {}",
+                            self.name,
+                            stderr_trimmed
+                        );
+                    } else if !stdout_trimmed.is_empty() {
+                        tracing::warn!(
+                            "Healthcheck failed for '{}': {}",
+                            self.name,
+                            stdout_trimmed
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Healthcheck failed for '{}' (exit code {})",
+                            self.name,
+                            output.status.code().unwrap_or(-1)
+                        );
+                    }
                 }
+                return Ok(success);
             }
 
             // No healthcheck configured - fall back to checking if container is running
@@ -985,10 +981,12 @@ mod tests {
         // SECURITY: Reject absolute Unix paths
         let result = DockerService::validate_volume_spec("/etc/passwd:/etc/passwd");
         assert!(result.is_err(), "Absolute Unix paths should be rejected");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Absolute host paths"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Absolute host paths")
+        );
     }
 
     #[test]
@@ -996,10 +994,12 @@ mod tests {
         // SECURITY: Reject root filesystem mount
         let result = DockerService::validate_volume_spec("/:/host");
         assert!(result.is_err(), "Root mount should be rejected");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Absolute host paths"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Absolute host paths")
+        );
     }
 
     #[test]
@@ -1010,10 +1010,12 @@ mod tests {
             result.is_err(),
             "Windows paths with backslash should be rejected"
         );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Absolute host paths"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Absolute host paths")
+        );
     }
 
     #[test]
@@ -1024,10 +1026,12 @@ mod tests {
             result.is_err(),
             "Windows paths with forward slash should be rejected"
         );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Absolute host paths"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Absolute host paths")
+        );
     }
 
     #[test]
@@ -1444,9 +1448,13 @@ mod tests {
         // Attribution relies on this invariant: every container of a stack
         // starts with that stack's prefix, with or without isolation.
         let dir = Path::new("/tmp/project");
-        assert!(docker_container_name("db", None, dir).starts_with(&docker_stack_prefix(None, dir)));
-        assert!(docker_container_name("db", Some("iso-abc123"), dir)
-            .starts_with(&docker_stack_prefix(Some("iso-abc123"), dir)));
+        assert!(
+            docker_container_name("db", None, dir).starts_with(&docker_stack_prefix(None, dir))
+        );
+        assert!(
+            docker_container_name("db", Some("iso-abc123"), dir)
+                .starts_with(&docker_stack_prefix(Some("iso-abc123"), dir))
+        );
     }
 
     #[test]

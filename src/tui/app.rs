@@ -223,15 +223,15 @@ impl App {
 
         // Debounce: skip if service was restarted within the last 2 seconds
         const DEBOUNCE_DURATION: Duration = Duration::from_secs(2);
-        if let Some(last) = self.last_restart.get(&service_name) {
-            if last.elapsed() < DEBOUNCE_DURATION {
-                tracing::debug!(
-                    "Skipping restart of '{}' - debounced ({:?} since last restart)",
-                    service_name,
-                    last.elapsed()
-                );
-                return Ok(());
-            }
+        if let Some(last) = self.last_restart.get(&service_name)
+            && last.elapsed() < DEBOUNCE_DURATION
+        {
+            tracing::debug!(
+                "Skipping restart of '{}' - debounced ({:?} since last restart)",
+                service_name,
+                last.elapsed()
+            );
+            return Ok(());
         }
 
         // Record restart time
@@ -411,12 +411,12 @@ impl App {
 
             // Other - toggle follow for selected service
             KeyCode::Char('f') => {
-                if let Some(idx) = self.selected_service {
-                    if let Some(service) = self.services.get(idx) {
-                        let name = service.name.clone();
-                        let current = self.is_following(&name);
-                        self.follow_logs.insert(name, !current);
-                    }
+                if let Some(idx) = self.selected_service
+                    && let Some(service) = self.services.get(idx)
+                {
+                    let name = service.name.clone();
+                    let current = self.is_following(&name);
+                    self.follow_logs.insert(name, !current);
                 }
             }
 
@@ -695,10 +695,10 @@ impl App {
     /// Called on each tick (e.g., every 250ms)
     pub async fn on_tick(&mut self) -> anyhow::Result<()> {
         // Clear expired status messages
-        if let Some(ref msg) = self.status_message {
-            if Instant::now() > msg.expires_at {
-                self.status_message = None;
-            }
+        if let Some(ref msg) = self.status_message
+            && Instant::now() > msg.expires_at
+        {
+            self.status_message = None;
         }
 
         // Refresh service status
@@ -747,13 +747,12 @@ impl App {
             .into_iter()
             .map(|(name, status)| {
                 // Detect status change from stopped to starting/running (restart)
-                if let Some(&prev_status) = self.previous_status.get(&name) {
-                    if matches!(prev_status, Status::Stopped | Status::Failing)
-                        && matches!(status, Status::Starting | Status::Running | Status::Healthy)
-                    {
-                        // Service is restarting, reset log counter
-                        self.log_seen_count.insert(name.clone(), 0);
-                    }
+                if let Some(&prev_status) = self.previous_status.get(&name)
+                    && matches!(prev_status, Status::Stopped | Status::Failing)
+                    && matches!(status, Status::Starting | Status::Running | Status::Healthy)
+                {
+                    // Service is restarting, reset log counter
+                    self.log_seen_count.insert(name.clone(), 0);
                 }
 
                 // Update previous status
@@ -860,76 +859,74 @@ impl App {
     }
 
     fn select_previous_service(&mut self) {
-        if let Some(selected) = self.selected_service {
-            if selected > 0 {
-                self.selected_service = Some(selected - 1);
-            }
+        if let Some(selected) = self.selected_service
+            && selected > 0
+        {
+            self.selected_service = Some(selected - 1);
         }
     }
 
     fn view_service_details(&mut self) -> anyhow::Result<()> {
-        if let Some(idx) = self.selected_service {
-            if let Some(service) = self.services.get(idx) {
-                self.view = View::ServiceDetails(service.name.clone());
-            }
+        if let Some(idx) = self.selected_service
+            && let Some(service) = self.services.get(idx)
+        {
+            self.view = View::ServiceDetails(service.name.clone());
         }
         Ok(())
     }
 
     fn view_logs(&mut self) -> anyhow::Result<()> {
-        if let Some(idx) = self.selected_service {
-            if let Some(service) = self.services.get(idx) {
-                self.view = View::Logs(service.name.clone());
-            }
+        if let Some(idx) = self.selected_service
+            && let Some(service) = self.services.get(idx)
+        {
+            self.view = View::Logs(service.name.clone());
         }
         Ok(())
     }
 
     async fn toggle_service(&mut self) -> anyhow::Result<()> {
-        if let Some(idx) = self.selected_service {
-            if let Some(service) = self.services.get(idx) {
-                let name = service.name.clone();
-                let status = service.status;
-                let result = {
-                    let orch = self.orchestrator.write().await;
-                    match status {
-                        // Same Failing semantics as the details and graph views:
-                        // a Failing service is running, so toggle stops it.
-                        Status::Running | Status::Healthy | Status::Failing => {
-                            orch.stop(&name).await
-                        }
-                        Status::Stopped => orch.start(&name).await,
-                        _ => Ok(()),
-                    }
-                };
-                if let Err(e) = result {
-                    self.set_status(
-                        &format!("Failed to toggle '{}': {}", name, e),
-                        StatusLevel::Error,
-                        5,
-                    );
+        if let Some(idx) = self.selected_service
+            && let Some(service) = self.services.get(idx)
+        {
+            let name = service.name.clone();
+            let status = service.status;
+            let result = {
+                let orch = self.orchestrator.write().await;
+                match status {
+                    // Same Failing semantics as the details and graph views:
+                    // a Failing service is running, so toggle stops it.
+                    Status::Running | Status::Healthy | Status::Failing => orch.stop(&name).await,
+                    Status::Stopped => orch.start(&name).await,
+                    _ => Ok(()),
                 }
+            };
+            if let Err(e) = result {
+                self.set_status(
+                    &format!("Failed to toggle '{}': {}", name, e),
+                    StatusLevel::Error,
+                    5,
+                );
             }
         }
         Ok(())
     }
 
     async fn restart_service(&mut self) -> anyhow::Result<()> {
-        if let Some(idx) = self.selected_service {
-            if let Some(service) = self.services.get(idx) {
-                let name = service.name.clone();
-                let result = {
-                    let orch = self.orchestrator.write().await;
-                    let _ = orch.stop(&name).await;
-                    orch.start(&name).await
-                };
-                if let Err(e) = result {
-                    self.set_status(
-                        &format!("Failed to restart '{}': {}", name, e),
-                        StatusLevel::Error,
-                        5,
-                    );
-                }
+        if let Some(idx) = self.selected_service
+            && let Some(service) = self.services.get(idx)
+        {
+            let name = service.name.clone();
+            let result = {
+                let orch = self.orchestrator.write().await;
+                let _ = orch.stop(&name).await;
+                orch.start(&name).await
+            };
+            if let Err(e) = result {
+                self.set_status(
+                    &format!("Failed to restart '{}': {}", name, e),
+                    StatusLevel::Error,
+                    5,
+                );
             }
         }
         Ok(())
@@ -1071,14 +1068,12 @@ impl App {
     /// Exit search mode and apply/cancel search
     fn exit_search_mode(&mut self, apply: bool) {
         self.search_mode = false;
-        if apply {
-            if let Some(service) = self.current_log_service() {
-                let service = service.to_string();
-                if self.search_input.is_empty() {
-                    self.log_search.remove(&service);
-                } else {
-                    self.log_search.insert(service, self.search_input.clone());
-                }
+        if apply && let Some(service) = self.current_log_service() {
+            let service = service.to_string();
+            if self.search_input.is_empty() {
+                self.log_search.remove(&service);
+            } else {
+                self.log_search.insert(service, self.search_input.clone());
             }
         }
         self.search_input.clear();

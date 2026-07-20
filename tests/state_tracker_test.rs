@@ -551,16 +551,20 @@ async fn test_regression_update_status_requires_plain_name() {
     tracker.register_service(service_state).await.unwrap();
 
     // Update with plain name should succeed
-    assert!(tracker
-        .update_service_status("my-service", Status::Running)
-        .await
-        .is_ok());
+    assert!(
+        tracker
+            .update_service_status("my-service", Status::Running)
+            .await
+            .is_ok()
+    );
 
     // Update with namespaced ID should fail (service not found)
-    assert!(tracker
-        .update_service_status("root/my-service", Status::Healthy)
-        .await
-        .is_err());
+    assert!(
+        tracker
+            .update_service_status("root/my-service", Status::Healthy)
+            .await
+            .is_err()
+    );
 }
 
 /// Regression test: unregister_service must use plain name

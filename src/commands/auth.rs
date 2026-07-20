@@ -1,7 +1,7 @@
 //! `fed login` / `fed logout` / `fed whoami` — Service Federation Cloud auth.
 
 use crate::output::UserOutput;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use fed::cloud;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;

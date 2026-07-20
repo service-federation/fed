@@ -11,8 +11,8 @@ use tracing::Instrument;
 // to avoid blocking tokio threads across .await points.
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use super::health::SharedHealthCheckerRegistry;
@@ -634,11 +634,9 @@ impl Orchestrator {
         if self.isolation_id.is_none() {
             let tracker = self.state_tracker.read().await;
             let (isolated, isolation_id) = tracker.get_isolation_mode().await;
-            if isolated {
-                if let Some(id) = isolation_id {
-                    tracing::debug!("Applying persisted isolation_id: {}", id);
-                    self.isolation_id = Some(id);
-                }
+            if isolated && let Some(id) = isolation_id {
+                tracing::debug!("Applying persisted isolation_id: {}", id);
+                self.isolation_id = Some(id);
             }
         }
 
@@ -1945,12 +1943,11 @@ impl Orchestrator {
         // Collect unique images from Docker-type services
         let mut images: Vec<String> = Vec::new();
         for name in services {
-            if let Some(svc) = self.config.services.get(name) {
-                if let Some(ref image) = svc.image {
-                    if !images.contains(image) {
-                        images.push(image.clone());
-                    }
-                }
+            if let Some(svc) = self.config.services.get(name)
+                && let Some(ref image) = svc.image
+                && !images.contains(image)
+            {
+                images.push(image.clone());
             }
         }
 

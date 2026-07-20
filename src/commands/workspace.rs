@@ -1,6 +1,6 @@
 use crate::cli::WorkspaceCommands;
 use crate::output::UserOutput;
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
@@ -299,15 +299,15 @@ async fn ws_rm(name: &str, force: bool, out: &dyn UserOutput) -> anyhow::Result<
     }
 
     // Stop running services if any
-    if let Some(count) = count_running_services(&wt.path).await {
-        if count > 0 {
-            out.warning(&format!(
-                "  Stopping {} running service(s) in '{}'...",
-                count, name
-            ));
-            if let Err(e) = super::run_stop_from_state(&wt.path, vec![], out).await {
-                tracing::warn!("Failed to stop services in worktree: {}", e);
-            }
+    if let Some(count) = count_running_services(&wt.path).await
+        && count > 0
+    {
+        out.warning(&format!(
+            "  Stopping {} running service(s) in '{}'...",
+            count, name
+        ));
+        if let Err(e) = super::run_stop_from_state(&wt.path, vec![], out).await {
+            tracing::warn!("Failed to stop services in worktree: {}", e);
         }
     }
 
@@ -382,28 +382,28 @@ async fn ws_prune(out: &dyn UserOutput) -> anyhow::Result<()> {
     let base = get_worktree_base(&main_wt);
     let mut pruned = 0;
 
-    if base.exists() {
-        if let Ok(entries) = std::fs::read_dir(&base) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    // If the directory is empty, it's a leftover from a removed worktree
-                    let is_stale = match std::fs::read_dir(&path) {
-                        Ok(mut contents) => contents.next().is_none(),
-                        Err(_) => false,
-                    };
-                    if is_stale {
-                        let name = path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string();
-                        if let Err(e) = std::fs::remove_dir_all(&path) {
-                            tracing::warn!("Failed to remove stale directory {}: {}", name, e);
-                        } else {
-                            out.status(&format!("  Removed '{}'", name));
-                            pruned += 1;
-                        }
+    if base.exists()
+        && let Ok(entries) = std::fs::read_dir(&base)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // If the directory is empty, it's a leftover from a removed worktree
+                let is_stale = match std::fs::read_dir(&path) {
+                    Ok(mut contents) => contents.next().is_none(),
+                    Err(_) => false,
+                };
+                if is_stale {
+                    let name = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    if let Err(e) = std::fs::remove_dir_all(&path) {
+                        tracing::warn!("Failed to remove stale directory {}: {}", name, e);
+                    } else {
+                        out.status(&format!("  Removed '{}'", name));
+                        pruned += 1;
                     }
                 }
             }
@@ -437,7 +437,11 @@ fn detect_shell_rc() -> anyhow::Result<(PathBuf, &'static str)> {
     } else {
         bail!(
             "Unsupported shell: {}. Manually add `eval \"$(fed ws init-shell)\"` to your shell rc file.",
-            if shell.is_empty() { "(unknown)" } else { &shell }
+            if shell.is_empty() {
+                "(unknown)"
+            } else {
+                &shell
+            }
         );
     }
 }

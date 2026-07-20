@@ -1,7 +1,7 @@
 use super::PortAllocator;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::port::{handle_port_conflict, PortConflict, PortConflictAction};
+use crate::port::{PortConflict, PortConflictAction, handle_port_conflict};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -757,14 +757,12 @@ impl Resolver {
             let (in_repo, ignored) = super::secret::path_git_status(&cache_path);
             if in_repo && !ignored {
                 let existed = cache_path.exists();
-                if existed {
-                    if let Err(e) = std::fs::remove_file(&cache_path) {
-                        tracing::warn!(
-                            "could not remove commit-eligible secrets cache {}: {}",
-                            cache_path.display(),
-                            e
-                        );
-                    }
+                if existed && let Err(e) = std::fs::remove_file(&cache_path) {
+                    tracing::warn!(
+                        "could not remove commit-eligible secrets cache {}: {}",
+                        cache_path.display(),
+                        e
+                    );
                 }
                 tracing::warn!(
                     "vault secret caching disabled: {} is not gitignored (was .fed/.gitignore \
@@ -899,31 +897,30 @@ impl Resolver {
             }
             // cache_usable was decided (and warned about) up front; an unsafe
             // path means no cache writes at all.
-            if cache_usable {
-                if let Err(e) = super::secret::write_cache_file(&cache_path, &new_cache) {
-                    tracing::warn!(
-                        "could not cache vault secrets to {}: {}",
-                        cache_path.display(),
-                        e
-                    );
-                }
+            if cache_usable && let Err(e) = super::secret::write_cache_file(&cache_path, &new_cache)
+            {
+                tracing::warn!(
+                    "could not cache vault secrets to {}: {}",
+                    cache_path.display(),
+                    e
+                );
             }
         } else {
             // Vault unavailable (--offline, unlinked, or lookup failed): the
             // cache satisfies missing manual secrets, required ones included.
             let cache = &analysis.cache_values;
             for (name, _) in &analysis.missing_manual {
-                if let Some(value) = cache.get(name) {
-                    if let Some(param) = config.get_effective_parameters_mut().get_mut(name) {
-                        param.value = Some(value.clone());
-                    }
+                if let Some(value) = cache.get(name)
+                    && let Some(param) = config.get_effective_parameters_mut().get_mut(name)
+                {
+                    param.value = Some(value.clone());
                 }
             }
             for name in &analysis.missing_optional_manual {
-                if let Some(value) = cache.get(name) {
-                    if let Some(param) = config.get_effective_parameters_mut().get_mut(name) {
-                        param.value = Some(value.clone());
-                    }
+                if let Some(value) = cache.get(name)
+                    && let Some(param) = config.get_effective_parameters_mut().get_mut(name)
+                {
+                    param.value = Some(value.clone());
                 }
             }
             analysis
@@ -937,10 +934,10 @@ impl Resolver {
         // Optional manual secrets the vault couldn't supply fall back to an
         // empty string so they resolve without error.
         for name in &analysis.missing_optional_manual {
-            if let Some(param) = config.get_effective_parameters_mut().get_mut(name) {
-                if param.value.is_none() {
-                    param.value = Some(String::new());
-                }
+            if let Some(param) = config.get_effective_parameters_mut().get_mut(name)
+                && param.value.is_none()
+            {
+                param.value = Some(String::new());
             }
         }
 
@@ -1330,17 +1327,15 @@ impl Resolver {
                 }
                 if let Some(env_value) = param.get_value_for_environment(&self.environment) {
                     let default_str = Self::value_to_string(env_value);
-                    if default_str.contains("{{") {
-                        if let Ok(resolved_default) =
+                    if default_str.contains("{{")
+                        && let Ok(resolved_default) =
                             self.resolve_template(&default_str, &parameters)
-                        {
-                            if resolved_default != default_str {
-                                parameters.insert(name.clone(), resolved_default.clone());
-                                self.resolved_parameters
-                                    .insert(name.clone(), resolved_default);
-                                any_resolved = true;
-                            }
-                        }
+                        && resolved_default != default_str
+                    {
+                        parameters.insert(name.clone(), resolved_default.clone());
+                        self.resolved_parameters
+                            .insert(name.clone(), resolved_default);
+                        any_resolved = true;
                     }
                 }
             }
@@ -1362,22 +1357,22 @@ impl Resolver {
                 let default_str = Self::value_to_string(env_value);
                 if default_str.contains("{{") {
                     // Check if parameter was resolved
-                    if let Some(resolved_value) = parameters.get(name) {
-                        if resolved_value.contains("{{") {
-                            // Extract the unresolved variable names
-                            let unresolved_vars = self.extract_template_variables(resolved_value);
-                            if pass_count >= MAX_PASSES {
-                                return Err(Error::TemplateResolution(format!(
-                                    "Circular parameter reference detected in parameter '{}'. \
+                    if let Some(resolved_value) = parameters.get(name)
+                        && resolved_value.contains("{{")
+                    {
+                        // Extract the unresolved variable names
+                        let unresolved_vars = self.extract_template_variables(resolved_value);
+                        if pass_count >= MAX_PASSES {
+                            return Err(Error::TemplateResolution(format!(
+                                "Circular parameter reference detected in parameter '{}'. \
                                      Unresolved variables after {} passes: {:?}",
-                                    name, MAX_PASSES, unresolved_vars
-                                )));
-                            } else {
-                                return Err(Error::TemplateResolution(format!(
-                                    "Parameter '{}' has unresolved template variables: {:?}",
-                                    name, unresolved_vars
-                                )));
-                            }
+                                name, MAX_PASSES, unresolved_vars
+                            )));
+                        } else {
+                            return Err(Error::TemplateResolution(format!(
+                                "Parameter '{}' has unresolved template variables: {:?}",
+                                name, unresolved_vars
+                            )));
                         }
                     }
                 }
@@ -1420,15 +1415,14 @@ impl Resolver {
             if self.deferred_params.contains(name) {
                 continue;
             }
-            if !param.either.is_empty() {
-                if let Some(resolved_value) = parameters.get(name) {
-                    if !param.either.contains(resolved_value) {
-                        return Err(Error::TemplateResolution(format!(
-                            "Parameter '{}' has value '{}' which is not in the allowed values: {:?}",
-                            name, resolved_value, param.either
-                        )));
-                    }
-                }
+            if !param.either.is_empty()
+                && let Some(resolved_value) = parameters.get(name)
+                && !param.either.contains(resolved_value)
+            {
+                return Err(Error::TemplateResolution(format!(
+                    "Parameter '{}' has value '{}' which is not in the allowed values: {:?}",
+                    name, resolved_value, param.either
+                )));
             }
         }
 
@@ -2215,7 +2209,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_prefer_config_defaults(false); // isolated-mode behavior
-                                                    // No cached port in the store — this is a fresh allocation.
+        // No cached port in the store — this is a fresh allocation.
         resolver.set_port_store(Box::new(crate::port::SqlitePortStore::new(HashMap::new())));
 
         // Hold the default port open so allocating it would succeed if tried.
@@ -2425,10 +2419,12 @@ mod tests {
 
         let result = resolver.resolve_parameters(&mut config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid port value"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid port value")
+        );
     }
 
     #[test]
@@ -2458,10 +2454,12 @@ mod tests {
 
         let result = resolver.resolve_parameters(&mut config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid port value '0'"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid port value '0'")
+        );
     }
 
     #[test]
@@ -2491,10 +2489,12 @@ mod tests {
 
         let result = resolver.resolve_parameters(&mut config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid port value"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid port value")
+        );
     }
 
     #[test]

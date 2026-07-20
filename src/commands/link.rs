@@ -1,7 +1,7 @@
 //! `fed link [org/project]` — bind this checkout to a Cloud project.
 
 use crate::output::UserOutput;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use fed::cloud;
 use fed::parameter::secret::is_gitignored;
 use std::path::PathBuf;
