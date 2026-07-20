@@ -103,10 +103,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Pinned rather than tracking stable: with -D warnings, a new Rust
+      # release can turn main red without a code change, as the 1.97
+      # collapsible_if expansion did. Bump this deliberately.
+      # scripts/lint-linux.sh should be bumped to match.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: "1.97"
           components: clippy
 
       - name: Cache cargo registry

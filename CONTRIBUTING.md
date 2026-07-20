@@ -67,6 +67,23 @@ Feature requests are welcome! Please:
 - Write tests for new functionality
 - Add doc comments for complex logic
 
+### Linting platform-specific code
+
+Some code is behind `#[cfg(target_os = "linux")]` (`/proc` parsing in
+`src/error.rs`, the `lsof`/`ss` handling in `src/port/conflict.rs`). On macOS
+that code is compiled out, so `cargo clippy` cannot see it — a clean local run
+can still fail CI, which lints on Linux.
+
+If you touch `cfg`-gated code, lint the Linux target through Docker:
+
+```bash
+scripts/lint-linux.sh
+```
+
+CI pins clippy to a specific Rust version so that lint failures are always
+caused by a change rather than by a new compiler release. When bumping it,
+update both `.github/workflows/ci.yml` and `scripts/lint-linux.sh`.
+
 ## Commit Messages
 
 Write clear, concise commit messages that describe what the change does:
