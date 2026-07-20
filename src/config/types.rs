@@ -10,7 +10,7 @@ use super::{Dependency, Metadata, Parameter, Script, Service};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Root configuration structure for service-federation.yaml
+/// Root configuration structure for fed.yaml (or service-federation.yaml)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     /// Variables/parameters declared for this config. Values support

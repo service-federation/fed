@@ -19,7 +19,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/service-federation/fed/
 cargo install --git https://github.com/service-federation/fed
 ```
 
-Create `service-federation.yaml` (or run `fed init`). Adapt it to your app — this example assumes a Node backend in `./backend` that reads `PORT` and serves `/health`:
+Create `fed.yaml` (or run `fed init`). The older `service-federation.yaml` name is still fully supported. Adapt the config to your app — this example assumes a Node backend in `./backend` that reads `PORT` and serves `/health`:
 
 ```yaml
 parameters:
@@ -64,10 +64,10 @@ That's the whole workflow. `git clone`, add a config, `fed start`, the project i
 
 ## In a repo that already uses fed?
 
-If you found a `service-federation.yaml` in a project — especially if you're a coding agent working in a checkout — these four rules keep you out of trouble:
+If you found a `fed.yaml` (or `service-federation.yaml`) in a project — especially if you're a coding agent working in a checkout — these four rules keep you out of trouble:
 
 1. **New worktree? Isolate first.** Run `fed isolate enable` before any other fed command. It persists: every fed command after it gets this directory's own ports, containers, and volumes.
-2. **Run tasks through fed.** `fed <script>` (like `fed test:integration` or `fed psql`) resolves the ports and `DATABASE_URL` this directory was actually allocated. The same command run bare hits whichever checkout owns the default ports. The `scripts:` section of `service-federation.yaml` lists what's available.
+2. **Run tasks through fed.** `fed <script>` (like `fed test:integration` or `fed psql`) resolves the ports and `DATABASE_URL` this directory was actually allocated. The same command run bare hits whichever checkout owns the default ports. The `scripts:` section of `fed.yaml` lists what's available.
 3. **Port conflict on start?** Another checkout owns those ports — the fix is `fed isolate enable`. Never `fed start --replace` in a worktree: it takes the port by killing the other checkout's services.
 4. **Look before you guess.** `fed status`, `fed ports list`, and `fed logs <service> --tail 100` show what's running, where, and why it failed.
 
@@ -75,7 +75,7 @@ Details: [isolation docs](https://www.service-federation.com/docs/isolation/).
 
 ## Why fed
 
-- **One config, one command** — Docker containers, native processes, and Compose services all live in one `service-federation.yaml`. `fed start` handles dependency ordering and health checks.
+- **One config, one command** — Docker containers, native processes, and Compose services all live in one `fed.yaml`. `fed start` handles dependency ordering and health checks.
 - **Directory-scoped isolation** — Containers, volumes, and state are namespaced by working directory automatically; `fed isolate enable` gives a checkout its own ports too. Git worktrees plus one command = parallel environments.
 - **No Docker Compose sprawl** — Port parameters, templating, profiles, and cross-project packages replace the pile of override files and `.env` juggling.
 

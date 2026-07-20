@@ -4,7 +4,7 @@ use fed::Parser;
 async fn test_service_merging_example() {
     // This test demonstrates the service merging example
     let example_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/service-merging/service-federation.yaml");
+        .join("examples/service-merging/fed.yaml");
 
     if !example_path.exists() {
         panic!("Example config not found at: {}", example_path.display());

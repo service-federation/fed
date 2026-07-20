@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(name = "fed", version)]
 #[command(about = "Service Federation - Orchestrate complex service dependencies")]
 pub struct Cli {
-    /// Config file path (defaults to service-federation.yaml)
+    /// Config file path (defaults to fed.yaml, or service-federation.yaml)
     #[arg(short, long)]
     pub config: Option<PathBuf>,
 
@@ -103,7 +103,7 @@ pub enum Commands {
         #[arg(short, long)]
         watch: bool,
     },
-    /// Run a script defined in service-federation.yaml
+    /// Run a script defined in fed.yaml
     Run {
         /// Script name
         name: String,
@@ -146,10 +146,10 @@ pub enum Commands {
     /// Manage port allocations
     #[command(subcommand)]
     Ports(PortsCommands),
-    /// Initialize a new service-federation.yaml config
+    /// Initialize a new fed.yaml config
     Init {
         /// Output file path
-        #[arg(short, long, default_value = "service-federation.yaml")]
+        #[arg(short, long, default_value = "fed.yaml")]
         output: PathBuf,
         /// Overwrite existing file
         #[arg(short, long)]

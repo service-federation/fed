@@ -110,7 +110,7 @@ async fn run() -> anyhow::Result<()> {
             eprintln!("  Detected call chain:");
             eprintln!("    fed start -> {} (process) -> fed", parent_service);
             eprintln!();
-            eprintln!("  Fix: Change the process command in service-federation.yaml to run");
+            eprintln!("  Fix: Change the process command in your fed config to run");
             eprintln!("  the actual application directly instead of invoking 'fed'.");
             eprintln!();
             eprintln!("  Example: Instead of 'npm run dev' where dev runs 'fed start',");
