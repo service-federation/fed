@@ -228,14 +228,6 @@ pub enum SecretsCommands {
         #[arg(long, default_value = "development")]
         env: String,
     },
-    /// Set a secret in the team vault (value read from stdin, never argv)
-    Set {
-        /// Secret name (A-Z, digits, _)
-        name: String,
-        /// Environment
-        #[arg(long, default_value = "development")]
-        env: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -398,4 +390,30 @@ pub enum IsolateCommands {
         #[arg(long, short)]
         force: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn secrets_ls_still_parses() {
+        let cli =
+            Cli::try_parse_from(["fed", "secrets", "ls"]).expect("`fed secrets ls` must parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Secrets(SecretsCommands::Ls { .. })
+        ));
+    }
+
+    #[test]
+    fn secrets_set_is_rejected() {
+        // fed 7.0 removed `fed secrets set` — secret writes are dashboard-only,
+        // so a leaked bearer token cannot write. The subcommand must not parse.
+        assert!(
+            Cli::try_parse_from(["fed", "secrets", "set", "API_KEY"]).is_err(),
+            "`fed secrets set` must be rejected after fed 7.0",
+        );
+    }
 }

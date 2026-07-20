@@ -977,7 +977,7 @@ impl Resolver {
                 )));
             }
             return Err(Error::Validation(format!(
-                "Missing secret values — add them to your env_file ({}), or put them in your team vault (fed login, fed link, fed secrets set NAME):\n{}\n\nThese secrets have source: manual, so fed won't generate them.",
+                "Missing secret values — add them to your env_file ({}), or put them in your team vault (fed login, fed link, then set them in the dashboard):\n{}\n\nThese secrets have source: manual, so fed won't generate them.",
                 env_files_hint,
                 details.join("\n")
             )));
@@ -4547,6 +4547,16 @@ mod tests {
         assert!(
             !msg.contains("team vault could not be reached"),
             "no vault failure means no unreachable-cloud message: {msg}"
+        );
+        // Writes are dashboard-only since fed 7.0 — the hint points there and
+        // must never mention the removed `fed secrets set` command.
+        assert!(
+            msg.contains("set them in the dashboard"),
+            "hint should direct writes to the dashboard: {msg}"
+        );
+        assert!(
+            !msg.contains("fed secrets set"),
+            "the removed `fed secrets set` command must not appear: {msg}"
         );
     }
 

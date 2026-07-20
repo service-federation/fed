@@ -449,7 +449,7 @@ pub fn spawn_fetch_values(work_dir: &Path, env: &str, names: &[String]) -> Optio
 
 /// Run a cloud future, printing a one-line "waking vault…" hint to stderr if it
 /// takes longer than the grace window. Used by the deliberately-blocking
-/// `fed secrets` commands (D5): the user asked the cloud a question, so
+/// `fed secrets ls` command (D5): the user asked the cloud a question, so
 /// correctness wins over latency — they get the generous budget and the hint,
 /// never a cache fallback.
 pub async fn with_waking_hint<F, T>(fut: F) -> T
@@ -464,32 +464,6 @@ where
             fut.await
         }
     }
-}
-
-pub async fn put_secret(
-    creds: &Credentials,
-    link: &CloudLink,
-    env: &str,
-    name: &str,
-    value: &str,
-) -> Result<()> {
-    let res = client()
-        .put(format!(
-            "{}/api/v1/orgs/{}/projects/{}/secrets/{}",
-            creds.url, link.org, link.project, name
-        ))
-        .bearer_auth(&creds.token)
-        .json(&serde_json::json!({ "value": value, "env": env }))
-        .send()
-        .await
-        .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", creds.url, e)))?;
-    if !res.status().is_success() {
-        return Err(api_error(
-            res.status(),
-            format!("setting {}", name).as_str(),
-        ));
-    }
-    Ok(())
 }
 
 // ── Logout revocation (05-token-scope.md "Logout revocation") ───────────
