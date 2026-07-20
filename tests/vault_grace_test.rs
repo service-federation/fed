@@ -78,17 +78,28 @@ fn cold_vault_with_fresh_cache_proceeds_within_grace() {
         .env("FED_TOKEN", "test-token")
         .env("FED_CLOUD_URL", format!("http://127.0.0.1:{port}"))
         .env("FED_VAULT_GRACE", "1s")
-        .env("FED_VAULT_MAX_AGE", "24h")
+        // Seconds, not "24h": parse_duration_string has no hour suffix, so "24h"
+        // silently fell back to the default instead of setting anything.
+        .env("FED_VAULT_MAX_AGE", "86400s")
         // Keep the blocking budget short so a regression fails promptly.
         .env("FED_VAULT_TIMEOUT", "8s")
         .output()
         .expect("failed to run the cold-vault child test");
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
     assert!(
         output.status.success(),
-        "cold-vault child test failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+        "cold-vault child test failed\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+
+    // libtest exits 0 when `--exact` matches nothing, so a successful status
+    // alone would also be reported if the child test were renamed away. Require
+    // evidence that it actually ran.
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "expected the child test to run; it may have been renamed\nstdout:\n{stdout}\nstderr:\n{stderr}",
     );
 }
 

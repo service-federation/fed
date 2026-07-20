@@ -150,9 +150,14 @@ pub fn save_link(work_dir: &Path, link: &CloudLink) -> Result<PathBuf> {
 use std::time::Duration;
 
 fn env_duration(var: &str, default: Duration) -> Duration {
-    std::env::var(var)
-        .ok()
-        .and_then(|s| crate::config::parse_duration_string(&s))
+    duration_or_default(std::env::var(var).ok().as_deref(), default)
+}
+
+/// The parse-and-fall-back half of [`env_duration`], split out so it can be
+/// tested without mutating the process environment (`set_var` is unsafe as of
+/// Rust 2024, and a shared env races other tests).
+fn duration_or_default(raw: Option<&str>, default: Duration) -> Duration {
+    raw.and_then(crate::config::parse_duration_string)
         .unwrap_or(default)
 }
 
@@ -810,5 +815,37 @@ mod tests {
         assert_eq!(vault_grace(), Duration::from_secs(2));
         assert_eq!(vault_timeout(), Duration::from_secs(60));
         assert_eq!(vault_max_age(), Duration::from_secs(24 * 60 * 60));
+    }
+
+    #[test]
+    fn vault_knobs_parse_their_value_and_fall_back_on_junk() {
+        let default = Duration::from_secs(9);
+
+        // A set, well-formed value wins over the default. Without this, the
+        // knobs could be ignored entirely and every other test would still pass.
+        assert_eq!(
+            duration_or_default(Some("500ms"), default),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            duration_or_default(Some("30m"), default),
+            Duration::from_secs(30 * 60)
+        );
+
+        // Known gap: parse_duration_string handles ms/s/m but not h, so an hour
+        // suffix silently falls back to the default rather than meaning an hour.
+        // Asserted so the behaviour is visible; update this if `h` is supported.
+        assert_eq!(duration_or_default(Some("1h"), default), default);
+
+        // Unparseable values fall back rather than panicking or zeroing the
+        // knob — a zero grace would turn every cold vault into a hard block.
+        assert_eq!(
+            duration_or_default(Some("not-a-duration"), default),
+            default
+        );
+        assert_eq!(duration_or_default(Some(""), default), default);
+
+        // Unset falls back too.
+        assert_eq!(duration_or_default(None, default), default);
     }
 }
