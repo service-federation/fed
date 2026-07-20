@@ -5,7 +5,7 @@
 # Key features:
 # - env_file values MUST be declared as parameters
 # - .env files provide values for parameters (not direct environment injection)
-# - service-federation.yaml is the single source of truth
+# - fed.yaml is the single source of truth
 # - Priority: explicit value > env_file > default
 
 # Load .env files to set parameter values
