@@ -832,10 +832,12 @@ mod tests {
             Duration::from_secs(30 * 60)
         );
 
-        // Known gap: parse_duration_string handles ms/s/m but not h, so an hour
-        // suffix silently falls back to the default rather than meaning an hour.
-        // Asserted so the behaviour is visible; update this if `h` is supported.
-        assert_eq!(duration_or_default(Some("1h"), default), default);
+        // The hour suffix matters most here: FED_VAULT_MAX_AGE defaults to 24h,
+        // so an hour-scale override is the natural thing to write.
+        assert_eq!(
+            duration_or_default(Some("1h"), default),
+            Duration::from_secs(3600)
+        );
 
         // Unparseable values fall back rather than panicking or zeroing the
         // knob — a zero grace would turn every cold vault into a hard block.

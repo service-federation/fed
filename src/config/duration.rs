@@ -11,9 +11,11 @@ use std::time::Duration;
 /// - `"Nms"` - N milliseconds (e.g., "500ms")
 /// - `"Ns"` - N seconds (e.g., "30s")
 /// - `"Nm"` - N minutes (e.g., "5m")
+/// - `"Nh"` - N hours (e.g., "24h")
 /// - `"N"` - N seconds (no suffix, assumes seconds)
 ///
-/// Returns `None` if the string cannot be parsed.
+/// Returns `None` if the string cannot be parsed, including when the value
+/// would overflow (e.g. an hour count larger than `u64::MAX` seconds).
 ///
 /// # Examples
 ///
@@ -24,6 +26,7 @@ use std::time::Duration;
 /// assert_eq!(parse_duration_string("5s"), Some(Duration::from_secs(5)));
 /// assert_eq!(parse_duration_string("500ms"), Some(Duration::from_millis(500)));
 /// assert_eq!(parse_duration_string("1m"), Some(Duration::from_secs(60)));
+/// assert_eq!(parse_duration_string("24h"), Some(Duration::from_secs(86_400)));
 /// assert_eq!(parse_duration_string("30"), Some(Duration::from_secs(30)));
 /// ```
 pub fn parse_duration_string(s: &str) -> Option<Duration> {
@@ -44,10 +47,20 @@ pub fn parse_duration_string(s: &str) -> Option<Duration> {
             .ok()
             .map(Duration::from_secs)
     } else if s.ends_with('m') {
+        // checked_mul, not `*`: a minute count above u64::MAX/60 still parses as
+        // a u64, and the unchecked multiply panicked in debug builds on config
+        // input. Overflow is a parse failure, so the caller's default applies.
         s.trim_end_matches('m')
             .parse::<u64>()
             .ok()
-            .map(|m| Duration::from_secs(m * 60))
+            .and_then(|m| m.checked_mul(60))
+            .map(Duration::from_secs)
+    } else if s.ends_with('h') {
+        s.trim_end_matches('h')
+            .parse::<u64>()
+            .ok()
+            .and_then(|h| h.checked_mul(60 * 60))
+            .map(Duration::from_secs)
     } else {
         // Default to seconds if no suffix
         s.parse::<u64>().ok().map(Duration::from_secs)
@@ -72,6 +85,23 @@ mod tests {
     fn test_parse_duration_minutes() {
         assert_eq!(parse_duration_string("1m"), Some(Duration::from_secs(60)));
         assert_eq!(parse_duration_string("5m"), Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn test_parse_duration_hours() {
+        assert_eq!(parse_duration_string("1h"), Some(Duration::from_secs(3600)));
+        assert_eq!(
+            parse_duration_string("24h"),
+            Some(Duration::from_secs(86_400))
+        );
+    }
+
+    #[test]
+    fn test_parse_duration_rejects_overflow_instead_of_panicking() {
+        // These parse as u64 but overflow when scaled to seconds. The caller's
+        // default should apply rather than the process aborting on config input.
+        assert_eq!(parse_duration_string(&format!("{}m", u64::MAX)), None);
+        assert_eq!(parse_duration_string(&format!("{}h", u64::MAX)), None);
     }
 
     #[test]

@@ -78,9 +78,7 @@ fn cold_vault_with_fresh_cache_proceeds_within_grace() {
         .env("FED_TOKEN", "test-token")
         .env("FED_CLOUD_URL", format!("http://127.0.0.1:{port}"))
         .env("FED_VAULT_GRACE", "1s")
-        // Seconds, not "24h": parse_duration_string has no hour suffix, so "24h"
-        // silently fell back to the default instead of setting anything.
-        .env("FED_VAULT_MAX_AGE", "86400s")
+        .env("FED_VAULT_MAX_AGE", "24h")
         // Keep the blocking budget short so a regression fails promptly.
         .env("FED_VAULT_TIMEOUT", "8s")
         .output()
