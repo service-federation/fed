@@ -21,15 +21,13 @@ impl Parser {
     }
 
     fn find_config_in_dir_inner(dir: &Path, origin: &Path) -> Result<PathBuf> {
-        let config_path = dir.join("service-federation.yaml");
-        if config_path.exists() {
+        if let Some((config_path, warning)) =
+            crate::config::discovery::config_file_in_dir_with_warning(dir)
+        {
+            if let Some(warning) = warning {
+                eprintln!("{}", warning);
+            }
             return Ok(config_path);
-        }
-
-        // Try alternate name
-        let alt_path = dir.join("service-federation.yml");
-        if alt_path.exists() {
-            return Ok(alt_path);
         }
 
         // Try parent directory
@@ -38,7 +36,7 @@ impl Parser {
         }
 
         Err(Error::Config(format!(
-            "Could not find service-federation.yaml in '{}' or any parent directory.\n\
+            "Could not find fed.yaml (or service-federation.yaml) in '{}' or any parent directory.\n\
              Create one with `fed init` or specify a path with `fed -c <path>`",
             origin.display()
         )))

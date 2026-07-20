@@ -123,17 +123,13 @@ impl ExternalDependencyResolver {
 
     /// Load external config from a repository path
     fn load_external_config(&self, repo_path: &Path) -> Result<Config> {
-        let config_path = repo_path.join("service-federation.yaml");
-        if !config_path.exists() {
-            let alt_path = repo_path.join("service-federation.yml");
-            if alt_path.exists() {
-                return self.parse_config(&alt_path);
-            }
-            return Err(Error::Config(format!(
-                "No service-federation.yaml found in external repo at {:?}",
-                repo_path
-            )));
-        }
+        let config_path =
+            crate::config::discovery::config_file_in_dir(repo_path).ok_or_else(|| {
+                Error::Config(format!(
+                    "No fed.yaml or service-federation.yaml found in external repo at {:?}",
+                    repo_path
+                ))
+            })?;
 
         self.parse_config(&config_path)
     }

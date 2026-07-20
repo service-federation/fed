@@ -782,7 +782,7 @@ fn test_init_help() {
 #[test]
 fn test_init_creates_config() {
     let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("service-federation.yaml");
+    let config_path = temp_dir.path().join("fed.yaml");
 
     // Ensure no config exists
     assert!(!config_path.exists());
@@ -800,9 +800,31 @@ fn test_init_creates_config() {
     );
 
     // Config should now exist
+    assert!(config_path.exists(), "init should create fed.yaml");
+}
+
+#[test]
+fn test_init_default_output_is_fed_yaml() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let output = Command::new(fed_binary())
+        .args(["init"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("Failed to run fed");
+
     assert!(
-        config_path.exists(),
-        "init should create service-federation.yaml"
+        output.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        temp_dir.path().join("fed.yaml").exists(),
+        "init without -o should create fed.yaml"
+    );
+    assert!(
+        !temp_dir.path().join("service-federation.yaml").exists(),
+        "init should no longer create service-federation.yaml by default"
     );
 }
 

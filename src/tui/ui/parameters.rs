@@ -57,7 +57,7 @@ fn draw_parameters(f: &mut Frame, app: &App, area: Rect) {
                 )]),
                 Line::from(""),
                 Line::from(vec![Span::styled(
-                    "  Parameters are defined in your service-federation.yaml",
+                    "  Parameters are defined in your fed.yaml",
                     Style::default().fg(Color::DarkGray),
                 )]),
                 Line::from(vec![Span::styled(

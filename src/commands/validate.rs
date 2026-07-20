@@ -11,7 +11,7 @@ pub fn run_validate(config_path: Option<PathBuf>, out: &dyn UserOutput) -> anyho
             Ok(path) => path,
             Err(_) => {
                 anyhow::bail!(
-                    "No configuration file found.\n\nSearched for service-federation.yaml in:\n  - Current directory: {}\n  - Parent directories up to root\n\nRun 'fed init' to create a starter configuration.",
+                    "No configuration file found.\n\nSearched for fed.yaml (and service-federation.yaml) in:\n  - Current directory: {}\n  - Parent directories up to root\n\nRun 'fed init' to create a starter fed.yaml.",
                     std::env::current_dir()?.display()
                 );
             }

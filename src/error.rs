@@ -40,9 +40,7 @@ pub enum Error {
     #[error("Service not found: {0}")]
     #[diagnostic(
         code(fed::service::not_found),
-        help(
-            "Check available services with `fed status` or validate your service-federation.yaml"
-        )
+        help("Check available services with `fed status` or validate your fed.yaml")
     )]
     ServiceNotFound(String),
 
@@ -50,7 +48,7 @@ pub enum Error {
     #[diagnostic(
         code(fed::parameter::not_found),
         help(
-            "Declare the parameter in your service-federation.yaml:\n\nparameters:\n  {0}:\n    default: \"value\""
+            "Declare the parameter in your fed.yaml:\n\nparameters:\n  {0}:\n    default: \"value\""
         )
     )]
     ParameterNotFound(String),
@@ -65,7 +63,7 @@ pub enum Error {
     #[error("Invalid parameter value for '{name}': {reason}")]
     #[diagnostic(
         code(fed::parameter::invalid),
-        help("Check the parameter type and constraints in your service-federation.yaml")
+        help("Check the parameter type and constraints in your fed.yaml")
     )]
     InvalidParameter { name: String, reason: String },
 
@@ -215,12 +213,12 @@ pub enum Error {
     #[error("Script not found: {0}")]
     #[diagnostic(
         code(fed::script::not_found),
-        help("List available scripts in the 'scripts:' section of your service-federation.yaml")
+        help("List available scripts in the 'scripts:' section of your fed.yaml")
     )]
     ScriptNotFound(String),
 
     #[error(
-        "Environment file '{env_file}' sets undeclared parameter '{name}': declare it in service-federation.yaml or remove from .env"
+        "Environment file '{env_file}' sets undeclared parameter '{name}': declare it in fed.yaml or remove from .env"
     )]
     #[diagnostic(
         code(fed::env::undeclared),
@@ -240,7 +238,7 @@ impl Error {
     pub fn suggestion(&self) -> Option<String> {
         match self {
             Error::ServiceNotFound(name) => Some(format!(
-                "No service named '{}' is defined in your config. Run 'fed status' to list services, or check service-federation.yaml for typos.",
+                "No service named '{}' is defined in your config. Run 'fed status' to list services, or check your fed.yaml for typos.",
                 name
             )),
             Error::ServiceNotRunning(name) => Some(format!(
@@ -303,7 +301,7 @@ impl Error {
                 name
             )),
             Error::UndeclaredEnvVariable { name, .. } => Some(format!(
-                "Add a parameter declaration for '{}' in your service-federation.yaml:\n\nparameters:\n  {}:\n    default: \"\"",
+                "Add a parameter declaration for '{}' in your fed.yaml:\n\nparameters:\n  {}:\n    default: \"\"",
                 name, name
             )),
             Error::Database(e) => {

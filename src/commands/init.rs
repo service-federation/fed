@@ -1,7 +1,7 @@
 use crate::output::UserOutput;
 use std::path::Path;
 
-const TEMPLATE: &str = r#"# service-federation.yaml — your repository's runnable dev stack.
+const TEMPLATE: &str = r#"# fed.yaml — your repository's runnable dev stack.
 # `fed start` brings the whole thing up in dependency order, waiting on each healthcheck.
 # This is a starting point: rename the services, swap the commands, delete what you don't use.
 # Full reference: https://www.service-federation.com/docs/

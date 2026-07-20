@@ -160,7 +160,7 @@ impl ProcessService {
         let mut cmd = Command::new("/bin/bash");
 
         // NOTE: We do NOT shell-escape the process command here because:
-        // 1. The command comes from service-federation.yaml (trusted config)
+        // 1. The command comes from the fed config (trusted)
         // 2. We pass it to bash -c which expects a shell command string to parse
         // 3. Shell-escaping would break commands with quotes/args (e.g., `echo "hello"`
         //    becomes `'echo "hello"'` which bash treats as a literal filename)

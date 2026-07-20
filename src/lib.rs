@@ -24,7 +24,7 @@
 //! # async fn example() -> Result<(), fed::Error> {
 //! // Load and parse configuration
 //! let parser = Parser::new();
-//! let config = parser.load_config("service-federation.yaml")?;
+//! let config = parser.load_config("fed.yaml")?;
 //!
 //! // Create and initialize orchestrator
 //! let mut orchestrator = Orchestrator::new(config, std::path::PathBuf::from(".")).await?;

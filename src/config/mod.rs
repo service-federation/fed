@@ -17,6 +17,7 @@
 //! - `parser` - YAML config parsing
 //! - `validation` - Config validation
 
+pub mod discovery;
 pub mod env_loader;
 
 mod dependency;

@@ -8,7 +8,7 @@
 //! The expansion process:
 //! 1. Find all services with `type: external`
 //! 2. Clone/update the external repository
-//! 3. Load the external `service-federation.yaml`
+//! 3. Load the external config (`fed.yaml` or `service-federation.yaml`)
 //! 4. Resolve parameter templates from parent to external
 //! 5. Import the target service and its dependencies with namespacing
 //! 6. Adjust paths and dependencies for the imported services
@@ -125,9 +125,8 @@ impl<'a> ExternalServiceExpander<'a> {
         // Check if target service exists in external config
         if !external_config.services.contains_key(target_service_name) {
             return Err(Error::Config(format!(
-                "Service '{}' not found in external config {:?}",
-                target_service_name,
-                target_path.join("service-federation.yaml")
+                "Service '{}' not found in external config in {:?}",
+                target_service_name, target_path
             )));
         }
 
@@ -193,14 +192,13 @@ impl<'a> ExternalServiceExpander<'a> {
     /// Load external config from a repository path
     fn load_external_config(&self, repo_path: &Path) -> Result<Config> {
         let parser = Parser::new();
-        let config_path = repo_path.join("service-federation.yaml");
-
-        if !config_path.exists() {
-            return Err(Error::Config(format!(
-                "External config not found at {:?}",
-                config_path
-            )));
-        }
+        let config_path =
+            crate::config::discovery::config_file_in_dir(repo_path).ok_or_else(|| {
+                Error::Config(format!(
+                    "External config not found at {:?}",
+                    repo_path.join(crate::config::discovery::DEFAULT_CONFIG_FILENAME)
+                ))
+            })?;
 
         parser.load_config(&config_path)
     }
