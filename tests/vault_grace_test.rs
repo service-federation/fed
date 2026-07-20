@@ -1,8 +1,8 @@
 //! End-to-end check of the cold-vault grace window (02-cold-vault.md).
 //!
-//! This file runs as its own test binary with a single test, so setting
-//! process-global env (`FED_TOKEN`, `FED_CLOUD_URL`, the vault knobs) is safe —
-//! nothing else races it.
+//! The parent test configures a child test process with `Command::env`. This
+//! exercises the real environment-based CI path without mutating the parent
+//! process's global environment.
 //!
 //! Scenario: a "cold" vault that accepts the TCP connection but never answers,
 //! plus a fresh local cache. With a short grace the resolver must fall back to
@@ -13,11 +13,14 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::TcpListener;
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fed::config::{Config, Parameter};
 use fed::parameter::Resolver;
 use tempfile::TempDir;
+
+const CHILD_WORK_DIR: &str = "FED_VAULT_TEST_WORK_DIR";
 
 #[test]
 fn cold_vault_with_fresh_cache_proceeds_within_grace() {
@@ -62,15 +65,38 @@ fn cold_vault_with_fresh_cache_proceeds_within_grace() {
     )
     .unwrap();
 
-    // Credentials via env (the CI path), pointed at our dead server, with a
-    // tiny grace and a large freshness bound.
-    std::env::set_var("FED_TOKEN", "test-token");
-    std::env::set_var("FED_CLOUD_URL", format!("http://127.0.0.1:{port}"));
-    std::env::set_var("FED_VAULT_GRACE", "1s");
-    std::env::set_var("FED_VAULT_MAX_AGE", "24h");
-    // Keep the blocking budget short too, so a bug that blocks instead of using
-    // the cache fails fast rather than hanging the whole suite.
-    std::env::set_var("FED_VAULT_TIMEOUT", "8s");
+    // Configure the environment before the child starts. Unlike `set_var`,
+    // `Command::env` does not mutate process-global state.
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "cold_vault_with_fresh_cache_proceeds_within_grace_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(CHILD_WORK_DIR, temp.path())
+        .env("FED_TOKEN", "test-token")
+        .env("FED_CLOUD_URL", format!("http://127.0.0.1:{port}"))
+        .env("FED_VAULT_GRACE", "1s")
+        .env("FED_VAULT_MAX_AGE", "24h")
+        // Keep the blocking budget short so a regression fails promptly.
+        .env("FED_VAULT_TIMEOUT", "8s")
+        .output()
+        .expect("failed to run the cold-vault child test");
+
+    assert!(
+        output.status.success(),
+        "cold-vault child test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+#[ignore = "run by the parent test in an isolated child process"]
+fn cold_vault_with_fresh_cache_proceeds_within_grace_child() {
+    let work_dir = std::env::var_os(CHILD_WORK_DIR)
+        .expect("child test requires its work directory in the environment");
 
     let mut config = Config::default();
     config.parameters.insert(
@@ -83,25 +109,13 @@ fn cold_vault_with_fresh_cache_proceeds_within_grace() {
     );
 
     let mut resolver = Resolver::new();
-    resolver.set_work_dir(temp.path());
+    resolver.set_work_dir(work_dir);
 
     let start = Instant::now();
     resolver
         .resolve_parameters(&mut config)
         .expect("fresh cache must satisfy the run when the vault is cold");
     let elapsed = start.elapsed();
-
-    // Cleanup env before asserting (so a panic still leaves a clean process is
-    // moot here — single test — but tidy regardless).
-    for var in [
-        "FED_TOKEN",
-        "FED_CLOUD_URL",
-        "FED_VAULT_GRACE",
-        "FED_VAULT_MAX_AGE",
-        "FED_VAULT_TIMEOUT",
-    ] {
-        std::env::remove_var(var);
-    }
 
     let resolved: &HashMap<String, String> = resolver.get_resolved_parameters();
     assert_eq!(
