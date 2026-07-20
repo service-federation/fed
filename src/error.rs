@@ -414,35 +414,34 @@ pub fn validate_pid_start_time(pid: u32, expected_start: chrono::DateTime<chrono
             if let Some(close_paren) = stat.rfind(')') {
                 let fields: Vec<&str> = stat[close_paren + 2..].split_whitespace().collect();
                 // Field 20 (0-indexed after the first two fields) is starttime
-                if let Some(&starttime_str) = fields.get(19) {
-                    if let Ok(starttime_jiffies) = starttime_str.parse::<u64>() {
-                        let now = chrono::Utc::now();
-                        let expected_age = now.signed_duration_since(expected_start);
+                if let Some(&starttime_str) = fields.get(19)
+                    && let Ok(starttime_jiffies) = starttime_str.parse::<u64>()
+                {
+                    let now = chrono::Utc::now();
+                    let expected_age = now.signed_duration_since(expected_start);
 
-                        // Get uptime to calculate approximate process start
-                        if let Ok(uptime_str) = std::fs::read_to_string("/proc/uptime") {
-                            if let Some(uptime_secs_str) = uptime_str.split_whitespace().next() {
-                                if let Ok(uptime_secs) = uptime_secs_str.parse::<f64>() {
-                                    let jiffies_per_sec = get_clock_ticks_per_sec();
-                                    let process_age_secs = uptime_secs
-                                        - (starttime_jiffies as f64 / jiffies_per_sec as f64);
+                    // Get uptime to calculate approximate process start
+                    if let Ok(uptime_str) = std::fs::read_to_string("/proc/uptime")
+                        && let Some(uptime_secs_str) = uptime_str.split_whitespace().next()
+                        && let Ok(uptime_secs) = uptime_secs_str.parse::<f64>()
+                    {
+                        let jiffies_per_sec = get_clock_ticks_per_sec();
+                        let process_age_secs =
+                            uptime_secs - (starttime_jiffies as f64 / jiffies_per_sec as f64);
 
-                                    // If process started more than 60 seconds before our expected time,
-                                    // it's likely a different process that reused the PID
-                                    let expected_age_secs = expected_age.num_seconds() as f64;
-                                    let time_diff = (process_age_secs - expected_age_secs).abs();
+                        // If process started more than 60 seconds before our expected time,
+                        // it's likely a different process that reused the PID
+                        let expected_age_secs = expected_age.num_seconds() as f64;
+                        let time_diff = (process_age_secs - expected_age_secs).abs();
 
-                                    if time_diff > 60.0 {
-                                        tracing::warn!(
-                                            "PID {} appears to be reused: process age {:.0}s vs expected {:.0}s",
-                                            pid,
-                                            process_age_secs,
-                                            expected_age_secs
-                                        );
-                                        return false;
-                                    }
-                                }
-                            }
+                        if time_diff > 60.0 {
+                            tracing::warn!(
+                                "PID {} appears to be reused: process age {:.0}s vs expected {:.0}s",
+                                pid,
+                                process_age_secs,
+                                expected_age_secs
+                            );
+                            return false;
                         }
                     }
                 }

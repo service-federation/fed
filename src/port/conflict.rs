@@ -176,24 +176,22 @@ impl PortConflict {
             if let Some(users_part) = line.split_whitespace().last() {
                 // ss can report multiple pids per line
                 for part in users_part.split(',') {
-                    if let Some(pid_str) = part.strip_prefix("pid=") {
-                        if let Ok(pid) = pid_str.parse::<u32>() {
-                            if !seen_pids.contains(&pid) {
-                                seen_pids.insert(pid);
-                                // Get process name from /proc
-                                let name = std::fs::read_to_string(format!("/proc/{}/comm", pid))
-                                    .ok()
-                                    .map(|s| s.trim().to_string())
-                                    .unwrap_or_else(|| "unknown".to_string());
+                    if let Some(pid_str) = part.strip_prefix("pid=")
+                        && let Ok(pid) = pid_str.parse::<u32>()
+                        && !seen_pids.contains(&pid)
+                    {
+                        seen_pids.insert(pid);
+                        // Get process name from /proc
+                        let name = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
 
-                                let command =
-                                    std::fs::read_to_string(format!("/proc/{}/cmdline", pid))
-                                        .ok()
-                                        .map(|s| s.replace('\0', " ").trim().to_string());
+                        let command = std::fs::read_to_string(format!("/proc/{}/cmdline", pid))
+                            .ok()
+                            .map(|s| s.replace('\0', " ").trim().to_string());
 
-                                processes.push(ProcessInfo { pid, name, command });
-                            }
-                        }
+                        processes.push(ProcessInfo { pid, name, command });
                     }
                 }
             }
@@ -233,17 +231,17 @@ impl PortConflict {
 
         for line in stdout.lines() {
             if let Some(stripped) = line.strip_prefix('p') {
-                if let Some(pid) = current_pid {
-                    if !seen_pids.contains(&pid) {
-                        seen_pids.insert(pid);
-                        processes.push(ProcessInfo {
-                            pid,
-                            name: current_command
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string()),
-                            command: current_command.clone(),
-                        });
-                    }
+                if let Some(pid) = current_pid
+                    && !seen_pids.contains(&pid)
+                {
+                    seen_pids.insert(pid);
+                    processes.push(ProcessInfo {
+                        pid,
+                        name: current_command
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        command: current_command.clone(),
+                    });
                 }
                 current_pid = stripped.parse::<u32>().ok();
                 current_command = None;
@@ -252,16 +250,16 @@ impl PortConflict {
             }
         }
 
-        if let Some(pid) = current_pid {
-            if !seen_pids.contains(&pid) {
-                processes.push(ProcessInfo {
-                    pid,
-                    name: current_command
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    command: current_command,
-                });
-            }
+        if let Some(pid) = current_pid
+            && !seen_pids.contains(&pid)
+        {
+            processes.push(ProcessInfo {
+                pid,
+                name: current_command
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                command: current_command,
+            });
         }
 
         processes
