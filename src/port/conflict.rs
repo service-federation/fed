@@ -100,17 +100,17 @@ impl PortConflict {
         for line in stdout.lines() {
             if let Some(stripped) = line.strip_prefix('p') {
                 // New process - save the previous one if valid
-                if let Some(pid) = current_pid {
-                    if !seen_pids.contains(&pid) {
-                        seen_pids.insert(pid);
-                        processes.push(ProcessInfo {
-                            pid,
-                            name: current_command
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string()),
-                            command: current_command.clone(),
-                        });
-                    }
+                if let Some(pid) = current_pid
+                    && !seen_pids.contains(&pid)
+                {
+                    seen_pids.insert(pid);
+                    processes.push(ProcessInfo {
+                        pid,
+                        name: current_command
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        command: current_command.clone(),
+                    });
                 }
                 current_pid = stripped.parse::<u32>().ok();
                 current_command = None;
@@ -120,16 +120,16 @@ impl PortConflict {
         }
 
         // Don't forget the last process
-        if let Some(pid) = current_pid {
-            if !seen_pids.contains(&pid) {
-                processes.push(ProcessInfo {
-                    pid,
-                    name: current_command
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    command: current_command,
-                });
-            }
+        if let Some(pid) = current_pid
+            && !seen_pids.contains(&pid)
+        {
+            processes.push(ProcessInfo {
+                pid,
+                name: current_command
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                command: current_command,
+            });
         }
 
         processes
@@ -457,15 +457,15 @@ impl PortConflict {
 
             // Port still in use - find any new processes that appeared
             if attempt < max_attempts {
-                if let Some(new_conflict) = Self::check(self.port) {
-                    if !new_conflict.processes.is_empty() {
-                        // Kill these too
-                        let _ = new_conflict.kill_all_blocking_processes();
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Some(new_conflict) = Self::check(self.port)
+                    && !new_conflict.processes.is_empty()
+                {
+                    // Kill these too
+                    let _ = new_conflict.kill_all_blocking_processes();
+                    std::thread::sleep(std::time::Duration::from_millis(100));
 
-                        if Self::is_port_available(self.port) {
-                            return Ok(());
-                        }
+                    if Self::is_port_available(self.port) {
+                        return Ok(());
                     }
                 }
 

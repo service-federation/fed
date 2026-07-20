@@ -36,13 +36,13 @@ impl Config {
         }
 
         // Validate entrypoint references
-        if let Some(ref ep) = self.entrypoint {
-            if !self.services.contains_key(ep) {
-                return Err(Error::Validation(format!(
-                    "Entrypoint '{}' references non-existent service",
-                    ep
-                )));
-            }
+        if let Some(ref ep) = self.entrypoint
+            && !self.services.contains_key(ep)
+        {
+            return Err(Error::Validation(format!(
+                "Entrypoint '{}' references non-existent service",
+                ep
+            )));
         }
 
         for ep in &self.entrypoints {
@@ -63,15 +63,15 @@ impl Config {
             entrypoint_names.push(ep);
         }
         for ep_name in &entrypoint_names {
-            if let Some(service) = self.services.get(*ep_name) {
-                if service.startup_message.is_none() {
-                    eprintln!(
-                        "Warning: Entrypoint service '{}' has no startup_message.\n\
+            if let Some(service) = self.services.get(*ep_name)
+                && service.startup_message.is_none()
+            {
+                eprintln!(
+                    "Warning: Entrypoint service '{}' has no startup_message.\n\
                                   Without this, isolated mode won't show where to access the application.\n\
                                   Add: startup_message: \"http://localhost:{{{{PORT}}}}\"",
-                        ep_name
-                    );
-                }
+                    ep_name
+                );
             }
         }
 
@@ -141,21 +141,21 @@ impl Config {
 
         // Validate duration strings
         for (name, service) in &self.services {
-            if let Some(ref gp) = service.grace_period {
-                if parse_duration_string(gp).is_none() {
-                    return Err(Error::Validation(format!(
-                        "Service '{}' has invalid grace_period '{}'. Use formats like '5s', '30s', '1m', '500ms'",
-                        name, gp
-                    )));
-                }
+            if let Some(ref gp) = service.grace_period
+                && parse_duration_string(gp).is_none()
+            {
+                return Err(Error::Validation(format!(
+                    "Service '{}' has invalid grace_period '{}'. Use formats like '5s', '30s', '1m', '500ms'",
+                    name, gp
+                )));
             }
-            if let Some(ref st) = service.startup_timeout {
-                if parse_duration_string(st).is_none() {
-                    return Err(Error::Validation(format!(
-                        "Service '{}' has invalid startup_timeout '{}'. Use formats like '60s', '5m', '500ms'",
-                        name, st
-                    )));
-                }
+            if let Some(ref st) = service.startup_timeout
+                && parse_duration_string(st).is_none()
+            {
+                return Err(Error::Validation(format!(
+                    "Service '{}' has invalid startup_timeout '{}'. Use formats like '60s', '5m', '500ms'",
+                    name, st
+                )));
             }
             if let Some(ref hc) = service.healthcheck {
                 let timeout_str = match hc {
@@ -163,25 +163,25 @@ impl Config {
                     HealthCheck::CommandMap { timeout, .. } => timeout.as_deref(),
                     HealthCheck::Command(_) => None,
                 };
-                if let Some(t) = timeout_str {
-                    if parse_duration_string(t).is_none() {
-                        return Err(Error::Validation(format!(
-                            "Service '{}' has invalid healthcheck timeout '{}'. Use formats like '5s', '30s', '1m', '500ms'",
-                            name, t
-                        )));
-                    }
+                if let Some(t) = timeout_str
+                    && parse_duration_string(t).is_none()
+                {
+                    return Err(Error::Validation(format!(
+                        "Service '{}' has invalid healthcheck timeout '{}'. Use formats like '5s', '30s', '1m', '500ms'",
+                        name, t
+                    )));
                 }
             }
         }
 
         for (name, script) in &self.scripts {
-            if let Some(ref t) = script.timeout {
-                if parse_duration_string(t).is_none() {
-                    return Err(Error::Validation(format!(
-                        "Script '{}' has invalid timeout '{}'. Use formats like '5s', '30s', '1m', '500ms'",
-                        name, t
-                    )));
-                }
+            if let Some(ref t) = script.timeout
+                && parse_duration_string(t).is_none()
+            {
+                return Err(Error::Validation(format!(
+                    "Script '{}' has invalid timeout '{}'. Use formats like '5s', '30s', '1m', '500ms'",
+                    name, t
+                )));
             }
 
             // `keep_services` keeps the started stack up for later use, but an
@@ -258,13 +258,13 @@ impl Config {
             }
 
             // Only known source values are allowed
-            if let Some(ref source) = param.source {
-                if source != "manual" {
-                    return Err(Error::Validation(format!(
-                        "Secret parameter '{}' has unknown source '{}' — only 'manual' is currently supported",
-                        name, source
-                    )));
-                }
+            if let Some(ref source) = param.source
+                && source != "manual"
+            {
+                return Err(Error::Validation(format!(
+                    "Secret parameter '{}' has unknown source '{}' — only 'manual' is currently supported",
+                    name, source
+                )));
             }
 
             // Auto-generated secrets need no extra configuration: they default
@@ -274,15 +274,14 @@ impl Config {
 
         // Validate external service dependencies
         for (name, service) in &self.services {
-            if service.service_type() == ServiceType::External {
-                if let Some(ref dep_name) = service.dependency {
-                    if !self.dependencies.contains_key(dep_name) {
-                        return Err(Error::Validation(format!(
-                            "External service '{}' references undefined dependency '{}'",
-                            name, dep_name
-                        )));
-                    }
-                }
+            if service.service_type() == ServiceType::External
+                && let Some(ref dep_name) = service.dependency
+                && !self.dependencies.contains_key(dep_name)
+            {
+                return Err(Error::Validation(format!(
+                    "External service '{}' references undefined dependency '{}'",
+                    name, dep_name
+                )));
             }
 
             // Check service dependencies exist
@@ -396,12 +395,11 @@ impl Config {
         let mut path = Vec::new();
 
         for service_name in self.services.keys() {
-            if !visited.contains(service_name) {
-                if let Some(cycle) =
+            if !visited.contains(service_name)
+                && let Some(cycle) =
                     self.find_cycle(service_name, &mut visited, &mut rec_stack, &mut path)
-                {
-                    return Err(Error::CircularDependency(cycle));
-                }
+            {
+                return Err(Error::CircularDependency(cycle));
             }
         }
 
@@ -447,12 +445,11 @@ impl Config {
         let mut path = Vec::new();
 
         for script_name in self.scripts.keys() {
-            if !visited.contains(script_name) {
-                if let Some(cycle) =
+            if !visited.contains(script_name)
+                && let Some(cycle) =
                     self.find_script_cycle(script_name, &mut visited, &mut rec_stack, &mut path)
-                {
-                    return Err(Error::CircularDependency(cycle));
-                }
+            {
+                return Err(Error::CircularDependency(cycle));
             }
         }
 
@@ -532,10 +529,10 @@ impl Config {
         let mut findings: Vec<String> = Vec::new();
         for (name, service) in &self.services {
             let mut places: Vec<&str> = Vec::new();
-            if let Some(hc) = &service.healthcheck {
-                if hc.get_http_url().is_some_and(|u| local_port.is_match(u)) {
-                    places.push("healthcheck");
-                }
+            if let Some(hc) = &service.healthcheck
+                && hc.get_http_url().is_some_and(|u| local_port.is_match(u))
+            {
+                places.push("healthcheck");
             }
             if service
                 .startup_message
@@ -668,13 +665,13 @@ fn validate_resource_limits(service_name: &str, resources: &super::ResourceLimit
     }
 
     // Validate PIDs limit (must be > 0 or -1 for unlimited)
-    if let Some(pids) = resources.pids {
-        if pids == 0 {
-            return Err(Error::Validation(format!(
-                "Service '{}': pids limit must be greater than 0",
-                service_name
-            )));
-        }
+    if let Some(pids) = resources.pids
+        && pids == 0
+    {
+        return Err(Error::Validation(format!(
+            "Service '{}': pids limit must be greater than 0",
+            service_name
+        )));
     }
 
     // Validate nofile limit (must be > 0)

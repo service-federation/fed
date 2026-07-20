@@ -14,22 +14,20 @@ pub fn warn_if_dirty_tree() {
     if let Ok(output) = std::process::Command::new("git")
         .args(["diff", "--quiet"])
         .output()
+        && !output.status.success()
     {
-        if !output.status.success() {
-            eprintln!(
-                "Warning: Git working tree has uncommitted changes. Docker images will be tagged with the current commit hash, which may not reflect the actual contents."
-            );
-        }
+        eprintln!(
+            "Warning: Git working tree has uncommitted changes. Docker images will be tagged with the current commit hash, which may not reflect the actual contents."
+        );
     }
     if let Ok(output) = std::process::Command::new("git")
         .args(["diff", "--quiet", "--cached"])
         .output()
+        && !output.status.success()
     {
-        if !output.status.success() {
-            eprintln!(
-                "Warning: Git index has staged but uncommitted changes. Docker images will be tagged with the current commit hash, which may not reflect the actual contents."
-            );
-        }
+        eprintln!(
+            "Warning: Git index has staged but uncommitted changes. Docker images will be tagged with the current commit hash, which may not reflect the actual contents."
+        );
     }
 }
 

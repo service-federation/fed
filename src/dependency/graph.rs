@@ -136,12 +136,11 @@ impl Graph {
         let mut path = Vec::new();
 
         for node in &self.nodes {
-            if !visited.contains(node) {
-                if let Some(cycle) =
+            if !visited.contains(node)
+                && let Some(cycle) =
                     self.find_cycle_dfs(node, &mut visited, &mut rec_stack, &mut path)
-                {
-                    return cycle;
-                }
+            {
+                return cycle;
             }
         }
 

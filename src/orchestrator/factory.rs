@@ -138,15 +138,15 @@ impl Orchestrator {
                     merged_env.insert(k.clone(), v.clone());
                 }
                 // Use first service's working directory
-                if configs.len() == 1 {
-                    if let Some(ref cwd) = service.cwd {
-                        let cwd_path = PathBuf::from(cwd);
-                        work_dir_str = if cwd_path.is_absolute() {
-                            cwd.clone()
-                        } else {
-                            format!("{}/{}", self.work_dir().to_string_lossy(), cwd)
-                        };
-                    }
+                if configs.len() == 1
+                    && let Some(ref cwd) = service.cwd
+                {
+                    let cwd_path = PathBuf::from(cwd);
+                    work_dir_str = if cwd_path.is_absolute() {
+                        cwd.clone()
+                    } else {
+                        format!("{}/{}", self.work_dir().to_string_lossy(), cwd)
+                    };
                 }
             }
         }

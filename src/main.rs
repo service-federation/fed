@@ -84,43 +84,43 @@ async fn run() -> anyhow::Result<()> {
     // recursion; different dir → independent invocation, allow.
     //
     // FED_ALLOW_RECURSION=1 escapes the check entirely for unusual cases.
-    if std::env::var("FED_ALLOW_RECURSION").ok().as_deref() != Some("1") {
-        if let Ok(parent_service) = std::env::var("FED_SPAWNED_BY_SERVICE") {
-            let parent_workspace = std::env::var("FED_SPAWNED_FROM_WORKSPACE").ok();
-            let child_workspace = detect_current_workspace();
+    if std::env::var("FED_ALLOW_RECURSION").ok().as_deref() != Some("1")
+        && let Ok(parent_service) = std::env::var("FED_SPAWNED_BY_SERVICE")
+    {
+        let parent_workspace = std::env::var("FED_SPAWNED_FROM_WORKSPACE").ok();
+        let child_workspace = detect_current_workspace();
 
-            let same_workspace = match (&parent_workspace, &child_workspace) {
-                (Some(p), Some(c)) => canonicalize_eq(p, c),
-                // Older fed binaries (pre-3.6.3) didn't set
-                // FED_SPAWNED_FROM_WORKSPACE. Be conservative: treat as
-                // same-workspace and block, matching the old behavior.
-                _ => true,
-            };
+        let same_workspace = match (&parent_workspace, &child_workspace) {
+            (Some(p), Some(c)) => canonicalize_eq(p, c),
+            // Older fed binaries (pre-3.6.3) didn't set
+            // FED_SPAWNED_FROM_WORKSPACE. Be conservative: treat as
+            // same-workspace and block, matching the old behavior.
+            _ => true,
+        };
 
-            if same_workspace {
-                eprintln!("Error: Circular dependency detected!");
-                eprintln!();
-                eprintln!(
-                    "  Service '{}' invoked 'fed' against the same workspace,",
-                    parent_service
-                );
-                eprintln!("  which would create an infinite loop.");
-                eprintln!();
-                eprintln!("  Detected call chain:");
-                eprintln!("    fed start -> {} (process) -> fed", parent_service);
-                eprintln!();
-                eprintln!("  Fix: Change the process command in service-federation.yaml to run");
-                eprintln!("  the actual application directly instead of invoking 'fed'.");
-                eprintln!();
-                eprintln!("  Example: Instead of 'npm run dev' where dev runs 'fed start',");
-                eprintln!("  use 'npx next dev' or the direct command.");
-                eprintln!();
-                eprintln!("  Cross-config use case (orchestrator service shelling out to fed");
-                eprintln!("  for a different workspace): set FED_ALLOW_RECURSION=1 in the");
-                eprintln!("  child's environment, or invoke fed against a different");
-                eprintln!("  --workdir / cwd.");
-                std::process::exit(1);
-            }
+        if same_workspace {
+            eprintln!("Error: Circular dependency detected!");
+            eprintln!();
+            eprintln!(
+                "  Service '{}' invoked 'fed' against the same workspace,",
+                parent_service
+            );
+            eprintln!("  which would create an infinite loop.");
+            eprintln!();
+            eprintln!("  Detected call chain:");
+            eprintln!("    fed start -> {} (process) -> fed", parent_service);
+            eprintln!();
+            eprintln!("  Fix: Change the process command in service-federation.yaml to run");
+            eprintln!("  the actual application directly instead of invoking 'fed'.");
+            eprintln!();
+            eprintln!("  Example: Instead of 'npm run dev' where dev runs 'fed start',");
+            eprintln!("  use 'npx next dev' or the direct command.");
+            eprintln!();
+            eprintln!("  Cross-config use case (orchestrator service shelling out to fed");
+            eprintln!("  for a different workspace): set FED_ALLOW_RECURSION=1 in the");
+            eprintln!("  child's environment, or invoke fed against a different");
+            eprintln!("  --workdir / cwd.");
+            std::process::exit(1);
         }
     }
 
@@ -143,17 +143,16 @@ async fn run() -> anyhow::Result<()> {
 
         // Try to load config to show available scripts
         let parser = ConfigParser::new();
-        if let Ok(config_path) = parser.find_config_file() {
-            if let Ok(config) = parser.load_config(&config_path) {
-                if !config.scripts.is_empty() {
-                    println!();
-                    println!("Scripts (run with `fed <script>` or `fed run <script>`):");
-                    let mut script_names: Vec<_> = config.scripts.keys().collect();
-                    script_names.sort();
-                    for name in script_names {
-                        println!("  {}", name);
-                    }
-                }
+        if let Ok(config_path) = parser.find_config_file()
+            && let Ok(config) = parser.load_config(&config_path)
+            && !config.scripts.is_empty()
+        {
+            println!();
+            println!("Scripts (run with `fed <script>` or `fed run <script>`):");
+            let mut script_names: Vec<_> = config.scripts.keys().collect();
+            script_names.sort();
+            for name in script_names {
+                println!("  {}", name);
             }
         }
         return Ok(());

@@ -220,11 +220,11 @@ fn count_dirs(path: &std::path::Path) -> usize {
     let mut count = 0;
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
-            if let Ok(file_type) = entry.file_type() {
-                if file_type.is_dir() {
-                    count += 1;
-                    count += count_dirs(&entry.path());
-                }
+            if let Ok(file_type) = entry.file_type()
+                && file_type.is_dir()
+            {
+                count += 1;
+                count += count_dirs(&entry.path());
             }
         }
     }

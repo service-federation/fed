@@ -469,10 +469,10 @@ impl ServiceManager for ProcessService {
         } else {
             // In interactive mode: Store Child for log capture and proper cleanup
             // Also store PID
-            if let Some(pid) = child.id() {
-                if let Err(e) = self.validate_and_store_pid(pid) {
-                    tracing::error!("Invalid PID {} for '{}': {}", pid, self.name, e);
-                }
+            if let Some(pid) = child.id()
+                && let Err(e) = self.validate_and_store_pid(pid)
+            {
+                tracing::error!("Invalid PID {} for '{}': {}", pid, self.name, e);
             }
             *self.process.lock().await = Some(child);
         }
@@ -580,23 +580,23 @@ impl ServiceManager for ProcessService {
 
                 // Check for PID reuse before sending signals to avoid killing the wrong process
                 let started_at = *self.started_at.lock();
-                if let Some(expected_start) = started_at {
-                    if !crate::error::validate_pid_start_time(pid_val, expected_start) {
-                        tracing::warn!(
-                            "PID {} for service '{}' was reused by another process, skipping kill",
-                            pid_val,
-                            self.name
-                        );
-                        *self.pid.lock() = None;
+                if let Some(expected_start) = started_at
+                    && !crate::error::validate_pid_start_time(pid_val, expected_start)
+                {
+                    tracing::warn!(
+                        "PID {} for service '{}' was reused by another process, skipping kill",
+                        pid_val,
+                        self.name
+                    );
+                    *self.pid.lock() = None;
 
-                        // Shutdown log capture tasks
-                        self.log_capture.shutdown().await;
-                        *self.health_cache.lock().await = (None, Instant::now());
+                    // Shutdown log capture tasks
+                    self.log_capture.shutdown().await;
+                    *self.health_cache.lock().await = (None, Instant::now());
 
-                        let mut base = self.base.write();
-                        base.set_status(Status::Stopped);
-                        return Ok(());
-                    }
+                    let mut base = self.base.write();
+                    base.set_status(Status::Stopped);
+                    return Ok(());
                 }
 
                 // Try to get the actual process group ID (PGID) of the process.
@@ -724,10 +724,10 @@ impl ServiceManager for ProcessService {
         let mut cache = self.health_cache.lock().await;
 
         // Check if cached result is still valid
-        if let (Some(result), timestamp) = *cache {
-            if timestamp.elapsed() < HEALTH_CACHE_TTL {
-                return Ok(result);
-            }
+        if let (Some(result), timestamp) = *cache
+            && timestamp.elapsed() < HEALTH_CACHE_TTL
+        {
+            return Ok(result);
         }
 
         // Cache expired or empty - perform actual health check while holding lock.
@@ -854,15 +854,15 @@ impl ProcessService {
                     .output()
                     .await;
 
-                if let Ok(output) = output {
-                    if output.status.success() {
-                        let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        // Process state codes: Z = zombie, T = stopped
-                        if stat.starts_with('Z') || stat.starts_with('T') {
-                            return Ok(false); // Defunct/zombie or stopped
-                        }
-                        return Ok(true); // Process is alive and running
+                if let Ok(output) = output
+                    && output.status.success()
+                {
+                    let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    // Process state codes: Z = zombie, T = stopped
+                    if stat.starts_with('Z') || stat.starts_with('T') {
+                        return Ok(false); // Defunct/zombie or stopped
                     }
+                    return Ok(true); // Process is alive and running
                 }
             }
 

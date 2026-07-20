@@ -91,11 +91,11 @@ impl PackageResolver {
         let source = self.parse_source(&pkg_ref.source)?;
 
         // 2. Check cache (skip for local packages - they're always fresh)
-        if !matches!(source, PackageSource::Local { .. }) {
-            if let Some(cached) = self.check_cache(&source)? {
-                tracing::info!("Using cached package: {}", pkg_ref.r#as);
-                return self.load_from_cache(cached, &pkg_ref.r#as);
-            }
+        if !matches!(source, PackageSource::Local { .. })
+            && let Some(cached) = self.check_cache(&source)?
+        {
+            tracing::info!("Using cached package: {}", pkg_ref.r#as);
+            return self.load_from_cache(cached, &pkg_ref.r#as);
         }
 
         // 3. Fetch package
@@ -457,31 +457,30 @@ impl PackageResolver {
 
         // Try to read additional metadata from config file if it exists
         let metadata_file = path.join(".service-federation-metadata.json");
-        if metadata_file.exists() {
-            if let Ok(content) = std::fs::read_to_string(&metadata_file) {
-                if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&content) {
-                    return Ok(PackageMetadata {
-                        name: metadata
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                            .or(name),
-                        description: metadata
-                            .get("description")
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
-                        version: metadata
-                            .get("version")
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
-                        updated_at: chrono::Utc::now(),
-                        checksum: metadata
-                            .get("checksum")
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
-                    });
-                }
-            }
+        if metadata_file.exists()
+            && let Ok(content) = std::fs::read_to_string(&metadata_file)
+            && let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&content)
+        {
+            return Ok(PackageMetadata {
+                name: metadata
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .or(name),
+                description: metadata
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                version: metadata
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                updated_at: chrono::Utc::now(),
+                checksum: metadata
+                    .get("checksum")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+            });
         }
 
         // Try to extract version from source
@@ -769,14 +768,14 @@ services:
         }
 
         // Second package - should detect conflict
-        if let Some(identity) = source2.identity() {
-            if let Some((existing_version, _)) = resolved_versions.get(&identity) {
-                assert_ne!(
-                    existing_version,
-                    &source2.version(),
-                    "Should have detected version conflict"
-                );
-            }
+        if let Some(identity) = source2.identity()
+            && let Some((existing_version, _)) = resolved_versions.get(&identity)
+        {
+            assert_ne!(
+                existing_version,
+                &source2.version(),
+                "Should have detected version conflict"
+            );
         }
     }
 

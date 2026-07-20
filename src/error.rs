@@ -459,42 +459,40 @@ pub fn validate_pid_start_time(pid: u32, expected_start: chrono::DateTime<chrono
             .args(["-o", "lstart=", "-p", &pid.to_string()])
             .env("LC_ALL", "C")
             .output()
+            && output.status.success()
         {
-            if output.status.success() {
-                let lstart = String::from_utf8_lossy(&output.stdout);
-                // Parse the lstart format: "Mon Jan  1 12:00:00 2024"
-                let lstart = lstart.trim();
-                if !lstart.is_empty() {
-                    if let Ok(process_start) =
-                        chrono::NaiveDateTime::parse_from_str(lstart, "%a %b %e %H:%M:%S %Y")
-                    {
-                        // ps lstart returns local time, not UTC
-                        let process_start_utc = chrono::Local
-                            .from_local_datetime(&process_start)
-                            .earliest()
-                            .map(|dt| dt.with_timezone(&chrono::Utc));
-                        let Some(process_start_utc) = process_start_utc else {
-                            // Ambiguous/nonexistent time (DST transition) — trust the PID
-                            tracing::debug!(
-                                "PID {} start time {:?} is ambiguous during DST, trusting PID",
-                                pid,
-                                process_start
-                            );
-                            return true;
-                        };
-                        let time_diff = (process_start_utc - expected_start).num_seconds().abs();
+            let lstart = String::from_utf8_lossy(&output.stdout);
+            // Parse the lstart format: "Mon Jan  1 12:00:00 2024"
+            let lstart = lstart.trim();
+            if !lstart.is_empty()
+                && let Ok(process_start) =
+                    chrono::NaiveDateTime::parse_from_str(lstart, "%a %b %e %H:%M:%S %Y")
+            {
+                // ps lstart returns local time, not UTC
+                let process_start_utc = chrono::Local
+                    .from_local_datetime(&process_start)
+                    .earliest()
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+                let Some(process_start_utc) = process_start_utc else {
+                    // Ambiguous/nonexistent time (DST transition) — trust the PID
+                    tracing::debug!(
+                        "PID {} start time {:?} is ambiguous during DST, trusting PID",
+                        pid,
+                        process_start
+                    );
+                    return true;
+                };
+                let time_diff = (process_start_utc - expected_start).num_seconds().abs();
 
-                        // Allow 60 seconds tolerance for timing differences
-                        if time_diff > 60 {
-                            tracing::warn!(
-                                "PID {} appears to be reused: process started at {} vs expected {}",
-                                pid,
-                                process_start_utc,
-                                expected_start
-                            );
-                            return false;
-                        }
-                    }
+                // Allow 60 seconds tolerance for timing differences
+                if time_diff > 60 {
+                    tracing::warn!(
+                        "PID {} appears to be reused: process started at {} vs expected {}",
+                        pid,
+                        process_start_utc,
+                        expected_start
+                    );
+                    return false;
                 }
             }
         }

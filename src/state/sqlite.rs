@@ -55,14 +55,13 @@ fn is_fed_process(pid: u32) -> bool {
         .args(["-o", "comm=", "-p", &pid.to_string()])
         .env("LC_ALL", "C")
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let comm = String::from_utf8_lossy(&output.stdout);
-            let name = comm.trim();
-            // ps may return the full path (e.g. /usr/local/bin/fed) or just "fed"
-            let basename = name.rsplit('/').next().unwrap_or(name);
-            return basename.starts_with("fed");
-        }
+        let comm = String::from_utf8_lossy(&output.stdout);
+        let name = comm.trim();
+        // ps may return the full path (e.g. /usr/local/bin/fed) or just "fed"
+        let basename = name.rsplit('/').next().unwrap_or(name);
+        return basename.starts_with("fed");
     }
 
     // Can't determine — assume it's fed to be safe
@@ -287,15 +286,14 @@ impl SqliteStateTracker {
 
                 // Validate PIDs - filter out invalid ones (don't delete, just skip)
                 services.retain(|service_id, service_state| {
-                    if let Some(pid) = service_state.pid {
-                        if pid > i32::MAX as u32 || pid == 0 {
+                    if let Some(pid) = service_state.pid
+                        && (pid > i32::MAX as u32 || pid == 0) {
                             warn!(
                                 "Service '{}' has invalid PID {} (exceeds i32::MAX or is 0), skipping",
                                 service_id, pid
                             );
                             return false;
                         }
-                    }
                     true
                 });
 
@@ -1837,8 +1835,8 @@ impl SqliteStateTracker {
             // Validate and remove services with invalid PIDs
             let mut invalid_service_ids = Vec::new();
             services.retain(|service_id, service_state| {
-                if let Some(pid) = service_state.pid {
-                    if pid > i32::MAX as u32 || pid == 0 {
+                if let Some(pid) = service_state.pid
+                    && (pid > i32::MAX as u32 || pid == 0) {
                         warn!(
                             "Service '{}' has invalid PID {} (exceeds i32::MAX or is 0), removing from state",
                             service_id, pid
@@ -1846,7 +1844,6 @@ impl SqliteStateTracker {
                         invalid_service_ids.push(service_id.clone());
                         return false;
                     }
-                }
                 true
             });
 

@@ -248,14 +248,11 @@ impl DockerClient {
         let mut mappings = HashMap::new();
         if let Some(ports_obj) = ports_json.as_object() {
             for (container_port, bindings) in ports_obj {
-                if let Some(bindings_array) = bindings.as_array() {
-                    if let Some(first_binding) = bindings_array.first() {
-                        if let Some(host_port) =
-                            first_binding.get("HostPort").and_then(|v| v.as_str())
-                        {
-                            mappings.insert(container_port.clone(), host_port.to_string());
-                        }
-                    }
+                if let Some(bindings_array) = bindings.as_array()
+                    && let Some(first_binding) = bindings_array.first()
+                    && let Some(host_port) = first_binding.get("HostPort").and_then(|v| v.as_str())
+                {
+                    mappings.insert(container_port.clone(), host_port.to_string());
                 }
             }
         }
@@ -594,10 +591,10 @@ impl DockerClient {
         let v2 = self
             .run(&["compose", "version"], Duration::from_secs(5))
             .await;
-        if let Ok(ref o) = v2 {
-            if o.status.success() {
-                return v2;
-            }
+        if let Ok(ref o) = v2
+            && o.status.success()
+        {
+            return v2;
         }
         // Fall back to v1 binary
         let cmd_str = "docker-compose --version";

@@ -421,10 +421,10 @@ fn parse_cache_stamps(content: &str) -> HashMap<String, u64> {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("# fetched-at ") {
             let mut parts = rest.split_whitespace();
-            if let (Some(name), Some(ts)) = (parts.next(), parts.next()) {
-                if let Ok(t) = ts.parse::<u64>() {
-                    out.insert(name.to_string(), t);
-                }
+            if let (Some(name), Some(ts)) = (parts.next(), parts.next())
+                && let Ok(t) = ts.parse::<u64>()
+            {
+                out.insert(name.to_string(), t);
             }
         }
     }
