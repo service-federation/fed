@@ -77,6 +77,11 @@ pub struct DockerComposeService {
     compose_file: PathBuf,
     compose_service: String,
     project_name: String,
+    /// Container id captured after `compose up`, so the state tracker can do
+    /// real container-liveness checks across processes. Without it a compose
+    /// row has neither pid nor container id and `mark_dead_services` assumes
+    /// the service is dead the moment a new fed process looks at it.
+    container_id: Option<String>,
     /// Cached logs to avoid spawning compose subprocess on every call
     log_cache: Arc<tokio::sync::RwLock<(Vec<String>, Instant)>>,
 }
@@ -140,6 +145,7 @@ impl DockerComposeService {
             compose_file: compose_file_path,
             compose_service,
             project_name,
+            container_id: None,
             // Initialize with empty cache that's already expired
             log_cache: Arc::new(tokio::sync::RwLock::new((
                 Vec::new(),
@@ -165,6 +171,14 @@ impl DockerComposeService {
     /// Format: `fed-{hash}`
     fn get_project_name(compose_file_path: &Path) -> String {
         format!("fed-{}", Self::hash_path(compose_file_path))
+    }
+
+    /// Restore status from persisted state. Compose services have no PID or
+    /// container id to restore; a fresh process would otherwise report a
+    /// running compose project as Stopped. Callers should verify against
+    /// `health()` (a real `compose ps`) before restoring a live status.
+    pub fn restore_status(&mut self, status: Status) {
+        self.base.write().set_status(status);
     }
 
     /// Build base compose command with file and project
@@ -276,6 +290,20 @@ impl ServiceManager for DockerComposeService {
             return Err(Error::ServiceStartFailed(service_name, error_msg));
         }
 
+        // Capture the container id for cross-process liveness checks (see the
+        // field doc). Best effort: a miss leaves the pre-fix behavior.
+        let mut ps_cmd = self.build_base_command().await?;
+        ps_cmd.args(["ps", "-q", &self.compose_service]);
+        if let Ok(out) = ps_cmd.output().await
+            && out.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let id = stdout.lines().next().unwrap_or("").trim().to_string();
+            if !id.is_empty() {
+                self.container_id = Some(id);
+            }
+        }
+
         {
             let mut base = self.base.write();
             base.set_status(Status::Running);
@@ -285,11 +313,17 @@ impl ServiceManager for DockerComposeService {
     }
 
     async fn stop(&mut self) -> Result<()> {
-        {
-            let mut base = self.base.write();
-            if base.status == Status::Stopped {
+        let thinks_stopped = { self.base.read().status == Status::Stopped };
+        if thinks_stopped {
+            // In-memory status is per-process: a fresh `fed stop` starts at
+            // Stopped even when the compose project is up. Trust it only when
+            // `compose ps` agrees, otherwise fall through and run `down`.
+            if !self.health().await.unwrap_or(false) {
                 return Ok(());
             }
+        }
+        {
+            let mut base = self.base.write();
             base.set_status(Status::Stopping);
         }
 
@@ -380,6 +414,10 @@ impl ServiceManager for DockerComposeService {
 
     fn status(&self) -> Status {
         self.base.read().status
+    }
+
+    fn get_container_id(&self) -> Option<String> {
+        self.container_id.clone()
     }
 
     fn name(&self) -> &str {

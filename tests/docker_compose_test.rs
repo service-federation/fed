@@ -14,6 +14,12 @@ const COMPOSE_FIXTURE: &str = concat!(
     "/tests/fixtures/compose/test-services.yml"
 );
 
+/// Serialize these tests: they share one compose fixture and therefore ONE
+/// compose project (the project name is derived from the compose file path),
+/// and stopping any service runs `compose down` on the whole project. Run in
+/// parallel, tests tear down each other's containers mid-test.
+static COMPOSE_PROJECT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Compute the compose project name from a compose file path (same logic as DockerComposeService).
 fn compose_project_name(compose_file: &Path) -> String {
     let canonical =
@@ -100,6 +106,7 @@ async fn docker_compose_available() -> bool {
 #[tokio::test]
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_file_not_found() {
+    let _project_guard = COMPOSE_PROJECT_LOCK.lock().await;
     let yaml = r#"
 services:
   test:
@@ -128,6 +135,7 @@ services:
 #[tokio::test]
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_service_not_found() {
+    let _project_guard = COMPOSE_PROJECT_LOCK.lock().await;
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
         return;
@@ -167,6 +175,7 @@ services:
 #[tokio::test]
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_basic_lifecycle() {
+    let _project_guard = COMPOSE_PROJECT_LOCK.lock().await;
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
         return;
@@ -227,6 +236,7 @@ services:
 #[tokio::test]
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_environment_override() {
+    let _project_guard = COMPOSE_PROJECT_LOCK.lock().await;
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
         return;
@@ -284,6 +294,7 @@ services:
 #[tokio::test]
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_with_process_dependency() {
+    let _project_guard = COMPOSE_PROJECT_LOCK.lock().await;
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
         return;
@@ -351,6 +362,7 @@ services:
 #[tokio::test]
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_project_isolation() {
+    let _project_guard = COMPOSE_PROJECT_LOCK.lock().await;
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
         return;
@@ -443,6 +455,7 @@ services:
 #[tokio::test]
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_idempotent_start() {
+    let _project_guard = COMPOSE_PROJECT_LOCK.lock().await;
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
         return;
@@ -488,6 +501,7 @@ services:
 #[tokio::test]
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_health_check() {
+    let _project_guard = COMPOSE_PROJECT_LOCK.lock().await;
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
         return;
@@ -539,6 +553,7 @@ services:
 #[tokio::test]
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker (CI: cargo test --features docker-tests)
 async fn test_compose_port_conflict() {
+    let _project_guard = COMPOSE_PROJECT_LOCK.lock().await;
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
         return;
@@ -601,6 +616,7 @@ services:
 #[tokio::test]
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker, tests cleanup behavior
 async fn test_compose_process_cleanup() {
+    let _project_guard = COMPOSE_PROJECT_LOCK.lock().await;
     if !docker_available().await || !docker_compose_available().await {
         eprintln!("Skipping test - Docker or Docker Compose not available");
         return;

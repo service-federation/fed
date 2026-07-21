@@ -2,7 +2,11 @@ use crate::output::UserOutput;
 use fed::Parser as ConfigParser;
 use std::path::PathBuf;
 
-pub fn run_validate(config_path: Option<PathBuf>, out: &dyn UserOutput) -> anyhow::Result<()> {
+pub async fn run_validate(
+    config_path: Option<PathBuf>,
+    offline: bool,
+    out: &dyn UserOutput,
+) -> anyhow::Result<()> {
     let parser = ConfigParser::new();
     let config_path = if let Some(path) = config_path {
         path
@@ -20,8 +24,12 @@ pub fn run_validate(config_path: Option<PathBuf>, out: &dyn UserOutput) -> anyho
 
     out.status(&format!("Validating {}...", config_path.display()));
 
-    // On failure, return the error and let main print it once (with hints).
-    let config = parser.load_config(&config_path)?;
+    // Resolve packages the same way `fed start` does — validating the
+    // pre-merge config rejects `extends: "pkg.service"` services that start
+    // accepts. On failure, return the error and let main print it once.
+    let config = parser
+        .load_config_with_packages_offline(&config_path, offline)
+        .await?;
 
     // Surface typo'd keys before hard validation, so a typo that also breaks validation still
     // gets its "did you mean?" hint — not just the downstream validation error.

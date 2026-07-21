@@ -91,7 +91,7 @@ impl Config {
 
             if service.service_type() == ServiceType::Undefined {
                 return Err(Error::Validation(format!(
-                    "Service '{}' has no type defined. Add one of: process, image, gradle_task, compose_file + compose_service, or make it a hook-only node with install and/or migrate.",
+                    "Service '{}' has no type defined. Add one of: process, image, gradleTask, composeFile + composeService, or make it a hook-only node with install and/or migrate.",
                     name
                 )));
             }

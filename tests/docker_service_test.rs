@@ -391,6 +391,10 @@ async fn test_docker_service_orphan_cleanup() {
     require_docker!();
 
     let container_name = "fed-test-orphan";
+    // A crashed or interrupted previous run leaves this container behind, and
+    // `docker run --name` then fails at setup — clean up front like the other
+    // tests in this file.
+    cleanup_container(container_name).await;
 
     // Create an orphaned container manually
     let output = tokio::process::Command::new("docker")

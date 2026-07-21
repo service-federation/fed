@@ -322,6 +322,30 @@ impl Orchestrator {
                 if let Some(oneshot) = manager.as_any_mut().downcast_mut::<OneshotService>() {
                     oneshot.restore_status(service_state.status);
                 }
+
+                // Compose services also persist no PID/container id — their
+                // containers live under a compose project name. When the
+                // persisted status says the service was live, verify with a
+                // real `compose ps` and restore Running so a fresh process
+                // reports (and can stop) it instead of defaulting to Stopped.
+                let is_compose = manager
+                    .as_any_mut()
+                    .downcast_mut::<DockerComposeService>()
+                    .is_some();
+                if is_compose
+                    && matches!(
+                        service_state.status,
+                        crate::service::Status::Starting
+                            | crate::service::Status::Running
+                            | crate::service::Status::Healthy
+                            | crate::service::Status::Failing
+                    )
+                    && manager.health().await.unwrap_or(false)
+                    && let Some(compose) =
+                        manager.as_any_mut().downcast_mut::<DockerComposeService>()
+                {
+                    compose.restore_status(crate::service::Status::Running);
+                }
             }
         }
     }

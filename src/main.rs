@@ -178,7 +178,7 @@ async fn run() -> anyhow::Result<()> {
             return commands::run_init(output, *force, &out);
         }
         Commands::Validate => {
-            return commands::run_validate(cli.config.clone(), &out);
+            return commands::run_validate(cli.config.clone(), cli.offline, &out).await;
         }
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
