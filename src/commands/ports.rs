@@ -9,6 +9,7 @@ pub async fn run_ports(
     cmd: &PortsCommands,
     workdir: Option<PathBuf>,
     config_path: Option<PathBuf>,
+    ctx: super::isolate::IsolateContext,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
     match cmd {
@@ -28,6 +29,7 @@ pub async fn run_ports(
                 &IsolateCommands::Enable { force: *force },
                 workdir,
                 config_path,
+                ctx,
                 out,
             )
             .await
@@ -40,6 +42,7 @@ pub async fn run_ports(
                 &IsolateCommands::Disable { force: *force },
                 workdir,
                 config_path,
+                ctx,
                 out,
             )
             .await

@@ -320,6 +320,26 @@ impl Orchestrator {
         self.resolver.set_offline(offline);
     }
 
+    /// Whether this orchestrator resolves secrets offline. Used to propagate
+    /// `--offline` into isolated-child orchestrators.
+    pub fn get_offline(&self) -> bool {
+        self.resolver.get_offline()
+    }
+
+    /// Set the environment for parameter resolution and vault fetches
+    /// (development/staging/production). Must be set before
+    /// [`Orchestrator::initialize`], which resolves parameters.
+    pub fn set_environment(&mut self, environment: crate::config::Environment) {
+        self.resolver.set_environment(environment);
+    }
+
+    /// The environment this orchestrator resolves parameters in. Used to
+    /// propagate a parent run's environment into an isolated-child
+    /// orchestrator so `-e staging` survives `isolated: true` scripts.
+    pub fn get_environment(&self) -> crate::config::Environment {
+        self.resolver.get_environment()
+    }
+
     /// Scope the vault query to the manual-secret names the target script
     /// transitively references. `None` fetches every missing manual secret (the
     /// safe default). Must be set before [`Orchestrator::initialize`], which

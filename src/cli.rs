@@ -144,8 +144,11 @@ pub enum Commands {
     #[command(subcommand)]
     Package(PackageCommands),
     /// Manage port allocations
-    #[command(subcommand)]
-    Ports(PortsCommands),
+    Ports {
+        /// Defaults to `list` when no subcommand is given
+        #[command(subcommand)]
+        cmd: Option<PortsCommands>,
+    },
     /// Initialize a new fed.yaml config
     Init {
         /// Output file path
@@ -222,7 +225,7 @@ pub enum Commands {
 
 #[derive(Subcommand)]
 pub enum SecretsCommands {
-    /// List the linked project's secrets (names only)
+    /// List the linked project's secrets (names and last-updated info, never values)
     Ls {
         /// Environment
         #[arg(long, default_value = "development")]
@@ -360,9 +363,9 @@ pub enum WorkspaceCommands {
         #[arg(long, short)]
         force: bool,
     },
-    /// Remove worktrees for deleted branches
+    /// Unregister worktrees whose directories are gone and remove empty leftovers
     Prune,
-    /// Install shell integration into ~/.zshrc (one-time)
+    /// Install shell integration into your shell rc file (zsh or bash, one-time)
     Setup,
     /// Print shell function for eval (used internally by setup)
     InitShell,

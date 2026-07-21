@@ -160,6 +160,11 @@ async fn run() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // -e/--env selects which per-parameter environment value resolves and which
+    // vault environment manual secrets are fetched from. Parse it up front so
+    // an invalid value fails fast for every command that resolves parameters.
+    let environment: fed::config::Environment = cli.env.parse().map_err(fed::Error::Validation)?;
+
     // Initialize tracing and output
     let is_tui = matches!(cli.command, Commands::Tui { .. });
     let is_tty = std::io::stderr().is_terminal();
@@ -190,9 +195,18 @@ async fn run() -> anyhow::Result<()> {
         Commands::Package(package_cmd) => {
             return commands::run_package(package_cmd, &out).await;
         }
-        Commands::Ports(ports_cmd) => {
-            return commands::run_ports(ports_cmd, cli.workdir.clone(), cli.config.clone(), &out)
-                .await;
+        Commands::Ports { cmd: ports_cmd } => {
+            return commands::run_ports(
+                &ports_cmd.clone().unwrap_or_default(),
+                cli.workdir.clone(),
+                cli.config.clone(),
+                commands::IsolateContext {
+                    environment,
+                    offline: cli.offline,
+                },
+                &out,
+            )
+            .await;
         }
         Commands::Workspace(ws_cmd) => {
             return commands::run_workspace(ws_cmd, &out).await;
@@ -217,6 +231,10 @@ async fn run() -> anyhow::Result<()> {
                 isolate_cmd,
                 cli.workdir.clone(),
                 cli.config.clone(),
+                commands::IsolateContext {
+                    environment,
+                    offline: cli.offline,
+                },
                 &out,
             )
             .await;
@@ -463,6 +481,7 @@ async fn run() -> anyhow::Result<()> {
     let mut orchestrator = Orchestrator::builder()
         .config(config.clone())
         .work_dir(work_dir)
+        .environment(environment)
         .profiles(cli.profile.clone())
         .output_mode(output_mode)
         .randomize_ports(randomize)
@@ -634,7 +653,7 @@ async fn run() -> anyhow::Result<()> {
         | Commands::Doctor
         | Commands::Prune { .. }
         | Commands::Package(_)
-        | Commands::Ports(_)
+        | Commands::Ports { .. }
         | Commands::Docker(_)
         | Commands::Debug(_)
         | Commands::Workspace(_)

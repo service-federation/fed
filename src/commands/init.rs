@@ -85,7 +85,7 @@ scripts:
       npm test
 
 # Profiles switch services on by context: tag one with `profiles: [production]`, then
-# `fed start --profile production`. See https://www.service-federation.com/docs/configuration/
+# `fed -p production start`. See https://www.service-federation.com/docs/configuration/
 "#;
 
 pub fn run_init(output: &Path, force: bool, out: &dyn UserOutput) -> anyhow::Result<()> {

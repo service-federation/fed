@@ -347,6 +347,13 @@ impl<'a> ScriptRunner<'a> {
         child_orchestrator.output_mode = self.orchestrator.output_mode;
         // Must be set before initialize() runs the child's secret resolution.
         child_orchestrator.set_required_secret_names(child_required_secret_names);
+        // Inherit the parent's environment (-e/--env) so the isolated child
+        // resolves the same staging/production parameter values and vault
+        // environment instead of silently resetting to development.
+        child_orchestrator.set_environment(self.orchestrator.get_environment());
+        // Likewise --offline: a child that reset to online would call the
+        // vault from a run the user explicitly marked offline.
+        child_orchestrator.set_offline(self.orchestrator.get_offline());
 
         // Give the child its own container namespace so Docker containers don't
         // collide with (or kill) the parent's running containers.
@@ -487,8 +494,11 @@ impl<'a> ScriptRunner<'a> {
             .collect()
     }
 
-    /// Stop every service that became `Running`/`Healthy` since the `before`
-    /// snapshot — i.e. the ones this script run started.
+    /// Stop every service that left `Stopped` since the `before` snapshot —
+    /// i.e. the ones this script run started. Any non-`Stopped` state counts
+    /// (mirroring the ownership snapshot): a dependency still `Starting`, or
+    /// `Failing` its health checks, is a live process this run created and
+    /// must not outlive it.
     ///
     /// `Orchestrator::stop` is idempotent and cascades to dependents first, so
     /// re-stopping an already-stopped service in the loop is harmless. A service
@@ -497,8 +507,8 @@ impl<'a> ScriptRunner<'a> {
     async fn stop_services_started_since(&self, before: &HashSet<String>) {
         let now = self.orchestrator.get_status_passive().await;
         for (name, status) in now {
-            let running = matches!(status, Status::Running | Status::Healthy);
-            if running
+            let live = !matches!(status, Status::Stopped);
+            if live
                 && !before.contains(&name)
                 && let Err(e) = self.orchestrator.stop(&name).await
             {

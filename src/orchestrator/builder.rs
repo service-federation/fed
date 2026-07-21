@@ -47,6 +47,7 @@ pub struct OrchestratorBuilder {
     startup_timeout: Option<Duration>,
     stop_timeout: Option<Duration>,
     required_secret_names: Option<std::collections::HashSet<String>>,
+    environment: Option<crate::config::Environment>,
 }
 
 impl OrchestratorBuilder {
@@ -67,6 +68,7 @@ impl OrchestratorBuilder {
             startup_timeout: None,
             stop_timeout: None,
             required_secret_names: None,
+            environment: None,
         }
     }
 
@@ -185,6 +187,17 @@ impl OrchestratorBuilder {
         self
     }
 
+    /// Set the environment for parameter resolution and vault fetches
+    /// (development/staging/production).
+    ///
+    /// If not set, defaults to development. Selects which per-parameter
+    /// environment value (`development:`/`staging:`/`production:`) resolves and
+    /// which vault environment manual secrets are fetched from.
+    pub fn environment(mut self, environment: crate::config::Environment) -> Self {
+        self.environment = Some(environment);
+        self
+    }
+
     /// Enable readonly initialization.
     ///
     /// When enabled, `build()` calls `initialize_readonly()` instead of
@@ -251,6 +264,11 @@ impl OrchestratorBuilder {
         // Scope the vault query before initialize() runs secret resolution.
         // None keeps today's fetch-everything behavior.
         orchestrator.set_required_secret_names(self.required_secret_names);
+
+        // Must precede initialize(): parameter resolution reads the environment.
+        if let Some(environment) = self.environment {
+            orchestrator.set_environment(environment);
+        }
 
         if let Some(timeout) = self.startup_timeout {
             orchestrator.startup_timeout = timeout;

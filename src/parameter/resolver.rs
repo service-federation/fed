@@ -373,6 +373,11 @@ impl Resolver {
         self.offline = offline;
     }
 
+    /// Whether this resolver is in offline mode.
+    pub fn get_offline(&self) -> bool {
+        self.offline
+    }
+
     /// Test seam: stub the team-vault lookup with fixed values.
     #[cfg(test)]
     pub(crate) fn set_test_vault_values(&mut self, values: HashMap<String, String>) {

@@ -46,13 +46,18 @@ pub async fn run_clean(
 
     if services_to_clean.is_empty() {
         out.status("No services with clean field or Docker volumes found");
-        return Ok(());
+        if !cleaning_all {
+            return Ok(());
+        }
+        // A full `fed clean` still resets persisted ports and install markers
+        // below — an install-only project has markers to clear even when no
+        // service has a `clean:` hook or volumes.
+    } else {
+        out.status(&format!(
+            "Running clean for services: {}",
+            services_to_clean.join(", ")
+        ));
     }
-
-    out.status(&format!(
-        "Running clean for services: {}",
-        services_to_clean.join(", ")
-    ));
 
     for service in &services_to_clean {
         out.status(&format!("\n[clean] {}", service));

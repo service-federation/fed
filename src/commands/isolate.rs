@@ -4,25 +4,36 @@ use fed::state::StateTracker;
 use fed::{Orchestrator, Parser as ConfigParser};
 use std::path::PathBuf;
 
+pub struct IsolateContext {
+    pub environment: fed::config::Environment,
+    pub offline: bool,
+}
+
 pub async fn run_isolate(
     cmd: &IsolateCommands,
     workdir: Option<PathBuf>,
     config_path: Option<PathBuf>,
+    ctx: IsolateContext,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
     let work_dir = super::ports::resolve_work_dir(workdir, config_path.as_deref())?;
 
     match cmd {
-        IsolateCommands::Enable { force } => enable(&work_dir, config_path, *force, out).await,
+        IsolateCommands::Enable { force } => {
+            enable(&work_dir, config_path, &ctx, *force, out).await
+        }
         IsolateCommands::Disable { force } => disable(&work_dir, *force, out).await,
         IsolateCommands::Status => status(&work_dir, out).await,
-        IsolateCommands::Rotate { force } => rotate(&work_dir, config_path, *force, out).await,
+        IsolateCommands::Rotate { force } => {
+            rotate(&work_dir, config_path, &ctx, *force, out).await
+        }
     }
 }
 
 async fn enable(
     work_dir: &std::path::Path,
     config_path: Option<PathBuf>,
+    ctx: &IsolateContext,
     force: bool,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
@@ -59,6 +70,8 @@ async fn enable(
     // Create orchestrator with randomized ports and initialize to resolve them
     let mut orchestrator = Orchestrator::new(config, work_dir.to_path_buf()).await?;
     orchestrator.set_work_dir(work_dir.to_path_buf()).await?;
+    orchestrator.set_environment(ctx.environment);
+    orchestrator.set_offline(ctx.offline);
     orchestrator.set_randomize_ports(true);
     orchestrator.set_isolation_id(isolation_id.clone());
     orchestrator.initialize().await?;
@@ -187,6 +200,7 @@ async fn status(work_dir: &std::path::Path, out: &dyn UserOutput) -> anyhow::Res
 async fn rotate(
     work_dir: &std::path::Path,
     config_path: Option<PathBuf>,
+    ctx: &IsolateContext,
     force: bool,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
@@ -225,6 +239,8 @@ async fn rotate(
     // Create orchestrator with randomized ports and initialize to resolve new ports
     let mut orchestrator = Orchestrator::new(config, work_dir.to_path_buf()).await?;
     orchestrator.set_work_dir(work_dir.to_path_buf()).await?;
+    orchestrator.set_environment(ctx.environment);
+    orchestrator.set_offline(ctx.offline);
     orchestrator.set_randomize_ports(true);
     orchestrator.set_isolation_id(isolation_id.clone());
     orchestrator.initialize().await?;
