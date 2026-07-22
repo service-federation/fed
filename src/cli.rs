@@ -218,6 +218,25 @@ pub enum Commands {
     /// Run a script by name (shorthand for `fed run <script>`)
     #[command(external_subcommand)]
     External(Vec<String>),
+
+    /// Internal: run the restart-policy supervisor daemon for this
+    /// workspace (`07-supervisor.md`). Spawned automatically by `fed
+    /// start`/`fed restart` when a started service has a `restart:`
+    /// policy — never invoke this directly.
+    ///
+    /// Named `supervise`, not `__supervise` as originally sketched in the
+    /// design doc: clap_complete's bash generator uses a literal `__` as
+    /// its internal subcommand-path separator (it joins/splits function
+    /// names on it), and a subcommand whose own name already contains `__`
+    /// desyncs that reconstruction — `fed completions bash` panicked
+    /// (`Option::unwrap()` on `None` in `clap_complete`'s
+    /// `find_subcommand_with_path`) with the double-underscore name. Since
+    /// this command is hidden and only ever invoked by fed's own
+    /// `spawn_if_needed`, the exact token is an implementation detail, not
+    /// a user-facing contract — `hide = true` is what actually keeps it out
+    /// of `--help`/normal discovery.
+    #[command(hide = true)]
+    Supervise,
 }
 
 #[derive(Subcommand)]

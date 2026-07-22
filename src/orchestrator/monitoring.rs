@@ -462,6 +462,30 @@ async fn execute_health_check_cycle(
     let mut successful_restarts = Vec::new();
 
     for (service_name, manager_arc) in unhealthy {
+        // A service the user explicitly stopped (any of the three `fed
+        // stop` paths — whole-project, per-service, or the config-can't-
+        // load fallback) must never be treated as crash-looping. This is
+        // the persisted, cross-process signal (`07-supervisor.md` Design
+        // §1): a separate `fed stop` invocation never touches this
+        // process's manager objects, but it does write `desired_state`, so
+        // gating here — rather than only on `restart_single_service`'s own
+        // same-process `manager.status()` check below — is what makes
+        // `fed stop` reliably prevent resurrection across processes (the
+        // supervisor's whole reason for existing). Skipped entirely,
+        // before any circuit-breaker/restart-history accounting, so a
+        // stopped service is never counted as a crash.
+        let desired_running = {
+            let tracker = state_tracker.read().await;
+            tracker.is_desired_running(&service_name).await
+        };
+        if !desired_running {
+            tracing::debug!(
+                "Service '{}' is desired_state=stopped — skipping restart/circuit-breaker accounting",
+                service_name
+            );
+            continue;
+        }
+
         let consecutive_failures = failure_counts.get(&service_name).copied().unwrap_or(1);
 
         // Get service config for circuit breaker and restart settings

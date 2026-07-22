@@ -9,6 +9,7 @@ mod ports;
 mod registration;
 mod run_context;
 mod scripts;
+pub mod supervisor;
 
 pub use builder::OrchestratorBuilder;
 pub use core::*;

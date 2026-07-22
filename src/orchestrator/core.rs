@@ -737,6 +737,46 @@ impl Orchestrator {
                             e
                         );
                     }
+                    // `record_restart` only appends to `restart_history`
+                    // (the circuit-breaker's own accounting) — it does not
+                    // touch the separate `services.restart_count` column
+                    // that `fed status`/`debug state --json` display and
+                    // that the ordinary monitoring-loop restart path
+                    // (`batch_increment_restart_counts`, `monitoring.rs`)
+                    // increments after every crash-restart. Without this, a
+                    // service discovered-and-restarted here (as opposed to
+                    // one that crashes again later under this same
+                    // supervisor's regular health checks) would silently
+                    // under-report its restart count.
+                    if let Err(e) = tracker
+                        .batch_increment_restart_counts(vec![service_name.to_string()])
+                        .await
+                    {
+                        tracing::warn!(
+                            "Supervisor attach: failed to increment restart_count for '{}': {}",
+                            service_name,
+                            e
+                        );
+                    }
+                    // The row's `status` column is still 'stale' — this
+                    // pass is exactly what just marked it so, before
+                    // discovering it should come back. Left uncorrected,
+                    // `get_services()`'s stale filter (`service_crud.rs`)
+                    // would hide this row from every future command
+                    // (`fed status`, the next `fed start`, even this same
+                    // supervisor's own next `mark_dead_services` sweep)
+                    // forever, despite the service being alive and
+                    // supervised again right now.
+                    if let Err(e) = tracker
+                        .update_service_status(service_name, Status::Running)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Supervisor attach: failed to clear stale status for '{}': {}",
+                            service_name,
+                            e
+                        );
+                    }
                     let manager = manager_arc.lock().await;
                     if let Some(pid) = manager.get_pid()
                         && let Err(e) = tracker.update_service_pid(service_name, pid).await
@@ -770,6 +810,16 @@ impl Orchestrator {
         }
 
         self.state_tracker.write().await.save().await?;
+
+        // The monitoring loop no-ops every tick until this flag is set
+        // (`run_monitoring_loop`'s `startup_complete` check exists to avoid
+        // racing a normal `fed start`'s own graduated startup sequence).
+        // The supervisor has no such sequence to race — it either attached
+        // to already-running services or just fresh-started the newly-stale
+        // ones above — so there is no "still starting up" phase to wait
+        // out. Without this, the supervisor's monitoring loop would spin
+        // forever without ever running a single health check.
+        self.mark_startup_complete();
 
         // Start monitoring unconditionally — a supervisor exists precisely
         // to watch backgrounded (File-mode) services, so the output-mode
@@ -2240,6 +2290,35 @@ impl Orchestrator {
         }
 
         tracing::debug!("stop_monitoring_only: complete (services left running)");
+    }
+
+    /// Whether at least one service inside the supervisor's health-check
+    /// scope ([`super::monitoring::supervised_service_names`]) is currently
+    /// `desired_state == Running`.
+    ///
+    /// Used by `fed supervise`'s per-tick self-exit check
+    /// (`07-supervisor.md` Design §1/§7): once nothing the supervisor
+    /// cares about remains desired-running (every such service has either
+    /// been explicitly `fed stop`'d or was never started), the daemon has
+    /// nothing left to protect and should exit rather than run forever.
+    ///
+    /// A service in scope with no persisted row at all (never started)
+    /// correctly counts as "not desired-running" here — see
+    /// [`crate::state::SqliteStateTracker::is_desired_running`]'s own doc
+    /// comment on why missing and stopped collapse to the same answer.
+    pub async fn any_supervised_service_desired_running(&self) -> bool {
+        let scope = super::monitoring::supervised_service_names(&self.config);
+        if scope.is_empty() {
+            return false;
+        }
+
+        let tracker = self.state_tracker.read().await;
+        for name in &scope {
+            if tracker.is_desired_running(name).await {
+                return true;
+            }
+        }
+        false
     }
 
     /// Pre-pull Docker images needed by the given services.

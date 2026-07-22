@@ -160,6 +160,25 @@ async fn run() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // `fed supervise` ignores SIGHUP at the very start, before anything
+    // else runs — this is what lets the daemon survive terminal close
+    // (`07-supervisor.md` Design §5). Unlike a user `process:` command
+    // (which needs the `nohup bash -c` shell-wrapper trick because it's an
+    // opaque shell string), `supervise` is fed's own binary, so it can
+    // just ignore the signal directly rather than needing a wrapping shell.
+    // Placed here, immediately after argv parsing and before tracing/config
+    // I/O, so there's no window where a terminal-close SIGHUP could still
+    // reach the default handler.
+    if matches!(cli.command, Commands::Supervise) {
+        #[cfg(unix)]
+        unsafe {
+            let _ = nix::sys::signal::signal(
+                nix::sys::signal::Signal::SIGHUP,
+                nix::sys::signal::SigHandler::SigIgn,
+            );
+        }
+    }
+
     // -e/--env was removed in fed 8.0 (the development/staging/production
     // axis no longer exists). The flag is kept registered (hidden, optional)
     // so a stale invocation gets this explicit migration error instead of a
@@ -174,9 +193,16 @@ async fn run() -> anyhow::Result<()> {
 
     // Initialize tracing and output
     let is_tui = matches!(cli.command, Commands::Tui { .. });
+    let is_supervise = matches!(cli.command, Commands::Supervise);
     let is_tty = std::io::stderr().is_terminal();
     let is_interactive = std::io::stdin().is_terminal();
-    init_tracing(is_tui, cli.verbose, is_tty)?;
+    init_tracing(
+        is_tui,
+        is_supervise,
+        cli.workdir.clone(),
+        cli.verbose,
+        is_tty,
+    )?;
     let out = output::CliOutput::new(is_tty);
 
     // Session-scoped run settings, threaded through every command and into
@@ -360,6 +386,17 @@ async fn run() -> anyhow::Result<()> {
 
     let work_dir = resolve_work_dir(cli.workdir.clone(), &config_path)?;
 
+    // `fed supervise` builds its orchestrator through a completely
+    // different path (`.supervisor_attach(true)` -> `initialize_supervisor`,
+    // never `.readonly()`/`.dry_run()`/plain `initialize()`) and then runs
+    // its own long-lived event loop instead of dispatching into a
+    // `commands::run_*` function — handled here, before any of the
+    // Tier-3 output-mode/readonly/isolate logic below, none of which
+    // applies to it.
+    if matches!(cli.command, Commands::Supervise) {
+        return commands::run_supervise(config, work_dir).await;
+    }
+
     // ── Tier 3: Commands that need orchestrator ─────────────────────
 
     // Determine output mode before initializing.
@@ -480,6 +517,30 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // Watch/tui pre-flight handoff (`07-supervisor.md` Design §6): a
+    // foreground `--watch`/`fed tui` orchestrator starts its own in-process
+    // monitoring loop as part of `initialize()`, *before* `run_watch_mode`/
+    // `run_tui` is ever reached — so tearing down a leftover background
+    // supervisor has to happen here, before `Orchestrator::builder()...
+    // build()` below, not inside the watch loop after the fact. Otherwise
+    // there would be a window (however brief) with two live monitoring
+    // loops racing over the same services. A plain lock-file read/SIGTERM;
+    // no `Orchestrator`/`StateTracker` needed for this step. Once this
+    // foreground session exits, nothing auto-respawns the daemon — it comes
+    // back only via the next `fed start`/`fed restart`, per the scaled-back
+    // self-heal promise (`spawn_if_needed`, wired into both below).
+    let is_watch_or_tui = matches!(
+        &cli.command,
+        Commands::Start { watch: true, .. } | Commands::Tui { .. }
+    );
+    if is_watch_or_tui {
+        fed::orchestrator::supervisor::signal_stop_and_wait(
+            &work_dir,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+    }
+
     // Build orchestrator with all settings applied and initialized
     let mut orchestrator = Orchestrator::builder()
         .config(config.clone())
@@ -511,6 +572,8 @@ async fn run() -> anyhow::Result<()> {
                     replace,
                     dry_run,
                     config_path: &config_path,
+                    offline: cli.offline,
+                    profiles: cli.profile.clone(),
                 },
                 &out,
             )
@@ -520,7 +583,16 @@ async fn run() -> anyhow::Result<()> {
             commands::run_stop(&mut orchestrator, &config, services, &out).await?;
         }
         Commands::Restart { services } => {
-            commands::run_restart(&mut orchestrator, &config, services, &out).await?;
+            commands::run_restart(
+                &mut orchestrator,
+                &config,
+                services,
+                &config_path,
+                cli.offline,
+                cli.profile.clone(),
+                &out,
+            )
+            .await?;
         }
         Commands::Status { json, tag } => {
             commands::run_status(&orchestrator, &config, json, tag, &out).await?;
@@ -659,7 +731,8 @@ async fn run() -> anyhow::Result<()> {
         | Commands::Logout
         | Commands::Whoami
         | Commands::Link { .. }
-        | Commands::Secrets(_) => {
+        | Commands::Secrets(_)
+        | Commands::Supervise => {
             unreachable!("handled in earlier dispatch tiers");
         }
     }
@@ -686,8 +759,40 @@ fn resolve_work_dir(
     }
 }
 
-fn init_tracing(is_tui: bool, verbose: bool, is_tty: bool) -> anyhow::Result<()> {
-    if is_tui {
+fn init_tracing(
+    is_tui: bool,
+    is_supervise: bool,
+    workdir: Option<PathBuf>,
+    verbose: bool,
+    is_tty: bool,
+) -> anyhow::Result<()> {
+    if is_supervise {
+        // The supervisor daemon has no attached terminal to print to —
+        // logs go to `.fed/logs/supervisor.log`, matching the existing
+        // per-service log convention (`07-supervisor.md` Design §4).
+        // `--workdir` is always passed explicitly by `spawn_if_needed`
+        // (the only thing that ever spawns `fed supervise`), so this is
+        // reliable; a bare manual invocation without `--workdir` falls back
+        // to the current directory, same as every other command.
+        let work_dir = workdir.unwrap_or_else(|| PathBuf::from("."));
+        let log_dir = work_dir.join(".fed").join("logs");
+        std::fs::create_dir_all(&log_dir)?;
+
+        let log_path = log_dir.join("supervisor.log");
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with_writer(std::sync::Mutex::new(log_file))
+            .with_ansi(false)
+            .init();
+    } else if is_tui {
         // For TUI mode, write logs to a file
         let log_dir = dirs::home_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))

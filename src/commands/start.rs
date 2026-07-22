@@ -16,6 +16,11 @@ pub struct StartOptions<'a> {
     pub replace: bool,
     pub dry_run: bool,
     pub config_path: &'a std::path::Path,
+    /// Threaded to `spawn_if_needed` so a spawned `fed supervise` sees the
+    /// same `--offline`/`--profile` session settings as this invocation
+    /// (`07-supervisor.md` Design §1's note on settings-threading).
+    pub offline: bool,
+    pub profiles: Vec<String>,
 }
 
 pub async fn run_start(
@@ -30,6 +35,8 @@ pub async fn run_start(
         replace,
         dry_run,
         config_path,
+        offline,
+        profiles,
     } = opts;
     let services_to_start = if services.is_empty() {
         // Use entrypoint
@@ -464,6 +471,23 @@ pub async fn run_start(
         out.status("\nServices running in background");
         out.status("  Use 'fed stop' to stop them");
         out.status("  Use 'fed tui' for interactive mode");
+
+        // A plain, non-watch `fed start` backgrounds services and this
+        // process exits immediately — without a supervisor, a `restart:`
+        // policy would never fire again (`07-supervisor.md`). Spawn one iff
+        // it's actually needed and not already running; `fed status` never
+        // does this (Design's scaled-back self-heal promise).
+        if super::supervise::any_has_restart_policy(config, started.iter()) {
+            let work_dir = orchestrator.work_dir().to_path_buf();
+            if let Err(e) =
+                super::supervise::spawn_if_needed(&work_dir, config_path, offline, &profiles)
+            {
+                out.warning(&format!(
+                    "Warning: failed to start the restart-policy supervisor: {}",
+                    e
+                ));
+            }
+        }
     } else {
         run_watch_mode(orchestrator, config, config_path, out).await?;
     }

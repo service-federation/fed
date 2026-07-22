@@ -66,6 +66,20 @@ pub async fn run_stop(
         }
 
         orchestrator.cleanup().await;
+
+        // Whole-project stop just quiesced every service's desired_state to
+        // Stopped and killed them all — nothing remains for a supervisor to
+        // protect, so tear it down now rather than waiting for its own
+        // per-tick self-exit check (`07-supervisor.md` Design §1). A
+        // partial (per-service) stop does NOT do this: other supervised
+        // services may still legitimately be running, so it relies on the
+        // persisted `desired_state` alone (the supervisor simply skips the
+        // stopped one on its next tick).
+        fed::orchestrator::supervisor::signal_stop_and_wait(
+            orchestrator.work_dir(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
     } else {
         // Expand tag references (e.g., @backend) into service names
         let services_to_stop = config.expand_service_selection(&services);
@@ -290,6 +304,19 @@ pub async fn run_stop_from_state(
     let removed = remove_orphan_containers_for_workdir(work_dir).await;
     if removed > 0 {
         out.status(&format!("Removed {} orphaned container(s)", removed));
+    }
+
+    // Same whole-project teardown as the normal `run_stop` path above —
+    // this fallback exists precisely because config couldn't load, so
+    // there's no `Orchestrator` here to ask; a plain lock-file signal is
+    // all this needs. Only for the "stop everything" shape (empty
+    // `services`), mirroring `run_stop`'s own condition.
+    if services.is_empty() {
+        fed::orchestrator::supervisor::signal_stop_and_wait(
+            work_dir,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
     }
 
     if !failed.is_empty() {

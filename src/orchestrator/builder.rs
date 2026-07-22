@@ -163,7 +163,7 @@ impl OrchestratorBuilder {
     ///
     /// When enabled, `build()` calls `initialize_supervisor()` instead of
     /// `initialize()`/`initialize_readonly()`/`initialize_dry_run()` — the
-    /// attach-and-reconcile path used exclusively by the `fed __supervise`
+    /// attach-and-reconcile path used exclusively by the `fed supervise`
     /// process (`07-supervisor.md` Design §1). This is the operation flag
     /// this plan adds alongside `.readonly()`/`.dry_run()`, per
     /// `01-run-context.md`'s categorization of per-orchestrator behavior
@@ -263,7 +263,7 @@ impl OrchestratorBuilder {
         // Initialize mode selection:
         // - dry_run: resolve-only preview path (no persistent state writes)
         // - readonly: status/logs path (skip parameter resolution)
-        // - supervisor_attach: `fed __supervise`'s attach-and-reconcile path
+        // - supervisor_attach: `fed supervise`'s attach-and-reconcile path
         //   (`07-supervisor.md` Design §1)
         // - default: full initialization
         if self.dry_run {

@@ -244,6 +244,44 @@ impl SqliteStateTracker {
         Ok(())
     }
 
+    /// Whether a service's persisted `desired_state` is `Running`.
+    ///
+    /// This is the signal the supervisor consults **instead of** any
+    /// in-process manager's `Status` before ever attempting a restart
+    /// (`07-supervisor.md` Design §1) — a separate `fed stop` process never
+    /// touches the supervisor's manager objects, but it does write this
+    /// column, so gating on it (rather than `manager.status()`) is what
+    /// makes `fed stop` reliably prevent resurrection across processes.
+    ///
+    /// Returns `false` if the row doesn't exist. A service with no
+    /// persisted row has nothing for the supervisor to protect, so
+    /// "unknown" and "not desired-running" collapse to the same safe
+    /// answer here — unlike most other lookups in this module, there is no
+    /// case where a caller needs to distinguish "missing" from "stopped".
+    pub async fn is_desired_running(&self, service_id: &str) -> bool {
+        let service_id = service_id.to_string();
+
+        self.conn
+            .call(
+                move |conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<String>> {
+                    Ok(conn
+                        .query_row(
+                            "SELECT desired_state FROM services WHERE id = ?1",
+                            rusqlite::params![&service_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?)
+                },
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|s| {
+                s.parse::<DesiredState>().unwrap_or(DesiredState::Running) == DesiredState::Running
+            })
+            .unwrap_or(false)
+    }
+
     /// Update service PID
     #[must_use = "ignoring this result may cause state loss - the PID will not be persisted"]
     pub async fn update_service_pid(&mut self, service_id: &str, pid: u32) -> Result<()> {
