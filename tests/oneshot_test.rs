@@ -263,7 +263,7 @@ services:
 /// migration guidance. (Converted from `test_run_plus_process_is_rejected` and
 /// `test_lone_run_is_a_valid_service_type`, which encoded `run:` as a live type.)
 #[test]
-fn test_run_field_is_rejected_in_6_0() {
+fn test_run_field_is_rejected() {
     // Lone `run:` — previously a valid oneshot type.
     let yaml = r#"
 services:
@@ -273,11 +273,11 @@ services:
     let config = Parser::new().parse_config(yaml).expect("parse");
     let err = config
         .validate()
-        .expect_err("run: must be rejected in 6.0")
+        .expect_err("run: must be rejected")
         .to_string();
     assert!(
-        err.contains("run: was removed in 6.0"),
-        "error should explain run: was removed in 6.0, got: {err}"
+        err.contains("`run:` is not a service type"),
+        "error should reject run: as a service type, got: {err}"
     );
     assert!(
         err.contains("migrate:"),
@@ -298,8 +298,8 @@ services:
         .expect_err("run + process must be rejected")
         .to_string();
     assert!(
-        err2.contains("run: was removed in 6.0"),
-        "run + process should also surface the 6.0 removal error, got: {err2}"
+        err2.contains("`run:` is not a service type"),
+        "run + process should also surface the run: rejection, got: {err2}"
     );
 }
 

@@ -339,30 +339,32 @@ mod tests {
     fn test_allocate_port_with_default_common_ports() {
         let mut allocator = PortAllocator::new();
 
-        // Common ports that are likely in use (8080, 3000, 5432)
-        // These should fallback to random ports
-        let ports_to_try = vec![8080, 3000, 5432];
-        let mut allocated = vec![];
+        // Checking availability of well-known ports (8080, 3000, 5432) and
+        // then asserting on the result is a TOCTOU race against every other
+        // parallel test and whatever runs on the machine. Instead, make each
+        // case deterministic by owning the port state ourselves.
 
-        for default_port in ports_to_try {
-            // First check if the port is available
-            let is_available = crate::port::PortConflict::is_port_available(default_port);
+        // Case 1: default is genuinely taken — we hold the listener, so the
+        // allocator must fall back to a different port.
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken_port = held.local_addr().unwrap().port();
+        let fallback = allocator.allocate_port_with_default(taken_port).unwrap();
+        assert_ne!(fallback, taken_port);
+        assert!(allocator.allocated_ports().contains(&fallback));
+        drop(held);
 
-            let port = allocator.allocate_port_with_default(default_port).unwrap();
-            allocated.push(port);
+        // Case 2: default is free — bind an ephemeral port to discover a free
+        // one, release it, and allocate immediately. The race window here is
+        // microseconds against the ephemeral range, not a well-known port.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let free_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let got = allocator.allocate_port_with_default(free_port).unwrap();
+        assert_eq!(got, free_port);
+        assert!(allocator.allocated_ports().contains(&got));
 
-            if is_available {
-                // If port was available, we should have gotten it
-                assert_eq!(port, default_port);
-            }
-            // Port should be tracked
-            assert!(allocator.allocated_ports().contains(&port));
-        }
-
-        // All allocated ports should be unique
-        allocated.sort();
-        allocated.dedup();
-        assert_eq!(allocated.len(), 3);
+        // Both allocations are tracked and distinct.
+        assert_eq!(allocator.allocated_ports().len(), 2);
     }
 
     #[test]

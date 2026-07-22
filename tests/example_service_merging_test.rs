@@ -30,7 +30,7 @@ async fn test_service_merging_example() {
     assert_eq!(database.image.as_deref(), Some("postgres:15"));
 
     // Environment: merged from package and local
-    assert_eq!(database.environment.len(), 4); // 3 from package + 2 local (1 is override)
+    assert_eq!(database.environment.len(), 4); // 2 from package + 2 local
     assert_eq!(database.environment.get("POSTGRES_USER").unwrap(), "admin"); // From package
     assert_eq!(
         database.environment.get("POSTGRES_PASSWORD").unwrap(),
@@ -51,10 +51,10 @@ async fn test_service_merging_example() {
     );
     assert!(database.volumes.contains(&"./backups:/backups".to_string()));
 
-    // Ports: local has different host port, but since target is same, only local is kept
-    // Actually, both should be there since they're unique strings
-    assert!(!database.ports.is_empty());
-    assert!(database.ports.contains(&"5433:5432".to_string()));
+    // Ports: the package declares none (packages can't declare the parameters
+    // a host mapping needs, and merge combines port lists); the importing
+    // config maps the host port with its own parameter.
+    assert_eq!(database.ports, vec!["{{DB_PORT}}:5432".to_string()]);
 
     // Healthcheck from package
     assert!(database.healthcheck.is_some());
