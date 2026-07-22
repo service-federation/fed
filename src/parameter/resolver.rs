@@ -1477,11 +1477,10 @@ impl Resolver {
                 );
             }
 
-            // Resolve migrate command with shell escaping for security. (This is
-            // the resolution `run:` used to get — hook-only nodes and process
-            // services both express staged setup through `migrate:` in fed 6.0,
-            // so it must resolve templates the same way. `run:` itself was
-            // removed and is rejected by validation, so it is not resolved here.)
+            // Resolve migrate command with shell escaping for security.
+            // (Hook-only nodes and process services both express staged
+            // setup through `migrate:`, so it must resolve templates the
+            // same way.)
             if let Some(ref migrate) = service.migrate {
                 service.migrate = Some(
                     self.resolve_template_shell_safe(migrate, &parameters)

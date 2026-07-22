@@ -134,7 +134,7 @@ pub fn run_generate_command(command: &str, resolved: &HashMap<String, String>) -
 
 /// Resolve all `generate` parameters in DAG order with invalidation.
 ///
-/// `existing_values`: values already persisted (from .env.secrets).
+/// `existing_values`: values already persisted (from .fed/secrets.generated.env).
 /// Returns: list of (name, value, was_generated) for all generate params.
 pub fn resolve_generate_params(
     params: &HashMap<String, Parameter>,

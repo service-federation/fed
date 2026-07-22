@@ -188,7 +188,6 @@ impl Service {
             "clean",
             "build",
             "process",
-            "run",
             "image",
             "command",
             "volumes",
@@ -257,7 +256,7 @@ pub enum ServiceType {
     DockerCompose,
     /// A hook-only node: only `install:`/`migrate:`, no process/image/etc. Runs
     /// its hooks to completion during startup and gates its dependents on that
-    /// completion. (In fed <6.0 this was the `run:` service type.)
+    /// completion.
     Oneshot,
     Undefined,
 }
@@ -295,7 +294,7 @@ impl std::str::FromStr for ServiceType {
             "external" => Ok(ServiceType::External),
             "gradle" | "gradletask" | "gradle_task" => Ok(ServiceType::GradleTask),
             "docker-compose" | "dockercompose" | "docker_compose" => Ok(ServiceType::DockerCompose),
-            "oneshot" | "run" => Ok(ServiceType::Oneshot),
+            "oneshot" => Ok(ServiceType::Oneshot),
             "undefined" => Ok(ServiceType::Undefined),
             _ => Err(format!("Unknown service type: {}", s)),
         }

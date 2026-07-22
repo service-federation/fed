@@ -1056,7 +1056,7 @@ impl Orchestrator {
             }
         };
 
-        // Oneshot (`run:`) services take a dedicated run-to-completion path:
+        // Oneshot (hook-only) services take a dedicated run-to-completion path:
         // execute once, gate dependents on completion, re-run every startup.
         if self
             .config

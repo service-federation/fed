@@ -205,8 +205,6 @@ Add validation:
 ## Example: Filament config with keypairs
 
 ```yaml
-generated_secrets_file: .env.secrets
-
 parameters:
   DB_PASSWORD:
     type: secret

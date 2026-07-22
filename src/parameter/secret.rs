@@ -515,7 +515,7 @@ mod tests {
 
     #[test]
     fn write_env_preserves_comments_blanks_and_export_lines() {
-        // A hand-edited / deprecated generated-secrets file with a user comment,
+        // A hand-edited generated-secrets file with a user comment,
         // a blank line, and a valid `export OTHER=value` line must survive a fed
         // rewrite that updates ONE managed secret — verbatim — and `OTHER` must
         // still parse.

@@ -33,7 +33,7 @@ pub enum Status {
     Failing,
     /// Service is in the process of stopping
     Stopping,
-    /// Oneshot service (`run:`) that executed to completion successfully.
+    /// Hook-only (oneshot) service that executed to completion successfully.
     /// Not a running process — completion is its terminal, healthy state.
     Completed,
 }
@@ -113,7 +113,7 @@ impl Status {
             // Stopping always transitions to Stopped
             (Stopping, Stopped) => true,
 
-            // Oneshot (`run:`) completion: reached from Starting/Running, and
+            // Oneshot (hook-only) completion: reached from Starting/Running, and
             // torn down like any terminal state. Re-running a restored-Completed
             // oneshot goes back through Starting.
             (Starting, Completed) => true,
