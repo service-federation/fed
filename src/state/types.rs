@@ -94,6 +94,22 @@ pub struct ServiceState {
     /// object it never touched.
     #[serde(default)]
     pub desired_state: DesiredState,
+
+    /// Whether this service qualifies for Docker's native `--restart
+    /// unless-stopped` reboot-survival flag — mirrors
+    /// [`crate::config::Service::docker_native_restart_enabled`], captured
+    /// at registration time (registration leaves an already-registered row
+    /// untouched, same as `startup_message`).
+    ///
+    /// Read by `mark_dead_services` (`07-supervisor.md` Design §3): a
+    /// concurrent `fed` command's container-liveness check would otherwise
+    /// mark a row `'stale'` (permanently filtering it out of
+    /// `get_services()`) during Docker's own brief native-restart backoff
+    /// window. Services with this flag set get a short grace period
+    /// (consecutive-failure counter, not a single snapshot) before staling;
+    /// everything else keeps today's one-shot staleness check.
+    #[serde(default)]
+    pub native_restart_enabled: bool,
 }
 
 /// Persisted intent for whether a service should be running.
@@ -147,6 +163,7 @@ impl ServiceState {
             consecutive_failures: 0,
             startup_message: None,
             desired_state: DesiredState::Running,
+            native_restart_enabled: false,
         }
     }
 

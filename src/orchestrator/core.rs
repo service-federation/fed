@@ -1369,6 +1369,12 @@ impl Orchestrator {
             ServiceState::new(name.to_string(), service_type, self.namespace.clone());
         if let Some(service_config) = self.config.services.get(name) {
             service_state.startup_message = service_config.startup_message.clone();
+            // 07-supervisor.md Design §3: captured once at registration
+            // (an already-registered row is left untouched, so this only
+            // ever matters for a fresh row) — read back by
+            // `mark_dead_services` to decide whether this service's
+            // container-liveness check gets a stale-grace period.
+            service_state.native_restart_enabled = service_config.docker_native_restart_enabled();
         }
 
         let Some(registration) =
@@ -2830,6 +2836,7 @@ mod tests {
                     port_allocations: Default::default(),
                     startup_message: None,
                     desired_state: DesiredState::Running,
+                    native_restart_enabled: false,
                 })
                 .await
                 .unwrap();
@@ -2850,6 +2857,7 @@ mod tests {
                     port_allocations: Default::default(),
                     startup_message: None,
                     desired_state: DesiredState::Stopped,
+                    native_restart_enabled: false,
                 })
                 .await
                 .unwrap();
@@ -2949,6 +2957,7 @@ mod tests {
                     port_allocations: Default::default(),
                     startup_message: None,
                     desired_state: DesiredState::Running,
+                    native_restart_enabled: false,
                 })
                 .await
                 .unwrap();
@@ -2969,6 +2978,7 @@ mod tests {
                     port_allocations: Default::default(),
                     startup_message: None,
                     desired_state: DesiredState::Stopped,
+                    native_restart_enabled: false,
                 })
                 .await
                 .unwrap();

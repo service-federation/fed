@@ -67,6 +67,7 @@ impl Config {
         }
 
         self.warn_on_literal_local_ports();
+        self.warn_on_compose_restart();
 
         // Validate each service has exactly one type
         for (name, service) in &self.services {
@@ -509,6 +510,42 @@ impl Config {
         }
     }
 
+    /// Warn (once, aggregated) when a docker-compose-backed service
+    /// (`composeFile` + `composeService`) also sets `restart:`.
+    /// `07-supervisor.md` Design §3: fed does not rewrite a user-owned
+    /// `docker-compose.yml`, so this `restart:` has no native-mapping
+    /// effect the way it does for `image`-backed services (which get
+    /// `--restart unless-stopped` on `docker run`, `Always` only —
+    /// `DockerService::start()`). fed's own healthcheck/circuit-breaker
+    /// supervision still applies as configured either way; this is only
+    /// flagging that the *native* Docker-level safety net a user may be
+    /// expecting isn't there unless they set `restart:` inside the compose
+    /// file itself.
+    fn warn_on_compose_restart(&self) {
+        let findings = self.compose_restart_findings();
+        if !findings.is_empty() {
+            eprintln!(
+                "Warning: `restart:` on docker-compose-backed service {} has no effect on \
+                 Docker's own native restart policy — fed does not rewrite `docker-compose.yml`. \
+                 Set `restart:` directly in the compose file for Docker-native restart behavior. \
+                 fed's own healthcheck-driven restart/circuit-breaker supervision still applies \
+                 as configured.",
+                findings.join(", service ")
+            );
+        }
+    }
+
+    /// Names of docker-compose-backed services that also set `restart:`.
+    fn compose_restart_findings(&self) -> Vec<String> {
+        self.services
+            .iter()
+            .filter(|(_, service)| {
+                service.service_type() == ServiceType::DockerCompose && service.restart.is_some()
+            })
+            .map(|(name, _)| format!("'{}'", name))
+            .collect()
+    }
+
     /// One entry per offending service: `'name' (place, place)`.
     fn literal_local_port_findings(&self) -> Vec<String> {
         use std::sync::OnceLock;
@@ -817,6 +854,46 @@ mod tests {
                 "'app' (healthcheck, startup_message)".to_string(),
                 "'db' (ports)".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn compose_restart_findings_flags_restart_on_compose_service_only() {
+        use crate::config::RestartPolicy;
+
+        let mut config = Config::default();
+        config.services.insert(
+            "compose-with-restart".to_string(),
+            Service {
+                compose_file: Some("docker-compose.yml".to_string()),
+                compose_service: Some("web".to_string()),
+                restart: Some(RestartPolicy::Always),
+                ..Default::default()
+            },
+        );
+        config.services.insert(
+            "compose-without-restart".to_string(),
+            Service {
+                compose_file: Some("docker-compose.yml".to_string()),
+                compose_service: Some("db".to_string()),
+                ..Default::default()
+            },
+        );
+        config.services.insert(
+            "image-with-restart".to_string(),
+            Service {
+                image: Some("postgres:16".to_string()),
+                restart: Some(RestartPolicy::Always),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            config.compose_restart_findings(),
+            vec!["'compose-with-restart'".to_string()],
+            "only the compose-backed service with a restart policy should be flagged — \
+             image-backed services get native mapping instead (DockerService::start()), \
+             and compose services without restart: have nothing to warn about"
         );
     }
 

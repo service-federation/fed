@@ -107,6 +107,7 @@ impl SqliteStateTracker {
         let consecutive_failures = service_state.consecutive_failures;
         let startup_message = service_state.startup_message.clone();
         let desired_state = service_state.desired_state.to_string();
+        let native_restart_enabled = service_state.native_restart_enabled;
 
         self.conn
             .call(move |conn: &mut rusqlite::Connection| {
@@ -133,9 +134,13 @@ impl SqliteStateTracker {
                 // (defaulting to 'running' via ServiceState::new) rather than
                 // relying solely on the column's SQL DEFAULT, so a fresh
                 // registration always marks intent as running.
+                // native_restart_enabled is likewise written explicitly at
+                // registration time — captured once per fresh row, same as
+                // startup_message, since an already-registered row is left
+                // untouched above.
                 tx.execute(
-                    "INSERT INTO services (id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    "INSERT INTO services (id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     rusqlite::params![
                         &id,
                         &status,
@@ -150,6 +155,7 @@ impl SqliteStateTracker {
                         consecutive_failures,
                         startup_message.as_deref(),
                         &desired_state,
+                        native_restart_enabled,
                     ],
                 )?;
 
@@ -497,7 +503,7 @@ impl SqliteStateTracker {
     pub async fn get_services(&self) -> HashMap<String, ServiceState> {
         match self.conn.call(|conn: &mut rusqlite::Connection| {
             let mut stmt = conn.prepare(
-                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state FROM services"
+                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled FROM services"
             )?;
 
             let services_iter = stmt.query_map([], |row| {
@@ -507,6 +513,7 @@ impl SqliteStateTracker {
                 let started_at_str: String = row.get(5)?;
                 let last_restart_str: Option<String> = row.get(9)?;
                 let desired_state_str: String = row.get(12)?;
+                let native_restart_enabled: bool = row.get(13)?;
 
                 Ok((
                     id.clone(),
@@ -528,6 +535,7 @@ impl SqliteStateTracker {
                         port_allocations: HashMap::new(), // Will be populated below
                         startup_message: row.get(11)?,
                         desired_state: desired_state_str.parse::<DesiredState>().unwrap_or(DesiredState::Running),
+                        native_restart_enabled,
                     },
                 ))
             })?;
@@ -598,7 +606,7 @@ impl SqliteStateTracker {
 
         self.conn.call(move |conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<ServiceState>> {
             let service = match conn.query_row(
-                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state FROM services WHERE id = ?1",
+                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled FROM services WHERE id = ?1",
                 rusqlite::params![&service_id],
                 |row| {
                     let id: String = row.get(0)?;
@@ -607,6 +615,7 @@ impl SqliteStateTracker {
                     let started_at_str: String = row.get(5)?;
                     let last_restart_str: Option<String> = row.get(9)?;
                     let desired_state_str: String = row.get(12)?;
+                    let native_restart_enabled: bool = row.get(13)?;
 
                     Ok(ServiceState {
                         id,
@@ -623,6 +632,7 @@ impl SqliteStateTracker {
                         port_allocations: HashMap::new(),
                         startup_message: row.get(11)?,
                         desired_state: desired_state_str.parse::<DesiredState>().unwrap_or(DesiredState::Running),
+                        native_restart_enabled,
                     })
                 }
             ) {
@@ -664,6 +674,15 @@ impl SqliteStateTracker {
             .unwrap_or(false)
     }
 
+    /// Consecutive failed liveness checks a native-restart-enabled service
+    /// (`ServiceState::native_restart_enabled`) tolerates before being marked
+    /// `'stale'` — `07-supervisor.md` Design §3's state-reconciliation gap
+    /// mitigation. Docker's own restart backoff after a container-exit event
+    /// is brief; this spans the same order of magnitude rather than an
+    /// arbitrary long timeout, so a service genuinely gone (not just
+    /// mid-backoff) is still caught within a few `fed` invocations.
+    const STALE_GRACE_THRESHOLD: u32 = 3;
+
     /// Mark dead/stale services in state without deleting them.
     ///
     /// Sets status to `stale` so that port_allocations remain readable
@@ -676,9 +695,28 @@ impl SqliteStateTracker {
     /// `07-supervisor.md` Design §1) to notice a crashed, restart-worthy
     /// service *before* it becomes permanently invisible to `get_services()`.
     /// Plain `initialize()` discards this value (see `validate_and_cleanup`).
+    ///
+    /// Services with `native_restart_enabled` (Docker services with
+    /// `restart: always` — see
+    /// `crate::config::Service::docker_native_restart_enabled`) get a short
+    /// grace period instead of one-shot staleness (Design §3): a concurrent
+    /// `fed` command's liveness check can catch the container mid-backoff
+    /// while Docker's own `--restart unless-stopped` is bringing it back up,
+    /// and a single such snapshot marking the row `'stale'` would filter it
+    /// out of `get_services()` permanently, even after Docker's restart
+    /// succeeds a moment later. Everything else (process services, and
+    /// Docker services without native restart) keeps today's one-shot
+    /// check unchanged — they have no external process racing to revive
+    /// them on its own.
     pub async fn mark_dead_services(&mut self) -> Result<Vec<String>> {
         let services = self.get_services().await;
         let mut stale_services = Vec::new();
+        // Native-restart services whose liveness check just passed: reset
+        // their grace counter so a future blip starts counting fresh.
+        let mut grace_reset: Vec<String> = Vec::new();
+        // Native-restart services whose liveness check just failed: bump
+        // the counter and only stale once the threshold is exceeded.
+        let mut grace_hit: Vec<String> = Vec::new();
 
         // Check Docker daemon health with retry before evaluating container services.
         // If daemon is unhealthy after retries, we cannot reliably determine container state,
@@ -711,8 +749,40 @@ impl SqliteStateTracker {
             };
 
             if is_stale {
-                debug!("Service '{}' appears to be stale", service_id);
-                stale_services.push(service_id.clone());
+                if service_state.native_restart_enabled {
+                    grace_hit.push(service_id.clone());
+                } else {
+                    debug!("Service '{}' appears to be stale", service_id);
+                    stale_services.push(service_id.clone());
+                }
+            } else if service_state.native_restart_enabled {
+                grace_reset.push(service_id.clone());
+            }
+        }
+
+        if !grace_reset.is_empty() {
+            self.reset_stale_grace_counts(grace_reset).await?;
+        }
+
+        for service_id in grace_hit {
+            let failures = self.increment_stale_grace_count(&service_id).await?;
+            if failures >= Self::STALE_GRACE_THRESHOLD {
+                debug!(
+                    "Native-restart service '{}' failed its liveness check {} times in a row \
+                     (>= grace threshold {}); marking stale",
+                    service_id,
+                    failures,
+                    Self::STALE_GRACE_THRESHOLD
+                );
+                stale_services.push(service_id);
+            } else {
+                debug!(
+                    "Native-restart service '{}' failed its liveness check ({}/{}); within \
+                     Docker's own restart-backoff grace period, not marking stale yet",
+                    service_id,
+                    failures,
+                    Self::STALE_GRACE_THRESHOLD
+                );
             }
         }
 
@@ -740,6 +810,42 @@ impl SqliteStateTracker {
         }
 
         Ok(stale_services)
+    }
+
+    /// Bump a native-restart-enabled service's consecutive-liveness-check-
+    /// failure counter and return the new value. See
+    /// [`SqliteStateTracker::mark_dead_services`]'s `STALE_GRACE_THRESHOLD`.
+    async fn increment_stale_grace_count(&mut self, service_id: &str) -> Result<u32> {
+        let service_id = service_id.to_string();
+        self.with_transaction(move |tx| {
+            tx.execute(
+                "UPDATE services SET stale_grace_count = stale_grace_count + 1 WHERE id = ?1",
+                rusqlite::params![&service_id],
+            )?;
+            tx.query_row(
+                "SELECT stale_grace_count FROM services WHERE id = ?1",
+                rusqlite::params![&service_id],
+                |row| row.get(0),
+            )
+        })
+        .await
+    }
+
+    /// Reset the stale-grace counter to 0 for every given service — called
+    /// when a native-restart-enabled service's liveness check passes again,
+    /// so a later blip starts counting fresh rather than inheriting a stale
+    /// partial count from an unrelated earlier failure.
+    async fn reset_stale_grace_counts(&mut self, service_ids: Vec<String>) -> Result<()> {
+        self.with_transaction(move |tx| {
+            for service_id in &service_ids {
+                tx.execute(
+                    "UPDATE services SET stale_grace_count = 0 WHERE id = ?1",
+                    rusqlite::params![service_id],
+                )?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Purge services previously marked as stale by [`SqliteStateTracker::mark_dead_services`].
@@ -1047,6 +1153,7 @@ mod tests {
             port_allocations: HashMap::new(),
             startup_message: Some("Running on port 8080".to_string()),
             desired_state: DesiredState::Running,
+            native_restart_enabled: false,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1168,6 +1275,7 @@ mod tests {
             port_allocations: HashMap::new(),
             startup_message: None,
             desired_state: DesiredState::Running,
+            native_restart_enabled: false,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1254,6 +1362,7 @@ mod tests {
             port_allocations: HashMap::new(),
             startup_message: None,
             desired_state: DesiredState::Running,
+            native_restart_enabled: false,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1288,6 +1397,7 @@ mod tests {
             port_allocations: HashMap::new(),
             startup_message: None,
             desired_state: DesiredState::Running,
+            native_restart_enabled: false,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1327,6 +1437,7 @@ mod tests {
             port_allocations: HashMap::new(),
             startup_message: None,
             desired_state: DesiredState::Running,
+            native_restart_enabled: false,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1364,6 +1475,7 @@ mod tests {
             port_allocations: HashMap::new(),
             startup_message: None,
             desired_state: DesiredState::Running,
+            native_restart_enabled: false,
         };
         tracker.register_service(dead).await.unwrap();
         register_stopped_service(&mut tracker, "stopped-one").await;
@@ -1407,6 +1519,7 @@ mod tests {
             port_allocations: HashMap::new(),
             startup_message: None,
             desired_state: DesiredState::Running,
+            native_restart_enabled: false,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1445,6 +1558,7 @@ mod tests {
             port_allocations: HashMap::new(),
             startup_message: None,
             desired_state: DesiredState::Running,
+            native_restart_enabled: false,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1508,6 +1622,7 @@ mod tests {
             port_allocations: HashMap::new(),
             startup_message: None,
             desired_state: DesiredState::Running,
+            native_restart_enabled: false,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1522,6 +1637,134 @@ mod tests {
         assert!(
             services.is_empty(),
             "Stale Starting service should be filtered from get_services()"
+        );
+    }
+
+    // --- 07-supervisor.md Design §3: native-restart stale-grace period ---
+    //
+    // These exercise the grace-period *mechanism* directly against a
+    // Process-backed row with `native_restart_enabled` forced to `true` —
+    // the flag is decoupled from actual service type in
+    // `mark_dead_services`'s logic, so this covers the counter behavior
+    // without needing a real Docker daemon (the docker-gated integration
+    // test in `tests/docker_service_test.rs` covers the real container
+    // case end-to-end).
+
+    #[tokio::test]
+    async fn test_mark_dead_services_native_restart_gets_grace_period_not_immediate_stale() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+
+        let state = ServiceState {
+            id: "native-restart-svc".to_string(),
+            status: Status::Running,
+            service_type: ServiceType::Docker,
+            pid: Some(dead_pid),
+            container_id: None,
+            started_at: Utc::now(),
+            external_repo: None,
+            namespace: "test".to_string(),
+            restart_count: 0,
+            last_restart_at: None,
+            consecutive_failures: 0,
+            port_allocations: HashMap::new(),
+            startup_message: None,
+            desired_state: DesiredState::Running,
+            native_restart_enabled: true,
+        };
+        tracker.register_service(state).await.unwrap();
+
+        // First two failed liveness checks: within the grace threshold
+        // (STALE_GRACE_THRESHOLD = 3), so the row must stay visible.
+        for attempt in 1..SqliteStateTracker::STALE_GRACE_THRESHOLD {
+            let marked = tracker.mark_dead_services().await.unwrap();
+            assert!(
+                marked.is_empty(),
+                "attempt {attempt}: native-restart service should not be marked stale \
+                 within its grace period"
+            );
+            assert_eq!(
+                tracker.get_services().await.len(),
+                1,
+                "attempt {attempt}: service must remain visible during its grace period"
+            );
+        }
+
+        // The threshold-th consecutive failure marks it stale.
+        let marked = tracker.mark_dead_services().await.unwrap();
+        assert_eq!(
+            marked,
+            vec!["native-restart-svc".to_string()],
+            "service should be marked stale once its failures reach the grace threshold"
+        );
+        assert!(tracker.get_services().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mark_dead_services_native_restart_grace_count_resets_on_recovery() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        let live_pid = std::process::id();
+
+        let state = ServiceState {
+            id: "native-restart-svc".to_string(),
+            status: Status::Running,
+            service_type: ServiceType::Docker,
+            pid: Some(dead_pid),
+            container_id: None,
+            started_at: Utc::now(),
+            external_repo: None,
+            namespace: "test".to_string(),
+            restart_count: 0,
+            last_restart_at: None,
+            consecutive_failures: 0,
+            port_allocations: HashMap::new(),
+            startup_message: None,
+            desired_state: DesiredState::Running,
+            native_restart_enabled: true,
+        };
+        tracker.register_service(state).await.unwrap();
+
+        // One failed check (grace count -> 1), well under the threshold.
+        let marked = tracker.mark_dead_services().await.unwrap();
+        assert!(marked.is_empty());
+
+        // Docker's own restart brings it back — a subsequent liveness check
+        // observes a live PID and must reset the grace counter, not just
+        // leave it short of the threshold.
+        tracker
+            .update_service_pid("native-restart-svc", live_pid)
+            .await
+            .unwrap();
+        let marked = tracker.mark_dead_services().await.unwrap();
+        assert!(marked.is_empty(), "a healthy check must not stale the row");
+
+        // Simulate it dying again — if the counter had NOT been reset, this
+        // would only need 2 more failures (1 already banked + 2 = 3) to hit
+        // the threshold. Prove it actually needs a fresh 3 by checking the
+        // row survives exactly `STALE_GRACE_THRESHOLD - 1` more failures.
+        tracker
+            .update_service_pid("native-restart-svc", dead_pid)
+            .await
+            .unwrap();
+        for attempt in 1..SqliteStateTracker::STALE_GRACE_THRESHOLD {
+            let marked = tracker.mark_dead_services().await.unwrap();
+            assert!(
+                marked.is_empty(),
+                "attempt {attempt} after reset: should still be within a fresh grace period"
+            );
+        }
+        let marked = tracker.mark_dead_services().await.unwrap();
+        assert_eq!(
+            marked,
+            vec!["native-restart-svc".to_string()],
+            "a fresh run of failures (post-reset) should still take the full threshold to stale"
         );
     }
 
@@ -1547,6 +1790,7 @@ mod tests {
             port_allocations: HashMap::new(),
             startup_message: None,
             desired_state: DesiredState::Running,
+            native_restart_enabled: false,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1566,6 +1810,7 @@ mod tests {
             port_allocations: HashMap::new(),
             startup_message: None,
             desired_state: DesiredState::Running,
+            native_restart_enabled: false,
         };
         let outcome = tracker.register_service(new_state).await.unwrap();
         assert_eq!(

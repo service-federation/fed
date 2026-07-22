@@ -60,6 +60,12 @@ impl SqliteStateTracker {
             self.migrate_v6_to_v7().await?;
         }
 
+        // Migration from v7 to v8: Add native_restart_enabled and
+        // stale_grace_count columns
+        if current_version < 8 {
+            self.migrate_v7_to_v8().await?;
+        }
+
         Ok(())
     }
 
@@ -419,6 +425,83 @@ impl SqliteStateTracker {
         Ok(())
     }
 
+    /// Migration v7 -> v8: Add `native_restart_enabled` and
+    /// `stale_grace_count` columns to `services`.
+    ///
+    /// `native_restart_enabled` mirrors
+    /// [`crate::config::Service::docker_native_restart_enabled`], captured
+    /// at registration time. `stale_grace_count` is the consecutive-failure
+    /// counter `mark_dead_services` uses for those services instead of
+    /// one-shot staleness — see `07-supervisor.md` Design §3's
+    /// state-reconciliation gap: a concurrent `fed` command's
+    /// container-liveness check would otherwise mark a row `'stale'`
+    /// (permanently filtering it from `get_services()`) during Docker's own
+    /// brief native-restart backoff window.
+    async fn migrate_v7_to_v8(&self) -> Result<()> {
+        debug!(
+            "Running migration v7 -> v8: Adding native_restart_enabled and stale_grace_count columns"
+        );
+
+        self.conn
+            .call(|conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+                let tx = conn.transaction()?;
+
+                let already_applied: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM schema_version WHERE version = 8",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+
+                if already_applied {
+                    return Ok(());
+                }
+
+                let has_native_restart_column: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM pragma_table_info('services') WHERE name = 'native_restart_enabled'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+
+                if !has_native_restart_column {
+                    tx.execute(
+                        "ALTER TABLE services ADD COLUMN native_restart_enabled INTEGER NOT NULL DEFAULT 0",
+                        [],
+                    )?;
+                }
+
+                let has_grace_column: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM pragma_table_info('services') WHERE name = 'stale_grace_count'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+
+                if !has_grace_column {
+                    tx.execute(
+                        "ALTER TABLE services ADD COLUMN stale_grace_count INTEGER NOT NULL DEFAULT 0",
+                        [],
+                    )?;
+                }
+
+                tx.execute(
+                    "INSERT INTO schema_version (version, applied_at) VALUES (8, datetime('now'))",
+                    [],
+                )?;
+
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+
+        info!("Migration v7 -> v8 completed successfully");
+        Ok(())
+    }
+
     /// Create database schema
     pub(super) async fn create_schema(&self) -> Result<()> {
         self.conn.call(|conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
@@ -454,7 +537,9 @@ impl SqliteStateTracker {
                     consecutive_failures INTEGER NOT NULL DEFAULT 0,
                     circuit_breaker_open_until TEXT,
                     startup_message TEXT,
-                    desired_state TEXT NOT NULL DEFAULT 'running'
+                    desired_state TEXT NOT NULL DEFAULT 'running',
+                    native_restart_enabled INTEGER NOT NULL DEFAULT 0,
+                    stale_grace_count INTEGER NOT NULL DEFAULT 0
                 );
 
                 -- Indexes for services
@@ -654,7 +739,10 @@ mod desired_state_migration_tests {
             "column added by ALTER TABLE ... DEFAULT 'running' should backfill existing rows"
         );
 
-        // Schema version must have advanced all the way to current.
+        // Schema version must have advanced all the way to current — a
+        // legacy v6 db run through `initialize()` now migrates straight
+        // through v7 (desired_state) to v8 (native_restart_enabled /
+        // stale_grace_count), not just to v7.
         let conn = rusqlite::Connection::open(fed_dir.join("lock.db")).unwrap();
         let version: i32 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
@@ -662,7 +750,7 @@ mod desired_state_migration_tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[tokio::test]
@@ -716,6 +804,218 @@ mod desired_state_migration_tests {
 
         let retrieved = tracker.get_service("fresh-svc").await.unwrap();
         assert_eq!(retrieved.desired_state, DesiredState::Running);
+
+        let conn = rusqlite::Connection::open(temp_dir.path().join(".fed/lock.db")).unwrap();
+        let version: i32 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+}
+
+#[cfg(test)]
+mod native_restart_migration_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Hand-write a `lock.db` matching the exact v7 schema (post-`desired_state`,
+    /// pre-`native_restart_enabled`/`stale_grace_count`) so migrating it
+    /// forward exercises the real `ALTER TABLE` path rather than a
+    /// freshly-created (already up to date) database.
+    fn write_legacy_v7_db(fed_dir: &std::path::Path, service_id: &str) {
+        std::fs::create_dir_all(fed_dir).unwrap();
+        let db_path = fed_dir.join("lock.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+
+            CREATE TABLE lock_file (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                fed_pid INTEGER NOT NULL,
+                work_dir TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE services (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                service_type TEXT NOT NULL,
+                pid INTEGER,
+                container_id TEXT,
+                started_at TEXT NOT NULL,
+                external_repo TEXT,
+                namespace TEXT NOT NULL,
+                restart_count INTEGER NOT NULL DEFAULT 0,
+                last_restart_at TEXT,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                circuit_breaker_open_until TEXT,
+                startup_message TEXT,
+                desired_state TEXT NOT NULL DEFAULT 'running'
+            );
+
+            CREATE TABLE port_allocations (
+                service_id TEXT NOT NULL,
+                parameter_name TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                PRIMARY KEY (service_id, parameter_name)
+            );
+
+            CREATE TABLE allocated_ports (
+                port INTEGER PRIMARY KEY,
+                allocated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE persisted_ports (
+                param_name TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                allocated_at TEXT NOT NULL,
+                isolation_id TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (param_name, isolation_id)
+            );
+
+            CREATE TABLE restart_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id TEXT NOT NULL,
+                restarted_at TEXT NOT NULL
+            );
+
+            CREATE TABLE project_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            "#,
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (7, datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO lock_file (id, fed_pid, work_dir, started_at, updated_at) VALUES (1, 999999, 'legacy', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO services (id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, circuit_breaker_open_until, startup_message, desired_state)
+             VALUES (?1, 'running', 'docker', NULL, NULL, datetime('now'), NULL, 'root', 0, NULL, 0, NULL, NULL, 'running')",
+            rusqlite::params![service_id],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrate_v7_to_v8_adds_native_restart_columns_defaulting_to_false_and_zero() {
+        let temp_dir = TempDir::new().unwrap();
+        let fed_dir = temp_dir.path().join(".fed");
+        write_legacy_v7_db(&fed_dir, "legacy-docker-svc");
+
+        let mut tracker = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        tracker
+            .initialize()
+            .await
+            .expect("migrating a v7 db to v8 should succeed");
+
+        // The pre-existing row must have gained both new columns with their
+        // documented defaults, without anything explicitly writing them.
+        let state = tracker
+            .get_service("legacy-docker-svc")
+            .await
+            .expect("legacy row should survive the migration");
+        assert!(
+            !state.native_restart_enabled,
+            "column added by ALTER TABLE ... DEFAULT 0 should backfill existing rows to false"
+        );
+
+        let conn = rusqlite::Connection::open(fed_dir.join("lock.db")).unwrap();
+        let grace_count: i64 = conn
+            .query_row(
+                "SELECT stale_grace_count FROM services WHERE id = 'legacy-docker-svc'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            grace_count, 0,
+            "stale_grace_count should backfill existing rows to 0"
+        );
+
+        let version: i32 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, 8);
+    }
+
+    #[tokio::test]
+    async fn migrate_v7_to_v8_is_idempotent_on_rerun() {
+        let temp_dir = TempDir::new().unwrap();
+        let fed_dir = temp_dir.path().join(".fed");
+        write_legacy_v7_db(&fed_dir, "legacy-docker-svc");
+
+        // First migration.
+        {
+            let mut tracker = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap();
+            tracker.initialize().await.unwrap();
+        }
+
+        // Re-opening (simulating a second `fed` invocation against an
+        // already-migrated db) must not error on the already-applied guard
+        // or the already-existing columns.
+        let mut tracker = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        tracker
+            .initialize()
+            .await
+            .expect("re-running migrations against an already-migrated db should be a no-op");
+
+        let state = tracker.get_service("legacy-docker-svc").await.unwrap();
+        assert!(!state.native_restart_enabled);
+    }
+
+    /// A brand-new `.fed/` directory (the `create_schema` path, not the
+    /// migration path) must get both columns directly — same "two touch
+    /// points" concern as `desired_state` in Design §1, but for Design §3's
+    /// columns: forgetting to also add them to `create_schema` would leave
+    /// fresh projects one migration behind their own schema version.
+    #[tokio::test]
+    async fn fresh_database_has_native_restart_columns_without_migrating() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut tracker = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        tracker.initialize().await.unwrap();
+
+        let mut state = crate::state::ServiceState::new(
+            "fresh-docker-svc".to_string(),
+            crate::config::ServiceType::Docker,
+            "root".to_string(),
+        );
+        state.native_restart_enabled = true;
+        tracker.register_service(state).await.unwrap();
+
+        let retrieved = tracker.get_service("fresh-docker-svc").await.unwrap();
+        assert!(retrieved.native_restart_enabled);
 
         let conn = rusqlite::Connection::open(temp_dir.path().join(".fed/lock.db")).unwrap();
         let version: i32 = conn

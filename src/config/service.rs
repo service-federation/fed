@@ -332,6 +332,33 @@ impl Service {
         }
     }
 
+    /// Whether this service qualifies for Docker's native `--restart
+    /// unless-stopped` reboot-survival flag (`07-supervisor.md` Design §3):
+    /// image-backed (`ServiceType::Docker`) with `restart: always`.
+    ///
+    /// `restart: onfailure` is deliberately **not** included even though it
+    /// looks like it should map to Docker's `--restart on-failure:N`: the
+    /// two aren't a 1:1 mapping. Docker's `on-failure` only restarts on a
+    /// non-zero container exit, while fed's own liveness check treats any
+    /// death — including a clean exit — as needing restart; and Docker's
+    /// retry counter is a lifetime count that never resets on a healthy run,
+    /// while fed's `consecutive_failures` resets on every successful health
+    /// check. Piping `max_retries` straight through as Docker's `N` would
+    /// silently exhaust Docker's own safety net during ordinary operation,
+    /// well before the host-reboot scenario the native flag exists to
+    /// protect against. fed's own supervisor already fully implements
+    /// `onfailure` semantics whenever any fed process is alive (Design §3);
+    /// only `always`, whose native counterpart has no such cap, gets the
+    /// extra native flag. `DockerService::start()` reads this to decide the
+    /// `docker run` args; the supervisor's stale-row grace period
+    /// (`mark_dead_services`) reads the persisted equivalent
+    /// (`ServiceState::native_restart_enabled`) to decide whether a failed
+    /// liveness check gets a grace period before staling.
+    pub fn docker_native_restart_enabled(&self) -> bool {
+        self.service_type() == ServiceType::Docker
+            && matches!(self.restart, Some(RestartPolicy::Always))
+    }
+
     /// Get grace period duration, defaulting to 10 seconds.
     ///
     /// Parses duration strings like "10s", "30s", "1m", "500ms".

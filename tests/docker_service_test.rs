@@ -2,6 +2,7 @@
 // These tests require Docker daemon to be running
 // Run with: cargo test --test docker_service_test -- --ignored
 
+use fed::RestartPolicy;
 use fed::config::Service as ServiceConfig;
 use fed::service::{DockerService, ServiceManager, Status};
 use std::collections::HashMap;
@@ -60,6 +61,43 @@ fn create_test_service_with_env(
         "/tmp".to_string(),
         None, // No isolation ID
     )
+}
+
+// Helper to create service with a given restart policy (07-supervisor.md
+// Design §3: native `--restart` mapping)
+fn create_test_service_with_restart(
+    name: &str,
+    image: &str,
+    restart: Option<RestartPolicy>,
+) -> DockerService {
+    let config = ServiceConfig {
+        image: Some(image.to_string()),
+        restart,
+        ..Default::default()
+    };
+
+    DockerService::new(
+        name.to_string(),
+        config,
+        HashMap::new(),
+        "/tmp".to_string(),
+        None, // No isolation ID
+    )
+}
+
+// Read a container's native Docker restart policy name via `docker inspect`
+// (empty string if the container has no restart policy at all).
+async fn docker_restart_policy_name(container_name: &str) -> String {
+    let out = tokio::process::Command::new("docker")
+        .args([
+            "inspect",
+            "--format={{.HostConfig.RestartPolicy.Name}}",
+            container_name,
+        ])
+        .output()
+        .await
+        .expect("docker inspect");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 // Helper to cleanup a container by name (best effort)
@@ -686,4 +724,166 @@ async fn prune_reaps_only_labeled_fed_volumes() {
     );
 
     docker(&["volume", "rm", "-f", labeled, unlabeled]);
+}
+
+// ============================================================================
+// Native `--restart` mapping tests (07-supervisor.md Design §3, Phase 4)
+// ============================================================================
+
+/// `restart: always` must get Docker's own `--restart unless-stopped` flag
+/// on the underlying container — the reboot-survival safety net that stacks
+/// on top of (never replaces) fed's own healthcheck-driven supervision.
+#[tokio::test]
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
+async fn test_docker_native_restart_flag_present_for_restart_always() {
+    require_docker!();
+
+    let container_name = "fed-test-native-restart-always";
+    cleanup_container(container_name).await;
+
+    let mut service = create_test_service_with_restart(
+        "native-restart-always",
+        "alpine:latest",
+        Some(RestartPolicy::Always),
+    );
+
+    service.start().await.expect("Start should succeed");
+    sleep(Duration::from_millis(500)).await;
+
+    let real_name = resolve_container_name("native-restart-always").await;
+    let policy = docker_restart_policy_name(&real_name).await;
+    assert_eq!(
+        policy, "unless-stopped",
+        "restart: always must map to Docker's --restart unless-stopped, not `always` \
+         (which would ignore an explicit `docker stop`)"
+    );
+
+    service.stop().await.ok();
+}
+
+/// No `restart:` policy at all must not add any native Docker restart flag.
+#[tokio::test]
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
+async fn test_docker_no_native_restart_flag_without_restart_policy() {
+    require_docker!();
+
+    let container_name = "fed-test-native-restart-none";
+    cleanup_container(container_name).await;
+
+    let mut service =
+        create_test_service_with_restart("native-restart-none", "alpine:latest", None);
+
+    service.start().await.expect("Start should succeed");
+    sleep(Duration::from_millis(500)).await;
+
+    let real_name = resolve_container_name("native-restart-none").await;
+    let policy = docker_restart_policy_name(&real_name).await;
+    assert_eq!(
+        policy, "no",
+        "a service with no restart: policy must not get any native Docker restart flag \
+         (docker inspect reports the absence of a restart policy as \"no\")"
+    );
+
+    service.stop().await.ok();
+}
+
+/// `restart: onfailure` deliberately does NOT map to Docker's native
+/// `--restart on-failure:N` — see `Service::docker_native_restart_enabled`'s
+/// doc comment: Docker's on-failure only reacts to a non-zero exit and its
+/// retry counter never resets on a healthy run, unlike fed's own
+/// `consecutive_failures`, so passing `max_retries` straight through as
+/// Docker's `N` would not be a 1:1 mapping. Only `always` gets the native
+/// flag; fed's own supervisor fully handles `onfailure` on its own whenever
+/// any fed process is alive.
+#[tokio::test]
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
+async fn test_docker_native_restart_omitted_for_onfailure() {
+    require_docker!();
+
+    let container_name = "fed-test-native-restart-onfailure";
+    cleanup_container(container_name).await;
+
+    let mut service = create_test_service_with_restart(
+        "native-restart-onfailure",
+        "alpine:latest",
+        Some(RestartPolicy::OnFailure {
+            max_retries: Some(3),
+        }),
+    );
+
+    service.start().await.expect("Start should succeed");
+    sleep(Duration::from_millis(500)).await;
+
+    let real_name = resolve_container_name("native-restart-onfailure").await;
+    let policy = docker_restart_policy_name(&real_name).await;
+    assert_eq!(
+        policy, "no",
+        "restart: onfailure must not get a native Docker restart flag — not a 1:1 mapping \
+         with Docker's own on-failure:N semantics (docker inspect reports the absence of a \
+         restart policy as \"no\")"
+    );
+
+    service.stop().await.ok();
+}
+
+/// `fed stop` must win over `--restart unless-stopped`: a real `docker stop`
+/// (what `DockerService::stop()` runs) is exactly the signal Docker's own
+/// restart-policy engine treats as "the user explicitly stopped this,
+/// don't bring it back" — and fed's `stop()` additionally removes the
+/// container entirely, leaving nothing for Docker to restart even in
+/// principle. Verified by waiting past Docker's own near-instant first
+/// restart-backoff window and confirming the container never reappears.
+#[tokio::test]
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
+async fn test_fed_stop_wins_over_unless_stopped() {
+    require_docker!();
+
+    let container_name = "fed-test-stop-wins";
+    cleanup_container(container_name).await;
+
+    // A long-lived process so the container is never observed to have
+    // exited "on its own" — the only way it goes down is via fed's stop().
+    let mut config = ServiceConfig {
+        image: Some("alpine:latest".to_string()),
+        restart: Some(RestartPolicy::Always),
+        ..Default::default()
+    };
+    config.command = Some(fed::config::DockerCommand::List(vec![
+        "sleep".to_string(),
+        "300".to_string(),
+    ]));
+
+    let mut service = DockerService::new(
+        "stop-wins".to_string(),
+        config,
+        HashMap::new(),
+        "/tmp".to_string(),
+        None,
+    );
+
+    service.start().await.expect("Start should succeed");
+    sleep(Duration::from_millis(500)).await;
+
+    let real_name = resolve_container_name("stop-wins").await;
+    assert_eq!(
+        docker_restart_policy_name(&real_name).await,
+        "unless-stopped"
+    );
+
+    service.stop().await.expect("Stop should succeed");
+
+    // Give Docker's own restart-policy engine several chances to (wrongly)
+    // bring the container back if `docker stop` hadn't disarmed it.
+    sleep(Duration::from_secs(3)).await;
+
+    let check = tokio::process::Command::new("docker")
+        .args(["ps", "-a", "-q", "-f", &format!("name={real_name}")])
+        .output()
+        .await
+        .expect("docker ps");
+    assert!(
+        String::from_utf8_lossy(&check.stdout).trim().is_empty(),
+        "container must be gone (not just stopped, not resurrected) after fed stop(), \
+         despite --restart unless-stopped"
+    );
 }

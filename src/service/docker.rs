@@ -431,6 +431,26 @@ impl ServiceManager for DockerService {
         // We'll manually remove containers in stop() to ensure proper state tracking
         let mut args = vec!["run".to_string(), "-d".to_string()];
 
+        // Native restart mapping (07-supervisor.md Design §3): `restart:
+        // always` also gets Docker's own `--restart unless-stopped` as an
+        // *additional* reboot-survival safety net — fed's own
+        // healthcheck-command supervision and circuit-breaker accounting
+        // stay fully active regardless (Docker has no visibility into
+        // fed's `healthcheck:` feature, so it can't be handed the whole
+        // job). `unless-stopped`, not Docker's literal `always`, so an
+        // explicit `fed stop` (which runs a real `docker stop` in this
+        // service's own `stop()`, below) is honored instead of the
+        // container being immediately resurrected by the daemon.
+        //
+        // `restart: onfailure` is deliberately NOT mapped to Docker's
+        // `--restart on-failure:N` — see
+        // `Service::docker_native_restart_enabled`'s doc comment for why
+        // that would not be a 1:1 mapping.
+        if self.config.docker_native_restart_enabled() {
+            args.push("--restart".to_string());
+            args.push("unless-stopped".to_string());
+        }
+
         // Add deterministic container name for tracking and orphan prevention
         // Format: fed-<work_dir_hash>-<service-name> or fed-<isolation-id>-<service-name>
         let (service_name, env_args) = {

@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 const DB_FILE_NAME: &str = "lock.db";
 const LOCK_FILE_NAME: &str = ".lock";
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 mod isolation;
 mod migrations;
@@ -294,7 +294,7 @@ impl SqliteStateTracker {
         match conn
             .call(|conn: &mut rusqlite::Connection| {
                 let mut stmt = conn.prepare(
-                    "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state FROM services"
+                    "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled FROM services"
                 )?;
 
                 let services_iter = stmt.query_map([], |row| {
@@ -304,6 +304,7 @@ impl SqliteStateTracker {
                     let started_at_str: String = row.get(5)?;
                     let last_restart_str: Option<String> = row.get(9)?;
                     let desired_state_str: String = row.get(12)?;
+                    let native_restart_enabled: bool = row.get(13)?;
 
                     Ok((
                         id.clone(),
@@ -328,6 +329,7 @@ impl SqliteStateTracker {
                             desired_state: desired_state_str
                                 .parse::<DesiredState>()
                                 .unwrap_or(DesiredState::Running),
+                            native_restart_enabled,
                         },
                     ))
                 })?;
@@ -687,6 +689,7 @@ mod tests {
                 port_allocations: HashMap::new(),
                 startup_message: None,
                 desired_state: DesiredState::Running,
+                native_restart_enabled: false,
             };
             tracker.register_service(state).await.unwrap();
         }
@@ -711,6 +714,7 @@ mod tests {
                 port_allocations: HashMap::new(),
                 startup_message: None,
                 desired_state: DesiredState::Running,
+                native_restart_enabled: false,
             };
             tracker.register_service(state).await.unwrap();
         }
@@ -739,6 +743,7 @@ mod tests {
                 port_allocations: HashMap::new(),
                 startup_message: None,
                 desired_state: DesiredState::Running,
+                native_restart_enabled: false,
             }
         }
     }
