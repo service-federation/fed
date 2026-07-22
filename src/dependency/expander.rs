@@ -130,6 +130,18 @@ impl<'a> ExternalServiceExpander<'a> {
             )));
         }
 
+        // Only the directly-named target service must be exposed; services
+        // pulled in transitively through its own dependency tree (collected
+        // below) are exempt. This mirrors subsystem B's (dormant)
+        // `merge_external_services` policy in `dependency/external.rs`.
+        let target_service = &external_config.services[target_service_name];
+        if !target_service.expose {
+            return Err(Error::Config(format!(
+                "External service '{}' (dependency '{}') is not marked expose: true in its own config. Mark it exposed before importing it as '{}'",
+                target_service_name, dep_name, service_name
+            )));
+        }
+
         // Collect all services to import (target + dependencies)
         let services_to_import =
             collect_service_dependencies(&external_config, target_service_name);
@@ -392,5 +404,124 @@ mod tests {
 
         let deps = collect_service_dependencies(&config, "service_b");
         assert_eq!(deps, vec!["service_c", "service_b"]);
+    }
+
+    // ── `expose: true` enforcement (D1 Option A, subsystem A) ───────────
+    //
+    // These build a real tempdir fixture — a parent config plus an external
+    // `file://`-referenced repo with its own fed.yaml — and drive
+    // `expand_single_service` end-to-end, since nothing else in the crate
+    // exercises `ExternalServiceExpander::expand()` against a real fixture.
+
+    /// Write an external repo at `<tempdir>/<dir_name>/fed.yaml` containing a
+    /// `target` service (optionally exposed) that depends on a `helper`
+    /// service (never exposed, to prove the transitive exemption).
+    fn write_external_repo(root: &Path, dir_name: &str, target_expose: bool) -> PathBuf {
+        let repo_dir = root.join(dir_name);
+        std::fs::create_dir_all(&repo_dir).unwrap();
+
+        let expose_line = if target_expose {
+            "    expose: true\n"
+        } else {
+            ""
+        };
+        let yaml = format!(
+            "services:\n\
+             \x20\x20target:\n\
+             \x20\x20\x20\x20process: \"echo target\"\n\
+             {expose_line}\
+             \x20\x20\x20\x20depends_on:\n\
+             \x20\x20\x20\x20\x20\x20- helper\n\
+             \x20\x20helper:\n\
+             \x20\x20\x20\x20process: \"echo helper\"\n\
+             entrypoint: target\n"
+        );
+
+        std::fs::write(repo_dir.join("fed.yaml"), yaml).unwrap();
+        repo_dir
+    }
+
+    fn make_importer_config(dep_dir_name: &str) -> Config {
+        let mut config = Config::default();
+
+        let mut dependency_service = Service::default();
+        dependency_service.dependency = Some("ext".to_string());
+        dependency_service.service = Some("target".to_string());
+        config
+            .services
+            .insert("imported".to_string(), dependency_service);
+
+        config.dependencies.insert(
+            "ext".to_string(),
+            crate::config::Dependency {
+                repo: format!("file://{}", dep_dir_name),
+                branch: None,
+            },
+        );
+
+        config
+    }
+
+    #[tokio::test]
+    async fn test_expand_unexposed_target_fails() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_external_repo(temp_dir.path(), "ext-repo", false);
+
+        let config = make_importer_config("ext-repo");
+        let resolver = Resolver::new();
+        let expander =
+            ExternalServiceExpander::new(&config, &resolver, temp_dir.path().to_path_buf());
+
+        let result = expander.expand().await;
+
+        assert!(
+            result.is_err(),
+            "importing an unexposed target service should fail"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("expose: true"),
+            "error should mention expose: true, got: {}",
+            err
+        );
+        assert!(
+            err.contains("target") && err.contains("ext") && err.contains("imported"),
+            "error should name the target service, dependency, and importing service, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expand_exposed_target_succeeds_and_imports_unexposed_transitive_dependency() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_external_repo(temp_dir.path(), "ext-repo", true);
+
+        let config = make_importer_config("ext-repo");
+        let resolver = Resolver::new();
+        let expander =
+            ExternalServiceExpander::new(&config, &resolver, temp_dir.path().to_path_buf());
+
+        let result = expander.expand().await;
+
+        assert!(
+            result.is_ok(),
+            "importing an exposed target service should succeed: {:?}",
+            result.err()
+        );
+        let expanded = result.unwrap();
+
+        // Target is imported under the parent service's own name.
+        assert!(
+            expanded.services.contains_key("imported"),
+            "expected the exposed target service to be imported as 'imported'"
+        );
+
+        // Its transitive dependency ("helper", never exposed) still comes
+        // along, namespaced — the exemption applies to everything except the
+        // directly-named target.
+        assert!(
+            expanded.services.contains_key("imported:helper"),
+            "expected the unexposed transitive dependency 'helper' to be imported alongside the exposed target"
+        );
     }
 }

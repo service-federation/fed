@@ -46,5 +46,6 @@ services:
       AUTH_URL: '{{AUTH_URL}}'
     healthcheck:
       httpGet: 'http://localhost:{{PORT}}/health'
+    expose: true
 
 entrypoint: middleware

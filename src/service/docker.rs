@@ -578,7 +578,11 @@ impl ServiceManager for DockerService {
 
         // Add command override (appended after image, replaces Docker CMD)
         if let Some(ref command) = self.config.command {
-            args.extend(command.to_args());
+            let command_args = command.to_args().map_err(|e| match e {
+                Error::Config(msg) => Error::Config(format!("Service '{}': {}", self.name, msg)),
+                other => other,
+            })?;
+            args.extend(command_args);
         }
 
         // PERFORMANCE: Check if image exists locally before pulling (avoid 5min timeout on cached images)

@@ -46,6 +46,7 @@ services:
       - logger-external
     healthcheck:
       httpGet: 'http://localhost:{{PORT}}/health'
+    expose: true
 
   # Logger from external dependency
   logger-external:

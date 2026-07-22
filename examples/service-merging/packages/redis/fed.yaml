@@ -13,3 +13,6 @@ services:
     healthcheck:
       command: "redis-cli ping"
     restart: always
+    # Marks this service as the package's public API — required as of
+    # fed 8.0 for any service extended via `extends: "cache-package.redis"`.
+    expose: true

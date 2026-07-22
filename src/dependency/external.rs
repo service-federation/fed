@@ -5,6 +5,26 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// External dependency resolver
+///
+/// **Status as of the fed 8.0 surface-cleanup pass (plan 09):** this is a
+/// second, independent external-dependency subsystem (`metadata.
+/// external_dependencies` + `depends_on: - external: name`), separate from
+/// the live one (`dependency:`/`service:` fields, handled by
+/// [`crate::dependency::expander::ExternalServiceExpander`]). Nothing in the
+/// binary calls [`ExternalDependencyResolver::resolve_external_dependencies`]
+/// or [`merge_external_services`](Self::merge_external_services) outside of
+/// this module's own unit tests and `tests/external_dependencies_test.rs` —
+/// it is dormant, not wired into `orchestrator/core.rs`. It is not, however,
+/// dead code safe to delete: `DependsOn::is_external()` is a live call site
+/// in `config/validation.rs`, so this subsystem's types are load-bearing
+/// even though its resolution logic never runs in production.
+///
+/// `merge_external_services` already enforces `expose: true` on the service
+/// it imports (see below) — that check was the model for the `expose`
+/// enforcement added to the two *live* import mechanisms in 8.0 (package
+/// `extends` in `package/merger.rs`, and `dependency:`/`service:` in
+/// `dependency/expander.rs`). This resolver was left as-is, dormant, for
+/// 8.0 — removing or wiring it up is a separate decision, out of scope here.
 pub struct ExternalDependencyResolver {
     /// Base working directory
     work_dir: PathBuf,

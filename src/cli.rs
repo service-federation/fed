@@ -59,10 +59,6 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// [deprecated: use --isolate] Allocate fresh random ports
-        #[arg(long, hide = true)]
-        randomize: bool,
-
         /// Enable isolation mode before starting (persisted)
         #[arg(long)]
         isolate: bool,
@@ -316,20 +312,6 @@ pub enum PortsCommands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
-    },
-    /// [deprecated: use `fed isolate enable`] Allocate fresh random ports for all port parameters
-    #[command(hide = true)]
-    Randomize {
-        /// Skip confirmation, auto-stop running services
-        #[arg(long, short)]
-        force: bool,
-    },
-    /// [deprecated: use `fed isolate disable`] Clear port allocations (next start uses defaults)
-    #[command(hide = true)]
-    Reset {
-        /// Skip confirmation, auto-stop running services
-        #[arg(long, short)]
-        force: bool,
     },
 }
 

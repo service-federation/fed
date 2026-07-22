@@ -1,4 +1,4 @@
-use crate::cli::{IsolateCommands, PortsCommands};
+use crate::cli::PortsCommands;
 use crate::output::UserOutput;
 use fed::Parser as ConfigParser;
 use fed::RunContext;
@@ -10,43 +10,13 @@ pub async fn run_ports(
     cmd: &PortsCommands,
     workdir: Option<PathBuf>,
     config_path: Option<PathBuf>,
-    ctx: RunContext,
+    _ctx: RunContext,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
     match cmd {
         PortsCommands::List { json } => {
             let work_dir = resolve_work_dir(workdir, config_path.as_deref())?;
             list_ports(&work_dir, *json, out).await
-        }
-        // The randomize/reset commands are deprecated aliases. They delegate to
-        // the isolate commands rather than reimplementing port persistence —
-        // standalone randomization has no isolation scope to persist into and
-        // would leak random ports into the non-isolated start path.
-        PortsCommands::Randomize { force } => {
-            eprintln!(
-                "Warning: `fed ports randomize` is deprecated. Use `fed isolate enable` instead."
-            );
-            super::isolate::run_isolate(
-                &IsolateCommands::Enable { force: *force },
-                workdir,
-                config_path,
-                ctx,
-                out,
-            )
-            .await
-        }
-        PortsCommands::Reset { force } => {
-            eprintln!(
-                "Warning: `fed ports reset` is deprecated. Use `fed isolate disable` instead."
-            );
-            super::isolate::run_isolate(
-                &IsolateCommands::Disable { force: *force },
-                workdir,
-                config_path,
-                ctx,
-                out,
-            )
-            .await
         }
     }
 }

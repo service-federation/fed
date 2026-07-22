@@ -1,7 +1,7 @@
 use crate::config::{Config, Service};
 use crate::error::{Error, Result};
 use crate::package::types::Package;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Service merger for merging package services into main config
 pub struct ServiceMerger;
@@ -90,6 +90,17 @@ impl ServiceMerger {
                     ))
                 })?;
 
+            // Only services the package author marked `expose: true` may be
+            // extended from outside the package. This mirrors the enforcement
+            // on the live `dependency:`/`service:` import path in
+            // `dependency/expander.rs`.
+            if !base_service.expose {
+                return Err(Error::Package(format!(
+                    "Service '{}' in package '{}' is not marked expose: true. Mark it exposed in the package's fed.yaml before extending it from '{}'",
+                    package_service_name, package_alias, service_name
+                )));
+            }
+
             // Check for circular extends in the base service
             if base_service.extends.is_some() {
                 return Err(Error::CircularPackageDependency);
@@ -108,9 +119,16 @@ impl ServiceMerger {
         Ok(())
     }
 
-    /// Build map of service names to their extends references
-    fn build_extends_map(config: &Config) -> Result<HashMap<String, String>> {
-        let mut map = HashMap::new();
+    /// Build map of service names to their extends references.
+    ///
+    /// Uses a `BTreeMap` (rather than `HashMap`) so `merge_packages` iterates
+    /// services in deterministic (sorted-by-name) order. This matters because
+    /// `merge_packages`'s loop body uses `?` to bail out on the first error —
+    /// with a `HashMap`'s randomized iteration order, *which* service's error
+    /// surfaces first (and which not-yet-processed entries get abandoned)
+    /// would vary from run to run given the same input.
+    fn build_extends_map(config: &Config) -> Result<BTreeMap<String, String>> {
+        let mut map = BTreeMap::new();
 
         for (name, service) in &config.services {
             if let Some(ref extend_ref) = service.extends {
@@ -682,6 +700,7 @@ mod tests {
         let mut pkg_config = Config::default();
         let pkg_service = Service {
             image: Some("postgres:15".to_string()),
+            expose: true,
             extends: Some("another-pkg.base".to_string()), // This triggers the error
             ..Default::default()
         };
@@ -742,6 +761,7 @@ mod tests {
                 "POSTGRES_DB".to_string(),
                 "app".to_string(),
             )]),
+            expose: true,
             extends: None, // No further extends - this is fine
             ..Default::default()
         };
@@ -783,5 +803,168 @@ mod tests {
             merged.extends.is_none(),
             "extends should be cleared after merge"
         );
+    }
+
+    fn make_extends_package(pkg_service: Service) -> Package {
+        let mut pkg_config = Config::default();
+        pkg_config
+            .services
+            .insert("postgres".to_string(), pkg_service);
+
+        Package {
+            alias: "db-pkg".to_string(),
+            source: crate::package::PackageSource::Local {
+                path: std::path::PathBuf::from("/fake/path"),
+            },
+            config: pkg_config,
+            path: std::path::PathBuf::from("/fake/path"),
+            metadata: crate::package::PackageMetadata {
+                name: None,
+                description: None,
+                version: None,
+                updated_at: chrono::Utc::now(),
+                checksum: None,
+            },
+        }
+    }
+
+    #[test]
+    fn test_package_service_not_exposed_fails() {
+        // A package service that doesn't declare `expose: true` must not be
+        // extendable from outside the package.
+        let mut main_config = Config::default();
+        let local_service = Service {
+            extends: Some("db-pkg.postgres".to_string()),
+            ..Default::default()
+        };
+        main_config
+            .services
+            .insert("my-db".to_string(), local_service);
+
+        let pkg_service = Service {
+            image: Some("postgres:15".to_string()),
+            expose: false,
+            ..Default::default()
+        };
+        let package = make_extends_package(pkg_service);
+
+        let mut packages = HashMap::new();
+        packages.insert("db-pkg".to_string(), package);
+
+        let result = ServiceMerger::merge_packages(&mut main_config, &packages);
+
+        assert!(
+            result.is_err(),
+            "extending an unexposed package service should fail"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("expose: true"),
+            "error should mention expose: true, got: {}",
+            err
+        );
+        assert!(
+            err.contains("my-db") && err.contains("postgres") && err.contains("db-pkg"),
+            "error should name the service, package service, and package alias, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_package_service_exposed_succeeds() {
+        // The positive counterpart to test_package_service_not_exposed_fails:
+        // an exposed package service extends without error.
+        let mut main_config = Config::default();
+        let local_service = Service {
+            extends: Some("db-pkg.postgres".to_string()),
+            ..Default::default()
+        };
+        main_config
+            .services
+            .insert("my-db".to_string(), local_service);
+
+        let pkg_service = Service {
+            image: Some("postgres:15".to_string()),
+            expose: true,
+            ..Default::default()
+        };
+        let package = make_extends_package(pkg_service);
+
+        let mut packages = HashMap::new();
+        packages.insert("db-pkg".to_string(), package);
+
+        let result = ServiceMerger::merge_packages(&mut main_config, &packages);
+
+        assert!(
+            result.is_ok(),
+            "extending an exposed package service should succeed: {:?}",
+            result.err()
+        );
+        let merged = main_config.services.get("my-db").unwrap();
+        assert_eq!(merged.image.as_deref(), Some("postgres:15"));
+    }
+
+    #[test]
+    fn test_merge_packages_deterministic_order_same_input_same_output() {
+        // Regression test for D4: build_extends_map/merge_packages used to
+        // traverse two unordered HashMaps, so which service's error surfaced
+        // first (and which entries got merged before an early `?` abort)
+        // depended on random iteration order. With a BTreeMap, the same
+        // input must always produce the same result, regardless of how many
+        // times we run it.
+        //
+        // Fixture: two services extend two different packages; one package
+        // alias doesn't exist, so `merge_packages` always errors — but which
+        // error (naming which service) surfaces must be stable across runs
+        // since services are now processed in sorted-name order ("svc-a"
+        // before "svc-b").
+        fn build_config_and_packages() -> (Config, HashMap<String, Package>) {
+            let mut main_config = Config::default();
+            main_config.services.insert(
+                "svc-a".to_string(),
+                Service {
+                    extends: Some("missing-pkg.thing".to_string()),
+                    ..Default::default()
+                },
+            );
+            main_config.services.insert(
+                "svc-b".to_string(),
+                Service {
+                    extends: Some("db-pkg.postgres".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            let pkg_service = Service {
+                image: Some("postgres:15".to_string()),
+                expose: true,
+                ..Default::default()
+            };
+            let package = make_extends_package(pkg_service);
+            let mut packages = HashMap::new();
+            packages.insert("db-pkg".to_string(), package);
+
+            (main_config, packages)
+        }
+
+        let mut first_error: Option<String> = None;
+        for _ in 0..50 {
+            let (mut main_config, packages) = build_config_and_packages();
+            let result = ServiceMerger::merge_packages(&mut main_config, &packages);
+            assert!(result.is_err(), "missing package alias should error");
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("svc-a"),
+                "error should always name svc-a (sorted first), got: {}",
+                err
+            );
+            match &first_error {
+                None => first_error = Some(err),
+                Some(expected) => assert_eq!(
+                    &err, expected,
+                    "merge_packages error must be identical across runs given identical input"
+                ),
+            }
+        }
     }
 }

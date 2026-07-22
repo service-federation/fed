@@ -421,20 +421,7 @@ async fn run() -> anyhow::Result<()> {
     // --isolate enables isolation mode (randomize ports + unique container names)
     let isolate = matches!(&cli.command, Commands::Start { isolate: true, .. });
 
-    // --randomize is deprecated, treat as --isolate
-    let deprecated_randomize = matches!(
-        &cli.command,
-        Commands::Start {
-            randomize: true,
-            ..
-        }
-    );
-
-    if deprecated_randomize {
-        eprintln!("Warning: --randomize is deprecated. Use --isolate instead.");
-    }
-
-    let randomize = isolate || deprecated_randomize;
+    let randomize = isolate;
 
     // --replace kills blocking processes/containers and uses original ports
     let replace = matches!(&cli.command, Commands::Start { replace: true, .. });
@@ -513,7 +500,6 @@ async fn run() -> anyhow::Result<()> {
             replace,
             output: _,
             dry_run,
-            randomize: _,
             isolate: _,
         } => {
             commands::run_start(

@@ -92,12 +92,14 @@ async fn test_service_merging_example() {
     // Extends cleared
     assert!(cache.extends.is_none());
 
-    // Verify web service (no extends)
+    // Verify web service (no extends) — process-only, no `image:` (that was a
+    // copy-paste leftover that made the config fail "exactly one type" validation)
     let web = config
         .services
         .get("web")
         .expect("web service should exist");
-    assert_eq!(web.image.as_deref(), Some("node:18"));
+    assert!(web.image.is_none());
+    assert_eq!(web.process.as_deref(), Some("npm start"));
     assert!(web.extends.is_none());
     assert_eq!(web.depends_on.len(), 2);
     assert!(

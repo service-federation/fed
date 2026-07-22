@@ -50,6 +50,9 @@ reqwest = { version = "0.12", features = ["json"] }
 # Regex for template parsing
 regex = "1.10"
 
+# Shell-style tokenizing (quoted Docker `command:` strings)
+shell-words = "1"
+
 # Git operations
 git2 = "0.19"
 

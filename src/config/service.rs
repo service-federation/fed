@@ -7,6 +7,7 @@ use super::{
     CircuitBreakerConfig, DependsOn, HealthCheck, ResourceLimits, RestartPolicy,
     parse_duration_string,
 };
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -219,12 +220,13 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
-/// Docker CMD override. Accepts either a string (split on whitespace)
-/// or an array of strings for exact argument control.
+/// Docker CMD override. Accepts either a string (tokenized the way a shell
+/// would, so quoted arguments stay together) or an array of strings for
+/// exact argument control.
 ///
 /// ```yaml
-/// # String form (split on whitespace):
-/// command: "--jetstream --store_dir /data"
+/// # String form (shell-style tokenizing — quotes group an argument):
+/// command: "--jetstream --store_dir '/data with spaces'"
 ///
 /// # Array form (exact arguments):
 /// command: ["--jetstream", "--store_dir", "/data"]
@@ -238,10 +240,17 @@ pub enum DockerCommand {
 
 impl DockerCommand {
     /// Convert to a list of arguments for `docker run`.
-    pub fn to_args(&self) -> Vec<String> {
+    ///
+    /// The string form is tokenized with `shell_words`, the same quoting
+    /// rules a POSIX shell uses, so `"a 'b c' d"` yields `["a", "b c", "d"]`
+    /// instead of splitting the quoted argument apart. Malformed quoting
+    /// (e.g. an unterminated quote) is a config error, not a panic.
+    pub fn to_args(&self) -> Result<Vec<String>> {
         match self {
-            DockerCommand::String(s) => s.split_whitespace().map(String::from).collect(),
-            DockerCommand::List(v) => v.clone(),
+            DockerCommand::String(s) => {
+                shell_words::split(s).map_err(|e| Error::Config(format!("Invalid command: {e}")))
+            }
+            DockerCommand::List(v) => Ok(v.clone()),
         }
     }
 }
@@ -569,7 +578,10 @@ command: "--jetstream --store_dir /data"
 "#;
         let svc: Service = serde_yaml::from_str(yaml).unwrap();
         let cmd = svc.command.unwrap();
-        assert_eq!(cmd.to_args(), vec!["--jetstream", "--store_dir", "/data"]);
+        assert_eq!(
+            cmd.to_args().unwrap(),
+            vec!["--jetstream", "--store_dir", "/data"]
+        );
     }
 
     #[test]
@@ -580,7 +592,39 @@ command: ["--jetstream", "--store_dir", "/data"]
 "#;
         let svc: Service = serde_yaml::from_str(yaml).unwrap();
         let cmd = svc.command.unwrap();
-        assert_eq!(cmd.to_args(), vec!["--jetstream", "--store_dir", "/data"]);
+        assert_eq!(
+            cmd.to_args().unwrap(),
+            vec!["--jetstream", "--store_dir", "/data"]
+        );
+    }
+
+    #[test]
+    fn test_docker_command_string_with_quotes() {
+        let yaml = r#"
+image: myimage:latest
+command: "a 'b c' d"
+"#;
+        let svc: Service = serde_yaml::from_str(yaml).unwrap();
+        let cmd = svc.command.unwrap();
+        assert_eq!(cmd.to_args().unwrap(), vec!["a", "b c", "d"]);
+    }
+
+    #[test]
+    fn test_docker_command_string_invalid_quoting() {
+        let yaml = r#"
+image: myimage:latest
+command: "a 'unterminated"
+"#;
+        let svc: Service = serde_yaml::from_str(yaml).unwrap();
+        let cmd = svc.command.unwrap();
+        let result = cmd.to_args();
+        assert!(result.is_err(), "unterminated quote should be an error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Invalid command"),
+            "error should mention invalid command, got: {}",
+            err
+        );
     }
 
     #[test]

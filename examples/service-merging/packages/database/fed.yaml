@@ -17,3 +17,6 @@ services:
     healthcheck:
       command: "pg_isready -U admin"
     restart: always
+    # Marks this service as the package's public API — required as of
+    # fed 8.0 for any service extended via `extends: "db-package.postgres"`.
+    expose: true

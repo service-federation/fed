@@ -22,6 +22,7 @@ services:
     environment:
       NGINX_HOST: localhost
       NGINX_PORT: "80"
+    expose: true
 "#,
     )
     .unwrap();
@@ -98,6 +99,7 @@ services:
     volumes:
       - "postgres-data:/var/lib/postgresql/data"
       - "./base-config:/etc/postgresql"
+    expose: true
 "#,
     )
     .unwrap();
@@ -168,6 +170,7 @@ services:
     process: npm start
     cwd: /app
     install: npm install
+    expose: true
 "#,
     )
     .unwrap();
@@ -220,6 +223,7 @@ services:
     image: api:latest
     depends_on:
       - cache
+    expose: true
   cache:
     image: redis:latest
 "#,
@@ -287,6 +291,7 @@ services:
     image: test:latest
     healthcheck:
       command: "curl localhost"
+    expose: true
 "#,
     )
     .unwrap();
@@ -339,6 +344,7 @@ services:
     image: postgres:15
     environment:
       POSTGRES_USER: admin
+    expose: true
 "#,
     )
     .unwrap();
@@ -354,6 +360,7 @@ services:
     image: redis:7
     ports:
       - "6379:6379"
+    expose: true
 "#,
     )
     .unwrap();
@@ -549,6 +556,7 @@ services:
   base:
     extends: "other.service"
     image: test:latest
+    expose: true
 "#,
     )
     .unwrap();
@@ -623,6 +631,7 @@ services:
     parameters:
       base_param: "base_value"
       override_param: "base_override"
+    expose: true
 "#,
     )
     .unwrap();
@@ -683,6 +692,7 @@ services:
   service:
     image: test:latest
     restart: always
+    expose: true
 "#,
     )
     .unwrap();
@@ -753,6 +763,7 @@ services:
     healthcheck:
       command: "curl localhost:3000"
     restart: always
+    expose: true
   db:
     image: postgres:latest
 "#,

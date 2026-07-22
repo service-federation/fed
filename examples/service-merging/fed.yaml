@@ -50,7 +50,6 @@ services:
 
   # Application service that depends on the extended services
   web:
-    image: node:18
     cwd: ./app
     install: npm install
     process: npm start

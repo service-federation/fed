@@ -15,5 +15,6 @@ services:
     environment:
       PORT: '{{PORT}}'
     healthcheck: echo "Analytics service healthy"
+    expose: true
 
 entrypoint: analytics
