@@ -100,8 +100,7 @@ pub fn path_git_status(path: &Path) -> (bool, bool) {
 /// Scan config for secret parameters and classify what's present vs. missing.
 ///
 /// `secrets_file` is the absolute path to the file where generated secrets are
-/// stored (the deprecated `generated_secrets_file` if configured, otherwise
-/// `.fed/secrets.generated.env`). `cache_file` is the absolute path to the
+/// stored (`.fed/secrets.generated.env`). `cache_file` is the absolute path to the
 /// vault secrets cache (`.fed/secrets.cache.env`); its values are reported
 /// separately in `cache_values` and do not count as present — the vault stays
 /// authoritative when reachable, the cache covers `--offline`.
@@ -890,7 +889,7 @@ mod tests {
 
     #[test]
     fn path_git_status_absolute_path_outside_work_repo() {
-        // A gsf pointing outside the repo (e.g. ~/shared/secrets.env) must be
+        // An absolute path outside the work repo must be
         // treated as outside-any-repo even though the work dir is a repo.
         let repo_dir = tempfile::tempdir().unwrap();
         git2::Repository::init(repo_dir.path()).unwrap();

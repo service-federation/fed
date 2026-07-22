@@ -337,9 +337,7 @@ impl<'a> ScriptRunner<'a> {
         // Inherit the parent's *actual* stored scope rather than re-deriving:
         // for CLI runs the re-derivation is provably identical, but a public-API
         // caller who set a custom scope (or `None`) must get a child that honors
-        // it, not one that computes its own. This also carries the deprecated
-        // `generated_secrets_file` fallback (parent scope is `None` = fetch all)
-        // through unchanged.
+        // it, not one that computes its own.
         let child_required_secret_names = self.orchestrator.get_required_secret_names();
 
         let mut child_orchestrator =

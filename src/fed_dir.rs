@@ -21,8 +21,7 @@ pub const FED_DIR: &str = ".fed";
 /// lives here regardless of configuration.
 pub const SECRETS_CACHE_REL: &str = ".fed/secrets.cache.env";
 
-/// Default location for generated secrets, relative to the work dir.
-/// Used when the (deprecated) `generated_secrets_file` key is not set.
+/// Location for generated secrets, relative to the work dir.
 pub const GENERATED_SECRETS_REL: &str = ".fed/secrets.generated.env";
 
 /// Contents of the self-managed `.fed/.gitignore`.

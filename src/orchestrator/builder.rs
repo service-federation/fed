@@ -175,10 +175,9 @@ impl OrchestratorBuilder {
     /// transitively references.
     ///
     /// `None` (the default) fetches every missing manual secret — used for
-    /// interactive `fed`, `fed start`, unknown commands, and the deprecated
-    /// `generated_secrets_file` config. Pass `Some(set)` (derived by
-    /// [`crate::parameter::scanner::required_parameter_names`]) for a specific
-    /// script run so it never blocks on secrets it doesn't use.
+    /// interactive `fed`, `fed start`, and unknown commands. Pass `Some(set)`
+    /// (derived by [`crate::parameter::scanner::required_parameter_names`])
+    /// for a specific script run so it never blocks on secrets it doesn't use.
     pub fn required_secret_names(
         mut self,
         names: Option<std::collections::HashSet<String>>,

@@ -248,9 +248,8 @@ impl Config {
                 )));
             }
 
-            // Auto-generated secrets need no extra configuration: they default
-            // to .fed/secrets.generated.env. The deprecated
-            // generated_secrets_file key is still honored when set.
+            // Auto-generated secrets need no extra configuration: they
+            // default to .fed/secrets.generated.env.
         }
 
         // Validate external service dependencies
@@ -1824,25 +1823,9 @@ mod tests {
     }
 
     #[test]
-    fn generated_secret_with_generated_secrets_file_is_valid() {
-        let mut config = Config {
-            generated_secrets_file: Some(".env.secrets".to_string()),
-            ..Default::default()
-        };
-        config.parameters.insert(
-            "SESSION_KEY".to_string(),
-            Parameter {
-                param_type: Some("secret".to_string()),
-                ..Default::default()
-            },
-        );
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn generated_secret_without_generated_secrets_file_is_valid() {
-        // No generated_secrets_file needed — fed defaults to
-        // .fed/secrets.generated.env (the key is deprecated).
+    fn generated_secret_is_valid() {
+        // No extra configuration needed — fed defaults generated secrets to
+        // .fed/secrets.generated.env.
         let mut config = Config::default();
         config.parameters.insert(
             "SESSION_KEY".to_string(),
@@ -1855,7 +1838,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_secret_without_generated_secrets_file_is_valid() {
+    fn manual_secret_is_valid() {
         let mut config = Config::default();
         config.parameters.insert(
             "API_KEY".to_string(),
@@ -1870,10 +1853,7 @@ mod tests {
 
     #[test]
     fn secret_with_either_is_rejected() {
-        let mut config = Config {
-            generated_secrets_file: Some(".env.secrets".to_string()),
-            ..Default::default()
-        };
+        let mut config = Config::default();
         config.parameters.insert(
             "DB_SECRET".to_string(),
             Parameter {
