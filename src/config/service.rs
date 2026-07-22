@@ -76,15 +76,6 @@ pub struct Service {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process: Option<String>,
 
-    /// Removed in fed 6.0. Retained only so a config still declaring `run:`
-    /// deserializes and fails validation with actionable guidance rather than a
-    /// confusing "no type defined" error. Its old behavior — a command that runs
-    /// to completion during startup and gates dependents — is now expressed by a
-    /// hook-only service: `migrate:` (and optionally `install:`) on a service
-    /// with no process/image/etc.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run: Option<String>,
-
     // Docker-based service
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -327,8 +318,6 @@ impl Service {
         } else if self.install.is_some() || self.migrate.is_some() {
             // Hook-only node: no process/image/etc, just lifecycle hooks. Runs
             // its hooks to completion during startup and gates dependents.
-            // (`run:` is intentionally NOT a type here — it was removed in 6.0
-            // and is rejected by validation.)
             ServiceType::Oneshot
         } else {
             ServiceType::Undefined

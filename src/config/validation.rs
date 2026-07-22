@@ -79,16 +79,6 @@ impl Config {
 
         // Validate each service has exactly one type
         for (name, service) in &self.services {
-            // `run:` was removed in fed 6.0. Reject it before any type check so
-            // the user gets actionable migration guidance instead of a generic
-            // "no type defined" error (a lone `run:` is otherwise Undefined now).
-            if service.run.is_some() {
-                return Err(Error::Validation(format!(
-                    "Service '{}': `run:` is not a service type. Declare migrate: (and optionally install:) on a service with no process instead; it runs to completion on every start and gates dependents.",
-                    name
-                )));
-            }
-
             if service.service_type() == ServiceType::Undefined {
                 return Err(Error::Validation(format!(
                     "Service '{}' has no type defined. Add one of: process, image, gradleTask, composeFile + composeService, or make it a hook-only node with install and/or migrate.",

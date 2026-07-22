@@ -12,8 +12,6 @@
 //! gates its dependents on that completion, and a hook failure aborts `fed start`
 //! naming the node. Concurrent dependents get one execution per startup.
 //!
-//! `run:` was removed in 6.0 — a config declaring it fails validation.
-//!
 //! The driving real-world bug (Plenora): install/migrate were attached to the
 //! LAST service in the graph and ran just-in-time before that service spawned,
 //! so earlier services booted against an un-migrated database. A hook-only node
@@ -48,9 +46,6 @@ fn fed_stop(config_path: &std::path::Path, workdir: &str) {
 /// spawned.
 ///
 /// (b) A second start re-runs `migrate:` — the file ends up with two lines.
-/// (Converted from `test_oneshot_runs_before_dependent_and_reruns_every_start`:
-/// the ordering + every-start contract is identical, now carried by `migrate:`
-/// on a hook-only node instead of `run:`.)
 #[test]
 fn test_hookonly_migrate_runs_before_dependent_and_reruns_every_start() {
     let temp = tempdir().expect("temp dir");
@@ -259,52 +254,8 @@ services:
 // (d) Validation
 // ---------------------------------------------------------------------------
 
-/// `run:` was removed in 6.0 — any config declaring it fails validation with the
-/// migration guidance. (Converted from `test_run_plus_process_is_rejected` and
-/// `test_lone_run_is_a_valid_service_type`, which encoded `run:` as a live type.)
-#[test]
-fn test_run_field_is_rejected() {
-    // Lone `run:` — previously a valid oneshot type.
-    let yaml = r#"
-services:
-  schema:
-    run: "echo hi"
-"#;
-    let config = Parser::new().parse_config(yaml).expect("parse");
-    let err = config
-        .validate()
-        .expect_err("run: must be rejected")
-        .to_string();
-    assert!(
-        err.contains("`run:` is not a service type"),
-        "error should reject run: as a service type, got: {err}"
-    );
-    assert!(
-        err.contains("migrate:"),
-        "error should point users at migrate:, got: {err}"
-    );
-
-    // `run:` alongside a process is likewise rejected with the same guidance
-    // (previously this produced a "multiple type-defining fields" message).
-    let yaml2 = r#"
-services:
-  bad:
-    run: "echo hi"
-    process: "sleep 30"
-"#;
-    let config2 = Parser::new().parse_config(yaml2).expect("parse");
-    let err2 = config2
-        .validate()
-        .expect_err("run + process must be rejected")
-        .to_string();
-    assert!(
-        err2.contains("`run:` is not a service type"),
-        "run + process should also surface the run: rejection, got: {err2}"
-    );
-}
-
 /// A hook-only node completes to signal readiness — a healthcheck is
-/// contradictory. (Converted from `test_run_plus_healthcheck_is_rejected`.)
+/// contradictory.
 #[test]
 fn test_hookonly_plus_healthcheck_is_rejected() {
     let yaml = r#"
