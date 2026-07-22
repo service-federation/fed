@@ -38,9 +38,9 @@ pub struct OrchestratorBuilder {
     work_dir: Option<PathBuf>,
     /// Session-scoped run settings — see `RunContext`'s doc comment for the
     /// context-vs-operation-flag split. Applied to the built `Orchestrator`
-    /// in one call to `apply_run_context`, replacing what used to be 6
+    /// in one call to `apply_run_context`, replacing what used to be 5
     /// separate fields (`output_mode`, `is_interactive`, `offline`,
-    /// `environment`, `required_secret_names`, `profiles`).
+    /// `required_secret_names`, `profiles`).
     run_context: RunContext,
     auto_resolve_conflicts: bool,
     randomize_ports: bool,
@@ -86,10 +86,10 @@ impl OrchestratorBuilder {
         self
     }
 
-    /// Set the session-scoped run settings (environment, offline,
-    /// is_interactive, output_mode, profiles, required_secret_names) in one
-    /// call. See `RunContext`'s doc comment for why these six fields are
-    /// grouped separately from the operation flags below.
+    /// Set the session-scoped run settings (offline, is_interactive,
+    /// output_mode, profiles, required_secret_names) in one call. See
+    /// `RunContext`'s doc comment for why these fields are grouped
+    /// separately from the operation flags below.
     pub fn run_context(mut self, ctx: RunContext) -> Self {
         self.run_context = ctx;
         self
@@ -203,10 +203,10 @@ impl OrchestratorBuilder {
             Orchestrator::new(config, work_dir).await?
         };
 
-        // Applies environment / offline / is_interactive / output_mode /
-        // profiles / required_secret_names in the order initialize()
-        // requires (environment and required_secret_names before anything
-        // that reads them — see apply_run_context's doc comment).
+        // Applies offline / is_interactive / output_mode / profiles /
+        // required_secret_names in the order initialize() requires
+        // (required_secret_names before anything that reads it — see
+        // apply_run_context's doc comment).
         orchestrator.apply_run_context(&self.run_context);
 
         orchestrator.set_auto_resolve_conflicts(self.auto_resolve_conflicts);

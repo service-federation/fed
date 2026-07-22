@@ -174,11 +174,7 @@ impl Resolver {
             return VaultOutcome::Values(values);
         }
 
-        let Some(handle) = crate::cloud::spawn_fetch_values(
-            work_dir,
-            &self.environment.to_string(),
-            queried_names,
-        ) else {
+        let Some(handle) = crate::cloud::spawn_fetch_values(work_dir, queried_names) else {
             return VaultOutcome::Local;
         };
 
@@ -306,22 +302,19 @@ impl Resolver {
         // values are picked up. Requires `fed login` + `fed link`; skipped
         // with --offline.
         //
-        // Pre-network TTL skip (04-vault-ttl-cache.md): in `Development` only,
-        // if the cache already freshly covers every queried name — within
-        // `FED_VAULT_TTL` (default 5m) of its last fetch — the vault stays
-        // authoritative but is never even queried: no fetch fires, no thread
-        // spawns. Outside `Development` (`Staging`, `Production`, or a future
-        // custom environment) the vault stays authoritative unconditionally,
-        // exactly as before this knob existed, regardless of `FED_VAULT_TTL`
-        // or cache freshness. The guard exists because the local cache
+        // Pre-network TTL skip (04-vault-ttl-cache.md): if the cache already
+        // freshly covers every queried name — within `FED_VAULT_TTL` (default
+        // 5m) of its last fetch — the vault stays authoritative but is never
+        // even queried: no fetch fires, no thread spawns. This used to be
+        // gated to `Environment::Development` only, since the local cache
         // (`.fed/secrets.cache.env`) is a single project-wide file, not
-        // partitioned by environment: a pre-network skip with no environment
-        // check could let a fresh `staging` cache silently answer a
-        // `production` run within the TTL window (Sol's adversarial finding,
-        // see Design §4 in 04-vault-ttl-cache.md). It's temporary scaffolding
-        // — `08-environments-removal.md` deletes the environment axis
-        // entirely, at which point this check either becomes unconditionally
-        // true or is deleted outright as dead code.
+        // partitioned by environment, and a pre-network skip with no
+        // environment check could let a fresh `staging` cache silently answer
+        // a `production` run within the TTL window (Sol's adversarial
+        // finding, see Design §4 in 04-vault-ttl-cache.md). The environment
+        // axis was removed entirely in fed 8.0
+        // (`08-environments-removal.md`), so the guard is gone too — the skip
+        // is now unconditional on TTL/cache-freshness alone.
         let mut vault_resolved: Vec<(String, String)> = Vec::new();
         let mut vault_query_succeeded = false;
         // Captures why the vault lookup failed (network/auth), so a later
@@ -342,12 +335,7 @@ impl Resolver {
             .collect();
         if !queried_names.is_empty() && !self.offline {
             let ttl = crate::cloud::vault_ttl();
-            // The pre-network skip is gated on `environment == Development` —
-            // see the doc comment above for why. Every other environment
-            // keeps today's behavior unconditionally: the vault is always
-            // queried.
             let ttl_covers = ttl.as_secs() > 0
-                && self.environment == crate::config::Environment::Development
                 && cache_covers_fresh(
                     &queried_names,
                     &analysis.cache_values,
@@ -1282,7 +1270,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut resolver = Resolver::new(); // defaults to Environment::Development
+        let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
         resolver.set_test_vault_values(HashMap::from([(
             "API_KEY".to_string(),
@@ -1401,54 +1389,6 @@ mod tests {
              not a mix of cache and vault answers"
         );
         assert_eq!(resolved.get("OTHER_KEY").unwrap(), "vault-other-key");
-    }
-
-    #[test]
-    fn ttl_non_development_environment_always_queries_vault() {
-        // Sol's adversarial finding (Design §4): a pre-network skip with no
-        // environment check could let a fresh cache from one environment
-        // silently answer another environment's run. The guard closes this by
-        // restricting the skip to Environment::Development only.
-        use crate::config::{Config, Environment, Parameter};
-        use tempfile::TempDir;
-
-        for env in [Environment::Staging, Environment::Production] {
-            let temp_dir = TempDir::new().unwrap();
-            crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
-            let fresh_stamp = unix_now() - 10;
-            std::fs::write(
-                temp_dir.path().join(".fed/secrets.cache.env"),
-                format!("# fetched-at API_KEY {fresh_stamp}\nAPI_KEY=cached-value\n"),
-            )
-            .unwrap();
-
-            let mut resolver = Resolver::new();
-            resolver.set_work_dir(temp_dir.path());
-            resolver.set_environment(env);
-            resolver.set_test_vault_values(HashMap::from([(
-                "API_KEY".to_string(),
-                "vault-value".to_string(),
-            )]));
-
-            let mut config = Config::default();
-            config.parameters.insert(
-                "API_KEY".to_string(),
-                Parameter {
-                    param_type: Some("secret".to_string()),
-                    source: Some("manual".to_string()),
-                    ..Default::default()
-                },
-            );
-
-            resolver.resolve_parameters(&mut config).unwrap();
-            assert_eq!(
-                resolver.get_resolved_parameters().get("API_KEY").unwrap(),
-                "vault-value",
-                "{:?}: the TTL skip must be unreachable outside Development, even with a \
-                 fully-fresh cache",
-                env
-            );
-        }
     }
 
     #[test]

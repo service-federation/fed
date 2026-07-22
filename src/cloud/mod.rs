@@ -295,20 +295,15 @@ struct SecretListResponse {
 #[derive(Deserialize)]
 pub struct SecretEntry {
     pub name: String,
-    pub environment: String,
     pub updated_at: String,
     pub updated_by: String,
 }
 
-pub async fn list_secrets(
-    creds: &Credentials,
-    link: &CloudLink,
-    env: &str,
-) -> Result<Vec<SecretEntry>> {
+pub async fn list_secrets(creds: &Credentials, link: &CloudLink) -> Result<Vec<SecretEntry>> {
     let res = client()
         .get(format!(
-            "{}/api/v1/orgs/{}/projects/{}/secrets?env={}",
-            creds.url, link.org, link.project, env
+            "{}/api/v1/orgs/{}/projects/{}/secrets",
+            creds.url, link.org, link.project
         ))
         .bearer_auth(&creds.token)
         .send()
@@ -377,16 +372,14 @@ type VaultResult = std::result::Result<HashMap<String, String>, VaultFailure>;
 async fn fetch_values_inner(
     creds: &Credentials,
     link: &CloudLink,
-    env: &str,
     names: &[String],
 ) -> VaultResult {
     let res = client()
         .get(format!(
-            "{}/api/v1/orgs/{}/projects/{}/secrets/values?env={}&names={}",
+            "{}/api/v1/orgs/{}/projects/{}/secrets/values?names={}",
             creds.url,
             link.org,
             link.project,
-            env,
             names.join(",")
         ))
         .bearer_auth(&creds.token)
@@ -446,11 +439,10 @@ impl VaultHandle {
 /// Returns `None` when not logged in or the checkout isn't linked — the caller
 /// falls back to local/cache behavior. A panicked thread surfaces as a
 /// `Disconnected` join, landing in the warning path rather than aborting.
-pub fn spawn_fetch_values(work_dir: &Path, env: &str, names: &[String]) -> Option<VaultHandle> {
+pub fn spawn_fetch_values(work_dir: &Path, names: &[String]) -> Option<VaultHandle> {
     let creds = load_credentials()?;
     let link = load_link(work_dir)?;
     let url = creds.url.clone();
-    let env = env.to_string();
     let names = names.to_vec();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -459,7 +451,7 @@ pub fn spawn_fetch_values(work_dir: &Path, env: &str, names: &[String]) -> Optio
                 .enable_all()
                 .build()
                 .map_err(|e| VaultFailure::Failed(format!("cloud: runtime: {}", e)))?;
-            rt.block_on(fetch_values_inner(&creds, &link, &env, &names))
+            rt.block_on(fetch_values_inner(&creds, &link, &names))
         })();
         let _ = tx.send(out);
     });

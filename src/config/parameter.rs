@@ -1,7 +1,7 @@
 //! Parameter configuration types.
 //!
 //! This module contains the [`Parameter`] struct for configuring
-//! variables with environment-specific defaults and type constraints.
+//! variables with defaults and type constraints.
 
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 ///
 /// Parameters can have:
 /// - A default value
-/// - Environment-specific values (development, staging, production)
 /// - Type constraints (e.g., "port" for automatic port allocation)
 /// - Either constraints for validation
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -23,7 +22,13 @@ pub struct Parameter {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub either: Vec<String>,
 
-    // Environment-specific values
+    // Legacy environment-specific fields, removed in fed 8.0. Kept
+    // present-but-inert (never read for a value) purely so
+    // `Config::validate()` can detect an old config that still sets one of
+    // these and produce a specific migration error, instead of serde
+    // silently dropping the override with no warning at all (`Parameter` has
+    // no `unknown_fields` catch-all the way `Config`/`Service` do). See
+    // `08-environments-removal.md` Design §1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub development: Option<serde_yaml::Value>,
 
@@ -104,56 +109,11 @@ impl Parameter {
             None => Vec::new(),
         }
     }
-
-    /// Get the value for a specific environment.
-    /// Priority: environment-specific value > default value > None
-    pub fn get_value_for_environment(
-        &self,
-        env: &super::Environment,
-    ) -> Option<&serde_yaml::Value> {
-        use super::Environment;
-
-        match env {
-            Environment::Development => {
-                // Try "development" first, then "develop", then fall back to default
-                self.development
-                    .as_ref()
-                    .or(self.develop.as_ref())
-                    .or(self.default.as_ref())
-            }
-            Environment::Staging => {
-                // Try "staging", then fall back to default
-                self.staging.as_ref().or(self.default.as_ref())
-            }
-            Environment::Production => {
-                // Try "production", then fall back to default
-                self.production.as_ref().or(self.default.as_ref())
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Environment;
-
-    /// Helper to create a Parameter with only a default value.
-    fn param_with_default(val: &str) -> Parameter {
-        Parameter {
-            param_type: None,
-            default: Some(serde_yaml::Value::String(val.to_string())),
-            either: vec![],
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
-            source: None,
-            description: None,
-            optional: None,
-            ..Default::default()
-        }
-    }
 
     /// Helper to create an empty Parameter (no values at all).
     fn param_empty() -> Parameter {
@@ -161,172 +121,11 @@ mod tests {
             param_type: None,
             default: None,
             either: vec![],
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             source: None,
             description: None,
             optional: None,
             ..Default::default()
         }
-    }
-
-    // ========================================================================
-    // get_value_for_environment tests
-    // ========================================================================
-
-    #[test]
-    fn dev_returns_development_value_over_default() {
-        let param = Parameter {
-            development: Some(serde_yaml::Value::String("dev-val".into())),
-            default: Some(serde_yaml::Value::String("default-val".into())),
-            ..param_empty()
-        };
-        let val = param.get_value_for_environment(&Environment::Development);
-        assert_eq!(val.unwrap(), &serde_yaml::Value::String("dev-val".into()));
-    }
-
-    #[test]
-    fn dev_falls_back_to_develop_alias() {
-        let param = Parameter {
-            develop: Some(serde_yaml::Value::String("develop-val".into())),
-            default: Some(serde_yaml::Value::String("default-val".into())),
-            ..param_empty()
-        };
-        let val = param.get_value_for_environment(&Environment::Development);
-        assert_eq!(
-            val.unwrap(),
-            &serde_yaml::Value::String("develop-val".into())
-        );
-    }
-
-    #[test]
-    fn dev_development_takes_priority_over_develop() {
-        let param = Parameter {
-            development: Some(serde_yaml::Value::String("development-val".into())),
-            develop: Some(serde_yaml::Value::String("develop-val".into())),
-            ..param_empty()
-        };
-        let val = param.get_value_for_environment(&Environment::Development);
-        assert_eq!(
-            val.unwrap(),
-            &serde_yaml::Value::String("development-val".into())
-        );
-    }
-
-    #[test]
-    fn dev_falls_back_to_default() {
-        let param = param_with_default("fallback");
-        let val = param.get_value_for_environment(&Environment::Development);
-        assert_eq!(val.unwrap(), &serde_yaml::Value::String("fallback".into()));
-    }
-
-    #[test]
-    fn dev_returns_none_when_nothing_set() {
-        let param = param_empty();
-        assert!(
-            param
-                .get_value_for_environment(&Environment::Development)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn staging_returns_staging_value() {
-        let param = Parameter {
-            staging: Some(serde_yaml::Value::String("stage-val".into())),
-            default: Some(serde_yaml::Value::String("default-val".into())),
-            ..param_empty()
-        };
-        let val = param.get_value_for_environment(&Environment::Staging);
-        assert_eq!(val.unwrap(), &serde_yaml::Value::String("stage-val".into()));
-    }
-
-    #[test]
-    fn staging_falls_back_to_default() {
-        let param = param_with_default("fallback");
-        let val = param.get_value_for_environment(&Environment::Staging);
-        assert_eq!(val.unwrap(), &serde_yaml::Value::String("fallback".into()));
-    }
-
-    #[test]
-    fn staging_returns_none_when_nothing_set() {
-        let param = param_empty();
-        assert!(
-            param
-                .get_value_for_environment(&Environment::Staging)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn production_returns_production_value() {
-        let param = Parameter {
-            production: Some(serde_yaml::Value::String("prod-val".into())),
-            default: Some(serde_yaml::Value::String("default-val".into())),
-            ..param_empty()
-        };
-        let val = param.get_value_for_environment(&Environment::Production);
-        assert_eq!(val.unwrap(), &serde_yaml::Value::String("prod-val".into()));
-    }
-
-    #[test]
-    fn production_falls_back_to_default() {
-        let param = param_with_default("fallback");
-        let val = param.get_value_for_environment(&Environment::Production);
-        assert_eq!(val.unwrap(), &serde_yaml::Value::String("fallback".into()));
-    }
-
-    #[test]
-    fn production_returns_none_when_nothing_set() {
-        let param = param_empty();
-        assert!(
-            param
-                .get_value_for_environment(&Environment::Production)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn staging_ignores_development_and_develop_fields() {
-        let param = Parameter {
-            development: Some(serde_yaml::Value::String("dev-only".into())),
-            develop: Some(serde_yaml::Value::String("develop-only".into())),
-            ..param_empty()
-        };
-        // Staging should not see development/develop values
-        assert!(
-            param
-                .get_value_for_environment(&Environment::Staging)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn production_ignores_staging_field() {
-        let param = Parameter {
-            staging: Some(serde_yaml::Value::String("stage-only".into())),
-            ..param_empty()
-        };
-        assert!(
-            param
-                .get_value_for_environment(&Environment::Production)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn numeric_value_returned_correctly() {
-        let param = Parameter {
-            default: Some(serde_yaml::Value::Number(serde_yaml::Number::from(5432))),
-            ..param_empty()
-        };
-        let val = param.get_value_for_environment(&Environment::Development);
-        assert_eq!(
-            val.unwrap(),
-            &serde_yaml::Value::Number(serde_yaml::Number::from(5432))
-        );
     }
 
     // ========================================================================

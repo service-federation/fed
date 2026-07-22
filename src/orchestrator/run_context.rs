@@ -33,10 +33,6 @@ use std::collections::HashSet;
 /// share a `work_dir` (they don't).
 #[derive(Debug, Clone, Default)]
 pub struct RunContext {
-    /// development/staging/production — selects which per-parameter
-    /// environment value resolves and which vault environment manual
-    /// secrets are fetched from. From `-e`/`--env`.
-    pub environment: crate::config::Environment,
     /// Skip cloud vault lookups for manual secrets. From `--offline`.
     pub offline: bool,
     /// Whether stdin is a TTY, for interactive prompts like secret

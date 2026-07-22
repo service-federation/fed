@@ -137,8 +137,8 @@ impl Resolver {
         if self.managed_ports.contains(&cached_port) {
             return None;
         }
-        let env_value = param.get_value_for_environment(&self.environment)?;
-        let default_port = Self::value_to_string(env_value).parse::<u16>().ok()?;
+        let default_value = param.default.as_ref()?;
+        let default_port = Self::value_to_string(default_value).parse::<u16>().ok()?;
         if default_port == cached_port {
             return None;
         }
@@ -174,8 +174,8 @@ impl Resolver {
             ));
         }
 
-        if let Some(env_value) = param.get_value_for_environment(&self.environment) {
-            let default_str = Self::value_to_string(env_value);
+        if let Some(default_value) = param.default.as_ref() {
+            let default_str = Self::value_to_string(default_value);
             if let Ok(default_port) = default_str.parse::<u16>() {
                 if self.managed_ports.contains(&default_port) {
                     self.port_allocator.mark_allocated(default_port);
@@ -322,10 +322,6 @@ mod tests {
 
         // Create a port parameter with a default
         let param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: Some("port".to_string()),
             default: Some(serde_yaml::Value::Number(default_port.into())),
             either: vec![],
@@ -369,10 +365,6 @@ mod tests {
 
         // Create a port parameter with the occupied port as default
         let param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: Some("port".to_string()),
             default: Some(serde_yaml::Value::Number(occupied_port.into())),
             either: vec![],
@@ -406,10 +398,6 @@ mod tests {
 
         // Create a port parameter without default
         let param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: Some("port".to_string()),
             default: None,
             either: vec![],
@@ -442,10 +430,6 @@ mod tests {
         config.parameters.insert(
             "API_PORT".to_string(),
             Parameter {
-                development: None,
-                develop: None,
-                staging: None,
-                production: None,
                 param_type: Some("port".to_string()),
                 default: Some(serde_yaml::Value::Number(18380.into())),
                 either: vec![],
@@ -458,10 +442,6 @@ mod tests {
         config.parameters.insert(
             "DB_PORT".to_string(),
             Parameter {
-                development: None,
-                develop: None,
-                staging: None,
-                production: None,
                 param_type: Some("port".to_string()),
                 default: Some(serde_yaml::Value::Number(15732.into())),
                 either: vec![],
@@ -630,10 +610,6 @@ mod tests {
 
         // Create a port parameter with an invalid default
         let param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: Some("port".to_string()),
             default: Some(serde_yaml::Value::String("not-a-port".to_string())),
             either: vec![],
@@ -668,10 +644,6 @@ mod tests {
 
         // Create two port parameters with defaults
         let param1 = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: Some("port".to_string()),
             default: Some(serde_yaml::Value::Number(port1.into())),
             either: vec![],
@@ -682,10 +654,6 @@ mod tests {
         };
 
         let param2 = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: Some("port".to_string()),
             default: Some(serde_yaml::Value::Number(port2.into())),
             either: vec![],
@@ -719,10 +687,6 @@ mod tests {
 
         // Create a port parameter with a valid user-provided value
         let mut param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: Some("port".to_string()),
             default: None,
             either: vec![],
@@ -750,10 +714,6 @@ mod tests {
 
         // Create a port parameter with invalid string value
         let mut param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: Some("port".to_string()),
             default: None,
             either: vec![],
@@ -785,10 +745,6 @@ mod tests {
 
         // Create a port parameter with zero value
         let mut param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: Some("port".to_string()),
             default: None,
             either: vec![],
@@ -820,10 +776,6 @@ mod tests {
 
         // Create a port parameter with out-of-range value
         let mut param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: Some("port".to_string()),
             default: None,
             either: vec![],
@@ -855,10 +807,6 @@ mod tests {
 
         // Create a non-port parameter with "invalid" value (which is valid for non-ports)
         let mut param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: Some("string".to_string()),
             default: None,
             either: vec![],

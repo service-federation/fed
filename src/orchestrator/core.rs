@@ -326,20 +326,6 @@ impl Orchestrator {
         self.resolver.get_offline()
     }
 
-    /// Set the environment for parameter resolution and vault fetches
-    /// (development/staging/production). Must be set before
-    /// [`Orchestrator::initialize`], which resolves parameters.
-    pub fn set_environment(&mut self, environment: crate::config::Environment) {
-        self.resolver.set_environment(environment);
-    }
-
-    /// The environment this orchestrator resolves parameters in. Used to
-    /// propagate a parent run's environment into an isolated-child
-    /// orchestrator so `-e staging` survives `isolated: true` scripts.
-    pub fn get_environment(&self) -> crate::config::Environment {
-        self.resolver.get_environment()
-    }
-
     /// Scope the vault query to the manual-secret names the target script
     /// transitively references. `None` fetches every missing manual secret (the
     /// safe default). Must be set before [`Orchestrator::initialize`], which
@@ -380,12 +366,12 @@ impl Orchestrator {
     /// Apply every field of `ctx` to this orchestrator via the existing
     /// per-field setters (plus a direct write to the private
     /// `active_profiles` field, which has no post-construction setter
-    /// today), in the order `initialize()` requires (environment and
-    /// required_secret_names before anything that reads them). This is
-    /// the single place that encodes that ordering constraint; every
-    /// other caller — `OrchestratorBuilder::build()` and isolated-script
-    /// child orchestrators (`scripts.rs`) — calls this instead of
-    /// re-deriving the order.
+    /// today), in the order `initialize()` requires (required_secret_names
+    /// before anything that reads them). This is the single place that
+    /// encodes that ordering constraint; every other caller —
+    /// `OrchestratorBuilder::build()` and isolated-script child
+    /// orchestrators (`scripts.rs`) — calls this instead of re-deriving the
+    /// order.
     ///
     /// Every `RunContext` field is applied here, including `profiles` —
     /// omitting it would silently drop profile-gated services from an
@@ -395,7 +381,6 @@ impl Orchestrator {
     /// out before `depends_on` is ever resolved).
     pub fn apply_run_context(&mut self, ctx: &super::RunContext) {
         self.set_required_secret_names(ctx.required_secret_names.clone());
-        self.set_environment(ctx.environment);
         self.set_offline(ctx.offline);
         self.set_is_interactive(ctx.is_interactive);
         self.set_output_mode(ctx.output_mode);
@@ -411,7 +396,6 @@ impl Orchestrator {
     /// actually read back off `self`.
     pub fn current_run_context(&self) -> super::RunContext {
         super::RunContext {
-            environment: self.get_environment(),
             offline: self.get_offline(),
             is_interactive: self.resolver.get_is_interactive(),
             output_mode: self.output_mode,
@@ -2418,7 +2402,6 @@ mod tests {
         required_secret_names.insert("API_KEY".to_string());
 
         let ctx = super::super::RunContext {
-            environment: crate::config::Environment::Staging,
             offline: true,
             is_interactive: true,
             output_mode: OutputMode::Passthrough,
@@ -2429,7 +2412,6 @@ mod tests {
         orchestrator.apply_run_context(&ctx);
         let round_tripped = orchestrator.current_run_context();
 
-        assert_eq!(round_tripped.environment, ctx.environment);
         assert_eq!(round_tripped.offline, ctx.offline);
         assert_eq!(round_tripped.is_interactive, ctx.is_interactive);
         assert_eq!(round_tripped.output_mode, ctx.output_mode);
@@ -2437,51 +2419,6 @@ mod tests {
         assert_eq!(
             round_tripped.required_secret_names,
             ctx.required_secret_names
-        );
-    }
-
-    /// `OrchestratorBuilder::build()` must apply `environment` (via
-    /// `apply_run_context`) before `initialize()` resolves parameters — a
-    /// config with an environment-conditional parameter must resolve to the
-    /// `RunContext`'s environment, not the development default.
-    #[tokio::test]
-    async fn builder_applies_environment_before_initialize() {
-        let parser = crate::config::Parser::new();
-        let config = parser
-            .parse_config(
-                r#"
-parameters:
-  GREETING:
-    development: dev-value
-    staging: staging-value
-services:
-  app:
-    process: "true"
-    environment:
-      GREETING: '{{GREETING}}'
-"#,
-            )
-            .expect("valid yaml");
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        let ctx = super::super::RunContext {
-            environment: crate::config::Environment::Staging,
-            ..Default::default()
-        };
-
-        let orchestrator = super::super::OrchestratorBuilder::new()
-            .config(config)
-            .work_dir(temp_dir.path().to_path_buf())
-            .run_context(ctx)
-            .build()
-            .await
-            .expect("build");
-
-        let resolved = orchestrator.resolver.get_resolved_parameters().clone();
-        assert_eq!(
-            resolved.get("GREETING").map(String::as_str),
-            Some("staging-value"),
-            "environment must be applied before initialize() resolves parameters"
         );
     }
 }

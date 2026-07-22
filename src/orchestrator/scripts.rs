@@ -341,9 +341,9 @@ impl<'a> ScriptRunner<'a> {
         #[allow(clippy::disallowed_methods)]
         let mut child_orchestrator =
             Orchestrator::new_ephemeral(child_config, self.orchestrator.work_dir.clone()).await?;
-        // Inherit the parent's session settings verbatim — environment,
-        // offline, is_interactive, output_mode, required_secret_names, and
-        // profiles. `profiles` matters here specifically: the child is
+        // Inherit the parent's session settings verbatim — offline,
+        // is_interactive, output_mode, required_secret_names, and profiles.
+        // `profiles` matters here specifically: the child is
         // built from the parent's *unfiltered* original_config, so an empty
         // active_profiles would silently drop every profile-gated service
         // from the child's config before `depends_on` is ever resolved.

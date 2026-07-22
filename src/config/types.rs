@@ -13,8 +13,7 @@ use std::collections::HashMap;
 /// Root configuration structure for fed.yaml (or service-federation.yaml)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
-    /// Variables/parameters declared for this config. Values support
-    /// environment-specific overrides (`development`/`staging`/`production`).
+    /// Variables/parameters declared for this config.
     #[serde(default)]
     pub parameters: HashMap<String, Parameter>,
 
@@ -45,13 +44,14 @@ pub struct Config {
     /// Environment files for setting parameter values.
     /// Variables in these files MUST be declared as parameters in this config.
     /// This provides a way to override parameter defaults without modifying
-    /// the config file (e.g., for local secrets or environment-specific values).
+    /// the config file — the recommended mechanism for local secrets or
+    /// deployment-context-specific values (e.g. point a different `env_file`
+    /// path at each CI job or checkout).
     ///
     /// Paths are relative to the config file directory.
     ///
     /// NOTE: Paths do NOT support template substitution (no `{{VAR}}`) to avoid
-    /// circular dependencies. Use parameter environment fields (development/staging/production)
-    /// for environment-specific defaults instead.
+    /// circular dependencies.
     ///
     /// Missing files are non-fatal: fed logs a warning and continues without
     /// them. Parse errors and other I/O failures (e.g. permission denied) still

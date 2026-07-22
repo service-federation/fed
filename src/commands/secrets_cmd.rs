@@ -28,19 +28,28 @@ pub async fn run_secrets(
 ) -> Result<()> {
     match cmd {
         SecretsCommands::Ls { env } => {
+            // Removed in fed 8.0 — kept hidden and optional so a stale
+            // invocation gets this explicit migration error instead of a
+            // generic clap "unexpected argument" failure.
+            if env.is_some() {
+                bail!(
+                    "--env was removed in fed 8.0 — the development/staging/production axis no longer exists. Move deployment-specific parameter values into an env_file instead (see env_file: in fed.yaml docs)."
+                );
+            }
+
             let (creds, link) = context(workdir)?;
             // Cloud-first and blocking: the user is deliberately asking the
             // cloud, so correctness wins — generous budget + waking hint, never
             // a cache fallback (D5).
-            let secrets = cloud::with_waking_hint(cloud::list_secrets(&creds, &link, env)).await?;
+            let secrets = cloud::with_waking_hint(cloud::list_secrets(&creds, &link)).await?;
             if secrets.is_empty() {
                 out.status(&format!(
-                    "No {} secrets in {}/{} yet — add one in the dashboard.",
-                    env, link.org, link.project
+                    "No secrets in {}/{} yet — add one in the dashboard.",
+                    link.org, link.project
                 ));
                 return Ok(());
             }
-            out.status(&format!("{}/{} · {}", link.org, link.project, env));
+            out.status(&format!("{}/{}", link.org, link.project));
             for s in secrets {
                 out.status(&format!(
                     "  {}  (updated {} by {})",

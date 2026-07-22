@@ -74,7 +74,6 @@ pub fn compute_project_id(work_dir: &Path, isolation_id: Option<&str>) -> String
 /// - Resolving `{{parameter}}` template syntax in configuration values
 /// - Allocating ports for `type: port` parameters with TOCTOU prevention
 /// - Loading values from `.env` files (strict mode: variables must be declared)
-/// - Applying environment-specific values (development/staging/production)
 /// - Shell-escaping parameter values in process commands for security
 ///
 /// # Port Allocation
@@ -114,7 +113,6 @@ pub struct Resolver {
     resolved_parameters: HashMap<String, String>,
     /// Names of parameters with type: port
     port_parameter_names: Vec<String>,
-    environment: crate::config::Environment,
     /// When true, port conflicts are auto-resolved using alternative ports (no interactive prompt)
     auto_resolve_conflicts: bool,
     /// When true, kill blocking processes/containers and use original ports (for --replace flag)
@@ -167,32 +165,6 @@ impl Resolver {
             port_allocator: PortAllocator::new(),
             resolved_parameters: HashMap::new(),
             port_parameter_names: Vec::new(),
-            environment: crate::config::Environment::default(),
-            auto_resolve_conflicts: false,
-            replace_mode: false,
-            work_dir: None,
-            port_resolutions: Vec::new(),
-            managed_ports: HashSet::new(),
-            port_store: Box::new(crate::port::NoopPortStore),
-            force_random_ports: false,
-            prefer_config_defaults: true,
-            is_interactive: false,
-            offline: false,
-            test_vault_values: None,
-            test_vault_failure: None,
-            required_names: None,
-            isolation_id: None,
-            deferred_params: HashSet::new(),
-        }
-    }
-
-    /// Create a new resolver with a specific environment
-    pub fn with_environment(environment: crate::config::Environment) -> Self {
-        Self {
-            port_allocator: PortAllocator::new(),
-            resolved_parameters: HashMap::new(),
-            port_parameter_names: Vec::new(),
-            environment,
             auto_resolve_conflicts: false,
             replace_mode: false,
             work_dir: None,
@@ -277,16 +249,6 @@ impl Resolver {
     /// prompting to kill our own services when they're already running.
     pub fn set_managed_ports(&mut self, ports: HashSet<u16>) {
         self.managed_ports = ports;
-    }
-
-    /// Set the environment for resolution
-    pub fn set_environment(&mut self, environment: crate::config::Environment) {
-        self.environment = environment;
-    }
-
-    /// Get the current environment
-    pub fn get_environment(&self) -> crate::config::Environment {
-        self.environment
     }
 
     /// Set working directory for resolving relative paths (e.g., .env files)
@@ -416,8 +378,8 @@ impl Resolver {
                 // random port, and `default: 0` "binds" successfully because
                 // the OS assigns an ephemeral port — while the same values in
                 // `value:` are hard errors.
-                if let Some(env_value) = param.get_value_for_environment(&self.environment) {
-                    let default_str = Self::value_to_string(env_value);
+                if let Some(default_value) = param.default.as_ref() {
+                    let default_str = Self::value_to_string(default_value);
                     let default_port = default_str.parse::<u16>().map_err(|_| {
                         Error::TemplateResolution(format!(
                             "Parameter '{}' has invalid port default '{}': must be a literal number between 1 and 65535 (templates are not supported in port defaults)",
@@ -462,9 +424,9 @@ impl Resolver {
                 let port_str = port.to_string();
                 parameters.insert(name.clone(), port_str.clone());
                 self.resolved_parameters.insert(name.clone(), port_str);
-            } else if let Some(env_value) = param.get_value_for_environment(&self.environment) {
-                // Non-port parameter with environment-specific value
-                let default_str = Self::value_to_string(env_value);
+            } else if let Some(default_value) = param.default.as_ref() {
+                // Non-port parameter with a default value
+                let default_str = Self::value_to_string(default_value);
                 parameters.insert(name.clone(), default_str.clone());
                 self.resolved_parameters.insert(name.clone(), default_str);
             }
@@ -490,8 +452,8 @@ impl Resolver {
                 if param.is_port_type() {
                     continue;
                 }
-                if let Some(env_value) = param.get_value_for_environment(&self.environment) {
-                    let default_str = Self::value_to_string(env_value);
+                if let Some(default_value) = param.default.as_ref() {
+                    let default_str = Self::value_to_string(default_value);
                     if default_str.contains("{{")
                         && let Ok(resolved_default) =
                             self.resolve_template(&default_str, &parameters)
@@ -518,8 +480,8 @@ impl Resolver {
             if self.deferred_params.contains(name) {
                 continue;
             }
-            if let Some(env_value) = param.get_value_for_environment(&self.environment) {
-                let default_str = Self::value_to_string(env_value);
+            if let Some(default_value) = param.default.as_ref() {
+                let default_str = Self::value_to_string(default_value);
                 if default_str.contains("{{") {
                     // Check if parameter was resolved
                     if let Some(resolved_value) = parameters.get(name)
@@ -603,8 +565,8 @@ impl Resolver {
             for (name, param) in effective_params {
                 if let Some(ref value) = param.value {
                     params.insert(name.clone(), value.clone());
-                } else if let Some(env_value) = param.get_value_for_environment(&self.environment) {
-                    params.insert(name.clone(), Self::value_to_string(env_value));
+                } else if let Some(default_value) = param.default.as_ref() {
+                    params.insert(name.clone(), Self::value_to_string(default_value));
                 } else if param.is_port_type() {
                     let port = self.port_allocator.allocate_random_port()?;
                     params.insert(name.clone(), port.to_string());
@@ -828,10 +790,6 @@ mod tests {
 
         // Create circular reference: A -> B -> A
         let param_a = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("{{B}}".to_string())),
             either: vec![],
@@ -842,10 +800,6 @@ mod tests {
         };
 
         let param_b = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("{{A}}".to_string())),
             either: vec![],
@@ -876,10 +830,6 @@ mod tests {
 
         // Create circular reference: A -> B -> C -> A
         let param_a = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("{{B}}".to_string())),
             either: vec![],
@@ -890,10 +840,6 @@ mod tests {
         };
 
         let param_b = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("{{C}}".to_string())),
             either: vec![],
@@ -904,10 +850,6 @@ mod tests {
         };
 
         let param_c = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("{{A}}".to_string())),
             either: vec![],
@@ -939,10 +881,6 @@ mod tests {
 
         // Create valid chain: A -> B -> C (no cycle)
         let param_c = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("value_c".to_string())),
             either: vec![],
@@ -953,10 +891,6 @@ mod tests {
         };
 
         let param_b = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("{{C}}".to_string())),
             either: vec![],
@@ -967,10 +901,6 @@ mod tests {
         };
 
         let param_a = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("{{B}}".to_string())),
             either: vec![],
@@ -1001,10 +931,6 @@ mod tests {
 
         // Create parameter that references non-existent parameter
         let param_a = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("{{MISSING}}".to_string())),
             either: vec![],
@@ -1031,10 +957,6 @@ mod tests {
 
         // Create parameter with either constraint and valid default
         let param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("dev".to_string())),
             either: vec!["dev".to_string(), "staging".to_string(), "prod".to_string()],
@@ -1061,10 +983,6 @@ mod tests {
 
         // Create parameter with either constraint and invalid default
         let param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("invalid".to_string())),
             either: vec!["dev".to_string(), "staging".to_string(), "prod".to_string()],
@@ -1092,10 +1010,6 @@ mod tests {
 
         // Create parameter with either constraint and user-provided value
         let mut param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: None,
             either: vec!["dev".to_string(), "staging".to_string(), "prod".to_string()],
@@ -1123,10 +1037,6 @@ mod tests {
 
         // Create parameter with either constraint and invalid user-provided value
         let mut param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: None,
             either: vec!["dev".to_string(), "staging".to_string(), "prod".to_string()],
@@ -1155,10 +1065,6 @@ mod tests {
 
         // Create base parameter
         let base_param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("staging".to_string())),
             either: vec![],
@@ -1170,10 +1076,6 @@ mod tests {
 
         // Create parameter with either constraint that references base
         let env_param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("{{BASE}}".to_string())),
             either: vec!["dev".to_string(), "staging".to_string(), "prod".to_string()],

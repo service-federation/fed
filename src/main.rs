@@ -160,10 +160,17 @@ async fn run() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // -e/--env selects which per-parameter environment value resolves and which
-    // vault environment manual secrets are fetched from. Parse it up front so
-    // an invalid value fails fast for every command that resolves parameters.
-    let environment: fed::config::Environment = cli.env.parse().map_err(fed::Error::Validation)?;
+    // -e/--env was removed in fed 8.0 (the development/staging/production
+    // axis no longer exists). The flag is kept registered (hidden, optional)
+    // so a stale invocation gets this explicit migration error instead of a
+    // generic clap "unexpected argument" failure. Checked immediately after
+    // parsing, before any config loading happens.
+    if cli.env.is_some() {
+        eprintln!(
+            "error: -e/--env was removed in fed 8.0 — the development/staging/production axis no longer exists. Move deployment-specific parameter values into an env_file instead (see env_file: in fed.yaml docs)."
+        );
+        std::process::exit(1);
+    }
 
     // Initialize tracing and output
     let is_tui = matches!(cli.command, Commands::Tui { .. });
@@ -181,7 +188,6 @@ async fn run() -> anyhow::Result<()> {
     // commands (`Ports`/`Isolate`) don't read either field, so the partial
     // context is correct for them as-is.
     let mut run_context = RunContext {
-        environment,
         offline: cli.offline,
         is_interactive,
         output_mode: OutputMode::default(),

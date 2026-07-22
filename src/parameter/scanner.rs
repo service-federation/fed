@@ -87,8 +87,10 @@ pub fn required_parameter_names(config: &Config, script_name: &str) -> HashSet<S
     // pull in another via ANY of its interpolating fields, not just `generate`:
     //   - `generate: "derive --from {{SECRET}}"`
     //   - `default: "prefix-{{SECRET}}"`
-    //   - environment-specific values (`development`/`develop`/`staging`/
-    //     `production`: "{{SECRET}}")
+    // (The legacy `development`/`develop`/`staging`/`production` fields are
+    // inert-capture-only post-fed-8.0 and never reach this scan in practice —
+    // `Config::validate()` rejects any parameter that sets them before a run
+    // gets this far — but whole-struct scanning still sees them for free.)
     // Whole-struct scanning each referenced Parameter (the same regex sweep used
     // for scripts/services) catches all of them and subsumes the generate-only
     // closure — enumerating fields here would re-introduce the drift hazard the
@@ -423,51 +425,6 @@ mod tests {
             names.contains("SECRET"),
             "a default that interpolates a secret must pull it in: {names:?}"
         );
-    }
-
-    #[test]
-    fn closes_over_environment_specific_values() {
-        // DERIVED's value comes from environment-specific fields, each of which
-        // can interpolate a distinct secret. All must be pulled in (the scanner
-        // is environment-agnostic — it can't know which env will run).
-        let mut config = Config::default();
-        config.scripts.insert(
-            "run".to_string(),
-            Script {
-                script: "app {{DERIVED}}".to_string(),
-                ..Default::default()
-            },
-        );
-        config.parameters.insert(
-            "DERIVED".to_string(),
-            Parameter {
-                development: Some(serde_yaml::Value::String("{{DEV_SECRET}}".to_string())),
-                develop: Some(serde_yaml::Value::String("{{DEVELOP_SECRET}}".to_string())),
-                staging: Some(serde_yaml::Value::String("{{STAGING_SECRET}}".to_string())),
-                production: Some(serde_yaml::Value::String("{{PROD_SECRET}}".to_string())),
-                ..Default::default()
-            },
-        );
-        for s in [
-            "DEV_SECRET",
-            "DEVELOP_SECRET",
-            "STAGING_SECRET",
-            "PROD_SECRET",
-        ] {
-            config.parameters.insert(s.to_string(), secret_param());
-        }
-        let names = required_parameter_names(&config, "run");
-        for s in [
-            "DEV_SECRET",
-            "DEVELOP_SECRET",
-            "STAGING_SECRET",
-            "PROD_SECRET",
-        ] {
-            assert!(
-                names.contains(s),
-                "env-specific value referencing {s} must pull it in: {names:?}"
-            );
-        }
     }
 
     #[test]

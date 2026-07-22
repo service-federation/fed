@@ -13,7 +13,6 @@
 //! - `dependency` - Dependencies (`Dependency`, `DependsOn`, `Metadata`)
 //! - `parameter` - Variables/parameters (`Parameter`)
 //! - `script` - Script configuration (`Script`)
-//! - `environment` - Environment handling
 //! - `parser` - YAML config parsing
 //! - `validation` - Config validation
 
@@ -22,7 +21,6 @@ pub mod env_loader;
 
 mod dependency;
 mod duration;
-mod environment;
 mod health;
 mod parameter;
 mod parser;
@@ -35,7 +33,6 @@ mod validation;
 // Re-export all types for backward compatibility
 pub use dependency::*;
 pub use duration::*;
-pub use environment::*;
 pub use health::*;
 pub use parameter::*;
 pub use parser::*;

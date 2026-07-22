@@ -1135,23 +1135,6 @@ fn test_workdir_flag() {
 }
 
 #[test]
-fn test_env_flag() {
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = create_test_config(&temp_dir);
-
-    let output = Command::new(fed_binary())
-        .args(["-c", &config_path, "-e", "production", "validate"])
-        .output()
-        .expect("Failed to run fed");
-
-    assert!(
-        output.status.success(),
-        "-e flag not working: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
 fn test_profile_flag() {
     let temp_dir = TempDir::new().unwrap();
     let config_path = create_test_config(&temp_dir);

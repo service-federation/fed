@@ -101,10 +101,6 @@ mod tests {
 
         // Declare the parameter (must exist for .env file to work)
         let param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("default_value".to_string())),
             either: vec![],
@@ -141,10 +137,6 @@ mod tests {
 
         // Declare the parameter with an explicit value already set
         let param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("default_value".to_string())),
             either: vec![],
@@ -153,6 +145,7 @@ mod tests {
             optional: None,
             generate: None,
             value: Some("explicit_value".to_string()), // Explicit value takes precedence
+            ..Default::default()
         };
 
         config.parameters.insert("MY_PARAM".to_string(), param);
@@ -207,10 +200,6 @@ mod tests {
 
         // Declare the parameter
         let param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("".to_string())),
             either: vec![],
@@ -285,10 +274,6 @@ mod tests {
         let mut config = Config::default();
 
         let param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: Some(serde_yaml::Value::String("default".to_string())),
             either: vec![],

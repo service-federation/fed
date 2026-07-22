@@ -13,9 +13,10 @@ pub struct Cli {
     #[arg(short, long)]
     pub workdir: Option<PathBuf>,
 
-    /// Environment for variable resolution
-    #[arg(short, long, default_value = "development", hide = true)]
-    pub env: String,
+    /// Removed in fed 8.0 — kept hidden and optional so a stale invocation
+    /// gets an explicit migration error instead of a clap parse failure.
+    #[arg(short, long, hide = true)]
+    pub env: Option<String>,
 
     /// Active profiles for conditional service startup (can be repeated)
     #[arg(short, long)]
@@ -227,9 +228,11 @@ pub enum Commands {
 pub enum SecretsCommands {
     /// List the linked project's secrets (names and last-updated info, never values)
     Ls {
-        /// Environment
-        #[arg(long, default_value = "development", hide = true)]
-        env: String,
+        /// Removed in fed 8.0 — kept hidden and optional so a stale
+        /// invocation gets an explicit migration error instead of a clap
+        /// parse failure.
+        #[arg(long, hide = true)]
+        env: Option<String>,
     },
 }
 

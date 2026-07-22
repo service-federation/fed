@@ -29,7 +29,6 @@ scripts:
     let temp = tempfile::tempdir().unwrap();
 
     let ctx = RunContext {
-        environment: fed::config::Environment::Development,
         offline: true,
         is_interactive: false,
         output_mode: fed::OutputMode::Captured,

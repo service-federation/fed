@@ -204,6 +204,29 @@ impl Config {
             }
         }
 
+        // Parameters must not use environment-specific values — the
+        // development/staging/production axis was removed in fed 8.0. Unlike
+        // the `unknown_fields` warning path used for structural typos
+        // (`Config`/`Service`'s `#[serde(flatten)]` catch-all), this is a
+        // values-correctness issue — a parameter silently resolving to the
+        // wrong thing — so it stays a hard `validate()` error, not a
+        // warning. This check covers every parameter, not just secrets:
+        // secret parameters get it "for free" here, so the old
+        // secret-specific env check is folded into this one rather than
+        // kept as a near-duplicate.
+        for (name, param) in self.get_effective_parameters() {
+            if param.development.is_some()
+                || param.develop.is_some()
+                || param.staging.is_some()
+                || param.production.is_some()
+            {
+                return Err(Error::Validation(format!(
+                    "Parameter '{}' uses environment-specific values ('development'/'staging'/'production'), removed in fed 8.0. Move the varying value into an env_file instead (see the 'env_file:' config key) and select the right file per deployment context.",
+                    name
+                )));
+            }
+        }
+
         // Validate secret parameter constraints
         for (name, param) in self.get_effective_parameters() {
             if !param.is_secret_type() {
@@ -214,18 +237,6 @@ impl Config {
             if param.default.is_some() {
                 return Err(Error::Validation(format!(
                     "Secret parameter '{}' must not have a default value — secrets are generated or provided via .env",
-                    name
-                )));
-            }
-
-            // Secrets must not have environment-specific values
-            if param.development.is_some()
-                || param.develop.is_some()
-                || param.staging.is_some()
-                || param.production.is_some()
-            {
-                return Err(Error::Validation(format!(
-                    "Secret parameter '{}' must not have environment-specific values — secrets are generated or provided via .env",
                     name
                 )));
             }
@@ -1786,10 +1797,31 @@ mod tests {
             },
         );
         let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("must not have environment-specific")
+        let msg = err.to_string();
+        assert!(msg.contains("removed in fed 8.0"));
+        assert!(msg.contains("env_file"));
+    }
+
+    #[test]
+    fn non_secret_with_env_specific_value_is_rejected() {
+        // The removal check isn't secret-only — any parameter (e.g. a plain
+        // string/port parameter) that still sets one of the four legacy
+        // environment fields must fail validate() with the same migration
+        // guidance, since `Parameter` has no unknown-field catch-all to fall
+        // back on (see 08-environments-removal.md Design §1).
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_URL".to_string(),
+            Parameter {
+                staging: Some(serde_yaml::Value::String("https://staging".to_string())),
+                ..Default::default()
+            },
         );
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("API_URL"));
+        assert!(msg.contains("removed in fed 8.0"));
+        assert!(msg.contains("env_file"));
     }
 
     #[test]

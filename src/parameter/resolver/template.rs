@@ -219,10 +219,6 @@ mod tests {
 
         // Create parameter with dangerous value
         let mut param = Parameter {
-            development: None,
-            develop: None,
-            staging: None,
-            production: None,
             param_type: None,
             default: None,
             either: vec![],
