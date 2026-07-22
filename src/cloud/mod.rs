@@ -137,15 +137,24 @@ pub fn save_link(work_dir: &Path, link: &CloudLink) -> Result<PathBuf> {
 //
 // A booting (scale-to-zero) backend is not a failing one: the timeout must be
 // a function of whether we can proceed without the answer, not a constant.
-// Three knobs realize that (see 02-cold-vault.md), each with a default chosen
-// so it rarely matters:
+// Four knobs realize that (see 02-cold-vault.md and 04-vault-ttl-cache.md),
+// each with a default chosen so it rarely matters:
 //
 // - `FED_VAULT_GRACE` (2s): how long the resolver waits before falling back to
 //   a fresh cache. Warm vaults answer in ~0.17s, well inside this.
 // - `FED_VAULT_TIMEOUT` (60s): the blocking budget when the cache can't cover
 //   the run and we must wait for a cold start. Also the HTTP client timeout.
 // - `FED_VAULT_MAX_AGE` (24h): freshness bound on cached values. Beyond it, a
-//   run blocks to refresh rather than serve a stale value forever.
+//   run blocks to refresh rather than serve a stale value forever. Applies
+//   only once a fetch has already been fired and grace has expired (deciding
+//   whether to keep waiting), and as the fallback bound when the vault is
+//   unreachable.
+// - `FED_VAULT_TTL` (5m): freshness window in which a fully-cached run skips
+//   the vault call entirely — no fetch is fired at all. Distinct from
+//   `FED_VAULT_MAX_AGE`: this bound decides whether to fire the fetch in the
+//   first place, checked before any network activity. 0 disables the skip
+//   (every run with queried names always calls the vault, matching behavior
+//   before this knob existed).
 
 use std::time::Duration;
 
@@ -176,6 +185,16 @@ pub fn vault_timeout() -> Duration {
 /// Freshness bound on cached secret values (`FED_VAULT_MAX_AGE`, default 24h).
 pub fn vault_max_age() -> Duration {
     env_duration("FED_VAULT_MAX_AGE", Duration::from_secs(24 * 60 * 60))
+}
+
+/// Freshness window in which a fully-cached run skips the vault call
+/// entirely — no fetch is fired at all (`FED_VAULT_TTL`, default 5m). Distinct
+/// from `FED_VAULT_MAX_AGE` (24h): that bound only applies once a fetch has
+/// already been fired and grace has expired; this bound decides whether to
+/// fire the fetch at all. 0 disables the skip (every run with queried names
+/// always calls the vault, today's behavior).
+pub fn vault_ttl() -> Duration {
+    env_duration("FED_VAULT_TTL", Duration::from_secs(5 * 60))
 }
 
 // ── API client ────────────────────────────────────────────────────────
@@ -789,6 +808,7 @@ mod tests {
         assert_eq!(vault_grace(), Duration::from_secs(2));
         assert_eq!(vault_timeout(), Duration::from_secs(60));
         assert_eq!(vault_max_age(), Duration::from_secs(24 * 60 * 60));
+        assert_eq!(vault_ttl(), Duration::from_secs(300));
     }
 
     #[test]

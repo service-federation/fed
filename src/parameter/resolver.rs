@@ -779,6 +779,23 @@ impl Resolver {
         // name, including names the cache could satisfy, so rotated or revoked
         // values are picked up. Requires `fed login` + `fed link`; skipped
         // with --offline.
+        //
+        // Pre-network TTL skip (04-vault-ttl-cache.md): in `Development` only,
+        // if the cache already freshly covers every queried name — within
+        // `FED_VAULT_TTL` (default 5m) of its last fetch — the vault stays
+        // authoritative but is never even queried: no fetch fires, no thread
+        // spawns. Outside `Development` (`Staging`, `Production`, or a future
+        // custom environment) the vault stays authoritative unconditionally,
+        // exactly as before this knob existed, regardless of `FED_VAULT_TTL`
+        // or cache freshness. The guard exists because the local cache
+        // (`.fed/secrets.cache.env`) is a single project-wide file, not
+        // partitioned by environment: a pre-network skip with no environment
+        // check could let a fresh `staging` cache silently answer a
+        // `production` run within the TTL window (Sol's adversarial finding,
+        // see Design §4 in 04-vault-ttl-cache.md). It's temporary scaffolding
+        // — `08-environments-removal.md` deletes the environment axis
+        // entirely, at which point this check either becomes unconditionally
+        // true or is deleted outright as dead code.
         let mut vault_resolved: Vec<(String, String)> = Vec::new();
         let mut vault_query_succeeded = false;
         // Captures why the vault lookup failed (network/auth), so a later
@@ -798,47 +815,78 @@ impl Resolver {
             .filter(|name| self.name_in_scope(name))
             .collect();
         if !queried_names.is_empty() && !self.offline {
-            match self.obtain_vault_outcome(&work_dir, &queried_names, &analysis) {
-                VaultOutcome::Values(values) => {
-                    vault_query_succeeded = true;
-                    for (name, value) in values {
-                        if let Some(param) = config.get_effective_parameters_mut().get_mut(&name) {
-                            param.value = Some(value.clone());
+            let ttl = crate::cloud::vault_ttl();
+            // The pre-network skip is gated on `environment == Development` —
+            // see the doc comment above for why. Every other environment
+            // keeps today's behavior unconditionally: the vault is always
+            // queried.
+            let ttl_covers = ttl.as_secs() > 0
+                && self.environment == crate::config::Environment::Development
+                && cache_covers_fresh(
+                    &queried_names,
+                    &analysis.cache_values,
+                    &analysis.cache_stamps,
+                    unix_now(),
+                    ttl.as_secs(),
+                );
+            if ttl_covers {
+                // Cache is fresh within FED_VAULT_TTL — skip the network call
+                // entirely. vault_query_succeeded stays false, so this falls
+                // through to the existing cache-fallback branch below
+                // unchanged. The cache is deliberately NOT rewritten here:
+                // nothing changed, and rewriting would reset the very stamps
+                // the next run's TTL check depends on, for no benefit.
+                tracing::debug!(
+                    "team vault skipped: cached secret values are fresh (< {:?})",
+                    ttl
+                );
+            } else {
+                match self.obtain_vault_outcome(&work_dir, &queried_names, &analysis) {
+                    VaultOutcome::Values(values) => {
+                        vault_query_succeeded = true;
+                        for (name, value) in values {
+                            if let Some(param) =
+                                config.get_effective_parameters_mut().get_mut(&name)
+                            {
+                                param.value = Some(value.clone());
+                            }
+                            vault_resolved.push((name, value));
                         }
-                        vault_resolved.push((name, value));
+                        let resolved_names: HashSet<&str> =
+                            vault_resolved.iter().map(|(n, _)| n.as_str()).collect();
+                        analysis
+                            .missing_manual
+                            .retain(|(name, _)| !resolved_names.contains(name.as_str()));
+                        analysis
+                            .missing_optional_manual
+                            .retain(|name| !resolved_names.contains(name.as_str()));
+                        if !vault_resolved.is_empty() {
+                            tracing::info!(
+                                "Resolved {} secret(s) from the team vault",
+                                vault_resolved.len()
+                            );
+                        }
                     }
-                    let resolved_names: HashSet<&str> =
-                        vault_resolved.iter().map(|(n, _)| n.as_str()).collect();
-                    analysis
-                        .missing_manual
-                        .retain(|(name, _)| !resolved_names.contains(name.as_str()));
-                    analysis
-                        .missing_optional_manual
-                        .retain(|name| !resolved_names.contains(name.as_str()));
-                    if !vault_resolved.is_empty() {
-                        tracing::info!(
-                            "Resolved {} secret(s) from the team vault",
-                            vault_resolved.len()
+                    VaultOutcome::CacheFresh => {
+                        // Grace expired but the cache covers every queried name
+                        // freshly — proceed on it, no warning. The abandoned
+                        // in-flight request has already warmed the backend.
+                        tracing::debug!(
+                            "team vault slow to answer; proceeding on fresh cached values"
                         );
                     }
-                }
-                VaultOutcome::CacheFresh => {
-                    // Grace expired but the cache covers every queried name
-                    // freshly — proceed on it, no warning. The abandoned
-                    // in-flight request has already warmed the backend.
-                    tracing::debug!("team vault slow to answer; proceeding on fresh cached values");
-                }
-                VaultOutcome::Local => {} // not logged in / not linked — local mode
-                VaultOutcome::Failed(reason) => {
-                    // Reached-but-unusable or unreachable: fall back to the
-                    // cache regardless of age (offline work must keep working),
-                    // and remember the reason so a missing-secret failure names
-                    // the cloud instead of the user's env_file.
-                    tracing::warn!(
-                        "team vault unavailable ({}); proceeding on cached secret values where available",
-                        reason
-                    );
-                    vault_failure = Some(reason);
+                    VaultOutcome::Local => {} // not logged in / not linked — local mode
+                    VaultOutcome::Failed(reason) => {
+                        // Reached-but-unusable or unreachable: fall back to the
+                        // cache regardless of age (offline work must keep working),
+                        // and remember the reason so a missing-secret failure names
+                        // the cloud instead of the user's env_file.
+                        tracing::warn!(
+                            "team vault unavailable ({}); proceeding on cached secret values where available",
+                            reason
+                        );
+                        vault_failure = Some(reason);
+                    }
                 }
             }
         }
@@ -3851,6 +3899,22 @@ mod tests {
         assert!(!cache_covers_fresh(&names, &values, &stamps, now, max_age));
     }
 
+    /// A `max_age` of 0 naturally degrades to "never fresh": `now - stamped <
+    /// 0` never holds for a `u64`, even for a stamp equal to `now`. This means
+    /// `FED_VAULT_TTL=0` forces every run through `obtain_vault_outcome` even
+    /// without the explicit `ttl.as_secs() > 0` guard at the call site — that
+    /// guard is belt-and-suspenders for readability, not load-bearing.
+    #[test]
+    fn cache_covers_fresh_with_zero_max_age_is_never_fresh() {
+        let now = 1_000_000u64;
+        let names = vec!["A".to_string()];
+        let mut values = HashMap::new();
+        values.insert("A".to_string(), "va".to_string());
+        let mut stamps = HashMap::new();
+        stamps.insert("A".to_string(), now); // freshest possible stamp
+        assert!(!cache_covers_fresh(&names, &values, &stamps, now, 0));
+    }
+
     #[test]
     fn cache_covers_fresh_rejects_future_stamps() {
         // A stamp in the future must NOT count as fresh: saturating_sub would
@@ -3918,6 +3982,241 @@ mod tests {
         let cache =
             std::fs::read_to_string(temp_dir.path().join(".fed/secrets.cache.env")).unwrap();
         assert!(cache.contains("API_KEY=cached_old"));
+    }
+
+    // ── FED_VAULT_TTL pre-network skip (04-vault-ttl-cache.md) ──────────
+    //
+    // These all use `test_vault_values` with a value DIFFERENT from the
+    // pre-populated cache. That's deliberate: the only way the resolved value
+    // can be the cache's rather than the stub's is if `obtain_vault_outcome`
+    // (and the stub check inside it) was never reached — the sharpest
+    // possible proof the network path was skipped.
+
+    #[test]
+    fn ttl_fresh_cache_skips_vault_entirely() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+        let fresh_stamp = unix_now() - 10; // well under the 300s default TTL
+        std::fs::write(
+            temp_dir.path().join(".fed/secrets.cache.env"),
+            format!("# fetched-at API_KEY {fresh_stamp}\nAPI_KEY=cached-value\n"),
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new(); // defaults to Environment::Development
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_test_vault_values(HashMap::from([(
+            "API_KEY".to_string(),
+            "vault-value".to_string(),
+        )]));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(
+            resolver.get_resolved_parameters().get("API_KEY").unwrap(),
+            "cached-value",
+            "a fresh cache within FED_VAULT_TTL must skip the vault call entirely"
+        );
+    }
+
+    #[test]
+    fn ttl_stale_cache_still_queries_vault() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+        let stale_stamp = unix_now().saturating_sub(301); // just past the 300s default TTL
+        std::fs::write(
+            temp_dir.path().join(".fed/secrets.cache.env"),
+            format!("# fetched-at API_KEY {stale_stamp}\nAPI_KEY=cached-value\n"),
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_test_vault_values(HashMap::from([(
+            "API_KEY".to_string(),
+            "vault-value".to_string(),
+        )]));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(
+            resolver.get_resolved_parameters().get("API_KEY").unwrap(),
+            "vault-value",
+            "a cache older than FED_VAULT_TTL must still query the vault"
+        );
+        // The vault answered, so the cache is rewritten with a fresh stamp.
+        let cache =
+            std::fs::read_to_string(temp_dir.path().join(".fed/secrets.cache.env")).unwrap();
+        assert!(cache.contains("API_KEY=vault-value"));
+    }
+
+    #[test]
+    fn ttl_partial_miss_forces_full_vault_query() {
+        // Any single missing/stale name among the queried set forces a full
+        // vault query for ALL queried names — no partial fetch.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+        let fresh_stamp = unix_now() - 10;
+        // API_KEY is fresh in cache; OTHER_KEY is entirely absent.
+        std::fs::write(
+            temp_dir.path().join(".fed/secrets.cache.env"),
+            format!("# fetched-at API_KEY {fresh_stamp}\nAPI_KEY=cached-value\n"),
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_test_vault_values(HashMap::from([
+            ("API_KEY".to_string(), "vault-api-key".to_string()),
+            ("OTHER_KEY".to_string(), "vault-other-key".to_string()),
+        ]));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "OTHER_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        let resolved = resolver.get_resolved_parameters();
+        assert_eq!(
+            resolved.get("API_KEY").unwrap(),
+            "vault-api-key",
+            "a miss anywhere in queried_names forces the full set through the vault, \
+             not a mix of cache and vault answers"
+        );
+        assert_eq!(resolved.get("OTHER_KEY").unwrap(), "vault-other-key");
+    }
+
+    #[test]
+    fn ttl_non_development_environment_always_queries_vault() {
+        // Sol's adversarial finding (Design §4): a pre-network skip with no
+        // environment check could let a fresh cache from one environment
+        // silently answer another environment's run. The guard closes this by
+        // restricting the skip to Environment::Development only.
+        use crate::config::{Config, Environment, Parameter};
+        use tempfile::TempDir;
+
+        for env in [Environment::Staging, Environment::Production] {
+            let temp_dir = TempDir::new().unwrap();
+            crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+            let fresh_stamp = unix_now() - 10;
+            std::fs::write(
+                temp_dir.path().join(".fed/secrets.cache.env"),
+                format!("# fetched-at API_KEY {fresh_stamp}\nAPI_KEY=cached-value\n"),
+            )
+            .unwrap();
+
+            let mut resolver = Resolver::new();
+            resolver.set_work_dir(temp_dir.path());
+            resolver.set_environment(env);
+            resolver.set_test_vault_values(HashMap::from([(
+                "API_KEY".to_string(),
+                "vault-value".to_string(),
+            )]));
+
+            let mut config = Config::default();
+            config.parameters.insert(
+                "API_KEY".to_string(),
+                Parameter {
+                    param_type: Some("secret".to_string()),
+                    source: Some("manual".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            resolver.resolve_parameters(&mut config).unwrap();
+            assert_eq!(
+                resolver.get_resolved_parameters().get("API_KEY").unwrap(),
+                "vault-value",
+                "{:?}: the TTL skip must be unreachable outside Development, even with a \
+                 fully-fresh cache",
+                env
+            );
+        }
+    }
+
+    #[test]
+    fn ttl_skip_does_not_rewrite_cache() {
+        // Guards against a future refactor accidentally rewriting the cache on
+        // the skip path — that would reset the very stamps the next run's TTL
+        // check depends on, for no benefit.
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+        let fresh_stamp = unix_now() - 10;
+        let cache_path = temp_dir.path().join(".fed/secrets.cache.env");
+        std::fs::write(
+            &cache_path,
+            format!("# fetched-at API_KEY {fresh_stamp}\nAPI_KEY=cached-value\n"),
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&cache_path).unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_test_vault_values(HashMap::from([(
+            "API_KEY".to_string(),
+            "vault-value".to_string(),
+        )]));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        let after = std::fs::read_to_string(&cache_path).unwrap();
+        assert_eq!(
+            before, after,
+            "the cache must be byte-for-byte unchanged on the TTL-skip path"
+        );
     }
 
     #[test]
