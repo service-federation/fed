@@ -43,7 +43,7 @@ impl LocalSourceHandler {
         // Verify it contains a fed config file
         if crate::config::discovery::config_file_in_dir(&canonical_path).is_none() {
             return Err(Error::Package(format!(
-                "Package at {} does not contain fed.yaml or service-federation.yaml (.yml also accepted)",
+                "Package at {} does not contain fed.yaml (.yml also accepted)",
                 canonical_path.display()
             )));
         }

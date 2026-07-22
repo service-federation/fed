@@ -126,7 +126,7 @@ impl ExternalDependencyResolver {
         let config_path =
             crate::config::discovery::config_file_in_dir(repo_path).ok_or_else(|| {
                 Error::Config(format!(
-                    "No fed.yaml or service-federation.yaml found in external repo at {:?}",
+                    "No fed.yaml found in external repo at {:?}",
                     repo_path
                 ))
             })?;

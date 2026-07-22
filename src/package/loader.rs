@@ -18,7 +18,7 @@ impl PackageLoader {
     pub fn load(&self, path: &Path) -> Result<Config> {
         let config_path = crate::config::discovery::config_file_in_dir(path).ok_or_else(|| {
             Error::Package(format!(
-                "Package at {} does not contain fed.yaml or service-federation.yaml (.yml also accepted)",
+                "Package at {} does not contain fed.yaml (.yml also accepted)",
                 path.display()
             ))
         })?;

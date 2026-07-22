@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(name = "fed", version)]
 #[command(about = "Service Federation - Orchestrate complex service dependencies")]
 pub struct Cli {
-    /// Config file path (defaults to fed.yaml, or service-federation.yaml)
+    /// Config file path (defaults to fed.yaml)
     #[arg(short, long)]
     pub config: Option<PathBuf>,
 

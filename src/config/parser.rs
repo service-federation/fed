@@ -36,7 +36,7 @@ impl Parser {
         }
 
         Err(Error::Config(format!(
-            "Could not find fed.yaml (or service-federation.yaml) in '{}' or any parent directory.\n\
+            "Could not find fed.yaml in '{}' or any parent directory.\n\
              Create one with `fed init` or specify a path with `fed -c <path>`",
             origin.display()
         )))
