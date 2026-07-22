@@ -50,6 +50,8 @@ pub async fn run_validate(
             "docker-compose"
         } else if service.gradle_task.is_some() {
             "gradle"
+        } else if service.install.is_some() || service.migrate.is_some() {
+            "hook-only"
         } else {
             "unknown"
         };

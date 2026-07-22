@@ -6,6 +6,22 @@ packages:
   - source: "./packages/redis"
     as: "cache-package"
 
+# Packages contribute services, not parameters — every host-mapped port
+# used below must be declared here, in the config that actually imports
+# the packages.
+parameters:
+  DB_PORT:
+    type: port
+    default: 5432
+
+  CACHE_PORT:
+    type: port
+    default: 6379
+
+  WEB_PORT:
+    type: port
+    default: 3000
+
 services:
   # Database service extending the base postgres configuration
   database:
@@ -17,16 +33,17 @@ services:
     # Add custom volume for backups
     volumes:
       - "./backups:/backups"
-    # Use a different port mapping
+    # Host port mapping — lives here, not in the package (see
+    # packages/database/fed.yaml for why).
     ports:
-      - "5433:5432"
+      - "{{DB_PORT}}:5432"
 
   # Cache service extending the base redis configuration
   cache:
     extends: "cache-package.redis"
-    # Override port for local development
+    # Host port mapping — lives here, not in the package.
     ports:
-      - "6380:6379"
+      - "{{CACHE_PORT}}:6379"
     # Add custom config
     volumes:
       - "./redis.conf:/usr/local/etc/redis/redis.conf"
@@ -38,14 +55,17 @@ services:
     install: npm install
     process: npm start
     environment:
-      DATABASE_URL: "postgres://admin:secret@database:5432/myapp"
-      REDIS_URL: "redis://cache:6379"
+      # fed's `image:` services run without a shared Docker network, so
+      # sibling services are reached via localhost + host port, not the
+      # fed service name as a hostname.
+      DATABASE_URL: "postgres://admin:secret@localhost:{{DB_PORT}}/myapp"
+      REDIS_URL: "redis://localhost:{{CACHE_PORT}}"
     ports:
-      - "3000:3000"
+      - "{{WEB_PORT}}:{{WEB_PORT}}"
     depends_on:
       - database
       - cache
     healthcheck:
-      httpGet: "http://localhost:3000/health"
+      httpGet: "http://localhost:{{WEB_PORT}}/health"
 
 entrypoint: web

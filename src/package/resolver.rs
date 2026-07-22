@@ -270,7 +270,7 @@ impl PackageResolver {
         // Warn if auth is configured (deprecated)
         if auth.is_some() {
             tracing::warn!(
-                "Package auth configuration is deprecated and ignored. \
+                "Package `auth` is ignored. \
                 Configure git credentials using ssh-agent or git credential helpers instead. \
                 See: https://git-scm.com/book/en/v2/Git-Tools-Credential-Storage"
             );
@@ -324,7 +324,7 @@ impl PackageResolver {
         // Warn if auth is configured (deprecated)
         if auth.is_some() {
             tracing::warn!(
-                "Package auth configuration is deprecated and ignored. \
+                "Package `auth` is ignored. \
                 Configure git credentials using ssh-agent or git credential helpers instead. \
                 See: https://git-scm.com/book/en/v2/Git-Tools-Credential-Storage"
             );

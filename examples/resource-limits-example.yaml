@@ -7,6 +7,14 @@ parameters:
     type: port
     default: 5432
 
+  REDIS_PORT:
+    type: port
+    default: 6379
+
+  FRONTEND_PORT:
+    type: port
+    default: 3000
+
 services:
   # Database service with resource limits
   # Prevents database from consuming all machine RAM
@@ -32,7 +40,7 @@ services:
   # Cache service with minimal resources
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    ports: ["{{REDIS_PORT}}:6379"]
     resources:
       memory: 256m
       cpus: "1.0"
@@ -47,7 +55,7 @@ services:
     environment:
       PORT: "{{API_PORT}}"
       DATABASE_URL: "postgres://developer:secure-password@localhost:{{DB_PORT}}/myapp"
-      REDIS_URL: "redis://localhost:6379"
+      REDIS_URL: "redis://localhost:{{REDIS_PORT}}"
       NODE_ENV: development
     resources:
       # Memory limit for Node process
@@ -70,7 +78,7 @@ services:
     depends_on: [database, redis]
     environment:
       DATABASE_URL: "postgres://developer:secure-password@localhost:{{DB_PORT}}/myapp"
-      REDIS_URL: "redis://localhost:6379"
+      REDIS_URL: "redis://localhost:{{REDIS_PORT}}"
     resources:
       # Smaller memory limit for background worker
       memory: 512m
@@ -86,7 +94,7 @@ services:
     process: |
       npm run dev
     cwd: ./frontend
-    ports: ["3000:3000"]
+    ports: ["{{FRONTEND_PORT}}:{{FRONTEND_PORT}}"]
     depends_on: [backend]
     environment:
       REACT_APP_API_URL: "http://localhost:{{API_PORT}}"
@@ -112,5 +120,5 @@ scripts:
     script: |
       echo "Starting development environment..."
       echo "Backend: http://localhost:{{API_PORT}}"
-      echo "Redis: localhost:6379"
+      echo "Redis: localhost:{{REDIS_PORT}}"
       echo "Database: localhost:{{DB_PORT}}"

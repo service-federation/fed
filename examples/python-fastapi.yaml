@@ -16,6 +16,10 @@ parameters:
     type: port
     default: 5555
 
+  DB_PORT:
+    type: port
+    default: 5432
+
   DB_NAME:
     default: fastapi_dev
 
@@ -33,7 +37,7 @@ services:
   # Infrastructure
   postgres:
     image: postgres:15-alpine
-    ports: ["5432:5432"]
+    ports: ["{{DB_PORT}}:5432"]
     environment:
       POSTGRES_DB: '{{DB_NAME}}'
       POSTGRES_USER: '{{DB_USER}}'
@@ -54,7 +58,7 @@ services:
     depends_on: [postgres, redis]
     environment:
       PORT: '{{API_PORT}}'
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
       REDIS_URL: 'redis://localhost:{{REDIS_PORT}}'
       CELERY_BROKER_URL: 'redis://localhost:{{REDIS_PORT}}/0'
       CELERY_RESULT_BACKEND: 'redis://localhost:{{REDIS_PORT}}/0'
@@ -72,7 +76,7 @@ services:
     cwd: ./backend
     depends_on: [redis, postgres]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
       REDIS_URL: 'redis://localhost:{{REDIS_PORT}}'
       CELERY_BROKER_URL: 'redis://localhost:{{REDIS_PORT}}/0'
       CELERY_RESULT_BACKEND: 'redis://localhost:{{REDIS_PORT}}/0'
@@ -114,7 +118,7 @@ scripts:
   migrate:
     depends_on: [postgres]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
     script: |
       cd backend
       source venv/bin/activate
@@ -124,7 +128,7 @@ scripts:
   makemigration:
     depends_on: [postgres]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
     script: |
       cd backend
       source venv/bin/activate
@@ -134,7 +138,7 @@ scripts:
   test:
     depends_on: [postgres, redis]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}_test'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}_test'
       REDIS_URL: 'redis://localhost:{{REDIS_PORT}}/1'
     script: |
       cd backend
@@ -145,7 +149,7 @@ scripts:
   seed:
     depends_on: [postgres]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
     script: |
       cd backend
       source venv/bin/activate

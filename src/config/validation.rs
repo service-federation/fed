@@ -8,7 +8,7 @@ impl Config {
         // `variables` was an alias for `parameters`; removed in 4.0.
         if self.legacy_variables.as_ref().is_some_and(|v| !v.is_null()) {
             return Err(Error::Validation(
-                "The top-level `variables:` key was removed in fed 4.0. \
+                "Unknown top-level key `variables:`. \
                  Rename it to `parameters:` — the schema is identical."
                     .to_string(),
             ));
@@ -84,7 +84,7 @@ impl Config {
             // "no type defined" error (a lone `run:` is otherwise Undefined now).
             if service.run.is_some() {
                 return Err(Error::Validation(format!(
-                    "Service '{}': run: was removed in 6.0 — declare migrate: (and optionally install:) on a service with no process instead; it runs to completion on every start and gates dependents.",
+                    "Service '{}': `run:` is not a service type. Declare migrate: (and optionally install:) on a service with no process instead; it runs to completion on every start and gates dependents.",
                     name
                 )));
             }

@@ -1,61 +1,72 @@
-parameters:
-  # Simple environment overrides
-  DEBUG_MODE:
-    default: "true"
-    production: "false"
+# Parameters showcase
+#
+# Parameters are fed's way of giving each worktree its own configuration —
+# ports, credentials, feature flags — without any of it living in the repo
+# or clashing between worktrees. This file demonstrates what they offer:
+#
+# - type: port    — auto-allocated, collision-free per worktree
+# - plain defaults — ordinary strings/numbers, just a name for a value
+# - either         — restrict a value to an allowed set
+# - type: secret   — generated once and persisted, never hand-typed
+# - {{...}} interpolation — the same parameter reused across ports,
+#   environment variables, and healthchecks
 
-  # Dynamic port allocation with environment-specific defaults
+parameters:
+  # Dynamic port allocation. Fed picks a free port per worktree instead of
+  # a fixed number, so two checkouts of this repo never fight over 8000.
   API_PORT:
     type: port
     default: 8000
-    production: 8080
 
-  # Database configuration per environment
+  # Every host-mapped port needs its own type: port parameter — including
+  # the database's. A literal port here would break isolation between
+  # worktrees just as surely as one on the app itself.
+  DB_PORT:
+    type: port
+    default: 5432
+
+  # A plain default — just a named value, nothing fancier.
   POSTGRES_DB:
     default: "myapp_dev"
-    develop: "myapp_dev"
-    staging: "myapp_staging"
-    production: "myapp_prod"
 
-  # Conditional replica counts
-  REPLICA_COUNT:
-    default: 1
-    staging: 2
-    production: 5
-
-  # Log level per environment
+  # `either` restricts the value to a fixed set of allowed strings.
+  # Handy for things like log level or deploy mode where only certain
+  # values make sense.
   LOG_LEVEL:
     default: "debug"
-    staging: "info"
-    production: "warn"
+    either: ["debug", "info", "warn", "error"]
+
+  # type: secret generates a random value once and persists it in fed's
+  # secrets store. It's never written to this file and never regenerated
+  # unless you delete it — safe to reference like any other parameter.
+  POSTGRES_PASSWORD:
+    type: secret
 
 services:
   database:
     image: postgres:15
     environment:
       POSTGRES_DB: '{{POSTGRES_DB}}'
-      POSTGRES_PASSWORD: 'password'
+      POSTGRES_PASSWORD: '{{POSTGRES_PASSWORD}}'
     ports:
-      - "5432:5432"
+      - "{{DB_PORT}}:5432"
 
+  # A minimal "backend" that actually serves HTTP, so the healthcheck
+  # below has something real to check. Swap this for your app's process.
   backend:
     process: |
-      echo "Starting backend API..."
-      echo "Environment: {{LOG_LEVEL}}"
-      echo "Debug mode: {{DEBUG_MODE}}"
+      echo "Starting backend..."
+      echo "Log level: {{LOG_LEVEL}}"
       echo "Port: {{API_PORT}}"
       echo "Database: {{POSTGRES_DB}}"
-      echo "Replicas: {{REPLICA_COUNT}}"
-      sleep infinity
+      python3 -m http.server {{API_PORT}}
     environment:
       PORT: '{{API_PORT}}'
       LOG_LEVEL: '{{LOG_LEVEL}}'
-      DEBUG: '{{DEBUG_MODE}}'
-      DATABASE_URL: 'postgresql://postgres:password@localhost:5432/{{POSTGRES_DB}}'
-      REPLICA_COUNT: '{{REPLICA_COUNT}}'
+      DATABASE_URL: 'postgresql://postgres:{{POSTGRES_PASSWORD}}@localhost:{{DB_PORT}}/{{POSTGRES_DB}}'
     depends_on:
       - database
     healthcheck:
-      httpGet: 'http://localhost:{{API_PORT}}/health'
+      httpGet: 'http://localhost:{{API_PORT}}/'
 
 entrypoint: backend

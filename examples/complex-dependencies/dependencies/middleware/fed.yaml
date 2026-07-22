@@ -20,7 +20,7 @@ services:
       import urllib.request
 
       PORT = int(os.environ.get('PORT', '3001'))
-      AUTH_URL = os.environ.get('AUTH_URL', 'http://localhost:3002')
+      AUTH_URL = os.environ.get('AUTH_URL', '{{AUTH_URL}}')
       print(f'Middleware: Attempting to bind to port {PORT}', flush=True)
 
       class Handler(http.server.SimpleHTTPRequestHandler):

@@ -9,6 +9,24 @@ parameters:
     type: port
     default: 8080
 
+  # Host-mapped ports for the compose-referenced services below. fed doesn't
+  # rewrite ports declared inside an external docker-compose.yml, but it does
+  # pass each service's resolved `environment:` to the `docker compose up`
+  # subprocess — so declaring these as `type: port` and referencing them via
+  # docker compose's own `${VAR}` substitution in docker-compose.yml gets the
+  # same per-worktree isolation as a native fed service.
+  DB_PORT:
+    type: port
+    default: 5432
+
+  REDIS_PORT:
+    type: port
+    default: 6379
+
+  ES_PORT:
+    type: port
+    default: 9200
+
 services:
   # Reference individual services from docker-compose.yml
   postgres:
@@ -17,12 +35,15 @@ services:
     environment:
       POSTGRES_PASSWORD: '{{DB_PASSWORD}}'
       POSTGRES_DB: '{{DB_NAME}}'
+      DB_PORT: '{{DB_PORT}}'
     healthcheck:
       command: pg_isready -U postgres
 
   redis:
     composeFile: ./docker-compose.yml
     composeService: redis
+    environment:
+      REDIS_PORT: '{{REDIS_PORT}}'
     depends_on:
       - postgres
 
@@ -38,8 +59,8 @@ services:
       done
     environment:
       PORT: '{{API_PORT}}'
-      DATABASE_URL: 'postgresql://postgres:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
-      REDIS_URL: 'redis://localhost:6379'
+      DATABASE_URL: 'postgresql://postgres:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
+      REDIS_URL: 'redis://localhost:{{REDIS_PORT}}'
     depends_on:
       - postgres
       - redis
@@ -50,6 +71,8 @@ services:
   elasticsearch:
     composeFile: ./docker-compose.yml
     composeService: elasticsearch
+    environment:
+      ES_PORT: '{{ES_PORT}}'
     depends_on:
       - api
 

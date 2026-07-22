@@ -23,6 +23,10 @@ parameters:
     default: 8080
 
   # Database configuration
+  DB_PORT:
+    type: port
+    default: 5432
+
   DB_NAME:
     default: microservices_dev
 
@@ -41,7 +45,7 @@ services:
   # Infrastructure
   postgres:
     image: postgres:15-alpine
-    ports: ["5432:5432"]
+    ports: ["{{DB_PORT}}:5432"]
     environment:
       POSTGRES_DB: '{{DB_NAME}}'
       POSTGRES_USER: '{{DB_USER}}'
@@ -62,7 +66,7 @@ services:
     depends_on: [postgres, redis]
     environment:
       PORT: '{{AUTH_PORT}}'
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
       REDIS_URL: 'redis://localhost:{{REDIS_PORT}}'
       JWT_SECRET: 'dev-secret-change-in-production'
       NODE_ENV: 'development'
@@ -92,7 +96,7 @@ services:
     cwd: ./services/workers
     depends_on: [postgres, redis]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
       REDIS_URL: 'redis://localhost:{{REDIS_PORT}}'
       NODE_ENV: 'development'
     install: |
@@ -119,7 +123,7 @@ scripts:
   migrate:
     depends_on: [postgres]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
     script: |
       cd services/auth && npx prisma migrate dev
 
@@ -127,7 +131,7 @@ scripts:
   seed:
     depends_on: [postgres]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
     script: |
       cd services/auth && npx prisma db seed
 

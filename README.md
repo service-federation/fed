@@ -33,13 +33,15 @@ parameters:
   DB_PORT:
     type: port
     default: 5432
+  DB_PASSWORD:
+    type: secret        # generated on first start, never committed
 
 services:
   database:
     image: postgres:15
     ports: ["{{DB_PORT}}:5432"]
     environment:
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD: '{{DB_PASSWORD}}'
       POSTGRES_DB: app
     healthcheck:
       command: pg_isready -U postgres
@@ -50,14 +52,14 @@ services:
     depends_on: [database]
     environment:
       PORT: '{{API_PORT}}'
-      DATABASE_URL: 'postgres://postgres:password@localhost:{{DB_PORT}}/app'
+      DATABASE_URL: 'postgres://postgres:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/app'
     healthcheck:
       httpGet: 'http://localhost:{{API_PORT}}/health'
 
 entrypoint: backend
 ```
 
-Then start it. Nothing reports ready until its healthcheck passes:
+Then start it. Each service is health-checked before its dependents start:
 
 ```console
 $ fed start
@@ -139,7 +141,7 @@ See [`examples/`](./examples):
 - [`scripts-example.yaml`](./examples/scripts-example.yaml): scripts with dependencies
 - [`env-file/`](./examples/env-file): environment files
 - [`templates-example.yaml`](./examples/templates-example.yaml): service templates
-- [`parameters-example.yaml`](./examples/parameters-example.yaml): environment-specific parameters
+- [`parameters-example.yaml`](./examples/parameters-example.yaml): parameter types, defaults, and constraints
 - [`resource-limits-example.yaml`](./examples/resource-limits-example.yaml): memory, CPU, file descriptor limits
 - [`docker-compose-example/`](./examples/docker-compose-example): Docker Compose integration
 - [`profiles-example.yaml`](./examples/profiles-example.yaml): profiles

@@ -16,6 +16,10 @@ parameters:
     type: port
     default: 3035
 
+  DB_PORT:
+    type: port
+    default: 5432
+
   DB_NAME:
     default: myapp_development
 
@@ -33,7 +37,7 @@ services:
   # Infrastructure
   postgres:
     image: postgres:15-alpine
-    ports: ["5432:5432"]
+    ports: ["{{DB_PORT}}:5432"]
     environment:
       POSTGRES_DB: '{{DB_NAME}}'
       POSTGRES_USER: '{{DB_USER}}'
@@ -54,7 +58,7 @@ services:
     depends_on: [postgres, redis]
     environment:
       PORT: '{{RAILS_PORT}}'
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
       REDIS_URL: 'redis://localhost:{{REDIS_PORT}}/0'
       RAILS_ENV: 'development'
       RAILS_MAX_THREADS: '5'
@@ -70,7 +74,7 @@ services:
     cwd: .
     depends_on: [postgres, redis]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
       REDIS_URL: 'redis://localhost:{{REDIS_PORT}}/0'
       RAILS_ENV: 'development'
     install: |
@@ -96,7 +100,7 @@ scripts:
   db-setup:
     depends_on: [postgres]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
       RAILS_ENV: 'development'
     script: |
       bundle exec rails db:create db:migrate
@@ -105,7 +109,7 @@ scripts:
   migrate:
     depends_on: [postgres]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
       RAILS_ENV: 'development'
     script: |
       bundle exec rails db:migrate
@@ -114,7 +118,7 @@ scripts:
   rollback:
     depends_on: [postgres]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
       RAILS_ENV: 'development'
     script: |
       bundle exec rails db:rollback
@@ -123,7 +127,7 @@ scripts:
   seed:
     depends_on: [postgres]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
       RAILS_ENV: 'development'
     script: |
       bundle exec rails db:seed
@@ -132,7 +136,7 @@ scripts:
   test:
     depends_on: [postgres, redis]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}_test'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}_test'
       REDIS_URL: 'redis://localhost:{{REDIS_PORT}}/1'
       RAILS_ENV: 'test'
     script: |
@@ -143,7 +147,7 @@ scripts:
   console:
     depends_on: [postgres, redis]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
       REDIS_URL: 'redis://localhost:{{REDIS_PORT}}/0'
       RAILS_ENV: 'development'
     script: |

@@ -31,6 +31,10 @@ parameters:
     default: 9002
 
   # Database
+  DB_PORT:
+    type: port
+    default: 5432
+
   DB_NAME:
     default: goapp_dev
 
@@ -48,7 +52,7 @@ services:
   # Infrastructure
   postgres:
     image: postgres:15-alpine
-    ports: ["5432:5432"]
+    ports: ["{{DB_PORT}}:5432"]
     environment:
       POSTGRES_DB: '{{DB_NAME}}'
       POSTGRES_USER: '{{DB_USER}}'
@@ -70,7 +74,7 @@ services:
     environment:
       HTTP_PORT: '{{AUTH_PORT}}'
       GRPC_PORT: '{{AUTH_GRPC_PORT}}'
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}?sslmode=disable'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}?sslmode=disable'
       REDIS_ADDR: 'localhost:{{REDIS_PORT}}'
       JWT_SECRET: 'dev-secret-change-in-production'
       ENV: 'development'
@@ -88,7 +92,7 @@ services:
     environment:
       HTTP_PORT: '{{USER_PORT}}'
       GRPC_PORT: '{{USER_GRPC_PORT}}'
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}?sslmode=disable'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}?sslmode=disable'
       REDIS_ADDR: 'localhost:{{REDIS_PORT}}'
       AUTH_SERVICE_ADDR: 'localhost:{{AUTH_GRPC_PORT}}'
       ENV: 'development'
@@ -120,7 +124,7 @@ services:
     cwd: ./services/worker
     depends_on: [postgres, redis]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}?sslmode=disable'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}?sslmode=disable'
       REDIS_ADDR: 'localhost:{{REDIS_PORT}}'
       ENV: 'development'
     install: |
@@ -134,7 +138,7 @@ scripts:
   migrate-up:
     depends_on: [postgres]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}?sslmode=disable'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}?sslmode=disable'
     script: |
       cd services/auth
       go run migrations/*.go up
@@ -143,7 +147,7 @@ scripts:
   migrate-down:
     depends_on: [postgres]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}?sslmode=disable'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}?sslmode=disable'
     script: |
       cd services/auth
       go run migrations/*.go down
@@ -159,7 +163,7 @@ scripts:
   test:
     depends_on: [postgres, redis]
     environment:
-      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:5432/{{DB_NAME}}_test?sslmode=disable'
+      DATABASE_URL: 'postgresql://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}_test?sslmode=disable'
       REDIS_ADDR: 'localhost:{{REDIS_PORT}}'
       ENV: 'test'
     script: |

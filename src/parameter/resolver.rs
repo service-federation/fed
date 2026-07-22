@@ -1067,8 +1067,8 @@ impl Resolver {
             return Err(Error::Validation(format!(
                 "Refusing to write secrets: '{}' is inside a git repository and is not gitignored.\n\n\
                  Add '{}' to your .gitignore (if the file is already tracked by git, also run \
-                 `git rm --cached {}`), or remove generated_secrets_file from your config to use \
-                 the default {} — fed keeps that location out of git automatically.",
+                 `git rm --cached {}`). For the default {} location, restoring fed's \
+                 .fed/.gitignore is enough — fed keeps it out of git automatically.",
                 gsf_key,
                 gsf_key,
                 gsf_key,

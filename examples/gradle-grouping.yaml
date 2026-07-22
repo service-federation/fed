@@ -18,6 +18,10 @@ parameters:
     type: port
     default: 8083
 
+  DB_PORT:
+    type: port
+    default: 5432
+
 services:
   # Infrastructure
   database:
@@ -27,7 +31,7 @@ services:
       POSTGRES_USER: 'user'
       POSTGRES_PASSWORD: 'password'
     ports:
-      - '5432:5432'
+      - '{{DB_PORT}}:5432'
 
   # Core services - same CWD, no dependencies between them
   # These should be GROUPED into a single gradle command:
@@ -36,7 +40,7 @@ services:
     gradleTask: ':auth-service:bootRun'
     environment:
       SERVER_PORT: '{{AUTH_PORT}}'
-      DB_URL: 'postgresql://localhost:5432/mydb'
+      DB_URL: 'postgresql://localhost:{{DB_PORT}}/mydb'
     depends_on:
       - database
     healthcheck:
@@ -46,7 +50,7 @@ services:
     gradleTask: ':user-service:bootRun'
     environment:
       SERVER_PORT: '{{USER_PORT}}'
-      DB_URL: 'postgresql://localhost:5432/mydb'
+      DB_URL: 'postgresql://localhost:{{DB_PORT}}/mydb'
     depends_on:
       - database
     healthcheck:

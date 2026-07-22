@@ -1,4 +1,11 @@
 # Database package - reusable PostgreSQL configuration
+#
+# No `ports:` here on purpose: fed.yaml packages can't declare their own
+# `parameters:` block (only the importing config can), and fed's package
+# merge combines port lists rather than replacing them — so a literal port
+# declared here would sit alongside whatever the importer maps, doubling
+# up the mapping. The host port is the importing application's call; see
+# ../../fed.yaml for the `{{DB_PORT}}:5432` override.
 services:
   postgres:
     image: postgres:15
@@ -7,8 +14,6 @@ services:
       POSTGRES_PASSWORD: secret
     volumes:
       - "postgres-data:/var/lib/postgresql/data"
-    ports:
-      - "5432:5432"
     healthcheck:
       command: "pg_isready -U admin"
     restart: always

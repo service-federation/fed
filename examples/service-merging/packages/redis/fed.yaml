@@ -1,9 +1,13 @@
 # Redis cache package - reusable Redis configuration
+#
+# No `ports:` here on purpose: fed.yaml packages can't declare their own
+# `parameters:` block, and fed's package merge combines port lists rather
+# than replacing them — see ../database/fed.yaml for the full reasoning.
+# The host port is the importing application's call; see ../../fed.yaml
+# for the `{{CACHE_PORT}}:6379` override.
 services:
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
     volumes:
       - "redis-data:/data"
     healthcheck:

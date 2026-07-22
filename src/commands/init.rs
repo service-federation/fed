@@ -7,8 +7,8 @@ const TEMPLATE: &str = r#"# fed.yaml — your repository's runnable dev stack.
 # Full reference: https://www.service-federation.com/docs/
 
 parameters:
-  # `type: port` grabs a free port — it prefers the default and falls back if it's taken,
-  # so two checkouts of this repo never fight over the same port.
+  # `type: port` grabs a free port, preferring the default. In a second checkout
+  # or worktree, run `fed isolate enable` once to give it its own ports.
   API_PORT:
     type: port
     default: 8080

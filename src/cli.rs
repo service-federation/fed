@@ -13,15 +13,15 @@ pub struct Cli {
     #[arg(short, long)]
     pub workdir: Option<PathBuf>,
 
-    /// Environment for variable resolution (development, staging, production)
-    #[arg(short, long, default_value = "development")]
+    /// Environment for variable resolution
+    #[arg(short, long, default_value = "development", hide = true)]
     pub env: String,
 
     /// Active profiles for conditional service startup (can be repeated)
     #[arg(short, long)]
     pub profile: Vec<String>,
 
-    /// Offline mode: skip git operations and use only cached packages
+    /// Offline mode: skip network package and vault lookups; use cached values only
     #[arg(long)]
     pub offline: bool,
 
@@ -228,7 +228,7 @@ pub enum SecretsCommands {
     /// List the linked project's secrets (names and last-updated info, never values)
     Ls {
         /// Environment
-        #[arg(long, default_value = "development")]
+        #[arg(long, default_value = "development", hide = true)]
         env: String,
     },
 }
@@ -291,7 +291,7 @@ pub enum PackageCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Refresh (re-fetch) a cached package
+    /// Clear a cached package so it is fetched again on next use
     Refresh {
         /// Package source (e.g., github:org/repo or git+ssh://...)
         /// If not specified, refreshes all packages in current config
@@ -368,6 +368,7 @@ pub enum WorkspaceCommands {
     /// Install shell integration into your shell rc file (zsh or bash, one-time)
     Setup,
     /// Print shell function for eval (used internally by setup)
+    #[command(hide = true)]
     InitShell,
 }
 
@@ -379,7 +380,7 @@ pub enum IsolateCommands {
         #[arg(long, short)]
         force: bool,
     },
-    /// Disable isolation mode (return to default ports + shared containers)
+    /// Disable isolation mode (return to default ports and the directory's normal container namespace)
     Disable {
         /// Skip confirmation, auto-stop running services
         #[arg(long, short)]
