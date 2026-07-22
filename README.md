@@ -6,9 +6,13 @@
 
 `git clone`, `fed start`, and the whole project is running: your app as a native process, your dependencies as Docker containers, one dependency graph, healthcheck-gated startup. Think `docker compose up`, except the app isn't in a container and every git worktree can run its own isolated copy of the stack.
 
-Full references: **[service-federation.com/docs](https://www.service-federation.com/docs/)**.
-
 ![fed demo: editing the config, starting the stack, and running a second isolated stack from a git worktree](docs/fed-demo.gif)
+
+## Why fed
+
+- **Your coding agents stop killing each other's databases.** One worktree per agent, one full stack per worktree, zero shared ports.
+- **Onboarding is `git clone`, `fed start`.** No README of setup steps nobody reruns. Dependencies start in order and wait for real healthchecks.
+- **No override-file archaeology.** Port parameters, templates, profiles, and packages replace the `docker-compose.override.yml` pile.
 
 ## Quick Start
 
@@ -72,22 +76,28 @@ All services started successfully!
 
 Day to day: `fed status`, `fed logs backend`, `fed stop`.
 
-## In a repo that already uses fed?
+## Built for coding agents
 
-Four rules, especially if you're a coding agent in a checkout:
+Claude Code, Cursor, and Codex parallelize with one worktree per task. Without isolation, those worktrees fight over ports and databases: one agent's test run wipes another's schema, and the fix is you, untangling it.
 
-1. **New worktree? Isolate first.** Run `fed isolate enable` before any other fed command. It persists.
-2. **Run tasks through fed.** `fed test:integration` gets this directory's ports and `DATABASE_URL`. The same command run bare hits another checkout's.
-3. **Port conflict on start?** Another checkout owns those ports. Fix: `fed isolate enable`.
-4. **Look before you guess.** `fed status`, `fed ports list`, `fed logs <service> --tail 100`.
+With fed, each worktree runs its own full stack:
 
-Details: [coding agents & isolation](https://www.service-federation.com/docs/isolation/#coding-agents).
+```console
+~/app          $ fed start                 # your stack, default ports
+~/app-agent-1  $ fed isolate enable        # its own ports, containers, volumes
+~/app-agent-1  $ fed start
+~/app-agent-2  $ fed isolate enable
+~/app-agent-2  $ fed start                 # three stacks, one laptop, no collisions
+```
 
-## Why fed
+Two lines in your `AGENTS.md` make every agent do this unprompted:
 
-- **Clone to running, one command.** Containers, native processes, and Compose services in one file, started in dependency order, gated on real healthchecks.
-- **Parallel checkouts stop fighting.** Five worktrees, five full stacks, one laptop, zero port collisions.
-- **No override-file archaeology.** Port parameters, templates, profiles, and packages replace the `docker-compose.override.yml` pile.
+```markdown
+Run `fed isolate enable` before any other fed command in a new worktree.
+Run `fed clean` before removing a worktree.
+```
+
+Scripts complete the story: `fed test:integration` resolves the ports and `DATABASE_URL` *this* worktree was allocated, so agents never guess. [Coding agents & isolation →](https://www.service-federation.com/docs/isolation/#coding-agents)
 
 ## Highlights
 
@@ -95,19 +105,25 @@ Details: [coding agents & isolation](https://www.service-federation.com/docs/iso
 - **Hook-only services**: a node that *is* the migration; everything needing the schema depends on it. [Docs →](https://www.service-federation.com/docs/configuration/#hook-only)
 - **Isolated scripts**: `isolated: true` gives tests a throwaway stack while your dev stack keeps running. [Docs →](https://www.service-federation.com/docs/scripts/#isolated-scripts)
 - **Secrets**: generated locally under `.fed/`, or shared via the team vault. Free for 3 people, €8/seat after. [Generated →](https://www.service-federation.com/docs/generated-secrets/) · [Team →](https://www.service-federation.com/docs/secrets/)
-- **Worktrees & agents**: one stack per worktree (`fed ws new feature -b`); `{{FED_PROJECT_ID}}` namespaces what parallel stacks would share. [Docs →](https://www.service-federation.com/docs/isolation/)
-
-Running coding agents? One line in your `AGENTS.md`:
-
-```markdown
-Run `fed isolate enable` before any other fed command in a new worktree.
-```
+- **`{{FED_PROJECT_ID}}`**: a per-checkout id for namespacing what parallel stacks would share, like cookie names. [Docs →](https://www.service-federation.com/docs/configuration/#fed-project-id)
 
 ## Documentation
 
 `fed --help` is always current. On the site: [Quickstart](https://www.service-federation.com/docs/) · [Configuration](https://www.service-federation.com/docs/configuration/) · [Commands](https://www.service-federation.com/docs/commands/) · [Scripts](https://www.service-federation.com/docs/scripts/) · [Isolation](https://www.service-federation.com/docs/isolation/) · [Generated secrets](https://www.service-federation.com/docs/generated-secrets/) · [Team secrets](https://www.service-federation.com/docs/secrets/)
 
-Runnable examples: [`examples/`](./examples), from a basic multi-service stack to templates, profiles, resource limits, and package imports.
+## Examples
+
+See [`examples/`](./examples):
+
+- [`simple.yaml`](./examples/simple.yaml): basic multi-service setup
+- [`scripts-example.yaml`](./examples/scripts-example.yaml): scripts with dependencies
+- [`env-file/`](./examples/env-file): environment files
+- [`templates-example.yaml`](./examples/templates-example.yaml): service templates
+- [`parameters-example.yaml`](./examples/parameters-example.yaml): parameter types, defaults, and constraints
+- [`resource-limits-example.yaml`](./examples/resource-limits-example.yaml): memory, CPU, file descriptor limits
+- [`docker-compose-example/`](./examples/docker-compose-example): Docker Compose integration
+- [`profiles-example.yaml`](./examples/profiles-example.yaml): profiles
+- [`service-merging/`](./examples/service-merging): package imports
 
 ## Questions & support
 
