@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+use fed::Parser;
 /// Reproduction tests for identified critical issues
 ///
 /// These tests attempt to reproduce:
@@ -7,10 +8,12 @@
 /// 2. Race condition in state tracker (concurrent failure increments)
 /// 3. Lock ordering deadlock (inconsistent lock acquisition order)
 use fed::config::ServiceType;
-use fed::{Orchestrator, Parser};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
+
+#[path = "support/mod.rs"]
+mod support;
 
 /// TEST 1: TOCTOU Race Condition in Monitoring Loop
 ///
@@ -50,7 +53,7 @@ services:
 
     let _orch_temp = tempfile::tempdir().unwrap();
     let orchestrator = Arc::new(tokio::sync::Mutex::new(
-        Orchestrator::new(config, _orch_temp.path().to_path_buf())
+        support::new_orchestrator_for_test(config, _orch_temp.path().to_path_buf())
             .await
             .unwrap(),
     ));
@@ -197,7 +200,7 @@ services:
     let config = parser.parse_config(config_content).unwrap();
     let _orch_temp = tempfile::tempdir().unwrap();
     let orchestrator = Arc::new(tokio::sync::Mutex::new(
-        Orchestrator::new(config, _orch_temp.path().to_path_buf())
+        support::new_orchestrator_for_test(config, _orch_temp.path().to_path_buf())
             .await
             .unwrap(),
     ));
@@ -268,7 +271,7 @@ async fn repro_unbounded_health_check_task_spawning() {
 
     let _orch_temp = tempfile::tempdir().unwrap();
     let orchestrator = Arc::new(tokio::sync::Mutex::new(
-        Orchestrator::new(config, _orch_temp.path().to_path_buf())
+        support::new_orchestrator_for_test(config, _orch_temp.path().to_path_buf())
             .await
             .unwrap(),
     ));
@@ -623,7 +626,7 @@ services:
     let cfg = parser.parse_config(config).unwrap();
     let _orch_temp5 = tempfile::tempdir().unwrap();
     let orchestrator = Arc::new(tokio::sync::Mutex::new(
-        Orchestrator::new(cfg, _orch_temp5.path().to_path_buf())
+        support::new_orchestrator_for_test(cfg, _orch_temp5.path().to_path_buf())
             .await
             .unwrap(),
     ));
@@ -979,7 +982,7 @@ entrypoint: app
     let config = parser.parse_config(config_content).unwrap();
 
     // Create orchestrator with the work directory containing stale lock file
-    let mut orchestrator = Orchestrator::new(config, work_dir.to_path_buf())
+    let mut orchestrator = support::new_orchestrator_for_test(config, work_dir.to_path_buf())
         .await
         .unwrap();
 

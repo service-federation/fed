@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser};
 use cli::{Cli, Commands};
-use fed::{Error as FedError, Orchestrator, OutputMode, Parser as ConfigParser};
+use fed::{Error as FedError, Orchestrator, OutputMode, Parser as ConfigParser, RunContext};
 
 /// Best-effort discovery of the workspace directory for the current
 /// invocation. Used by the recursion check to compare the child's
@@ -172,6 +172,23 @@ async fn run() -> anyhow::Result<()> {
     init_tracing(is_tui, cli.verbose, is_tty)?;
     let out = output::CliOutput::new(is_tty);
 
+    // Session-scoped run settings, threaded through every command and into
+    // OrchestratorBuilder. `output_mode`/`required_secret_names` depend on
+    // `cli.command` (tier-1 dispatch below) and, for the latter, on
+    // `config.scripts` (loaded after tier 1/2), so they're filled in with
+    // their tier-1 defaults here and finalized just before the
+    // orchestrator-needing tier — see the reassignment below. Tier-1
+    // commands (`Ports`/`Isolate`) don't read either field, so the partial
+    // context is correct for them as-is.
+    let mut run_context = RunContext {
+        environment,
+        offline: cli.offline,
+        is_interactive,
+        output_mode: OutputMode::default(),
+        profiles: cli.profile.clone(),
+        required_secret_names: None,
+    };
+
     // ── Tier 1: Commands that need NO config ──────────────────────────
     match &cli.command {
         Commands::Init { output, force } => {
@@ -200,10 +217,7 @@ async fn run() -> anyhow::Result<()> {
                 &ports_cmd.clone().unwrap_or_default(),
                 cli.workdir.clone(),
                 cli.config.clone(),
-                commands::IsolateContext {
-                    environment,
-                    offline: cli.offline,
-                },
+                run_context.clone(),
                 &out,
             )
             .await;
@@ -231,10 +245,7 @@ async fn run() -> anyhow::Result<()> {
                 isolate_cmd,
                 cli.workdir.clone(),
                 cli.config.clone(),
-                commands::IsolateContext {
-                    environment,
-                    offline: cli.offline,
-                },
+                run_context.clone(),
                 &out,
             )
             .await;
@@ -457,6 +468,13 @@ async fn run() -> anyhow::Result<()> {
         scoped_script.map(|name| fed::parameter::scanner::required_parameter_names(&config, &name))
     };
 
+    // Finalize the run context now that output_mode/required_secret_names
+    // are known (they depend on cli.command and, for the latter, on
+    // config.scripts — neither is available at the tier-1 dispatch point
+    // above).
+    run_context.output_mode = output_mode;
+    run_context.required_secret_names = required_secret_names;
+
     // If --isolate flag is used (and not dry-run), persist isolation mode before building orchestrator
     if isolate && !dry_run {
         let work_dir_for_isolation = resolve_work_dir(cli.workdir.clone(), &config_path)?;
@@ -473,17 +491,12 @@ async fn run() -> anyhow::Result<()> {
     let mut orchestrator = Orchestrator::builder()
         .config(config.clone())
         .work_dir(work_dir)
-        .environment(environment)
-        .profiles(cli.profile.clone())
-        .output_mode(output_mode)
+        .run_context(run_context)
         .randomize_ports(randomize)
         .replace_mode(replace)
         .dry_run(dry_run)
         .auto_resolve_conflicts(auto_resolve)
         .readonly(readonly)
-        .is_interactive(is_interactive)
-        .offline(cli.offline)
-        .required_secret_names(required_secret_names)
         .build()
         .await?;
 

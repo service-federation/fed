@@ -1,7 +1,10 @@
-use fed::{Orchestrator, Parser};
+use fed::Parser;
 use std::path::Path;
 use std::time::Duration;
 use tokio::time::sleep;
+
+#[path = "support/mod.rs"]
+mod support;
 
 /// Absolute path to the shared compose fixture.
 ///
@@ -120,9 +123,10 @@ services:
         .expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     let result = orchestrator.initialize().await;
 
@@ -154,9 +158,10 @@ services:
         .expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator.initialize().await.expect("Init failed");
 
@@ -197,9 +202,10 @@ services:
         .expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator.initialize().await.expect("Init failed");
 
@@ -264,9 +270,10 @@ services:
         .expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator.initialize().await.expect("Init failed");
 
@@ -325,9 +332,10 @@ services:
         .expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator.initialize().await.expect("Init failed");
 
@@ -411,7 +419,7 @@ services:
 
     let config1 = parser.parse_config(&yaml1).expect("Failed to parse 1");
     let orch1_temp = tempfile::tempdir().unwrap();
-    let mut orch1 = Orchestrator::new(config1, orch1_temp.path().to_path_buf())
+    let mut orch1 = support::new_orchestrator_for_test(config1, orch1_temp.path().to_path_buf())
         .await
         .unwrap();
     orch1.set_auto_resolve_conflicts(true);
@@ -421,7 +429,7 @@ services:
     // Different compose file path → different project name → isolated
     let config2 = parser.parse_config(&yaml2).expect("Failed to parse 2");
     let orch2_temp = tempfile::tempdir().unwrap();
-    let mut orch2 = Orchestrator::new(config2, orch2_temp.path().to_path_buf())
+    let mut orch2 = support::new_orchestrator_for_test(config2, orch2_temp.path().to_path_buf())
         .await
         .unwrap();
     orch2.set_auto_resolve_conflicts(true);
@@ -477,9 +485,10 @@ services:
         .expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator.initialize().await.expect("Init failed");
 
@@ -523,9 +532,10 @@ services:
         .expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator.initialize().await.expect("Init failed");
 
@@ -576,7 +586,7 @@ services:
         .expect("Failed to parse");
 
     let orch1_temp = tempfile::tempdir().unwrap();
-    let mut orch1 = Orchestrator::new(config1, orch1_temp.path().to_path_buf())
+    let mut orch1 = support::new_orchestrator_for_test(config1, orch1_temp.path().to_path_buf())
         .await
         .unwrap();
     orch1.set_auto_resolve_conflicts(true);
@@ -590,7 +600,7 @@ services:
         .parse_config(&yaml1.replace("tests/fixtures/compose/test-services.yml", COMPOSE_FIXTURE))
         .expect("Failed to parse");
     let orch2_temp = tempfile::tempdir().unwrap();
-    let mut orch2 = Orchestrator::new(config2, orch2_temp.path().to_path_buf())
+    let mut orch2 = support::new_orchestrator_for_test(config2, orch2_temp.path().to_path_buf())
         .await
         .unwrap();
     orch2.set_auto_resolve_conflicts(true);
@@ -655,9 +665,10 @@ services:
     let config = parser.parse_config(&yaml).expect("Failed to parse");
 
     let orch_temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator.initialize().await.expect("Init failed");
     orchestrator

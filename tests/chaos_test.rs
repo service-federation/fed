@@ -18,6 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
+#[path = "support/mod.rs"]
+mod support;
+
 /// Helper to create and initialize an orchestrator for testing
 /// Returns both the orchestrator and the temp dir (to keep it alive)
 async fn create_test_orchestrator(config_content: &str) -> (Arc<Orchestrator>, tempfile::TempDir) {
@@ -27,9 +30,10 @@ async fn create_test_orchestrator(config_content: &str) -> (Arc<Orchestrator>, t
         .expect("Failed to parse config");
 
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .expect("Failed to create orchestrator");
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .expect("Failed to create orchestrator");
 
     // Use shorter timeouts for tests to avoid slow cleanup
     orchestrator.startup_timeout = Duration::from_secs(30);
@@ -318,9 +322,10 @@ entrypoint: hanging_service
         .expect("Failed to parse config");
 
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .expect("Failed to create orchestrator");
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .expect("Failed to create orchestrator");
 
     // Set a very short timeout for testing
     orchestrator.startup_timeout = Duration::from_millis(500);
@@ -378,9 +383,10 @@ entrypoint: slow_to_be_healthy
         .expect("Failed to parse config");
 
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .expect("Failed to create orchestrator");
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .expect("Failed to create orchestrator");
 
     orchestrator.startup_timeout = Duration::from_secs(30);
     orchestrator.stop_timeout = Duration::from_secs(2);

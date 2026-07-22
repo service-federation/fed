@@ -34,7 +34,7 @@ pub use docker::{run_docker_build, run_docker_push};
 pub use doctor::run_doctor;
 pub use init::run_init;
 pub use install::run_install;
-pub use isolate::{IsolateContext, run_isolate};
+pub use isolate::run_isolate;
 pub use link::run_link;
 pub use logs::run_logs;
 pub use package::run_package;

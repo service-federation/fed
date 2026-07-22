@@ -1,4 +1,7 @@
-use fed::{Orchestrator, Parser};
+use fed::Parser;
+
+#[path = "support/mod.rs"]
+mod support;
 
 #[test]
 fn test_profiles_parsing() {
@@ -38,9 +41,10 @@ async fn test_no_profiles_active_starts_only_profileless_services() {
 
     // Create orchestrator with no active profiles
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -79,10 +83,11 @@ async fn test_production_profile_filters_services() {
 
     // Create orchestrator with production profile
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .unwrap()
-        .with_profiles(vec!["production".to_string()]);
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap()
+            .with_profiles(vec!["production".to_string()]);
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -130,10 +135,11 @@ async fn test_development_profile_filters_services() {
 
     // Create orchestrator with development profile
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .unwrap()
-        .with_profiles(vec!["development".to_string()]);
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap()
+            .with_profiles(vec!["development".to_string()]);
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -181,10 +187,11 @@ async fn test_multiple_profiles() {
 
     // Create orchestrator with production AND experimental profiles
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .unwrap()
-        .with_profiles(vec!["production".to_string(), "experimental".to_string()]);
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap()
+            .with_profiles(vec!["production".to_string(), "experimental".to_string()]);
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -232,10 +239,11 @@ async fn test_staging_profile() {
 
     // Create orchestrator with staging profile
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .unwrap()
-        .with_profiles(vec!["staging".to_string()]);
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap()
+            .with_profiles(vec!["staging".to_string()]);
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -271,10 +279,11 @@ async fn test_analytics_profile() {
 
     // Create orchestrator with analytics profile (testing OR logic)
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .unwrap()
-        .with_profiles(vec!["analytics".to_string()]);
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap()
+            .with_profiles(vec!["analytics".to_string()]);
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -311,10 +320,11 @@ async fn test_dependency_filtering() {
     // reporting depends on analytics and monitoring
     // All three have production profile, so all should be included
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .unwrap()
-        .with_profiles(vec!["production".to_string()]);
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap()
+            .with_profiles(vec!["production".to_string()]);
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -357,10 +367,11 @@ async fn test_profile_case_sensitivity() {
 
     // Profiles are case-sensitive, so "Production" should NOT match "production"
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .unwrap()
-        .with_profiles(vec!["Production".to_string()]); // Note: capital P
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap()
+            .with_profiles(vec!["Production".to_string()]); // Note: capital P
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -386,10 +397,11 @@ async fn test_nonexistent_profile() {
 
     // Use a profile that doesn't exist in any service
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .unwrap()
-        .with_profiles(vec!["nonexistent".to_string()]);
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap()
+            .with_profiles(vec!["nonexistent".to_string()]);
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()

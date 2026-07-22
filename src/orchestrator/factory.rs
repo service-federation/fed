@@ -469,6 +469,11 @@ impl Orchestrator {
 }
 
 #[cfg(test)]
+// clippy::disallowed_methods (clippy.toml) fires on these library-internal
+// unit-test call sites too (it matches on the resolved item path, not crate
+// boundaries) — same-crate, lower-risk, already bounded by #[cfg(test)], so
+// they're allowed here rather than migrated to a test-only helper.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::config::Parser;

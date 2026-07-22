@@ -21,9 +21,12 @@ use std::fs;
 use std::process::Command;
 use std::time::Duration;
 
+use fed::Parser;
 use fed::service::Status;
-use fed::{Orchestrator, Parser};
 use tempfile::tempdir;
+
+#[path = "support/mod.rs"]
+mod support;
 
 fn fed_binary() -> String {
     env!("CARGO_BIN_EXE_fed").to_string()
@@ -467,7 +470,7 @@ services:
 
     let config = Parser::new().parse_config(&yaml).expect("parse");
     let orch_temp = tempdir().unwrap();
-    let mut orch = Orchestrator::new(config, orch_temp.path().to_path_buf())
+    let mut orch = support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
         .await
         .unwrap();
     orch.set_work_dir(workdir).await.expect("set work dir");

@@ -1,6 +1,9 @@
 use fed::{Orchestrator, Parser};
 use tempfile::tempdir;
 
+#[path = "support/mod.rs"]
+mod support;
+
 #[tokio::test]
 async fn test_run_simple_script() {
     let yaml = r#"
@@ -17,9 +20,10 @@ services:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -59,9 +63,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator
         .set_work_dir(temp_dir.path().to_path_buf())
         .await
@@ -108,9 +113,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -143,9 +149,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -177,9 +184,10 @@ services:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -210,9 +218,10 @@ services:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -238,9 +247,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -271,9 +281,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -318,9 +329,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator
         .set_work_dir(temp_dir.path().to_path_buf())
         .await
@@ -360,9 +372,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -389,9 +402,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -427,9 +441,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator
         .set_work_dir(temp_dir.path().to_path_buf())
         .await
@@ -468,9 +483,10 @@ services:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -497,9 +513,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -530,9 +547,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -563,9 +581,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -594,9 +613,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -632,9 +652,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -681,9 +702,10 @@ scripts:
     let config = parser.parse_config(&yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -735,9 +757,10 @@ scripts:
     let config = parser.parse_config(&yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator
         .initialize()
@@ -782,9 +805,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator
         .set_work_dir(temp_dir.path().to_path_buf())
         .await
@@ -843,9 +867,10 @@ scripts:
     let config = parser.parse_config(&yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator
         .set_work_dir(temp_dir.path().to_path_buf())
         .await
@@ -903,9 +928,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator
         .set_work_dir(temp_dir.path().to_path_buf())
         .await
@@ -969,9 +995,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator
         .set_work_dir(temp_dir.path().to_path_buf())
         .await
@@ -1035,9 +1062,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator
         .set_work_dir(temp_dir.path().to_path_buf())
         .await
@@ -1101,9 +1129,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator
         .set_work_dir(temp_dir.path().to_path_buf())
         .await
@@ -1191,9 +1220,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator
         .set_work_dir(temp_dir.path().to_path_buf())
         .await
@@ -1291,9 +1321,10 @@ scripts:
     let config = parser.parse_config(&yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator
         .set_work_dir(temp_dir.path().to_path_buf())
         .await
@@ -1383,9 +1414,10 @@ async fn init_orchestrator(
 ) -> (Orchestrator, tempfile::TempDir) {
     let config = Parser::new().parse_config(yaml).expect("Failed to parse");
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator
         .set_work_dir(work_dir.to_path_buf())
         .await
@@ -1766,9 +1798,10 @@ services:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let orch_temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, orch_temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, orch_temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator
         .set_work_dir(temp_dir.path().to_path_buf())
         .await
@@ -1845,9 +1878,10 @@ scripts:
     let config = parser.parse_config(yaml).expect("Failed to parse");
 
     let temp = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config.clone(), temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config.clone(), temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
 
     // Scope the parent exactly as the CLI does for a script run: `iso` references
@@ -1919,9 +1953,10 @@ scripts:
     // DB_PW is resolvable from .env, so the service would start fine if kept.
     std::fs::write(temp.path().join(".env"), "DB_PW=from_env\n").unwrap();
 
-    let mut orchestrator = Orchestrator::new(config.clone(), temp.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config.clone(), temp.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     // Custom, narrower-than-re-derivation scope set by the (public-API) caller.
     orchestrator.set_required_secret_names(Some(HashSet::new()));

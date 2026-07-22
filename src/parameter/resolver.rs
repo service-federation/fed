@@ -368,6 +368,13 @@ impl Resolver {
         self.is_interactive = is_interactive;
     }
 
+    /// Whether this resolver was told stdin is a TTY. Used to propagate
+    /// `is_interactive` into a `RunContext` read back off an orchestrator
+    /// (`Orchestrator::current_run_context`).
+    pub fn get_is_interactive(&self) -> bool {
+        self.is_interactive
+    }
+
     /// Offline mode: never call the cloud vault for manual secrets.
     pub fn set_offline(&mut self, offline: bool) {
         self.offline = offline;

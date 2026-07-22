@@ -4,7 +4,10 @@ use fed::error::Error;
 use fed::parameter::Resolver;
 /// Edge case tests for service-federation
 /// This file tests boundary conditions, error handling, and unusual inputs
-use fed::{Config, Orchestrator, Parser};
+use fed::{Config, Parser};
+
+#[path = "support/mod.rs"]
+mod support;
 
 // ==================== Parser Edge Cases ====================
 
@@ -735,9 +738,10 @@ fn test_healthcheck_command_string_format() {
 async fn test_orchestrator_empty_config() {
     let config = Config::default();
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
 
     orchestrator.set_auto_resolve_conflicts(true);
     let result = orchestrator.initialize().await;
@@ -759,9 +763,10 @@ async fn test_orchestrator_service_with_no_type() {
     config.services.insert("undefined".to_string(), service);
 
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     let result = orchestrator.initialize().await;
 
@@ -790,9 +795,10 @@ async fn test_orchestrator_multiple_entrypoints() {
     config.validate().expect("Config should be valid");
 
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     let result = orchestrator.initialize().await;
 
@@ -824,9 +830,10 @@ async fn test_gradle_empty_cwd_vs_none() {
     config.entrypoint = Some("service1".to_string());
 
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
-        .await
-        .unwrap();
+    let mut orchestrator =
+        support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
     orchestrator.set_auto_resolve_conflicts(true);
     orchestrator.initialize().await.expect("Should initialize");
 
@@ -894,10 +901,11 @@ async fn test_multiple_service_failures_returns_aggregated_error() {
 
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 
-    let mut orchestrator = match Orchestrator::new(config, temp_dir.path().to_path_buf()).await {
-        Ok(o) => o,
-        Err(_) => return, // Orchestrator creation failure is acceptable
-    };
+    let mut orchestrator =
+        match support::new_orchestrator_for_test(config, temp_dir.path().to_path_buf()).await {
+            Ok(o) => o,
+            Err(_) => return, // Orchestrator creation failure is acceptable
+        };
     orchestrator.set_auto_resolve_conflicts(true);
     if orchestrator.initialize().await.is_err() {
         return;

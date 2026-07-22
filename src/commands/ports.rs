@@ -1,6 +1,7 @@
 use crate::cli::{IsolateCommands, PortsCommands};
 use crate::output::UserOutput;
 use fed::Parser as ConfigParser;
+use fed::RunContext;
 use fed::service::Status;
 use fed::state::StateTracker;
 use std::path::PathBuf;
@@ -9,7 +10,7 @@ pub async fn run_ports(
     cmd: &PortsCommands,
     workdir: Option<PathBuf>,
     config_path: Option<PathBuf>,
-    ctx: super::isolate::IsolateContext,
+    ctx: RunContext,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
     match cmd {

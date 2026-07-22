@@ -1,0 +1,34 @@
+# Repo-wide clippy configuration.
+#
+# `disallowed-methods` below flags direct construction of `Orchestrator` via
+# `Orchestrator::new`/`new_ephemeral`, bypassing `OrchestratorBuilder` (and
+# therefore `apply_run_context`). Settings-threading bugs have shipped
+# multiple times from exactly this pattern (see
+# src/orchestrator/run_context.rs and the RunContext consolidation plan).
+#
+# Confirmed against clippy 1.97 (the CI-pinned version): with the path
+# written as the item's *reachable* re-export (`fed::Orchestrator::new`,
+# matching src/lib.rs's `pub use orchestrator::Orchestrator;`), this fires
+# everywhere — the `fed` binary, integration tests under tests/*.rs, AND
+# library-internal call sites (src/orchestrator/builder.rs,
+# src/orchestrator/scripts.rs, and the #[cfg(test)] unit tests in core.rs/
+# factory.rs). It does NOT resolve if given the item's private definition
+# path (`fed::orchestrator::Orchestrator::new`, through the private `core`
+# module) — clippy reports "does not refer to a reachable function" for
+# that form, so the path here must stay the crate-root re-export.
+#
+# The four legitimate call sites (builder.rs's one construction, scripts.rs's
+# marked isolated-child construction, and core.rs's/factory.rs's own
+# #[cfg(test)] unit tests) each carry a local `#[allow(clippy::disallowed_methods)]`.
+# tests/support/mod.rs wraps the constructors for integration tests the same way.
+#
+# A CI grep-gate step (scripts/check-orchestrator-construction.sh) additionally
+# scans src/orchestrator/*.rs as a second, crate-boundary-agnostic layer —
+# redundant with clippy today given the finding above, but kept per the
+# RunContext consolidation plan as a text-based backstop that doesn't depend
+# on `-D warnings` staying wired into CI or on this exact path string
+# continuing to resolve across future refactors.
+disallowed-methods = [
+    { path = "fed::Orchestrator::new", reason = "bypasses OrchestratorBuilder/apply_run_context — settings-threading bugs have shipped from this exact pattern. Use Orchestrator::builder() in production code, or tests/support::new_orchestrator_for_test in integration tests." },
+    { path = "fed::Orchestrator::new_ephemeral", reason = "same as Orchestrator::new — see tests/support/mod.rs for the test-only escape hatch." },
+]

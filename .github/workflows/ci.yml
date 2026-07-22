@@ -127,6 +127,19 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  orchestrator-construction-gate:
+    name: Orchestrator construction gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # clippy::disallowed_methods (clippy.toml) catches bin/integration-test
+      # bypasses of OrchestratorBuilder, but not library-internal calls from
+      # one src/orchestrator/*.rs file to another (same crate, no boundary
+      # for clippy to see). This plain-text scan closes that gap.
+      - name: Check for raw Orchestrator construction in src/orchestrator/**
+        run: ./scripts/check-orchestrator-construction.sh
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

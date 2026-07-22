@@ -69,7 +69,7 @@ pub mod watch;
 // Re-export commonly used types
 pub use config::{Config, Parser, RestartPolicy};
 pub use error::{Error, Result};
-pub use orchestrator::Orchestrator;
+pub use orchestrator::{Orchestrator, RunContext};
 pub use package::{PackageLoader, PackageResolver, ServiceMerger};
 pub use service::{OutputMode, ServiceManager, Status};
 pub use state::StateTracker;

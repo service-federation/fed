@@ -121,14 +121,14 @@ impl Orchestrator {
     /// # Example
     ///
     /// ```no_run
-    /// use fed::{Config, Orchestrator};
+    /// use fed::{Config, Orchestrator, RunContext};
     /// use fed::service::OutputMode;
     ///
     /// # async fn example() -> Result<(), fed::Error> {
     /// let config = Config::default();
     /// let orchestrator = Orchestrator::builder()
     ///     .config(config)
-    ///     .output_mode(OutputMode::Captured)
+    ///     .run_context(RunContext { output_mode: OutputMode::Captured, ..Default::default() })
     ///     .build()
     ///     .await?;
     /// // initialize() is called automatically
@@ -375,6 +375,49 @@ impl Orchestrator {
     /// and preventing collisions with the parent orchestrator's containers.
     pub fn set_isolation_id(&mut self, id: String) {
         self.isolation_id = Some(id);
+    }
+
+    /// Apply every field of `ctx` to this orchestrator via the existing
+    /// per-field setters (plus a direct write to the private
+    /// `active_profiles` field, which has no post-construction setter
+    /// today), in the order `initialize()` requires (environment and
+    /// required_secret_names before anything that reads them). This is
+    /// the single place that encodes that ordering constraint; every
+    /// other caller — `OrchestratorBuilder::build()` and isolated-script
+    /// child orchestrators (`scripts.rs`) — calls this instead of
+    /// re-deriving the order.
+    ///
+    /// Every `RunContext` field is applied here, including `profiles` —
+    /// omitting it would silently drop profile-gated services from an
+    /// isolated-script child's config (the child is built from the
+    /// parent's unfiltered `original_config`, so `active_profiles`
+    /// defaulting to empty means every profile-gated service is filtered
+    /// out before `depends_on` is ever resolved).
+    pub fn apply_run_context(&mut self, ctx: &super::RunContext) {
+        self.set_required_secret_names(ctx.required_secret_names.clone());
+        self.set_environment(ctx.environment);
+        self.set_offline(ctx.offline);
+        self.set_is_interactive(ctx.is_interactive);
+        self.set_output_mode(ctx.output_mode);
+        self.active_profiles = ctx.profiles.clone();
+    }
+
+    /// Build a `RunContext` describing this orchestrator's current session
+    /// settings — the mirror of `apply_run_context`, used to inherit a
+    /// parent's context into a child instead of copying fields one by one.
+    ///
+    /// Every field here round-trips losslessly through `apply_run_context`
+    /// — this method does not invent or default any value it can't
+    /// actually read back off `self`.
+    pub fn current_run_context(&self) -> super::RunContext {
+        super::RunContext {
+            environment: self.get_environment(),
+            offline: self.get_offline(),
+            is_interactive: self.resolver.get_is_interactive(),
+            output_mode: self.output_mode,
+            profiles: self.active_profiles.clone(),
+            required_secret_names: self.get_required_secret_names(),
+        }
     }
 
     /// Set active profiles for service filtering
@@ -2097,6 +2140,11 @@ impl std::fmt::Debug for Orchestrator {
 }
 
 #[cfg(test)]
+// clippy::disallowed_methods (clippy.toml) fires on these library-internal
+// unit-test call sites too (it matches on the resolved item path, not crate
+// boundaries) — same-crate, lower-risk, already bounded by #[cfg(test)], so
+// they're allowed here rather than migrated to a test-only helper.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::config::Config;
@@ -2349,6 +2397,91 @@ mod tests {
             dependents.contains(&"b".to_string()) && dependents.contains(&"c".to_string()),
             "expected b and c in dependents; got {:?}",
             dependents
+        );
+    }
+
+    /// `apply_run_context` followed by `current_run_context` must reproduce
+    /// every field of the original `RunContext` exactly — including
+    /// `profiles`, which an earlier draft of the RunContext plan omitted
+    /// from `apply_run_context` while still reading it back in
+    /// `current_run_context`, an asymmetric pairing that would have shipped
+    /// a silent round-trip gap.
+    #[tokio::test]
+    async fn apply_run_context_round_trips_every_field() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let mut required_secret_names = std::collections::HashSet::new();
+        required_secret_names.insert("API_KEY".to_string());
+
+        let ctx = super::super::RunContext {
+            environment: crate::config::Environment::Staging,
+            offline: true,
+            is_interactive: true,
+            output_mode: OutputMode::Passthrough,
+            profiles: vec!["a".to_string(), "b".to_string()],
+            required_secret_names: Some(required_secret_names),
+        };
+
+        orchestrator.apply_run_context(&ctx);
+        let round_tripped = orchestrator.current_run_context();
+
+        assert_eq!(round_tripped.environment, ctx.environment);
+        assert_eq!(round_tripped.offline, ctx.offline);
+        assert_eq!(round_tripped.is_interactive, ctx.is_interactive);
+        assert_eq!(round_tripped.output_mode, ctx.output_mode);
+        assert_eq!(round_tripped.profiles, ctx.profiles);
+        assert_eq!(
+            round_tripped.required_secret_names,
+            ctx.required_secret_names
+        );
+    }
+
+    /// `OrchestratorBuilder::build()` must apply `environment` (via
+    /// `apply_run_context`) before `initialize()` resolves parameters — a
+    /// config with an environment-conditional parameter must resolve to the
+    /// `RunContext`'s environment, not the development default.
+    #[tokio::test]
+    async fn builder_applies_environment_before_initialize() {
+        let parser = crate::config::Parser::new();
+        let config = parser
+            .parse_config(
+                r#"
+parameters:
+  GREETING:
+    development: dev-value
+    staging: staging-value
+services:
+  app:
+    process: "true"
+    environment:
+      GREETING: '{{GREETING}}'
+"#,
+            )
+            .expect("valid yaml");
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let ctx = super::super::RunContext {
+            environment: crate::config::Environment::Staging,
+            ..Default::default()
+        };
+
+        let orchestrator = super::super::OrchestratorBuilder::new()
+            .config(config)
+            .work_dir(temp_dir.path().to_path_buf())
+            .run_context(ctx)
+            .build()
+            .await
+            .expect("build");
+
+        let resolved = orchestrator.resolver.get_resolved_parameters().clone();
+        assert_eq!(
+            resolved.get("GREETING").map(String::as_str),
+            Some("staging-value"),
+            "environment must be applied before initialize() resolves parameters"
         );
     }
 }

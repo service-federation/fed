@@ -1,19 +1,14 @@
 use crate::cli::IsolateCommands;
 use crate::output::UserOutput;
 use fed::state::StateTracker;
-use fed::{Orchestrator, Parser as ConfigParser};
+use fed::{Orchestrator, Parser as ConfigParser, RunContext};
 use std::path::PathBuf;
-
-pub struct IsolateContext {
-    pub environment: fed::config::Environment,
-    pub offline: bool,
-}
 
 pub async fn run_isolate(
     cmd: &IsolateCommands,
     workdir: Option<PathBuf>,
     config_path: Option<PathBuf>,
-    ctx: IsolateContext,
+    ctx: RunContext,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
     let work_dir = super::ports::resolve_work_dir(workdir, config_path.as_deref())?;
@@ -33,7 +28,7 @@ pub async fn run_isolate(
 async fn enable(
     work_dir: &std::path::Path,
     config_path: Option<PathBuf>,
-    ctx: &IsolateContext,
+    ctx: &RunContext,
     force: bool,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
@@ -67,14 +62,17 @@ async fn enable(
     // that non-isolated `fed start` reads from.
     let isolation_id = format!("iso-{:08x}", rand::random::<u32>());
 
-    // Create orchestrator with randomized ports and initialize to resolve them
-    let mut orchestrator = Orchestrator::new(config, work_dir.to_path_buf()).await?;
-    orchestrator.set_work_dir(work_dir.to_path_buf()).await?;
-    orchestrator.set_environment(ctx.environment);
-    orchestrator.set_offline(ctx.offline);
-    orchestrator.set_randomize_ports(true);
-    orchestrator.set_isolation_id(isolation_id.clone());
-    orchestrator.initialize().await?;
+    // Create orchestrator with randomized ports and initialize to resolve them.
+    // isolation_id is applied before build()'s internal initialize() call so
+    // ports resolve and persist under this new scope, not the shared one.
+    let orchestrator = Orchestrator::builder()
+        .config(config)
+        .work_dir(work_dir.to_path_buf())
+        .run_context(ctx.clone())
+        .randomize_ports(true)
+        .isolation_id(isolation_id.clone())
+        .build()
+        .await?;
 
     // Persist isolation mode now that ports are resolved under this scope.
     let tracker = orchestrator.state_tracker.read().await;
@@ -200,7 +198,7 @@ async fn status(work_dir: &std::path::Path, out: &dyn UserOutput) -> anyhow::Res
 async fn rotate(
     work_dir: &std::path::Path,
     config_path: Option<PathBuf>,
-    ctx: &IsolateContext,
+    ctx: &RunContext,
     force: bool,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
@@ -236,14 +234,17 @@ async fn rotate(
     // the freshly randomized ports persist under the new scope.
     let isolation_id = format!("iso-{:08x}", rand::random::<u32>());
 
-    // Create orchestrator with randomized ports and initialize to resolve new ports
-    let mut orchestrator = Orchestrator::new(config, work_dir.to_path_buf()).await?;
-    orchestrator.set_work_dir(work_dir.to_path_buf()).await?;
-    orchestrator.set_environment(ctx.environment);
-    orchestrator.set_offline(ctx.offline);
-    orchestrator.set_randomize_ports(true);
-    orchestrator.set_isolation_id(isolation_id.clone());
-    orchestrator.initialize().await?;
+    // Create orchestrator with randomized ports and initialize to resolve new ports.
+    // isolation_id is applied before build()'s internal initialize() call so
+    // ports resolve and persist under this new scope, not the previous one.
+    let orchestrator = Orchestrator::builder()
+        .config(config)
+        .work_dir(work_dir.to_path_buf())
+        .run_context(ctx.clone())
+        .randomize_ports(true)
+        .isolation_id(isolation_id.clone())
+        .build()
+        .await?;
 
     // Persist the new isolation mode now that ports are resolved under this scope.
     let tracker = orchestrator.state_tracker.read().await;

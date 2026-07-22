@@ -1,6 +1,7 @@
-use super::Orchestrator;
+use super::{Orchestrator, RunContext};
 use crate::config::Config;
 use crate::error::Result;
+#[cfg(test)]
 use crate::service::OutputMode;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -15,7 +16,7 @@ use std::time::Duration;
 /// # Example
 ///
 /// ```no_run
-/// use fed::{Config, Orchestrator};
+/// use fed::{Config, Orchestrator, RunContext};
 /// use fed::service::OutputMode;
 /// use std::path::PathBuf;
 ///
@@ -24,7 +25,7 @@ use std::time::Duration;
 /// let orchestrator = Orchestrator::builder()
 ///     .config(config)
 ///     .work_dir(PathBuf::from("."))
-///     .output_mode(OutputMode::Captured)
+///     .run_context(RunContext { output_mode: OutputMode::Captured, ..Default::default() })
 ///     .auto_resolve_conflicts(true)
 ///     .build()
 ///     .await?;
@@ -35,19 +36,20 @@ use std::time::Duration;
 pub struct OrchestratorBuilder {
     config: Option<Config>,
     work_dir: Option<PathBuf>,
-    output_mode: OutputMode,
+    /// Session-scoped run settings — see `RunContext`'s doc comment for the
+    /// context-vs-operation-flag split. Applied to the built `Orchestrator`
+    /// in one call to `apply_run_context`, replacing what used to be 6
+    /// separate fields (`output_mode`, `is_interactive`, `offline`,
+    /// `environment`, `required_secret_names`, `profiles`).
+    run_context: RunContext,
     auto_resolve_conflicts: bool,
     randomize_ports: bool,
     replace_mode: bool,
     dry_run: bool,
     readonly: bool,
-    is_interactive: bool,
-    offline: bool,
-    profiles: Vec<String>,
+    isolation_id: Option<String>,
     startup_timeout: Option<Duration>,
     stop_timeout: Option<Duration>,
-    required_secret_names: Option<std::collections::HashSet<String>>,
-    environment: Option<crate::config::Environment>,
 }
 
 impl OrchestratorBuilder {
@@ -56,19 +58,15 @@ impl OrchestratorBuilder {
         Self {
             config: None,
             work_dir: None,
-            output_mode: OutputMode::default(),
+            run_context: RunContext::default(),
             auto_resolve_conflicts: false,
             randomize_ports: false,
             replace_mode: false,
             dry_run: false,
             readonly: false,
-            is_interactive: false,
-            offline: false,
-            profiles: Vec::new(),
+            isolation_id: None,
             startup_timeout: None,
             stop_timeout: None,
-            required_secret_names: None,
-            environment: None,
         }
     }
 
@@ -88,13 +86,12 @@ impl OrchestratorBuilder {
         self
     }
 
-    /// Set the output mode for process services.
-    ///
-    /// - `OutputMode::File`: Background mode, logs to files
-    /// - `OutputMode::Captured`: Interactive mode, logs to memory (default)
-    /// - `OutputMode::Passthrough`: Pass-through mode, inherit stdio
-    pub fn output_mode(mut self, mode: OutputMode) -> Self {
-        self.output_mode = mode;
+    /// Set the session-scoped run settings (environment, offline,
+    /// is_interactive, output_mode, profiles, required_secret_names) in one
+    /// call. See `RunContext`'s doc comment for why these six fields are
+    /// grouped separately from the operation flags below.
+    pub fn run_context(mut self, ctx: RunContext) -> Self {
+        self.run_context = ctx;
         self
     }
 
@@ -104,15 +101,6 @@ impl OrchestratorBuilder {
     /// This is useful in TUI mode to avoid blocking on interactive prompts.
     pub fn auto_resolve_conflicts(mut self, auto_resolve: bool) -> Self {
         self.auto_resolve_conflicts = auto_resolve;
-        self
-    }
-
-    /// Set active profiles for service filtering.
-    ///
-    /// Only services matching at least one of these profiles will be started.
-    /// If no profiles are set, all services are included.
-    pub fn profiles(mut self, profiles: Vec<String>) -> Self {
-        self.profiles = profiles;
         self
     }
 
@@ -159,44 +147,6 @@ impl OrchestratorBuilder {
         self
     }
 
-    /// Set whether stdin is a TTY (for interactive prompts like secret generation).
-    pub fn is_interactive(mut self, is_interactive: bool) -> Self {
-        self.is_interactive = is_interactive;
-        self
-    }
-
-    /// Offline mode: skip cloud vault lookups for manual secrets.
-    pub fn offline(mut self, offline: bool) -> Self {
-        self.offline = offline;
-        self
-    }
-
-    /// Scope the vault query to the manual-secret names the target script
-    /// transitively references.
-    ///
-    /// `None` (the default) fetches every missing manual secret — used for
-    /// interactive `fed`, `fed start`, and unknown commands. Pass `Some(set)`
-    /// (derived by [`crate::parameter::scanner::required_parameter_names`])
-    /// for a specific script run so it never blocks on secrets it doesn't use.
-    pub fn required_secret_names(
-        mut self,
-        names: Option<std::collections::HashSet<String>>,
-    ) -> Self {
-        self.required_secret_names = names;
-        self
-    }
-
-    /// Set the environment for parameter resolution and vault fetches
-    /// (development/staging/production).
-    ///
-    /// If not set, defaults to development. Selects which per-parameter
-    /// environment value (`development:`/`staging:`/`production:`) resolves and
-    /// which vault environment manual secrets are fetched from.
-    pub fn environment(mut self, environment: crate::config::Environment) -> Self {
-        self.environment = Some(environment);
-        self
-    }
-
     /// Enable readonly initialization.
     ///
     /// When enabled, `build()` calls `initialize_readonly()` instead of
@@ -204,6 +154,21 @@ impl OrchestratorBuilder {
     /// Use this for read-only commands like `status`, `logs`, and `stop`.
     pub fn readonly(mut self, readonly: bool) -> Self {
         self.readonly = readonly;
+        self
+    }
+
+    /// Set an isolation ID for this orchestrator's Docker containers and
+    /// persisted port scope.
+    ///
+    /// Must be applied before `initialize()` runs — `initialize()` only
+    /// adopts a *persisted* isolation_id when none is already set
+    /// (`core.rs`'s `initialize` doc comment), so a caller generating a
+    /// fresh isolation_id up front (e.g. `fed isolate enable`/`rotate`)
+    /// needs it in place before `build()`'s internal `initialize()` call —
+    /// setting it afterward would resolve and persist ports under the
+    /// wrong (previous/shared) scope.
+    pub fn isolation_id(mut self, id: String) -> Self {
+        self.isolation_id = Some(id);
         self
     }
 
@@ -226,25 +191,24 @@ impl OrchestratorBuilder {
             .config
             .ok_or_else(|| crate::error::Error::Validation("config is required".to_string()))?;
 
-        // Create orchestrator
+        // Create orchestrator. This is the one sanctioned construction site —
+        // clippy::disallowed_methods (clippy.toml) forbids Orchestrator::new/
+        // new_ephemeral everywhere else so settings-threading always goes
+        // through apply_run_context below, not hand-rolled setter calls.
         let work_dir = self.work_dir.unwrap_or_else(|| PathBuf::from("."));
-        let mut orchestrator = if self.profiles.is_empty() {
-            if self.dry_run {
-                Orchestrator::new_ephemeral(config, work_dir).await?
-            } else {
-                Orchestrator::new(config, work_dir).await?
-            }
-        } else if self.dry_run {
-            Orchestrator::new_ephemeral(config, work_dir)
-                .await?
-                .with_profiles(self.profiles)
+        #[allow(clippy::disallowed_methods)]
+        let mut orchestrator = if self.dry_run {
+            Orchestrator::new_ephemeral(config, work_dir).await?
         } else {
-            Orchestrator::new(config, work_dir)
-                .await?
-                .with_profiles(self.profiles)
+            Orchestrator::new(config, work_dir).await?
         };
 
-        orchestrator.set_output_mode(self.output_mode);
+        // Applies environment / offline / is_interactive / output_mode /
+        // profiles / required_secret_names in the order initialize()
+        // requires (environment and required_secret_names before anything
+        // that reads them — see apply_run_context's doc comment).
+        orchestrator.apply_run_context(&self.run_context);
+
         orchestrator.set_auto_resolve_conflicts(self.auto_resolve_conflicts);
 
         if self.randomize_ports {
@@ -253,20 +217,9 @@ impl OrchestratorBuilder {
         if self.replace_mode {
             orchestrator.set_replace_mode(true);
         }
-        if self.is_interactive {
-            orchestrator.set_is_interactive(true);
-        }
-        if self.offline {
-            orchestrator.set_offline(true);
-        }
-
-        // Scope the vault query before initialize() runs secret resolution.
-        // None keeps today's fetch-everything behavior.
-        orchestrator.set_required_secret_names(self.required_secret_names);
-
-        // Must precede initialize(): parameter resolution reads the environment.
-        if let Some(environment) = self.environment {
-            orchestrator.set_environment(environment);
+        // Must precede initialize(): see isolation_id()'s doc comment.
+        if let Some(id) = self.isolation_id {
+            orchestrator.set_isolation_id(id);
         }
 
         if let Some(timeout) = self.startup_timeout {
@@ -331,7 +284,10 @@ mod tests {
         let result = OrchestratorBuilder::new()
             .config(config)
             .work_dir(temp_dir.path().to_path_buf())
-            .output_mode(OutputMode::Captured)
+            .run_context(RunContext {
+                output_mode: OutputMode::Captured,
+                ..Default::default()
+            })
             .auto_resolve_conflicts(true)
             .build()
             .await;

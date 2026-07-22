@@ -333,25 +333,21 @@ impl<'a> ScriptRunner<'a> {
         // drops the block still leaves `child_orchestrator` intact for the
         // cleanup that follows — keeping isolated teardown symmetric with the
         // shared path, whose cleanup likewise runs after the guard.
-        // Scope the child's vault query the same way the parent scoped it.
-        // Inherit the parent's *actual* stored scope rather than re-deriving:
-        // for CLI runs the re-derivation is provably identical, but a public-API
-        // caller who set a custom scope (or `None`) must get a child that honors
-        // it, not one that computes its own.
-        let child_required_secret_names = self.orchestrator.get_required_secret_names();
-
+        // ALLOW-RAW-ORCHESTRATOR-CONSTRUCTION: must be constructed before
+        // entering run_guarded so a Ctrl+C during the child's initialize()
+        // is absorbed by the same interrupt guard as the rest of the
+        // isolated run. OrchestratorBuilder::build() always calls
+        // initialize() synchronously, which would run outside that guard.
+        #[allow(clippy::disallowed_methods)]
         let mut child_orchestrator =
             Orchestrator::new_ephemeral(child_config, self.orchestrator.work_dir.clone()).await?;
-        child_orchestrator.output_mode = self.orchestrator.output_mode;
-        // Must be set before initialize() runs the child's secret resolution.
-        child_orchestrator.set_required_secret_names(child_required_secret_names);
-        // Inherit the parent's environment (-e/--env) so the isolated child
-        // resolves the same staging/production parameter values and vault
-        // environment instead of silently resetting to development.
-        child_orchestrator.set_environment(self.orchestrator.get_environment());
-        // Likewise --offline: a child that reset to online would call the
-        // vault from a run the user explicitly marked offline.
-        child_orchestrator.set_offline(self.orchestrator.get_offline());
+        // Inherit the parent's session settings verbatim — environment,
+        // offline, is_interactive, output_mode, required_secret_names, and
+        // profiles. `profiles` matters here specifically: the child is
+        // built from the parent's *unfiltered* original_config, so an empty
+        // active_profiles would silently drop every profile-gated service
+        // from the child's config before `depends_on` is ever resolved.
+        child_orchestrator.apply_run_context(&self.orchestrator.current_run_context());
 
         // Give the child its own container namespace so Docker containers don't
         // collide with (or kill) the parent's running containers.
