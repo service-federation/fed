@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "fed", version)]
-#[command(about = "Service Federation - Orchestrate complex service dependencies")]
+#[command(about = "Run native apps and Docker dependencies as one local dev stack")]
 pub struct Cli {
     /// Config file path (defaults to fed.yaml)
     #[arg(short, long)]

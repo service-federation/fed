@@ -11,6 +11,17 @@ const SCHEMA_VERSION: u32 = 1;
 /// type or lifecycle state. Fields sourced from `ServiceState` are `null`/
 /// empty when no persisted row exists (never started, or stopped — the row
 /// is deleted on stop).
+///
+/// `supervisor_running`/`supervisor_pid` are directory-wide facts (there is
+/// exactly one `fed supervise` daemon per `.fed/` directory), repeated
+/// inside every per-service object rather than hoisted to a top-level
+/// sibling key — the same collision-avoidance reasoning `schema_version`
+/// already uses below: service names are unrestricted YAML keys with no
+/// reserved-word protection, so a top-level `"supervisor_pid"` key could
+/// collide with a real service literally named that. This is additive to
+/// the schema (every existing key keeps its exact shape), so
+/// `SCHEMA_VERSION` stays at `1` per its own "bumped only on a
+/// breaking/renaming change" rule (`07-supervisor.md` Design §4).
 #[derive(serde::Serialize)]
 struct ServiceStatusJson {
     status: &'static str,
@@ -25,6 +36,24 @@ struct ServiceStatusJson {
     // introspection is added, see 03-status-json.md
     ports: std::collections::HashMap<String, u16>,
     startup_message: Option<String>,
+    /// `"fed"` — in the supervisor's filtered health-check scope
+    /// (`fed::orchestrator::supervised_service_names`); `"docker-native"` —
+    /// a Docker service with `restart: always`, protected by Docker's own
+    /// `--restart unless-stopped` even with no fed process alive (this
+    /// implies `"fed"`-scope membership too, since `restart: always` is
+    /// always in the union — `"docker-native"` is reported instead of
+    /// `"fed"` in that case because it's the more specific, more
+    /// informative fact: fed-level supervision requires a live `fed
+    /// supervise`/`--watch`/`tui` process, the native flag doesn't); or
+    /// `"none"` — outside the union, never health-checked by the
+    /// supervisor.
+    supervised_by: &'static str,
+    /// Whether a `fed supervise` daemon currently holds
+    /// `.fed/supervisor.lock` for this project. Directory-wide.
+    supervisor_running: bool,
+    /// PID of the live supervisor, or `null` if none is running.
+    /// Directory-wide.
+    supervisor_pid: Option<u32>,
 }
 
 /// Coarse, agent-facing health bucket derived from the raw `Status`.
@@ -48,6 +77,30 @@ fn health_bucket(status: fed::Status) -> &'static str {
     }
 }
 
+/// Which supervision mechanism, if any, protects `name` — see
+/// `ServiceStatusJson::supervised_by`'s doc comment for the precedence
+/// rationale (docker-native takes priority over the plain "fed" bucket
+/// since a `restart: always` Docker service is always in `scope` too).
+fn supervised_by_bucket(
+    config: &Config,
+    name: &str,
+    scope: &std::collections::HashSet<String>,
+) -> &'static str {
+    let docker_native = config
+        .services
+        .get(name)
+        .map(|s| s.docker_native_restart_enabled())
+        .unwrap_or(false);
+
+    if docker_native {
+        "docker-native"
+    } else if scope.contains(name) {
+        "fed"
+    } else {
+        "none"
+    }
+}
+
 pub async fn run_status(
     orchestrator: &Orchestrator,
     config: &Config,
@@ -64,6 +117,16 @@ pub async fn run_status(
         let services_with_tag = config.services_with_tag(tag_filter);
         status.retain(|name, _| services_with_tag.contains(name));
     }
+
+    // Directory-wide supervisor facts, computed once regardless of the
+    // json/human branch below — a plain file read plus a non-blocking
+    // flock probe (`live_supervisor_pid`), not an Orchestrator/state-tracker
+    // call, so this never spawns or respawns anything (`fed status` stays
+    // strictly read-only, per `07-supervisor.md` Design §1's scaled-back
+    // self-heal promise).
+    let supervisor_pid =
+        fed::orchestrator::supervisor::live_supervisor_pid(orchestrator.work_dir());
+    let supervised_scope = fed::orchestrator::supervised_service_names(config);
 
     if json {
         // Fetch persisted state once, not per service — this is the single
@@ -108,6 +171,9 @@ pub async fn run_status(
                         .map(|s| s.port_allocations.clone())
                         .unwrap_or_default(),
                     startup_message: service_state.and_then(|s| s.startup_message.clone()),
+                    supervised_by: supervised_by_bucket(config, &name, &supervised_scope),
+                    supervisor_running: supervisor_pid.is_some(),
+                    supervisor_pid,
                 };
 
                 (name, entry)
@@ -118,6 +184,10 @@ pub async fn run_status(
     } else {
         out.status("Service Status:");
         out.status(&format!("{:-<50}", ""));
+        out.status(&match supervisor_pid {
+            Some(pid) => format!("Supervisor: active (pid {})", pid),
+            None => "Supervisor: none".to_string(),
+        });
 
         if status.is_empty() {
             match tag_filter {
@@ -165,5 +235,68 @@ mod tests {
         assert_eq!(health_bucket(fed::Status::Stopping), "stopping");
         assert_eq!(health_bucket(fed::Status::Stopped), "stopped");
         assert_eq!(health_bucket(fed::Status::Running), "unknown");
+    }
+
+    // --- supervised_by_bucket (07-supervisor.md Design §4) ---
+
+    /// `docker-native` takes precedence over `fed` when both technically
+    /// apply — a Docker service with `restart: always` is always in the
+    /// `fed` scope too (`restart != No`), so this is the only reachable
+    /// outcome for that combination; asserting it here pins the precedence
+    /// choice against an accidental flip.
+    #[test]
+    fn supervised_by_prefers_docker_native_over_fed_when_both_apply() {
+        let mut config = Config::default();
+        config.services.insert(
+            "web".to_string(),
+            fed::config::Service {
+                image: Some("nginx".to_string()),
+                restart: Some(fed::RestartPolicy::Always),
+                ..Default::default()
+            },
+        );
+        let scope = fed::orchestrator::supervised_service_names(&config);
+        assert!(scope.contains("web"), "restart: always must be in scope");
+        assert_eq!(
+            supervised_by_bucket(&config, "web", &scope),
+            "docker-native"
+        );
+    }
+
+    #[test]
+    fn supervised_by_reports_fed_for_process_service_with_restart_policy() {
+        let mut config = Config::default();
+        config.services.insert(
+            "worker".to_string(),
+            fed::config::Service {
+                process: Some("sleep 300".to_string()),
+                restart: Some(fed::RestartPolicy::Always),
+                ..Default::default()
+            },
+        );
+        let scope = fed::orchestrator::supervised_service_names(&config);
+        assert_eq!(supervised_by_bucket(&config, "worker", &scope), "fed");
+    }
+
+    #[test]
+    fn supervised_by_reports_none_outside_the_union_scope() {
+        let mut config = Config::default();
+        config.services.insert(
+            "idle".to_string(),
+            fed::config::Service {
+                process: Some("sleep 300".to_string()),
+                restart: Some(fed::RestartPolicy::No),
+                ..Default::default()
+            },
+        );
+        let scope = fed::orchestrator::supervised_service_names(&config);
+        assert_eq!(supervised_by_bucket(&config, "idle", &scope), "none");
+    }
+
+    #[test]
+    fn supervised_by_reports_none_for_unknown_service_name() {
+        let config = Config::default();
+        let scope = fed::orchestrator::supervised_service_names(&config);
+        assert_eq!(supervised_by_bucket(&config, "ghost", &scope), "none");
     }
 }

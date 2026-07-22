@@ -18,6 +18,19 @@ pub async fn run_stop(
     if services.is_empty() {
         out.status("Stopping all services...");
 
+        // Quiesce the supervisor daemon FIRST, before any desired-state
+        // write or kill signal. The daemon's restart-gate check and its
+        // actual respawn are not atomic: a restart that passed the gate a
+        // moment before we write Stopped would land after our kills and
+        // resurrect the service (`07-supervisor.md` Design §1 requires
+        // quiesce-before-kill for whole-project stop; the soak test
+        // reproduces the resurrection when this ordering is violated).
+        fed::orchestrator::supervisor::signal_stop_and_wait(
+            orchestrator.work_dir(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+
         // Quiesce every currently-registered service's intent to Stopped in
         // one upfront batch, before any kill signal goes out below. This
         // closes the race window where a per-service interleaved
@@ -66,20 +79,6 @@ pub async fn run_stop(
         }
 
         orchestrator.cleanup().await;
-
-        // Whole-project stop just quiesced every service's desired_state to
-        // Stopped and killed them all — nothing remains for a supervisor to
-        // protect, so tear it down now rather than waiting for its own
-        // per-tick self-exit check (`07-supervisor.md` Design §1). A
-        // partial (per-service) stop does NOT do this: other supervised
-        // services may still legitimately be running, so it relies on the
-        // persisted `desired_state` alone (the supervisor simply skips the
-        // stopped one on its next tick).
-        fed::orchestrator::supervisor::signal_stop_and_wait(
-            orchestrator.work_dir(),
-            std::time::Duration::from_secs(10),
-        )
-        .await;
     } else {
         // Expand tag references (e.g., @backend) into service names
         let services_to_stop = config.expand_service_selection(&services);
@@ -221,6 +220,18 @@ pub async fn run_stop_from_state(
     services: Vec<String>,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
+    // Whole-project fallback stop: quiesce the supervisor BEFORE any
+    // desired-state write or kill, for the same in-flight-restart race the
+    // normal run_stop path guards against. Partial stops rely on
+    // desired_state plus the supervisor's own reconcile tick.
+    if services.is_empty() {
+        fed::orchestrator::supervisor::signal_stop_and_wait(
+            work_dir,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+    }
+
     let mut tracker = StateTracker::new(work_dir.to_path_buf()).await?;
     tracker.initialize().await?;
 
@@ -304,19 +315,6 @@ pub async fn run_stop_from_state(
     let removed = remove_orphan_containers_for_workdir(work_dir).await;
     if removed > 0 {
         out.status(&format!("Removed {} orphaned container(s)", removed));
-    }
-
-    // Same whole-project teardown as the normal `run_stop` path above —
-    // this fallback exists precisely because config couldn't load, so
-    // there's no `Orchestrator` here to ask; a plain lock-file signal is
-    // all this needs. Only for the "stop everything" shape (empty
-    // `services`), mirroring `run_stop`'s own condition.
-    if services.is_empty() {
-        fed::orchestrator::supervisor::signal_stop_and_wait(
-            work_dir,
-            std::time::Duration::from_secs(10),
-        )
-        .await;
     }
 
     if !failed.is_empty() {

@@ -2327,6 +2327,42 @@ impl Orchestrator {
         false
     }
 
+    /// Stop any supervised service that is alive but has
+    /// `desired_state = stopped` — the reconcile half of the desired-state
+    /// contract. The restart gate only prevents future restarts of dead
+    /// services; a restart already in flight when a partial `fed stop`
+    /// wrote Stopped lands after the kill and leaves a live process the
+    /// user asked to stop. Called from the supervisor's poll tick.
+    pub async fn stop_supervised_not_desired_running(&self) {
+        let scope = super::monitoring::supervised_service_names(&self.config);
+        if scope.is_empty() {
+            return;
+        }
+
+        let mut to_stop = Vec::new();
+        {
+            let tracker = self.state_tracker.read().await;
+            let statuses = self.get_status_passive().await;
+            for name in &scope {
+                let live = statuses
+                    .get(name)
+                    .is_some_and(|s| !matches!(s, crate::service::Status::Stopped));
+                if live && !tracker.is_desired_running(name).await {
+                    to_stop.push(name.clone());
+                }
+            }
+        }
+        for name in to_stop {
+            tracing::info!(
+                "fed supervise: reconciling '{}': alive but desired_state=stopped; stopping it",
+                name
+            );
+            if let Err(e) = self.stop(&name).await {
+                tracing::warn!("fed supervise: reconcile stop of '{}' failed: {}", name, e);
+            }
+        }
+    }
+
     /// Pre-pull Docker images needed by the given services.
     ///
     /// Checks which images are missing locally and pulls them in parallel.
