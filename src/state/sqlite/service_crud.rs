@@ -1,0 +1,1415 @@
+// Split from sqlite.rs (see git history before this commit for pre-split blame).
+use super::*;
+
+impl SqliteStateTracker {
+    /// Check if a process with given PID is running (not a zombie)
+    async fn is_process_running(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::kill;
+
+            // Validate PID for read-only check (rejects 0 and >i32::MAX)
+            let Some(nix_pid) = validate_pid_for_check(pid) else {
+                warn!("Invalid PID {} for process check", pid);
+                return false;
+            };
+
+            // First check if process exists at all
+            if kill(nix_pid, None).is_err() {
+                return false;
+            }
+
+            // Check if process is a zombie using ps command
+            // Zombies have PID entries but aren't actually running
+            match tokio::process::Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()
+                .await
+            {
+                Ok(output) => {
+                    let stat = String::from_utf8_lossy(&output.stdout);
+                    let stat = stat.trim();
+                    // Process exists and is not a zombie (Z state)
+                    !stat.is_empty() && !stat.starts_with('Z')
+                }
+                Err(_) => {
+                    // If ps fails, fall back to just the kill check result
+                    true
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            warn!("Process validation not fully implemented for this platform");
+            false
+        }
+    }
+
+    /// Check if a Docker container is running
+    async fn is_container_running(container_id: &str) -> bool {
+        crate::docker::is_container_running(container_id).await
+    }
+
+    /// Check if a status string indicates the service MUST have a PID/container.
+    ///
+    /// Returns true for statuses where a missing PID/container indicates a crash:
+    /// - "running" - service is actively running, must have PID/container
+    /// - "healthy" - service is running and healthy, must have PID/container
+    /// - "failing" - service is running but failing health checks, must have PID/container
+    ///
+    /// Returns false for:
+    /// - "starting" - service may still be spinning up, don't clean up yet
+    /// - "stopped" - service is not running, no PID/container expected
+    /// - "stopping" - service is shutting down, PID/container may be gone
+    /// - any other status - unknown/invalid, err on side of not cleaning up
+    ///
+    /// Note: "starting" is included because a service stuck in Starting with no
+    /// PID and no container ID indicates a failed start that wasn't cleaned up.
+    /// The caller (`mark_dead_services`) additionally checks for missing PID/container,
+    /// so a legitimately-starting service that has already received a PID won't be
+    /// incorrectly cleaned up.
+    fn status_indicates_should_be_running(status: Status) -> bool {
+        matches!(
+            status,
+            Status::Running | Status::Healthy | Status::Failing | Status::Starting
+        )
+    }
+
+    /// Check if a status indicates the service is stale (marked for cleanup).
+    pub(super) fn status_is_stale(status: &str) -> bool {
+        status == "stale"
+    }
+
+    /// Register a new service in the state.
+    ///
+    /// Returns `Registered` if the service was newly inserted, or
+    /// `AlreadyExists { status }` if it was already in the DB. When a service
+    /// already exists, its row is left untouched — no status, PID, or timestamp
+    /// clobbering. The caller should inspect the outcome and skip starting if
+    /// the service already exists.
+    pub async fn register_service(
+        &mut self,
+        service_state: ServiceState,
+    ) -> Result<RegistrationOutcome> {
+        debug!("Registering service: {}", service_state.id);
+
+        let id = service_state.id.clone();
+        let status = service_state.status.to_string();
+        let service_type = service_state.service_type.to_string();
+        let namespace = service_state.namespace.clone();
+        let started_at = service_state.started_at.to_rfc3339();
+        let pid = service_state.pid;
+        let container_id = service_state.container_id.clone();
+        let external_repo = service_state.external_repo.clone();
+        let restart_count = service_state.restart_count;
+        let last_restart_at = service_state.last_restart_at.map(|dt| dt.to_rfc3339());
+        let consecutive_failures = service_state.consecutive_failures;
+        let startup_message = service_state.startup_message.clone();
+
+        self.conn
+            .call(move |conn: &mut rusqlite::Connection| {
+                let tx = conn.transaction()?;
+
+                // Check if service already exists and retrieve its current status
+                let existing_status: Option<String> = tx
+                    .query_row(
+                        "SELECT status FROM services WHERE id = ?1",
+                        rusqlite::params![&id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+
+                if let Some(status_str) = existing_status {
+                    // Service already registered — leave its row untouched.
+                    tx.commit()?;
+                    let status = status_str.parse::<Status>().unwrap_or(Status::Starting);
+                    return Ok(RegistrationOutcome::AlreadyExists { status });
+                }
+
+                // Insert new service
+                tx.execute(
+                    "INSERT INTO services (id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    rusqlite::params![
+                        &id,
+                        &status,
+                        &service_type,
+                        pid,
+                        container_id.as_deref(),
+                        &started_at,
+                        external_repo.as_deref(),
+                        &namespace,
+                        restart_count,
+                        last_restart_at,
+                        consecutive_failures,
+                        startup_message.as_deref(),
+                    ],
+                )?;
+
+                // Update lock file timestamp
+                tx.execute(
+                    "UPDATE lock_file SET updated_at = datetime('now') WHERE id = 1",
+                    [],
+                )?;
+
+                tx.commit()?;
+                Ok(RegistrationOutcome::Registered)
+            })
+            .await
+            .map_err(Error::from)
+    }
+
+    /// Update service status
+    #[must_use = "ignoring this result may cause state loss - the status update will not be persisted"]
+    pub async fn update_service_status(&mut self, service_id: &str, status: Status) -> Result<()> {
+        let service_id = service_id.to_string();
+        let service_id_for_tx = service_id.clone();
+        let status = status.to_string();
+
+        let rows = self
+            .with_transaction(move |tx| {
+                tx.execute(
+                    "UPDATE services SET status = ?1 WHERE id = ?2",
+                    rusqlite::params![&status, &service_id_for_tx],
+                )
+            })
+            .await?;
+
+        if rows == 0 {
+            return Err(Error::ServiceNotFound(service_id));
+        }
+
+        Ok(())
+    }
+
+    /// Update service PID
+    #[must_use = "ignoring this result may cause state loss - the PID will not be persisted"]
+    pub async fn update_service_pid(&mut self, service_id: &str, pid: u32) -> Result<()> {
+        // Validate PID can be safely used for signal operations
+        if pid > i32::MAX as u32 {
+            return Err(Error::Validation(format!(
+                "Service '{}': PID {} exceeds i32::MAX, cannot be used for signal operations",
+                service_id, pid
+            )));
+        }
+        if pid == 0 {
+            return Err(Error::Validation(format!(
+                "Service '{}': PID cannot be 0",
+                service_id
+            )));
+        }
+
+        let service_id = service_id.to_string();
+        let service_id_for_tx = service_id.clone();
+
+        // A new PID means a new process: refresh started_at so PID-reuse
+        // guards (validate_pid_start_time) compare against the right epoch.
+        let started_at = Utc::now().to_rfc3339();
+        let rows = self
+            .with_transaction(move |tx| {
+                tx.execute(
+                    "UPDATE services SET pid = ?1, started_at = ?2 WHERE id = ?3",
+                    rusqlite::params![pid, &started_at, &service_id_for_tx],
+                )
+            })
+            .await?;
+
+        if rows == 0 {
+            return Err(Error::ServiceNotFound(service_id));
+        }
+
+        Ok(())
+    }
+
+    /// Update service container ID
+    #[must_use = "ignoring this result may cause state loss - the container ID will not be persisted"]
+    pub async fn update_service_container_id(
+        &mut self,
+        service_id: &str,
+        container_id: String,
+    ) -> Result<()> {
+        let service_id = service_id.to_string();
+        let service_id_for_tx = service_id.clone();
+
+        let rows = self
+            .with_transaction(move |tx| {
+                tx.execute(
+                    "UPDATE services SET container_id = ?1 WHERE id = ?2",
+                    rusqlite::params![&container_id, &service_id_for_tx],
+                )
+            })
+            .await?;
+
+        if rows == 0 {
+            return Err(Error::ServiceNotFound(service_id));
+        }
+
+        Ok(())
+    }
+
+    /// Atomically transition service state with metadata updates.
+    ///
+    /// This method ensures that status transitions happen atomically with their associated
+    /// metadata (PID, container ID) in a single database transaction. This prevents
+    /// inconsistent state where the database shows "Running" but has no PID.
+    ///
+    /// The transition is validated against the current state to ensure it follows
+    /// valid state machine paths (see `Status::is_valid_transition`).
+    ///
+    /// # Arguments
+    ///
+    /// * `service_id` - The service to transition
+    /// * `transition` - The state transition to apply (includes status and metadata)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The service doesn't exist
+    /// - The transition is invalid (violates state machine)
+    /// - The database transaction fails
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Transition to Running with PID in one atomic operation
+    /// let transition = StateTransition::running_with_pid(12345);
+    /// state_tracker.apply_state_transition("my-service", transition).await?;
+    /// ```
+    #[must_use = "ignoring this result may cause state loss - the transition will not be applied"]
+    pub async fn apply_state_transition(
+        &mut self,
+        service_id: &str,
+        transition: crate::service::StateTransition,
+    ) -> Result<()> {
+        let service_id = service_id.to_string();
+        let service_id_for_tx = service_id.clone();
+
+        // Validate transition against current state
+        let current_status = {
+            let state = self.get_service(&service_id).await;
+            state
+                .ok_or_else(|| Error::ServiceNotFound(service_id.clone()))?
+                .status
+        };
+
+        // Validate the transition
+        transition.validate(current_status)?;
+
+        // Apply the transition atomically
+        let status_str = transition.status.to_string();
+        let pid = transition.pid;
+        let container_id = transition.container_id;
+        let clear_pid = transition.clear_pid;
+        let clear_container_id = transition.clear_container_id;
+
+        let rows = self
+            .with_transaction(move |tx| {
+                // Build UPDATE statement dynamically based on what needs to be updated
+                let mut updates = vec!["status = ?1".to_string()];
+                let mut param_index = 2;
+
+                // Track parameters for rusqlite
+                let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(status_str.clone())];
+
+                if let Some(pid_val) = pid {
+                    // Validate PID
+                    if pid_val > i32::MAX as u32 {
+                        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("PID {} exceeds i32::MAX", pid_val),
+                            ),
+                        )));
+                    }
+                    if pid_val == 0 {
+                        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "PID cannot be 0",
+                            ),
+                        )));
+                    }
+                    updates.push(format!("pid = ?{}", param_index));
+                    params.push(Box::new(pid_val));
+                    param_index += 1;
+                }
+
+                if let Some(ref cid) = container_id {
+                    updates.push(format!("container_id = ?{}", param_index));
+                    params.push(Box::new(cid.clone()));
+                    param_index += 1;
+                }
+
+                if clear_pid {
+                    updates.push("pid = NULL".to_string());
+                }
+
+                if clear_container_id {
+                    updates.push("container_id = NULL".to_string());
+                }
+
+                let query = format!(
+                    "UPDATE services SET {} WHERE id = ?{}",
+                    updates.join(", "),
+                    param_index
+                );
+                params.push(Box::new(service_id_for_tx.clone()));
+
+                // Convert params to references for rusqlite
+                let param_refs: Vec<&dyn rusqlite::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+
+                tx.execute(&query, param_refs.as_slice())
+            })
+            .await?;
+
+        if rows == 0 {
+            return Err(Error::ServiceNotFound(service_id));
+        }
+
+        Ok(())
+    }
+
+    /// Unregister a service (when stopped)
+    pub async fn unregister_service(&mut self, service_id: &str) -> Result<()> {
+        let service_id = service_id.to_string();
+        let service_id_for_tx = service_id.clone();
+
+        self.with_transaction(move |tx| {
+            tx.execute(
+                "DELETE FROM services WHERE id = ?1",
+                rusqlite::params![&service_id_for_tx],
+            )?;
+            // Clean up global ports no longer in use
+            tx.execute(
+                "DELETE FROM allocated_ports WHERE port NOT IN (SELECT DISTINCT port FROM port_allocations)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await?;
+
+        debug!("Unregistered service: {}", service_id);
+        Ok(())
+    }
+
+    /// Get all registered services
+    pub async fn get_services(&self) -> HashMap<String, ServiceState> {
+        match self.conn.call(|conn: &mut rusqlite::Connection| {
+            let mut stmt = conn.prepare(
+                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message FROM services"
+            )?;
+
+            let services_iter = stmt.query_map([], |row| {
+                let id: String = row.get(0)?;
+                let status_str: String = row.get(1)?;
+                let service_type_str: String = row.get(2)?;
+                let started_at_str: String = row.get(5)?;
+                let last_restart_str: Option<String> = row.get(9)?;
+
+                Ok((
+                    id.clone(),
+                    status_str.clone(),
+                    ServiceState {
+                        id,
+                        status: status_str.parse::<Status>().unwrap_or(Status::Stopped),
+                        service_type: service_type_str.parse::<ServiceType>().unwrap_or(ServiceType::Undefined),
+                        pid: row.get(3)?,
+                        container_id: row.get(4)?,
+                        started_at: started_at_str
+                            .parse::<DateTime<Utc>>()
+                            .unwrap_or_else(|_| Utc::now()),
+                        external_repo: row.get(6)?,
+                        namespace: row.get(7)?,
+                        restart_count: row.get(8)?,
+                        last_restart_at: last_restart_str.and_then(|s| s.parse::<DateTime<Utc>>().ok()),
+                        consecutive_failures: row.get(10)?,
+                        port_allocations: HashMap::new(), // Will be populated below
+                        startup_message: row.get(11)?,
+                    },
+                ))
+            })?;
+
+            // Filter out stale DB-only statuses before constructing the map
+            let mut services: HashMap<String, ServiceState> = services_iter
+                .filter_map(|r| r.ok())
+                .filter(|(_, raw_status, _)| !Self::status_is_stale(raw_status))
+                .map(|(id, _, state)| (id, state))
+                .collect();
+
+            // Validate and remove services with invalid PIDs
+            let mut invalid_service_ids = Vec::new();
+            services.retain(|service_id, service_state| {
+                if let Some(pid) = service_state.pid
+                    && (pid > i32::MAX as u32 || pid == 0) {
+                        warn!(
+                            "Service '{}' has invalid PID {} (exceeds i32::MAX or is 0), removing from state",
+                            service_id, pid
+                        );
+                        invalid_service_ids.push(service_id.clone());
+                        return false;
+                    }
+                true
+            });
+
+            // Delete invalid services from database
+            for service_id in invalid_service_ids {
+                let _ = conn.execute(
+                    "DELETE FROM services WHERE id = ?1",
+                    rusqlite::params![&service_id],
+                );
+            }
+
+            // Load port allocations for each service
+            for (service_id, service) in services.iter_mut() {
+                let mut port_stmt = conn.prepare(
+                    "SELECT parameter_name, port FROM port_allocations WHERE service_id = ?1"
+                )?;
+
+                let ports: HashMap<String, u16> = port_stmt
+                    .query_map(rusqlite::params![service_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                service.port_allocations = ports;
+            }
+
+            Ok(services)
+        }).await {
+            Ok(services) => services,
+            Err(e) => {
+                // A fresh directory has a state DB with no tables yet — that's
+                // legitimately empty state, not a condition to warn about.
+                if e.to_string().contains("no such table") {
+                    tracing::debug!("State DB has no tables yet; treating as empty");
+                } else {
+                    warn!("Failed to get services: {}", e);
+                }
+                HashMap::new()
+            }
+        }
+    }
+
+    /// Get specific service state
+    pub async fn get_service(&self, service_id: &str) -> Option<ServiceState> {
+        let service_id = service_id.to_string();
+
+        self.conn.call(move |conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<ServiceState>> {
+            let service = match conn.query_row(
+                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message FROM services WHERE id = ?1",
+                rusqlite::params![&service_id],
+                |row| {
+                    let id: String = row.get(0)?;
+                    let status_str: String = row.get(1)?;
+                    let service_type_str: String = row.get(2)?;
+                    let started_at_str: String = row.get(5)?;
+                    let last_restart_str: Option<String> = row.get(9)?;
+
+                    Ok(ServiceState {
+                        id,
+                        status: status_str.parse::<Status>().unwrap_or(Status::Stopped),
+                        service_type: service_type_str.parse::<ServiceType>().unwrap_or(ServiceType::Undefined),
+                        pid: row.get(3)?,
+                        container_id: row.get(4)?,
+                        started_at: started_at_str.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
+                        external_repo: row.get(6)?,
+                        namespace: row.get(7)?,
+                        restart_count: row.get(8)?,
+                        last_restart_at: last_restart_str.and_then(|s| s.parse::<DateTime<Utc>>().ok()),
+                        consecutive_failures: row.get(10)?,
+                        port_allocations: HashMap::new(),
+                        startup_message: row.get(11)?,
+                    })
+                }
+            ) {
+                Ok(s) => s,
+                Err(_) => return Ok(None),
+            };
+
+            // Load port allocations
+            let mut port_stmt = conn
+                .prepare("SELECT parameter_name, port FROM port_allocations WHERE service_id = ?1")?;
+
+            let ports: HashMap<String, u16> = port_stmt
+                .query_map(rusqlite::params![&service_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(Some(ServiceState {
+                port_allocations: ports,
+                ..service
+            }))
+        }).await.ok().flatten()
+    }
+
+    /// Check if a service is already registered
+    pub async fn is_service_registered(&self, service_id: &str) -> bool {
+        let service_id = service_id.to_string();
+
+        self.conn
+            .call(
+                move |conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<bool> {
+                    Ok(conn.query_row(
+                        "SELECT COUNT(*) > 0 FROM services WHERE id = ?1",
+                        rusqlite::params![&service_id],
+                        |row| row.get(0),
+                    )?)
+                },
+            )
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Mark dead/stale services in state without deleting them.
+    ///
+    /// Sets status to `stale` so that port_allocations remain readable
+    /// until [`SqliteStateTracker::purge_stale_services`] is called. This enables callers to
+    /// collect managed port information before data is deleted.
+    pub async fn mark_dead_services(&mut self) -> Result<usize> {
+        let services = self.get_services().await;
+        let mut stale_services = Vec::new();
+
+        // Check Docker daemon health with retry before evaluating container services.
+        // If daemon is unhealthy after retries, we cannot reliably determine container state,
+        // so we skip container cleanup to avoid removing healthy containers.
+        let daemon_healthy = crate::docker::check_daemon_with_retry().await;
+        if !daemon_healthy {
+            warn!(
+                "Docker daemon unhealthy after retries - skipping container cleanup to avoid data loss"
+            );
+        }
+
+        for (service_id, service_state) in &services {
+            // Stale services are already filtered out at the DB read boundary
+
+            let is_stale = if let Some(pid) = service_state.pid {
+                !Self::is_process_running(pid).await
+            } else if let Some(ref container_id) = service_state.container_id {
+                // Only check container status if daemon is healthy
+                if daemon_healthy {
+                    !Self::is_container_running(container_id).await
+                } else {
+                    // Daemon unhealthy - assume container is running to avoid spurious cleanup
+                    false
+                }
+            } else {
+                // Service has no PID and no container_id.
+                // Only consider stale if its status indicates it SHOULD be running.
+                // Services that are "stopped" or were never started are not stale.
+                Self::status_indicates_should_be_running(service_state.status)
+            };
+
+            if is_stale {
+                debug!("Service '{}' appears to be stale", service_id);
+                stale_services.push(service_id.clone());
+            }
+        }
+
+        let marked = stale_services.len();
+
+        if marked > 0 {
+            debug!(
+                "Marking {} stale service(s): {}",
+                marked,
+                stale_services.join(", ")
+            );
+            self.with_transaction(move |tx| {
+                for service_id in &stale_services {
+                    tx.execute(
+                        "UPDATE services SET status = 'stale' WHERE id = ?1",
+                        rusqlite::params![service_id],
+                    )?;
+                }
+                Ok(())
+            })
+            .await?;
+
+            info!("Marked {} dead service(s) as stale", marked);
+        }
+
+        Ok(marked)
+    }
+
+    /// Purge services previously marked as stale by [`SqliteStateTracker::mark_dead_services`].
+    ///
+    /// Deletes stale service records and their associated port_allocations
+    /// (via CASCADE). Call this after managed port information has been collected.
+    pub async fn purge_stale_services(&mut self) -> Result<usize> {
+        let count: usize = self
+            .conn
+            .call(
+                |conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<usize> {
+                    let tx = conn.transaction()?;
+                    let removed = tx.execute(
+                        "DELETE FROM services WHERE status = 'stale'",
+                        [],
+                    )?;
+                    // Clean up orphaned bind reservations: delete allocated_ports entries
+                    // for ports no longer in use by any service (port_allocations) or
+                    // global parameter resolution (persisted_ports).
+                    tx.execute(
+                        "DELETE FROM allocated_ports WHERE port NOT IN (SELECT DISTINCT port FROM port_allocations) AND port NOT IN (SELECT port FROM persisted_ports)",
+                        [],
+                    )?;
+                    tx.execute(
+                        "UPDATE lock_file SET updated_at = datetime('now') WHERE id = 1",
+                        [],
+                    )?;
+                    tx.commit()?;
+                    Ok(removed)
+                },
+            )
+            .await?;
+
+        if count > 0 {
+            info!("Purged {} stale service(s) from state", count);
+        }
+
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::sqlite::tests::test_support::*;
+
+    // ========================================================================
+    // apply_state_transition tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_apply_transition_stopped_to_starting() {
+        let (mut tracker, _temp_dir) = create_test_tracker().await;
+        register_stopped_service(&mut tracker, "svc").await;
+
+        let transition = crate::service::StateTransition::starting();
+        tracker
+            .apply_state_transition("svc", transition)
+            .await
+            .unwrap();
+
+        let state = tracker.get_service("svc").await.unwrap();
+        assert_eq!(state.status, Status::Starting);
+    }
+
+    #[tokio::test]
+    async fn test_apply_transition_starting_to_running_with_pid() {
+        let (mut tracker, _temp_dir) = create_test_tracker().await;
+        register_stopped_service(&mut tracker, "svc").await;
+
+        // Stopped -> Starting
+        tracker
+            .apply_state_transition("svc", crate::service::StateTransition::starting())
+            .await
+            .unwrap();
+
+        // Starting -> Running with PID
+        tracker
+            .apply_state_transition("svc", crate::service::StateTransition::running_with_pid(42))
+            .await
+            .unwrap();
+
+        let state = tracker.get_service("svc").await.unwrap();
+        assert_eq!(state.status, Status::Running);
+        assert_eq!(state.pid, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_apply_transition_starting_to_running_with_container() {
+        let (mut tracker, _temp_dir) = create_test_tracker().await;
+        register_stopped_service(&mut tracker, "svc").await;
+
+        tracker
+            .apply_state_transition("svc", crate::service::StateTransition::starting())
+            .await
+            .unwrap();
+
+        tracker
+            .apply_state_transition(
+                "svc",
+                crate::service::StateTransition::running_with_container("abc123".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let state = tracker.get_service("svc").await.unwrap();
+        assert_eq!(state.status, Status::Running);
+        assert_eq!(state.container_id, Some("abc123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_apply_transition_stopped_clears_pid_and_container() {
+        let (mut tracker, _temp_dir) = create_test_tracker().await;
+        register_stopped_service(&mut tracker, "svc").await;
+
+        // Go through Starting -> Running (with PID) -> Stopping -> Stopped
+        tracker
+            .apply_state_transition("svc", crate::service::StateTransition::starting())
+            .await
+            .unwrap();
+        tracker
+            .apply_state_transition("svc", crate::service::StateTransition::running_with_pid(99))
+            .await
+            .unwrap();
+        tracker
+            .apply_state_transition("svc", crate::service::StateTransition::stopping())
+            .await
+            .unwrap();
+        tracker
+            .apply_state_transition("svc", crate::service::StateTransition::stopped())
+            .await
+            .unwrap();
+
+        let state = tracker.get_service("svc").await.unwrap();
+        assert_eq!(state.status, Status::Stopped);
+        assert_eq!(state.pid, None);
+        assert_eq!(state.container_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_apply_transition_invalid_stopped_to_running() {
+        let (mut tracker, _temp_dir) = create_test_tracker().await;
+        register_stopped_service(&mut tracker, "svc").await;
+
+        // Stopped -> Running is invalid (must go through Starting)
+        let result = tracker
+            .apply_state_transition("svc", crate::service::StateTransition::running())
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Invalid state transition"),
+            "Expected validation error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_transition_nonexistent_service() {
+        let (mut tracker, _temp_dir) = create_test_tracker().await;
+
+        let result = tracker
+            .apply_state_transition(
+                "no-such-service",
+                crate::service::StateTransition::starting(),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_apply_transition_running_to_healthy() {
+        let (mut tracker, _temp_dir) = create_test_tracker().await;
+        register_stopped_service(&mut tracker, "svc").await;
+
+        tracker
+            .apply_state_transition("svc", crate::service::StateTransition::starting())
+            .await
+            .unwrap();
+        tracker
+            .apply_state_transition("svc", crate::service::StateTransition::running())
+            .await
+            .unwrap();
+        tracker
+            .apply_state_transition("svc", crate::service::StateTransition::healthy())
+            .await
+            .unwrap();
+
+        let state = tracker.get_service("svc").await.unwrap();
+        assert_eq!(state.status, Status::Healthy);
+    }
+
+    #[tokio::test]
+    async fn test_apply_transition_running_to_failing() {
+        let (mut tracker, _temp_dir) = create_test_tracker().await;
+        register_stopped_service(&mut tracker, "svc").await;
+
+        tracker
+            .apply_state_transition("svc", crate::service::StateTransition::starting())
+            .await
+            .unwrap();
+        tracker
+            .apply_state_transition("svc", crate::service::StateTransition::running())
+            .await
+            .unwrap();
+        tracker
+            .apply_state_transition("svc", crate::service::StateTransition::failing())
+            .await
+            .unwrap();
+
+        let state = tracker.get_service("svc").await.unwrap();
+        assert_eq!(state.status, Status::Failing);
+    }
+
+    #[tokio::test]
+    async fn test_apply_transition_same_state_is_noop() {
+        let (mut tracker, _temp_dir) = create_test_tracker().await;
+        register_stopped_service(&mut tracker, "svc").await;
+
+        // Stopped -> Stopped should succeed (same-state is valid)
+        tracker
+            .apply_state_transition("svc", crate::service::StateTransition::stopped())
+            .await
+            .unwrap();
+
+        let state = tracker.get_service("svc").await.unwrap();
+        assert_eq!(state.status, Status::Stopped);
+    }
+
+    // ========================================================================
+    // CRUD operation tests
+    // ========================================================================
+
+    // --- register_service ---
+
+    #[tokio::test]
+    async fn test_register_service_new() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let state = make_service_state("svc-a", ServiceType::Process);
+        let outcome = tracker.register_service(state).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            RegistrationOutcome::Registered,
+            "First registration should return Registered"
+        );
+
+        let retrieved = tracker.get_service("svc-a").await;
+        assert!(
+            retrieved.is_some(),
+            "Service should be retrievable after registration"
+        );
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.id, "svc-a");
+        assert_eq!(retrieved.status, Status::Running);
+        assert_eq!(retrieved.service_type, ServiceType::Process);
+        assert_eq!(retrieved.pid, Some(99999));
+        assert_eq!(retrieved.namespace, "test");
+    }
+
+    #[tokio::test]
+    async fn test_register_service_duplicate_returns_already_exists() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let state = make_service_state("svc-a", ServiceType::Process);
+        let first = tracker.register_service(state).await.unwrap();
+        assert_eq!(first, RegistrationOutcome::Registered);
+
+        let state2 = make_service_state("svc-a", ServiceType::Docker);
+        let second = tracker.register_service(state2).await.unwrap();
+        assert_eq!(
+            second,
+            RegistrationOutcome::AlreadyExists {
+                status: Status::Running
+            },
+            "Second registration should return AlreadyExists with current status"
+        );
+
+        // The existing row must be left completely untouched
+        let retrieved = tracker.get_service("svc-a").await.unwrap();
+        assert_eq!(
+            retrieved.service_type,
+            ServiceType::Process,
+            "service_type must not change on duplicate registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_service_with_all_fields() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let state = ServiceState {
+            id: "full-svc".to_string(),
+            status: Status::Healthy,
+            service_type: ServiceType::Docker,
+            pid: None,
+            container_id: Some("abc123def".to_string()),
+            started_at: Utc::now(),
+            external_repo: Some("github.com/test/repo".to_string()),
+            namespace: "external".to_string(),
+            restart_count: 3,
+            last_restart_at: Some(Utc::now()),
+            consecutive_failures: 1,
+            port_allocations: HashMap::new(),
+            startup_message: Some("Running on port 8080".to_string()),
+        };
+        tracker.register_service(state).await.unwrap();
+
+        let retrieved = tracker.get_service("full-svc").await.unwrap();
+        assert_eq!(retrieved.status, Status::Healthy);
+        assert_eq!(retrieved.container_id, Some("abc123def".to_string()));
+        assert_eq!(
+            retrieved.external_repo,
+            Some("github.com/test/repo".to_string())
+        );
+        assert_eq!(retrieved.namespace, "external");
+        assert_eq!(retrieved.restart_count, 3);
+        assert!(retrieved.last_restart_at.is_some());
+        assert_eq!(retrieved.consecutive_failures, 1);
+        assert_eq!(
+            retrieved.startup_message,
+            Some("Running on port 8080".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_multiple_services() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        for name in &["alpha", "beta", "gamma"] {
+            let state = make_service_state(name, ServiceType::Process);
+            tracker.register_service(state).await.unwrap();
+        }
+
+        let services = tracker.get_services().await;
+        assert_eq!(services.len(), 3);
+        assert!(services.contains_key("alpha"));
+        assert!(services.contains_key("beta"));
+        assert!(services.contains_key("gamma"));
+    }
+
+    // --- unregister_service ---
+
+    #[tokio::test]
+    async fn test_unregister_service_removes_it() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let state = make_service_state("to-remove", ServiceType::Process);
+        tracker.register_service(state).await.unwrap();
+
+        // Confirm it exists
+        assert!(tracker.get_service("to-remove").await.is_some());
+
+        tracker.unregister_service("to-remove").await.unwrap();
+
+        // Confirm it's gone
+        assert!(tracker.get_service("to-remove").await.is_none());
+        let services = tracker.get_services().await;
+        assert!(!services.contains_key("to-remove"));
+    }
+
+    #[tokio::test]
+    async fn test_unregister_nonexistent_service_succeeds() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        // Unregistering a service that doesn't exist should not error
+        // (DELETE WHERE id = ? simply affects 0 rows)
+        let result = tracker.unregister_service("ghost").await;
+        assert!(
+            result.is_ok(),
+            "Unregistering nonexistent service should succeed silently"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unregister_does_not_affect_other_services() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let s1 = make_service_state("keep-me", ServiceType::Process);
+        let s2 = make_service_state("remove-me", ServiceType::Docker);
+        tracker.register_service(s1).await.unwrap();
+        tracker.register_service(s2).await.unwrap();
+
+        tracker.unregister_service("remove-me").await.unwrap();
+
+        assert!(tracker.get_service("keep-me").await.is_some());
+        assert!(tracker.get_service("remove-me").await.is_none());
+    }
+
+    // --- update_service_status ---
+
+    #[tokio::test]
+    async fn test_update_service_status_happy_path() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let state = make_service_state("svc", ServiceType::Process);
+        tracker.register_service(state).await.unwrap();
+
+        tracker
+            .update_service_status("svc", Status::Healthy)
+            .await
+            .unwrap();
+
+        let retrieved = tracker.get_service("svc").await.unwrap();
+        assert_eq!(retrieved.status, Status::Healthy);
+    }
+
+    #[tokio::test]
+    async fn test_update_service_status_multiple_transitions() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let state = ServiceState {
+            id: "svc".to_string(),
+            status: Status::Starting,
+            service_type: ServiceType::Process,
+            pid: None,
+            container_id: None,
+            started_at: Utc::now(),
+            external_repo: None,
+            namespace: "test".to_string(),
+            restart_count: 0,
+            last_restart_at: None,
+            consecutive_failures: 0,
+            port_allocations: HashMap::new(),
+            startup_message: None,
+        };
+        tracker.register_service(state).await.unwrap();
+
+        // Starting -> Running
+        tracker
+            .update_service_status("svc", Status::Running)
+            .await
+            .unwrap();
+        assert_eq!(
+            tracker.get_service("svc").await.unwrap().status,
+            Status::Running
+        );
+
+        // Running -> Healthy
+        tracker
+            .update_service_status("svc", Status::Healthy)
+            .await
+            .unwrap();
+        assert_eq!(
+            tracker.get_service("svc").await.unwrap().status,
+            Status::Healthy
+        );
+
+        // Healthy -> Stopping
+        tracker
+            .update_service_status("svc", Status::Stopping)
+            .await
+            .unwrap();
+        assert_eq!(
+            tracker.get_service("svc").await.unwrap().status,
+            Status::Stopping
+        );
+
+        // Stopping -> Stopped
+        tracker
+            .update_service_status("svc", Status::Stopped)
+            .await
+            .unwrap();
+        assert_eq!(
+            tracker.get_service("svc").await.unwrap().status,
+            Status::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_service_status_nonexistent_returns_error() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let result = tracker
+            .update_service_status("no-such-service", Status::Running)
+            .await;
+        assert!(result.is_err(), "Updating nonexistent service should error");
+
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("no-such-service"),
+            "Error should mention the service name, got: {}",
+            err_msg
+        );
+    }
+
+    // --- mark_dead_services ---
+
+    #[tokio::test]
+    async fn test_mark_dead_services_no_pid_no_container_running_status() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        // A service with Running status but no PID and no container_id
+        // should be considered stale (it claims to be running but has no
+        // process or container to back that claim).
+        let state = ServiceState {
+            id: "orphan".to_string(),
+            status: Status::Running,
+            service_type: ServiceType::Process,
+            pid: None,
+            container_id: None,
+            started_at: Utc::now(),
+            external_repo: None,
+            namespace: "test".to_string(),
+            restart_count: 0,
+            last_restart_at: None,
+            consecutive_failures: 0,
+            port_allocations: HashMap::new(),
+            startup_message: None,
+        };
+        tracker.register_service(state).await.unwrap();
+
+        let marked = tracker.mark_dead_services().await.unwrap();
+        assert_eq!(marked, 1, "Should mark 1 stale service");
+
+        // get_services filters stale, so it should be empty now
+        let services = tracker.get_services().await;
+        assert!(
+            services.is_empty(),
+            "Stale services should be filtered from get_services()"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_dead_services_stopped_not_marked() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        // A Stopped service with no PID should NOT be marked stale
+        let state = ServiceState {
+            id: "stopped-svc".to_string(),
+            status: Status::Stopped,
+            service_type: ServiceType::Process,
+            pid: None,
+            container_id: None,
+            started_at: Utc::now(),
+            external_repo: None,
+            namespace: "test".to_string(),
+            restart_count: 0,
+            last_restart_at: None,
+            consecutive_failures: 0,
+            port_allocations: HashMap::new(),
+            startup_message: None,
+        };
+        tracker.register_service(state).await.unwrap();
+
+        let marked = tracker.mark_dead_services().await.unwrap();
+        assert_eq!(marked, 0, "Stopped service should not be marked stale");
+
+        let services = tracker.get_services().await;
+        assert_eq!(services.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_mark_dead_services_with_dead_pid() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        // Spawn a short-lived process and wait for it to finish, giving us a
+        // PID that is guaranteed to be dead without relying on magic constants.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+
+        let state = ServiceState {
+            id: "dead-pid-svc".to_string(),
+            status: Status::Running,
+            service_type: ServiceType::Process,
+            pid: Some(dead_pid),
+            container_id: None,
+            started_at: Utc::now(),
+            external_repo: None,
+            namespace: "test".to_string(),
+            restart_count: 0,
+            last_restart_at: None,
+            consecutive_failures: 0,
+            port_allocations: HashMap::new(),
+            startup_message: None,
+        };
+        tracker.register_service(state).await.unwrap();
+
+        let marked = tracker.mark_dead_services().await.unwrap();
+        assert_eq!(marked, 1, "Service with dead PID should be marked stale");
+    }
+
+    // --- purge_stale_services ---
+
+    #[tokio::test]
+    async fn test_purge_stale_services_removes_stale() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        // Register a service that will become stale
+        let state = ServiceState {
+            id: "will-be-stale".to_string(),
+            status: Status::Running,
+            service_type: ServiceType::Process,
+            pid: None,
+            container_id: None,
+            started_at: Utc::now(),
+            external_repo: None,
+            namespace: "test".to_string(),
+            restart_count: 0,
+            last_restart_at: None,
+            consecutive_failures: 0,
+            port_allocations: HashMap::new(),
+            startup_message: None,
+        };
+        tracker.register_service(state).await.unwrap();
+
+        // Mark it stale
+        let marked = tracker.mark_dead_services().await.unwrap();
+        assert_eq!(marked, 1);
+
+        // Purge stale services
+        let purged = tracker.purge_stale_services().await.unwrap();
+        assert_eq!(purged, 1, "Should purge 1 stale service");
+
+        // Service should be completely gone now (even from get_service which doesn't filter stale)
+        assert!(
+            tracker.get_service("will-be-stale").await.is_none(),
+            "Purged service should be completely removed from the database"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_purge_stale_services_leaves_healthy() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        // Register a healthy service with a real-ish PID (current process)
+        let state = ServiceState {
+            id: "alive".to_string(),
+            status: Status::Stopped,
+            service_type: ServiceType::Process,
+            pid: None,
+            container_id: None,
+            started_at: Utc::now(),
+            external_repo: None,
+            namespace: "test".to_string(),
+            restart_count: 0,
+            last_restart_at: None,
+            consecutive_failures: 0,
+            port_allocations: HashMap::new(),
+            startup_message: None,
+        };
+        tracker.register_service(state).await.unwrap();
+
+        // No services should be marked stale (Stopped status is not "should be running")
+        let marked = tracker.mark_dead_services().await.unwrap();
+        assert_eq!(marked, 0);
+
+        let purged = tracker.purge_stale_services().await.unwrap();
+        assert_eq!(purged, 0, "No stale services to purge");
+
+        assert!(tracker.get_service("alive").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_purge_with_no_stale_services() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let purged = tracker.purge_stale_services().await.unwrap();
+        assert_eq!(purged, 0, "Purging empty tracker should return 0");
+    }
+
+    // --- is_service_registered ---
+
+    #[tokio::test]
+    async fn test_is_service_registered() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        assert!(!tracker.is_service_registered("svc").await);
+
+        let state = make_service_state("svc", ServiceType::Process);
+        tracker.register_service(state).await.unwrap();
+
+        assert!(tracker.is_service_registered("svc").await);
+
+        tracker.unregister_service("svc").await.unwrap();
+
+        assert!(!tracker.is_service_registered("svc").await);
+    }
+
+    // --- Bug: Starting status not marked stale ---
+
+    #[tokio::test]
+    async fn test_mark_dead_services_starting_no_pid_is_stale() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        // A service with Starting status but no PID and no container_id
+        // is clearly stale — the process was never spawned (start failed
+        // between registration and actual process creation).
+        let state = ServiceState {
+            id: "stuck-starting".to_string(),
+            status: Status::Starting,
+            service_type: ServiceType::Process,
+            pid: None,
+            container_id: None,
+            started_at: Utc::now(),
+            external_repo: None,
+            namespace: "test".to_string(),
+            restart_count: 0,
+            last_restart_at: None,
+            consecutive_failures: 0,
+            port_allocations: HashMap::new(),
+            startup_message: None,
+        };
+        tracker.register_service(state).await.unwrap();
+
+        let marked = tracker.mark_dead_services().await.unwrap();
+        assert_eq!(
+            marked, 1,
+            "Service with Starting status and no PID should be marked stale"
+        );
+
+        let services = tracker.get_services().await;
+        assert!(
+            services.is_empty(),
+            "Stale Starting service should be filtered from get_services()"
+        );
+    }
+
+    // --- Bug: register_service clobbers existing service status ---
+
+    #[tokio::test]
+    async fn test_register_service_does_not_clobber_running_status() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        // Register a service as Running (simulates a successfully started service)
+        let state = ServiceState {
+            id: "svc".to_string(),
+            status: Status::Running,
+            service_type: ServiceType::Process,
+            pid: Some(12345),
+            container_id: None,
+            started_at: Utc::now(),
+            external_repo: None,
+            namespace: "test".to_string(),
+            restart_count: 0,
+            last_restart_at: None,
+            consecutive_failures: 0,
+            port_allocations: HashMap::new(),
+            startup_message: None,
+        };
+        tracker.register_service(state).await.unwrap();
+
+        // Try to register again (simulates a concurrent or duplicate start attempt)
+        let new_state = ServiceState {
+            id: "svc".to_string(),
+            status: Status::Starting,
+            service_type: ServiceType::Process,
+            pid: None,
+            container_id: None,
+            started_at: Utc::now(),
+            external_repo: None,
+            namespace: "test".to_string(),
+            restart_count: 0,
+            last_restart_at: None,
+            consecutive_failures: 0,
+            port_allocations: HashMap::new(),
+            startup_message: None,
+        };
+        let outcome = tracker.register_service(new_state).await.unwrap();
+        assert_eq!(
+            outcome,
+            RegistrationOutcome::AlreadyExists {
+                status: Status::Running
+            },
+            "Should return AlreadyExists with the existing Running status"
+        );
+
+        // The existing service's row must be completely untouched
+        let retrieved = tracker.get_service("svc").await.unwrap();
+        assert_eq!(
+            retrieved.status,
+            Status::Running,
+            "register_service must not clobber existing Running status to Starting"
+        );
+        assert_eq!(
+            retrieved.pid,
+            Some(12345),
+            "register_service must not lose the existing PID"
+        );
+    }
+}
