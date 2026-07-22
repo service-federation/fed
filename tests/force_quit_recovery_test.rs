@@ -1,8 +1,11 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use tempfile::TempDir;
+
+#[path = "support/mod.rs"]
+mod support;
 
 fn create_recovery_test_config() -> (TempDir, PathBuf) {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -14,9 +17,8 @@ services:
     process: |
       echo "Service starting"
       sleep 300
-    restart_policy:
-      on_failure:
-        max_retries: 3
+    restart: !onfailure
+      max_retries: 3
 
   simple-service:
     process: |
@@ -545,4 +547,171 @@ services:
         .expect("Failed to cleanup");
 
     assert!(cleanup.status.success(), "Cleanup should succeed");
+}
+
+// =============================================================================
+// Restart-on-failure recovery (watch mode)
+// =============================================================================
+//
+// `restart:` only has an observable effect while the monitoring loop is
+// running, and `start_monitoring` skips entirely in the default `file`
+// output mode used by plain `fed start` — only `fed start --watch`
+// (`captured` output by default) keeps it alive. So these tests drive the
+// scenario through `--watch`, spawned in the background so the test can
+// kill it once it's done, rather than the `.output()` pattern used above.
+//
+// The fixture process is `sleep 1 && exit 1`, not a bare `exit 1`: an
+// immediate failure trips `ProcessService::start`'s 300ms startup probe
+// before watch mode (and therefore the monitoring loop) ever begins, which
+// would make the test pass or fail for the wrong reason. Waiting past the
+// probe, then dying, is what actually reaches `run_monitoring_loop`.
+
+/// Fixture for the watch-mode restart tests: a service whose process exits
+/// ~1s after starting (past the 300ms startup probe), with or without a
+/// `restart: !onfailure` policy attached.
+fn create_flaky_service_config(with_restart_policy: bool) -> (TempDir, PathBuf) {
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("test-config.yaml");
+
+    let restart_block = if with_restart_policy {
+        "    restart: !onfailure\n      max_retries: 3\n"
+    } else {
+        ""
+    };
+
+    let config_content =
+        format!("services:\n  flaky-service:\n    process: sleep 1 && exit 1\n{restart_block}");
+
+    // Sanity check at the point of authorship: this is exactly the bug that
+    // shipped nine vacuous tests in this file before — a fixture key that
+    // doesn't parse into the field the test thinks it does. The standing
+    // audit (`tests/config_key_audit_test.rs`) covers every fixture in the
+    // repo structurally; this is the same check inline, for this one.
+    support::parse_checked(&config_content);
+
+    fs::write(&config_path, &config_content).expect("Failed to write test config");
+    (temp_dir, config_path)
+}
+
+/// Best-effort kill+reap so a panic mid-test doesn't leak a running
+/// `fed --watch` process on CI.
+fn kill_best_effort(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Run `fed debug state --json` (a fresh, ordinary invocation — not the
+/// spawned `--watch` process) and return the `restart_count` for `service`.
+/// This is the "stateless CLI rebuilds from SQLite" contract that makes it
+/// possible to assert on the watch process's behavior from the outside.
+fn restart_count_for(config_path: &Path, workdir: &str, service: &str) -> u64 {
+    let debug_output = Command::new(fed_binary())
+        .args([
+            "-c",
+            config_path.to_str().unwrap(),
+            "-w",
+            workdir,
+            "debug",
+            "state",
+            "--json",
+        ])
+        .output()
+        .expect("Failed to run debug state");
+
+    let stdout = String::from_utf8_lossy(&debug_output.stdout);
+    let state: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("debug state --json did not produce valid JSON: {e}\nstdout: {stdout}")
+    });
+
+    let services = state["services"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no 'services' array in debug state: {stdout}"));
+
+    let service_state = services
+        .iter()
+        .find(|s| s["name"] == service)
+        .unwrap_or_else(|| panic!("service '{service}' missing from debug state: {stdout}"));
+
+    service_state["restart_count"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no numeric restart_count for '{service}': {stdout}"))
+}
+
+#[test]
+fn test_restart_on_failure_recovers() {
+    let (temp_dir, config_path) = create_flaky_service_config(true);
+    let workdir = temp_dir.path().to_str().unwrap();
+
+    let mut watch_child = Command::new(fed_binary())
+        .args([
+            "-c",
+            config_path.to_str().unwrap(),
+            "-w",
+            workdir,
+            "start",
+            "flaky-service",
+            "--watch",
+        ])
+        .spawn()
+        .expect("Failed to spawn watch mode");
+
+    // The process dies at ~1s; the monitoring loop ticks every 5s. Sleep
+    // past two-plus ticks (loose, matching this file's existing sleep
+    // pattern) so at least one restart has had a chance to fire and be
+    // recorded, without pinning the assertion to exact tick timing.
+    std::thread::sleep(Duration::from_secs(13));
+
+    let restart_count = restart_count_for(&config_path, workdir, "flaky-service");
+
+    kill_best_effort(&mut watch_child);
+    Command::new(fed_binary())
+        .args(["-c", config_path.to_str().unwrap(), "-w", workdir, "stop"])
+        .output()
+        .ok();
+
+    assert!(
+        restart_count > 0,
+        "restart: !onfailure should have triggered at least one restart after \
+         the monitored process died, but restart_count was {restart_count}"
+    );
+}
+
+/// Negative control for `test_restart_on_failure_recovers`: same failing
+/// process, no `restart:` (defaults to `RestartPolicy::No`). Without this,
+/// a bug that always increments `restart_count` regardless of policy would
+/// pass the positive test too — this is what proves the harness actually
+/// checks the policy, not just "some counter is nonzero".
+#[test]
+fn test_restart_no_policy_does_not_recover() {
+    let (temp_dir, config_path) = create_flaky_service_config(false);
+    let workdir = temp_dir.path().to_str().unwrap();
+
+    let mut watch_child = Command::new(fed_binary())
+        .args([
+            "-c",
+            config_path.to_str().unwrap(),
+            "-w",
+            workdir,
+            "start",
+            "flaky-service",
+            "--watch",
+        ])
+        .spawn()
+        .expect("Failed to spawn watch mode");
+
+    std::thread::sleep(Duration::from_secs(13));
+
+    let restart_count = restart_count_for(&config_path, workdir, "flaky-service");
+
+    kill_best_effort(&mut watch_child);
+    Command::new(fed_binary())
+        .args(["-c", config_path.to_str().unwrap(), "-w", workdir, "stop"])
+        .output()
+        .ok();
+
+    assert_eq!(
+        restart_count, 0,
+        "no restart policy (defaults to RestartPolicy::No) should never restart, \
+         but restart_count was {restart_count}"
+    );
 }

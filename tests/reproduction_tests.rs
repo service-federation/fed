@@ -7,7 +7,7 @@ use fed::Parser;
 /// 1. TOCTOU race condition in monitoring loop (service removed during health check)
 /// 2. Race condition in state tracker (concurrent failure increments)
 /// 3. Lock ordering deadlock (inconsistent lock acquisition order)
-use fed::config::ServiceType;
+use fed::config::{Config, Parameter, Service, ServiceType};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -843,53 +843,93 @@ async fn FIXED_atomic_two_concurrent_increments() {
 
 /// TEST 5: Parameter Resolution State Inconsistency
 ///
-/// Scenario:
-/// 1. External service parameters are resolved in one pass
-/// 2. Main config parameters in another pass
-/// 3. Parameter values could diverge between these passes
-#[tokio::test]
-async fn repro_parameter_resolution_inconsistency() {
-    let config_content = r#"
-parameters:
-  PORT:
-    type: port
-    default: 9000
+/// Regression test for the two concerns the old (vacuous) version of this
+/// test only gestured at in comments — it built a config with a made-up
+/// `external_service_parameters` key (not a real field anywhere in the
+/// schema), then spawned 5 tasks that each locked a mutex and returned their
+/// loop index, never actually calling parameter resolution. Real coverage:
+///
+/// 1. A single resolver's second pass (`resolve_config`, template
+///    substitution) must use the exact value its own first pass
+///    (`resolve_parameters`) computed — no drift between passes.
+/// 2. Independent resolvers running concurrently (the realistic shape of
+///    two concurrent `fed start` invocations in different isolated
+///    projects, each with its own `Resolver`) must not be handed the same
+///    allocated port — `Resolver::new()` defaults to a `NoopPortStore`, so
+///    each resolver here binds a real, uncached OS port via
+///    `PortAllocator::allocate_random_port`, making a collision meaningful
+///    rather than trivially impossible.
+///
+/// This is conceptually adjacent to but distinct from `port_toctou_test.rs`
+/// (which tests `PortAllocator` directly against raw `TcpListener`s, not the
+/// `Resolver`'s two-pass `resolve_parameters`/`resolve_config` flow).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_resolvers_get_consistent_non_conflicting_ports() {
+    fn resolve_once(id: u32) -> (u16, String) {
+        let mut config = Config::default();
+        config.parameters.insert(
+            "PORT".to_string(),
+            Parameter {
+                param_type: Some("port".to_string()),
+                ..Default::default()
+            },
+        );
+        let service_name = format!("svc-{id}");
+        config.services.insert(
+            service_name.clone(),
+            Service {
+                process: Some("sleep 10".to_string()),
+                environment: std::collections::HashMap::from([(
+                    "PORT".to_string(),
+                    "{{PORT}}".to_string(),
+                )]),
+                ..Default::default()
+            },
+        );
 
-services:
-  main:
-    process: 'sleep 10'
-    environment:
-      PORT: '{{PORT}}'
-    external_service_parameters:
-      - name: PORT
-        mapping: '{{PORT}}'
-"#;
+        let mut resolver = fed::parameter::Resolver::new();
+        resolver
+            .resolve_parameters(&mut config)
+            .expect("resolve_parameters");
+        let first_pass = resolver
+            .get_resolved_parameters()
+            .get("PORT")
+            .expect("PORT resolved in first pass")
+            .clone();
 
-    let parser = Parser::new();
-    let config = parser.parse_config(config_content).unwrap();
+        let final_config = resolver.resolve_config(&config).expect("resolve_config");
+        let second_pass = final_config.services[&service_name].environment["PORT"].clone();
 
-    // Simulate concurrent resolution attempts
-    let config_arc = Arc::new(tokio::sync::Mutex::new(config));
-
-    let mut handles = vec![];
-    for i in 0..5 {
-        let cfg = config_arc.clone();
-        let handle = tokio::spawn(async move {
-            // Each task tries to resolve parameters
-            // In the real code, parameter values could differ between tasks
-            // if resolution happens in multiple passes
-            let _cfg = cfg.lock().await;
-            // Would call resolver.resolve_parameters() and resolver.resolve_config()
-            // separately, creating potential inconsistency
-            i
-        });
-        handles.push(handle);
+        (
+            first_pass.parse().expect("resolved PORT is a valid u16"),
+            second_pass,
+        )
     }
 
-    let _results: Vec<_> = futures::future::join_all(handles).await;
+    let handles: Vec<_> = (0..5)
+        .map(|i| tokio::task::spawn_blocking(move || resolve_once(i)))
+        .collect();
+    let results: Vec<(u16, String)> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.expect("resolver task panicked"))
+        .collect();
 
-    println!("✓ Parameter resolution test completed");
-    println!("  Note: Real inconsistency would show if parameters resolved in different passes");
+    for (port, second_pass) in &results {
+        assert_eq!(
+            port.to_string(),
+            *second_pass,
+            "resolve_config drifted from the value resolve_parameters computed"
+        );
+    }
+
+    let distinct: std::collections::HashSet<u16> = results.iter().map(|(p, _)| *p).collect();
+    assert_eq!(
+        distinct.len(),
+        results.len(),
+        "concurrent resolvers allocated the same port to two services: {:?}",
+        results
+    );
 }
 
 /// ACTUAL BUG REPRODUCTION: "Service not found" paradox with stale lock files

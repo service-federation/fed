@@ -96,7 +96,6 @@ dotenvy = "0.15"
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tui-textarea = "0.6"
-cli-clipboard = "0.4"
 futures = "0.3"
 unicode-width = "0.1"
 

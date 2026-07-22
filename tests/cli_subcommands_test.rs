@@ -31,12 +31,6 @@ services:
 scripts:
   test-script:
     script: echo "Script executed"
-
-install:
-  - echo "Installing..."
-
-clean:
-  - echo "Cleaning..."
 "#;
     fs::write(&config_path, config).expect("Failed to write config");
     config_path.to_str().unwrap().to_string()

@@ -102,6 +102,15 @@ Add health check retry with exponential backoff
 - Write integration tests for new features
 - Ensure existing tests continue to pass
 - Docker-related tests should be marked with `#[ignore]` and include `// Requires Docker` comment
+- When a new integration test builds a fed-config YAML fixture inline, parse
+  it through `support::parse_checked` (`tests/support/mod.rs`) instead of a
+  bare `Parser::parse_config(..).unwrap()`. fed's config parser is
+  deliberately permissive about unknown keys (a typo is a warning, not a
+  parse error), so a typo'd or made-up field in a fixture silently falls
+  back to "field absent" instead of failing the test that's supposed to
+  exercise it. `parse_checked` turns that into an immediate, loud failure.
+  `tests/config_key_audit_test.rs` is the standing gate that catches drift
+  in existing fixtures across the whole `tests/` tree either way.
 
 ## Architecture Overview
 

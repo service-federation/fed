@@ -97,6 +97,38 @@ jobs:
       - name: Run Docker-backed integration tests
         run: cargo test --features docker-tests -- --test-threads=1
 
+  future-incompat:
+    name: Future-incompat check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Catches a dependency that rustc will make a hard error in a future
+      # release before it bites us (e.g. block v0.1.6's uninhabited static,
+      # rust-lang/rust#74840 — dropped along with cli-clipboard, its sole
+      # entry point into this tree). No new tool: this reuses `cargo build`.
+      - name: Build and check for future-incompat warnings
+        run: |
+          cargo build --future-incompat-report 2>&1 | tee build.log
+          if grep -q "will be rejected by a future version of Rust" build.log; then
+            echo "::error::A dependency will be rejected by a future Rust version. Run 'cargo report future-incompatibilities' locally."
+            exit 1
+          fi
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
