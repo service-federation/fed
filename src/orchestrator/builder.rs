@@ -47,6 +47,7 @@ pub struct OrchestratorBuilder {
     replace_mode: bool,
     dry_run: bool,
     readonly: bool,
+    supervisor_attach: bool,
     isolation_id: Option<String>,
     startup_timeout: Option<Duration>,
     stop_timeout: Option<Duration>,
@@ -64,6 +65,7 @@ impl OrchestratorBuilder {
             replace_mode: false,
             dry_run: false,
             readonly: false,
+            supervisor_attach: false,
             isolation_id: None,
             startup_timeout: None,
             stop_timeout: None,
@@ -157,6 +159,25 @@ impl OrchestratorBuilder {
         self
     }
 
+    /// Enable supervisor-attach initialization.
+    ///
+    /// When enabled, `build()` calls `initialize_supervisor()` instead of
+    /// `initialize()`/`initialize_readonly()`/`initialize_dry_run()` — the
+    /// attach-and-reconcile path used exclusively by the `fed __supervise`
+    /// process (`07-supervisor.md` Design §1). This is the operation flag
+    /// this plan adds alongside `.readonly()`/`.dry_run()`, per
+    /// `01-run-context.md`'s categorization of per-orchestrator behavior
+    /// switches as operation flags rather than `RunContext` session state —
+    /// and per this plan's own re-anchoring note, it is the *only*
+    /// construction path that keeps both `clippy::disallowed_methods` and
+    /// `scripts/check-orchestrator-construction.sh` green, so no
+    /// `ALLOW-RAW-ORCHESTRATOR-CONSTRUCTION` marker is needed anywhere for
+    /// the supervisor's construction.
+    pub fn supervisor_attach(mut self, supervisor_attach: bool) -> Self {
+        self.supervisor_attach = supervisor_attach;
+        self
+    }
+
     /// Set an isolation ID for this orchestrator's Docker containers and
     /// persisted port scope.
     ///
@@ -195,9 +216,18 @@ impl OrchestratorBuilder {
         // clippy::disallowed_methods (clippy.toml) forbids Orchestrator::new/
         // new_ephemeral everywhere else so settings-threading always goes
         // through apply_run_context below, not hand-rolled setter calls.
+        //
+        // supervisor_attach also takes the new_ephemeral (in-memory, no
+        // `.fed/.lock`) branch: initialize_supervisor() is responsible for
+        // swapping in the real, unlocked, on-disk tracker
+        // (`StateTracker::new_for_supervisor`) as its first step, so the
+        // supervisor's construction never touches `.fed/.lock` at any point
+        // — not even transiently during `Orchestrator::new`'s own
+        // lock-then-immediately-drop, which would otherwise be a brief but
+        // real acquisition (`07-supervisor.md` Design §1).
         let work_dir = self.work_dir.unwrap_or_else(|| PathBuf::from("."));
         #[allow(clippy::disallowed_methods)]
-        let mut orchestrator = if self.dry_run {
+        let mut orchestrator = if self.dry_run || self.supervisor_attach {
             Orchestrator::new_ephemeral(config, work_dir).await?
         } else {
             Orchestrator::new(config, work_dir).await?
@@ -233,11 +263,15 @@ impl OrchestratorBuilder {
         // Initialize mode selection:
         // - dry_run: resolve-only preview path (no persistent state writes)
         // - readonly: status/logs path (skip parameter resolution)
+        // - supervisor_attach: `fed __supervise`'s attach-and-reconcile path
+        //   (`07-supervisor.md` Design §1)
         // - default: full initialization
         if self.dry_run {
             orchestrator.initialize_dry_run().await?;
         } else if self.readonly {
             orchestrator.initialize_readonly().await?;
+        } else if self.supervisor_attach {
+            orchestrator.initialize_supervisor().await?;
         } else {
             orchestrator.initialize().await?;
         }
@@ -292,5 +326,64 @@ mod tests {
             .build()
             .await;
         assert!(result.is_ok(), "Builder failed: {:?}", result.err());
+    }
+
+    /// The fourth arm added by `07-supervisor.md` Design §1:
+    /// `.supervisor_attach(true)` must route through
+    /// `Orchestrator::initialize_supervisor()`, not `initialize()`/
+    /// `initialize_readonly()`/`initialize_dry_run()`. Verified two ways:
+    /// the supervisor-safe tracker never holds `.fed/.lock` (unlike a
+    /// normal `initialize()`-backed tracker would), and monitoring is
+    /// started unconditionally (part of what `initialize_supervisor`
+    /// alone does).
+    #[tokio::test]
+    async fn test_builder_supervisor_attach_arm() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let config = Config::default();
+        let orchestrator = OrchestratorBuilder::new()
+            .config(config)
+            .work_dir(temp_dir.path().to_path_buf())
+            .supervisor_attach(true)
+            .build()
+            .await
+            .expect("supervisor_attach build should succeed on a fresh directory");
+
+        assert!(
+            !temp_dir.path().join(".fed").join(".lock").exists(),
+            "supervisor_attach must never create/hold .fed/.lock"
+        );
+
+        assert!(
+            orchestrator.monitoring_task.lock().await.is_some(),
+            "initialize_supervisor must start monitoring unconditionally, \
+             regardless of output mode"
+        );
+    }
+
+    /// `.supervisor_attach(true)` takes priority in the same way `.dry_run()`
+    /// and `.readonly()` do today — asserted here by checking the negative
+    /// space: without the flag, a fresh directory build still goes through
+    /// plain `initialize()`, which is exercised by the other tests in this
+    /// module; this test exists so a future refactor that accidentally
+    /// drops the `else if self.supervisor_attach` arm (falling through to
+    /// plain `initialize()`) is caught by the `.fed/.lock` assertion above,
+    /// not silently passing because `initialize_supervisor()` and
+    /// `initialize()` both happen to succeed on an empty config.
+    #[tokio::test]
+    async fn test_builder_without_supervisor_attach_holds_normal_lock() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let config = Config::default();
+        let _orchestrator = OrchestratorBuilder::new()
+            .config(config)
+            .work_dir(temp_dir.path().to_path_buf())
+            .build()
+            .await
+            .expect("plain build should succeed on a fresh directory");
+
+        assert!(
+            temp_dir.path().join(".fed").join(".lock").exists(),
+            "a plain (non-supervisor_attach) build must go through the normal, \
+             locked StateTracker::new — .fed/.lock should exist"
+        );
     }
 }

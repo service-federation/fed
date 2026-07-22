@@ -21,11 +21,11 @@
 //! - [`restart_single_service`]: Handles restart with backoff for one service
 //! - [`execute_health_check_cycle`]: Orchestrates a complete health check cycle
 
-use crate::config::{Config, RestartPolicy};
+use crate::config::{Config, DependencyFailurePolicy, RestartPolicy};
 use crate::error::{Error, Result};
 use crate::service::{ServiceManager, Status};
 use crate::state::StateTracker;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -100,6 +100,17 @@ pub(super) fn calculate_backoff_delay(consecutive_failures: u32) -> Duration {
 /// Only checks services that are in Running, Healthy, or Failing state.
 /// Uses concurrent futures to check all services in parallel.
 ///
+/// # Scope
+///
+/// `scope`, if `Some`, restricts health-checking to services whose name is
+/// in the set — everything else is skipped entirely (not even a liveness
+/// check), matching the supervisor's filtered-monitoring policy
+/// (`07-supervisor.md` Design §2; see [`supervised_service_names`] for the
+/// scope formula). `None` preserves today's behavior exactly: every
+/// Running/Healthy/Failing service is checked, unfiltered — this is what
+/// `--watch`/`fed tui` (via [`Orchestrator::start_monitoring`]) always pass,
+/// so their behavior is bit-identical to before this parameter existed.
+///
 /// # Lock Optimization
 ///
 /// Acquires the services read lock ONCE, collects all service Arcs, then
@@ -109,7 +120,10 @@ pub(super) fn calculate_backoff_delay(consecutive_failures: u32) -> Duration {
 ///
 /// Previously: N lock acquisitions (one per service)
 /// Now: 1 lock acquisition for all services
-async fn check_all_services(services: &ServicesMap) -> Vec<HealthCheckResult> {
+async fn check_all_services(
+    services: &ServicesMap,
+    scope: Option<&HashSet<String>>,
+) -> Vec<HealthCheckResult> {
     // Acquire read lock once and collect all service entries
     #[allow(clippy::type_complexity)]
     let service_entries: Vec<(String, Arc<Mutex<Box<dyn ServiceManager>>>)> = {
@@ -122,6 +136,15 @@ async fn check_all_services(services: &ServicesMap) -> Vec<HealthCheckResult> {
     let mut health_check_tasks = Vec::new();
 
     for (service_name, manager_arc) in service_entries {
+        // Out-of-scope services are skipped entirely — not even a liveness
+        // check — so monitoring a large project costs nothing for services
+        // nobody asked to have supervised.
+        if let Some(scope) = scope
+            && !scope.contains(&service_name)
+        {
+            continue;
+        }
+
         // Check if we should monitor this service
         let should_check = {
             let manager = manager_arc.lock().await;
@@ -150,6 +173,66 @@ async fn check_all_services(services: &ServicesMap) -> Vec<HealthCheckResult> {
 
     // Run all health checks concurrently
     futures::future::join_all(health_check_tasks).await
+}
+
+/// Compute the supervisor's health-check scope: the union of every service
+/// with a restart policy plus every dependency target whose failure someone
+/// has explicitly opted into caring about.
+///
+/// `restart:` and `depends_on: ...on_failure:` are two separate,
+/// already-shipped, orthogonal features — a service can have `restart: no`
+/// and still configure `on_failure: restart` against one of its
+/// dependencies, wanting to come back specifically when that dependency
+/// fails, with no general self-healing otherwise. Narrowing scope to "only
+/// services with `restart != No`" would silently stop firing `on_failure`
+/// handling for any dependency chain where the *failing* link has
+/// `restart: no` — under plain `fed start`, since that link would no longer
+/// be health-checked at all, its failure would never be detected, so
+/// nothing downstream would ever be told about it.
+///
+/// ```text
+/// scope = { s : s.restart != No }
+///       ∪ { d : d is a depends_on target of some s where either
+///               s.restart != No, or
+///               s's failure_policy for that dependency is not Ignore }
+/// ```
+///
+/// In words: check the health of every service that either wants its *own*
+/// crashes healed, or whose failure someone else has explicitly said they
+/// care about via `on_failure`. This is less obvious than "just
+/// restart-policy services" and is a case a future maintainer could
+/// plausibly "simplify" back into the parity gap above — don't.
+///
+/// [`handle_dependency_health_propagation`] itself is unaffected by this
+/// function and continues to act on the full dependent set regardless of a
+/// dependent's own restart policy — narrowing *that* too would break the
+/// existing, shipped `on_failure` feature for services with `restart: no`.
+///
+/// Recomputed once per supervisor tick (cheap; called fresh from `config`
+/// each cycle) so a later `fed start <new-service>` in the same directory is
+/// picked up without restarting the supervisor.
+pub(super) fn supervised_service_names(config: &Config) -> HashSet<String> {
+    let mut scope: HashSet<String> = HashSet::new();
+
+    for (name, service) in &config.services {
+        let restart_enabled = !matches!(
+            service.restart.clone().unwrap_or(RestartPolicy::No),
+            RestartPolicy::No
+        );
+        if restart_enabled {
+            scope.insert(name.clone());
+        }
+
+        for depends_on in &service.depends_on {
+            let someone_cares = restart_enabled
+                || !matches!(depends_on.failure_policy(), DependencyFailurePolicy::Ignore);
+            if someone_cares {
+                scope.insert(depends_on.service_name().to_string());
+            }
+        }
+    }
+
+    scope
 }
 
 /// Classify health results into healthy and unhealthy services.
@@ -324,14 +407,18 @@ async fn restart_single_service(
 ///
 /// Note: Dead service cleanup is NOT done here - it runs on startup only.
 /// This keeps the hot loop fast and predictable.
+///
+/// `scope` is forwarded verbatim to [`check_all_services`] — see that
+/// function's doc comment for the `None`-means-unfiltered contract.
 async fn execute_health_check_cycle(
     services: &ServicesMap,
     state_tracker: &StateTrackerRef,
     config: &Config,
     cancel_token: &CancellationToken,
+    scope: Option<&HashSet<String>>,
 ) {
     // Check all services concurrently
-    let health_results = check_all_services(services).await;
+    let health_results = check_all_services(services, scope).await;
 
     // Classify results
     let (healthy_names, unhealthy) = classify_health_results(health_results);
@@ -524,8 +611,6 @@ async fn handle_dependency_health_propagation(
     state_tracker: &StateTrackerRef,
     config: &Config,
 ) {
-    use crate::config::DependencyFailurePolicy;
-
     // Build reverse dependency map: dependency -> dependents
     let mut reverse_deps: HashMap<String, Vec<(String, DependencyFailurePolicy)>> = HashMap::new();
 
@@ -691,12 +776,23 @@ async fn apply_health_check_jitter() {
 ///
 /// Wraps each health check cycle in panic handling to prevent
 /// silent monitoring death from unexpected panics.
+///
+/// `filter_scope`: when `false`, every cycle passes `None` to
+/// [`execute_health_check_cycle`] — bit-identical to the pre-existing,
+/// unfiltered `--watch`/`tui` behavior. When `true`, [`supervised_service_names`]
+/// is recomputed fresh from `config` on *every* tick (cheap — a HashMap scan)
+/// rather than once at spawn time, so a later `fed start <new-service>` in
+/// the same directory would be picked up without restarting the supervisor,
+/// if `config` were ever live-reloaded (not yet implemented — but this keeps
+/// the loop shaped so that adding it later doesn't require touching this
+/// function again).
 async fn run_monitoring_loop(
     services: ServicesMap,
     state_tracker: StateTrackerRef,
     config: Config,
     cancel_token: CancellationToken,
     startup_complete: Arc<std::sync::atomic::AtomicBool>,
+    filter_scope: bool,
 ) {
     use futures::FutureExt;
     use std::panic::AssertUnwindSafe;
@@ -724,6 +820,14 @@ async fn run_monitoring_loop(
                 let state_tracker_clone = Arc::clone(&state_tracker);
                 let config_clone = config.clone();
 
+                // Recomputed fresh each tick, not cached across ticks — see
+                // this function's doc comment.
+                let scope = if filter_scope {
+                    Some(supervised_service_names(&config_clone))
+                } else {
+                    None
+                };
+
                 let cancel_token_clone = cancel_token.clone();
                 let health_check_result = AssertUnwindSafe(async {
                     execute_health_check_cycle(
@@ -731,6 +835,7 @@ async fn run_monitoring_loop(
                         &state_tracker_clone,
                         &config_clone,
                         &cancel_token_clone,
+                        scope.as_ref(),
                     )
                     .await;
                 })
@@ -798,6 +903,28 @@ impl Orchestrator {
             return;
         }
 
+        self.spawn_monitoring_loop(false).await;
+    }
+
+    /// Start monitoring unconditionally, regardless of output mode, scoped to
+    /// [`supervised_service_names`] rather than every service.
+    ///
+    /// Used exclusively by [`Orchestrator::initialize_supervisor`]
+    /// (`07-supervisor.md` Design §1/§2/§6): a supervisor exists precisely to
+    /// watch backgrounded (`OutputMode::File`) services, so the
+    /// output-mode skip in [`Orchestrator::start_monitoring`] above must not
+    /// apply, and its health-check scope must be the restart-policy/
+    /// dependency union rather than "every service" (the cost argument for
+    /// scoping only matters once monitoring actually runs unconditionally).
+    pub(super) async fn start_monitoring_for_supervisor(&self) {
+        self.spawn_monitoring_loop(true).await;
+    }
+
+    /// Shared spawn logic for [`Orchestrator::start_monitoring`] and
+    /// [`Orchestrator::start_monitoring_for_supervisor`] — the only
+    /// difference between the two call sites is whether the loop filters its
+    /// health-check scope.
+    async fn spawn_monitoring_loop(&self, filter_scope: bool) {
         let services = Arc::clone(&self.services);
         let config = self.config.clone();
         let state_tracker = Arc::clone(&self.state_tracker);
@@ -810,6 +937,7 @@ impl Orchestrator {
             config,
             cancel_token,
             startup_complete,
+            filter_scope,
         ));
 
         // Store the handle so we can await it during cleanup
@@ -882,5 +1010,278 @@ mod tests {
             let delay = calculate_backoff_delay(10);
             assert!(delay.as_secs() <= 90);
         }
+    }
+
+    // --- supervised_service_names (07-supervisor.md Design §2 union formula) ---
+
+    fn service_with_restart(restart: Option<RestartPolicy>) -> crate::config::Service {
+        crate::config::Service {
+            process: Some("sleep 300".to_string()),
+            restart,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_supervised_service_names_restart_policy_included() {
+        let mut config = Config::default();
+        config.services.insert(
+            "always".to_string(),
+            service_with_restart(Some(RestartPolicy::Always)),
+        );
+        config.services.insert(
+            "on-failure".to_string(),
+            service_with_restart(Some(RestartPolicy::OnFailure {
+                max_retries: Some(3),
+            })),
+        );
+        config.services.insert(
+            "no-restart".to_string(),
+            service_with_restart(Some(RestartPolicy::No)),
+        );
+        config
+            .services
+            .insert("unset".to_string(), service_with_restart(None));
+
+        let scope = supervised_service_names(&config);
+
+        assert!(scope.contains("always"));
+        assert!(scope.contains("on-failure"));
+        assert!(
+            !scope.contains("no-restart"),
+            "restart: no must not be in scope on its own"
+        );
+        assert!(
+            !scope.contains("unset"),
+            "unset restart (defaults to No) must not be in scope on its own"
+        );
+    }
+
+    #[test]
+    fn test_supervised_service_names_union_includes_on_failure_restart_dependency() {
+        use crate::config::{DependencyFailurePolicy, DependsOn};
+
+        // `dependent` has restart: no, but explicitly opts in to
+        // on_failure: restart against `dependency` — dependency must be in
+        // scope even though dependent itself is not, and even though
+        // dependency's own restart policy is `no`. This is the direct test
+        // for the union formula, not just "restart != No".
+        let mut config = Config::default();
+        config.services.insert(
+            "dependency".to_string(),
+            service_with_restart(Some(RestartPolicy::No)),
+        );
+        let mut dependent = service_with_restart(Some(RestartPolicy::No));
+        dependent.depends_on = vec![DependsOn::Structured {
+            service: "dependency".to_string(),
+            on_failure: DependencyFailurePolicy::Restart,
+        }];
+        config.services.insert("dependent".to_string(), dependent);
+
+        let scope = supervised_service_names(&config);
+
+        assert!(
+            scope.contains("dependency"),
+            "dependency must be in scope: dependent explicitly cares about its failure"
+        );
+        assert!(
+            !scope.contains("dependent"),
+            "dependent itself has restart: no and isn't anyone's on_failure target"
+        );
+    }
+
+    #[test]
+    fn test_supervised_service_names_ignore_policy_excluded() {
+        use crate::config::{DependencyFailurePolicy, DependsOn};
+
+        // `dependent` explicitly ignores dependency's failures and has no
+        // restart policy of its own — dependency must NOT be pulled into
+        // scope just because a depends_on edge exists.
+        let mut config = Config::default();
+        config.services.insert(
+            "dependency".to_string(),
+            service_with_restart(Some(RestartPolicy::No)),
+        );
+        let mut dependent = service_with_restart(Some(RestartPolicy::No));
+        dependent.depends_on = vec![DependsOn::Structured {
+            service: "dependency".to_string(),
+            on_failure: DependencyFailurePolicy::Ignore,
+        }];
+        config.services.insert("dependent".to_string(), dependent);
+
+        let scope = supervised_service_names(&config);
+
+        assert!(
+            !scope.contains("dependency"),
+            "an Ignore-policy dependency with no restart policy of its own must stay out of scope"
+        );
+    }
+
+    #[test]
+    fn test_supervised_service_names_default_depends_on_policy_counts_as_caring() {
+        use crate::config::DependsOn;
+
+        // Plain `depends_on: [dependency]` (no explicit on_failure) defaults
+        // to DependencyFailurePolicy::Stop, not Ignore — only Ignore is
+        // excluded from the union per Design §2, so this must still pull
+        // `dependency` into scope.
+        let mut config = Config::default();
+        config.services.insert(
+            "dependency".to_string(),
+            service_with_restart(Some(RestartPolicy::No)),
+        );
+        let mut dependent = service_with_restart(Some(RestartPolicy::No));
+        dependent.depends_on = vec![DependsOn::Simple("dependency".to_string())];
+        config.services.insert("dependent".to_string(), dependent);
+
+        let scope = supervised_service_names(&config);
+        assert!(
+            scope.contains("dependency"),
+            "default on_failure policy is Stop (not Ignore), so it counts as \
+             'someone cares about this dependency's failure' per the union formula"
+        );
+    }
+
+    #[test]
+    fn test_supervised_service_names_restart_dependent_pulls_in_dependency_regardless_of_edge_policy()
+     {
+        use crate::config::{DependencyFailurePolicy, DependsOn};
+
+        // `dependent` has restart: always — its OWN restart policy makes it
+        // care about everything it depends on (the union formula's first
+        // disjunct), even if the depends_on edge's own failure policy is
+        // Ignore.
+        let mut config = Config::default();
+        config.services.insert(
+            "dependency".to_string(),
+            service_with_restart(Some(RestartPolicy::No)),
+        );
+        let mut dependent = service_with_restart(Some(RestartPolicy::Always));
+        dependent.depends_on = vec![DependsOn::Structured {
+            service: "dependency".to_string(),
+            on_failure: DependencyFailurePolicy::Ignore,
+        }];
+        config.services.insert("dependent".to_string(), dependent);
+
+        let scope = supervised_service_names(&config);
+        assert!(scope.contains("dependent"));
+        assert!(
+            scope.contains("dependency"),
+            "dependent's own restart:always makes it care about dependency \
+             regardless of the on_failure policy on that edge"
+        );
+    }
+
+    // --- check_all_services scope filtering ---
+
+    /// Minimal `ServiceManager` test double — only `status()`/`health()` are
+    /// exercised by `check_all_services`.
+    struct FakeManager {
+        status: Status,
+        healthy: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ServiceManager for FakeManager {
+        async fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn kill(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<bool> {
+            Ok(self.healthy)
+        }
+        fn status(&self) -> Status {
+            self.status
+        }
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    fn fake_entry(status: Status, healthy: bool) -> ServiceEntry {
+        Arc::new(Mutex::new(
+            Box::new(FakeManager { status, healthy }) as Box<dyn ServiceManager>
+        ))
+    }
+
+    /// `scope: None` must remain bit-identical to the pre-scope behavior:
+    /// every Running/Healthy/Failing service gets checked.
+    #[tokio::test]
+    async fn test_check_all_services_scope_none_checks_everything() {
+        let services: ServicesMap = Arc::new(RwLock::new(HashMap::from([
+            ("a".to_string(), fake_entry(Status::Running, true)),
+            ("b".to_string(), fake_entry(Status::Running, false)),
+        ])));
+
+        let results = check_all_services(&services, None).await;
+        let names: HashSet<String> = results.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(names, HashSet::from(["a".to_string(), "b".to_string()]));
+    }
+
+    /// A service outside `scope` must not even get a liveness check — not
+    /// just be excluded from restart consideration afterward.
+    #[tokio::test]
+    async fn test_check_all_services_scope_filters_out_of_scope_services() {
+        let services: ServicesMap = Arc::new(RwLock::new(HashMap::from([
+            ("supervised".to_string(), fake_entry(Status::Running, true)),
+            (
+                "unsupervised".to_string(),
+                fake_entry(Status::Running, false),
+            ),
+        ])));
+
+        let scope: HashSet<String> = HashSet::from(["supervised".to_string()]);
+        let results = check_all_services(&services, Some(&scope)).await;
+
+        assert_eq!(
+            results.len(),
+            1,
+            "only the in-scope service should be checked"
+        );
+        assert_eq!(results[0].name, "supervised");
+    }
+
+    /// A service that's in scope but not in a checkable status
+    /// (Running/Healthy/Failing) must still be skipped — scope narrows the
+    /// candidate set, it doesn't override the existing status gate.
+    #[tokio::test]
+    async fn test_check_all_services_scope_still_respects_status_gate() {
+        let services: ServicesMap = Arc::new(RwLock::new(HashMap::from([(
+            "stopped-but-in-scope".to_string(),
+            fake_entry(Status::Stopped, true),
+        )])));
+
+        let scope: HashSet<String> = HashSet::from(["stopped-but-in-scope".to_string()]);
+        let results = check_all_services(&services, Some(&scope)).await;
+
+        assert!(
+            results.is_empty(),
+            "in-scope but Stopped services must still be skipped, same as unfiltered behavior"
+        );
+    }
+
+    /// Empty scope means nothing gets checked, even if everything is
+    /// Running — the degenerate case of the union formula (no service has a
+    /// restart policy and nothing depends on anything with non-Ignore
+    /// failure handling).
+    #[tokio::test]
+    async fn test_check_all_services_empty_scope_checks_nothing() {
+        let services: ServicesMap = Arc::new(RwLock::new(HashMap::from([(
+            "a".to_string(),
+            fake_entry(Status::Running, true),
+        )])));
+
+        let scope: HashSet<String> = HashSet::new();
+        let results = check_all_services(&services, Some(&scope)).await;
+
+        assert!(results.is_empty());
     }
 }

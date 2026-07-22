@@ -112,6 +112,51 @@ impl SqliteStateTracker {
         })
     }
 
+    /// Create an unlocked state tracker for the supervisor.
+    ///
+    /// Points at the same on-disk `lock.db` as [`SqliteStateTracker::new`]
+    /// (same WAL/pragma setup) but **skips `try_acquire_lock` entirely** — no
+    /// `.fed/.lock` file handle is held. A supervisor that holds `.fed/.lock`
+    /// for its entire (potentially hours/days) lifetime would push every
+    /// short-lived `fed` CLI invocation in the same directory into the
+    /// degraded "another fed instance ... proceeding anyway" path forever
+    /// (`try_acquire_lock`'s fallback below). The supervisor coordinates with
+    /// those short-lived invocations purely through SQLite's own WAL
+    /// concurrency instead — already the actual data-safety mechanism;
+    /// `.fed/.lock` has always been a courtesy warning layer on top. The
+    /// supervisor's own single-instance enforcement is the separate
+    /// `.fed/supervisor.lock` file (see `07-supervisor.md` Design §1),
+    /// unrelated to this tracker.
+    ///
+    /// Unlike [`SqliteStateTracker::new_ephemeral`] (in-memory, no `.fed/`
+    /// directory at all — for isolated child orchestrators that must not
+    /// touch the parent's persistent state), this variant must still point
+    /// at the real on-disk `lock.db` so it observes the same state every
+    /// other `fed` invocation in the directory does.
+    pub async fn new_for_supervisor(work_dir: PathBuf) -> Result<Self> {
+        let fed_dir = crate::fed_dir::ensure_fed_dir(&work_dir)?;
+        let db_path = fed_dir.join(DB_FILE_NAME);
+        let work_dir_str = work_dir.to_string_lossy().to_string();
+
+        let conn = Connection::open(&db_path).await?;
+
+        conn.call(|conn: &mut rusqlite::Connection| {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            conn.pragma_update(None, "busy_timeout", 5000)?;
+            Ok(())
+        })
+        .await?;
+
+        Ok(Self {
+            db_path,
+            conn,
+            work_dir: work_dir_str,
+            lock_file: None,
+        })
+    }
+
     /// Create an ephemeral in-memory state tracker.
     ///
     /// Uses an in-memory SQLite database with no file lock and no `.fed/` directory.
@@ -360,6 +405,29 @@ impl SqliteStateTracker {
 
     /// Initialize state tracker - create schema or load existing
     pub async fn initialize(&mut self) -> Result<()> {
+        self.initialize_for_supervisor().await?;
+        Ok(())
+    }
+
+    /// Same as [`SqliteStateTracker::initialize`], but returns the ids
+    /// [`SqliteStateTracker::mark_dead_services`] just staled on this pass
+    /// instead of discarding them.
+    ///
+    /// Plain `initialize()` (above) can't expose this — the real call chain
+    /// is `initialize()` -> `validate_and_cleanup()` -> `mark_dead_services()`,
+    /// and until now the outer two layers both returned plain `Result<()>`,
+    /// discarding the innermost function's `Vec<String>`. The supervisor
+    /// attach path (`Orchestrator::initialize_supervisor`,
+    /// `07-supervisor.md` Design §1) needs exactly this: which rows just
+    /// went stale, before they become invisible to `get_services()`, so it
+    /// can immediately re-derive whether each one should be restarted
+    /// (crashed while unsupervised, `desired_state == 'running'`) or left
+    /// alone (`desired_state == 'stopped'`).
+    ///
+    /// A brand-new `.fed/` directory has nothing to stale — this returns an
+    /// empty vec on the fresh-schema branch, matching `initialize()`'s own
+    /// no-special-casing behavior for that case.
+    pub async fn initialize_for_supervisor(&mut self) -> Result<Vec<String>> {
         // Check if schema exists
         let schema_exists: bool = self
             .conn
@@ -378,14 +446,13 @@ impl SqliteStateTracker {
             debug!("Creating SQLite schema");
             self.create_schema().await?;
             self.init_lock_file().await?;
+            Ok(Vec::new())
         } else {
             debug!("Loading existing SQLite state");
             // Run migrations if needed
             self.run_migrations().await?;
-            self.validate_and_cleanup().await?;
+            self.validate_and_cleanup().await
         }
-
-        Ok(())
     }
 
     /// Initialize lock file row
@@ -405,10 +472,15 @@ impl SqliteStateTracker {
         Ok(())
     }
 
-    /// Validate existing state and cleanup stale services
-    async fn validate_and_cleanup(&mut self) -> Result<()> {
+    /// Validate existing state and cleanup stale services.
+    ///
+    /// Returns the ids [`SqliteStateTracker::mark_dead_services`] just
+    /// staled on this pass (see [`SqliteStateTracker::initialize_for_supervisor`]
+    /// for why this needs to propagate all the way up); `initialize()`
+    /// itself discards it.
+    async fn validate_and_cleanup(&mut self) -> Result<Vec<String>> {
         // Mark dead services as stale (does not delete — purge_stale_services does that)
-        self.mark_dead_services().await?;
+        let newly_stale = self.mark_dead_services().await?;
 
         // Update to current PID
         let pid = std::process::id();
@@ -422,7 +494,7 @@ impl SqliteStateTracker {
             })
             .await?;
 
-        Ok(())
+        Ok(newly_stale)
     }
 
     /// Persist state to database (no-op for SQLite, always persisted)
@@ -806,5 +878,89 @@ mod tests {
             parent_services.contains_key("parent-svc"),
             "Parent service must survive child clear()"
         );
+    }
+
+    // --- new_for_supervisor: unlocked concurrent access (07-supervisor.md Design §1) ---
+
+    /// A `new_for_supervisor` tracker must never hold `.fed/.lock` — a normal,
+    /// locked `SqliteStateTracker::new` on the *same* directory must be able
+    /// to acquire the advisory lock cleanly while the supervisor tracker is
+    /// alive and initialized, with no "another fed instance ... proceeding
+    /// anyway" degraded path triggered. This is the direct regression test
+    /// for hole #4's locking half: a supervisor built via the normal `new()`
+    /// constructor would hold `.fed/.lock` for its entire lifetime, pushing
+    /// every subsequent `fed` invocation into the degraded path forever.
+    #[tokio::test]
+    async fn test_supervisor_tracker_does_not_hold_advisory_lock() {
+        let temp_dir = TempDir::new().unwrap();
+        let lock_path = temp_dir.path().join(LOCK_FILE_NAME);
+
+        // Bring up the "supervisor" first, exactly as initialize_supervisor
+        // would, and leave it alive for the rest of the test.
+        let mut supervisor = SqliteStateTracker::new_for_supervisor(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        supervisor.initialize_for_supervisor().await.unwrap();
+        assert!(
+            supervisor.lock_file.is_none(),
+            "supervisor tracker must never hold a lock file handle"
+        );
+
+        // The supervisor's own construction/initialization must never touch
+        // .fed/.lock at all — it doesn't call try_acquire_lock, so the file
+        // shouldn't even exist yet.
+        assert!(
+            !lock_path.exists(),
+            "supervisor tracker must never create or write .fed/.lock"
+        );
+
+        // A short-lived `fed status`-shaped invocation, using the real
+        // locked constructor, must acquire the advisory lock cleanly.
+        let normal = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        assert!(
+            normal.lock_file.is_some(),
+            "a normal tracker must still acquire .fed/.lock when nothing else holds it \
+             (the supervisor must not be silently holding it)"
+        );
+
+        // Concurrent access from both trackers must not corrupt state:
+        // register through the supervisor tracker, read back through the
+        // normal one, and vice versa.
+        register_test_service(&mut supervisor, "supervised-svc").await;
+        let seen_by_normal = normal.get_services().await;
+        assert!(
+            seen_by_normal.contains_key("supervised-svc"),
+            "the normal tracker must see writes made through the unlocked supervisor tracker"
+        );
+    }
+
+    /// Several `fed status`/`fed logs`-shaped invocations run in a loop while
+    /// a supervisor tracker is alive must all acquire the advisory lock
+    /// without warning about a competing instance — repeats the single-shot
+    /// check above across multiple sequential acquisitions, matching the
+    /// plan's "lock non-monopolization" test description.
+    #[tokio::test]
+    async fn test_supervisor_tracker_allows_many_sequential_normal_trackers() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut supervisor = SqliteStateTracker::new_for_supervisor(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        supervisor.initialize_for_supervisor().await.unwrap();
+
+        for i in 0..5 {
+            let normal = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap();
+            assert!(
+                normal.lock_file.is_some(),
+                "invocation {} should acquire .fed/.lock cleanly while the supervisor is alive",
+                i
+            );
+            // Dropped at end of each loop iteration, releasing the lock
+            // before the next short-lived invocation.
+        }
     }
 }

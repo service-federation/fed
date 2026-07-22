@@ -631,7 +631,14 @@ impl SqliteStateTracker {
     /// Sets status to `stale` so that port_allocations remain readable
     /// until [`SqliteStateTracker::purge_stale_services`] is called. This enables callers to
     /// collect managed port information before data is deleted.
-    pub async fn mark_dead_services(&mut self) -> Result<usize> {
+    ///
+    /// Returns the ids of the services just marked stale (not the ids of
+    /// services that were already stale from a previous pass) — needed by
+    /// the supervisor attach path (`Orchestrator::initialize_supervisor`,
+    /// `07-supervisor.md` Design §1) to notice a crashed, restart-worthy
+    /// service *before* it becomes permanently invisible to `get_services()`.
+    /// Plain `initialize()` discards this value (see `validate_and_cleanup`).
+    pub async fn mark_dead_services(&mut self) -> Result<Vec<String>> {
         let services = self.get_services().await;
         let mut stale_services = Vec::new();
 
@@ -679,8 +686,9 @@ impl SqliteStateTracker {
                 marked,
                 stale_services.join(", ")
             );
+            let ids_for_tx = stale_services.clone();
             self.with_transaction(move |tx| {
-                for service_id in &stale_services {
+                for service_id in &ids_for_tx {
                     tx.execute(
                         "UPDATE services SET status = 'stale' WHERE id = ?1",
                         rusqlite::params![service_id],
@@ -693,7 +701,7 @@ impl SqliteStateTracker {
             info!("Marked {} dead service(s) as stale", marked);
         }
 
-        Ok(marked)
+        Ok(stale_services)
     }
 
     /// Purge services previously marked as stale by [`SqliteStateTracker::mark_dead_services`].
@@ -1212,7 +1220,7 @@ mod tests {
         tracker.register_service(state).await.unwrap();
 
         let marked = tracker.mark_dead_services().await.unwrap();
-        assert_eq!(marked, 1, "Should mark 1 stale service");
+        assert_eq!(marked.len(), 1, "Should mark 1 stale service");
 
         // get_services filters stale, so it should be empty now
         let services = tracker.get_services().await;
@@ -1246,7 +1254,11 @@ mod tests {
         tracker.register_service(state).await.unwrap();
 
         let marked = tracker.mark_dead_services().await.unwrap();
-        assert_eq!(marked, 0, "Stopped service should not be marked stale");
+        assert_eq!(
+            marked.len(),
+            0,
+            "Stopped service should not be marked stale"
+        );
 
         let services = tracker.get_services().await;
         assert_eq!(services.len(), 1);
@@ -1281,7 +1293,58 @@ mod tests {
         tracker.register_service(state).await.unwrap();
 
         let marked = tracker.mark_dead_services().await.unwrap();
-        assert_eq!(marked, 1, "Service with dead PID should be marked stale");
+        assert_eq!(
+            marked.len(),
+            1,
+            "Service with dead PID should be marked stale"
+        );
+    }
+
+    /// The supervisor attach path (`Orchestrator::initialize_supervisor`)
+    /// needs the *ids* of services just marked stale, not just a count —
+    /// `07-supervisor.md` Design §1's `initialize_for_supervisor()` hop
+    /// depends on this to know which specific rows just went stale.
+    #[tokio::test]
+    async fn test_mark_dead_services_returns_stale_ids() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        // One dead service (Running status, no PID/container to back it —
+        // mark_dead_services treats this as a crash), one legitimately-
+        // stopped (not stale) service.
+        let dead = ServiceState {
+            id: "dead-one".to_string(),
+            status: Status::Running,
+            service_type: ServiceType::Process,
+            pid: None,
+            container_id: None,
+            started_at: Utc::now(),
+            external_repo: None,
+            namespace: "test".to_string(),
+            restart_count: 0,
+            last_restart_at: None,
+            consecutive_failures: 0,
+            port_allocations: HashMap::new(),
+            startup_message: None,
+            desired_state: DesiredState::Running,
+        };
+        tracker.register_service(dead).await.unwrap();
+        register_stopped_service(&mut tracker, "stopped-one").await;
+
+        let marked = tracker.mark_dead_services().await.unwrap();
+        assert_eq!(
+            marked,
+            vec!["dead-one".to_string()],
+            "Should return exactly the id of the service that just went stale"
+        );
+
+        // A second call with nothing new to mark returns an empty vec, not
+        // the previously-stale id again (mark_dead_services only sees
+        // already-filtered, non-stale rows via get_services()).
+        let marked_again = tracker.mark_dead_services().await.unwrap();
+        assert!(
+            marked_again.is_empty(),
+            "Second pass should find nothing new to mark stale"
+        );
     }
 
     // --- purge_stale_services ---
@@ -1311,7 +1374,7 @@ mod tests {
 
         // Mark it stale
         let marked = tracker.mark_dead_services().await.unwrap();
-        assert_eq!(marked, 1);
+        assert_eq!(marked.len(), 1);
 
         // Purge stale services
         let purged = tracker.purge_stale_services().await.unwrap();
@@ -1349,7 +1412,7 @@ mod tests {
 
         // No services should be marked stale (Stopped status is not "should be running")
         let marked = tracker.mark_dead_services().await.unwrap();
-        assert_eq!(marked, 0);
+        assert_eq!(marked.len(), 0);
 
         let purged = tracker.purge_stale_services().await.unwrap();
         assert_eq!(purged, 0, "No stale services to purge");
@@ -1412,7 +1475,8 @@ mod tests {
 
         let marked = tracker.mark_dead_services().await.unwrap();
         assert_eq!(
-            marked, 1,
+            marked.len(),
+            1,
             "Service with Starting status and no PID should be marked stale"
         );
 

@@ -1,4 +1,4 @@
-use crate::config::{Config, ServiceType};
+use crate::config::{Config, RestartPolicy, ServiceType};
 use crate::dependency::{ExternalServiceExpander, Graph};
 use crate::error::{Error, Result};
 use crate::parameter::Resolver;
@@ -104,6 +104,13 @@ pub struct Orchestrator {
     pub stop_timeout: Duration,
     /// Guard to ensure cleanup runs exactly once
     cleanup_started: AtomicBool,
+    /// Guard to ensure `stop_monitoring_only` runs exactly once. Separate
+    /// from `cleanup_started` — the two shutdown paths are mutually
+    /// exclusive by construction (a supervisor orchestrator calls only
+    /// `stop_monitoring_only`, never `cleanup`, since `cleanup` stops every
+    /// service — see its own doc comment), so sharing one guard would let an
+    /// unrelated future caller of the other method silently no-op.
+    monitoring_stop_started: AtomicBool,
     /// When true, skip port cache and allocate fresh random ports
     randomize_ports: bool,
     /// When set, Docker containers use this ID instead of the work-dir hash.
@@ -165,6 +172,7 @@ impl Orchestrator {
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
             cleanup_started: AtomicBool::new(false),
+            monitoring_stop_started: AtomicBool::new(false),
             randomize_ports: false,
             isolation_id: None,
         })
@@ -198,6 +206,7 @@ impl Orchestrator {
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
             cleanup_started: AtomicBool::new(false),
+            monitoring_stop_started: AtomicBool::new(false),
             randomize_ports: false,
             isolation_id: None,
         })
@@ -233,6 +242,7 @@ impl Orchestrator {
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
             cleanup_started: AtomicBool::new(false),
+            monitoring_stop_started: AtomicBool::new(false),
             randomize_ports: false,
             isolation_id: None,
         })
@@ -597,6 +607,174 @@ impl Orchestrator {
 
         // Create service managers and restore state (PIDs, container IDs)
         self.create_services().await?;
+
+        Ok(())
+    }
+
+    /// Initialization path for the supervisor's attach-and-reconcile flow
+    /// (`07-supervisor.md` Design §1). Used exclusively via
+    /// `OrchestratorBuilder::supervisor_attach(true)` — never called
+    /// directly by CLI commands.
+    ///
+    /// Unlike every other `initialize*` variant, this one must never let
+    /// [`Orchestrator::mark_dead_services`]'s stale-row filtering silently
+    /// swallow a service that crashed while genuinely unsupervised (the
+    /// exact case this whole feature exists for — see the module-level
+    /// "Attach/self-heal reality" note in `07-supervisor.md`). It:
+    ///
+    /// 1. Swaps in the unlocked, supervisor-safe state tracker
+    ///    ([`crate::state::StateTracker::new_for_supervisor`]) — the
+    ///    orchestrator was constructed with an ephemeral (in-memory) tracker
+    ///    by the builder specifically so this swap is the *first* thing that
+    ///    ever touches the real on-disk `lock.db`, and it never acquires
+    ///    `.fed/.lock`.
+    /// 2. Runs the schema-exists/migrations/cleanup sequence via
+    ///    [`crate::state::StateTracker::initialize_for_supervisor`], capturing
+    ///    which rows just went stale in *this* pass — before they become
+    ///    invisible to `get_services()`.
+    /// 3. Builds the dependency graph and creates service managers, honoring
+    ///    `desired_state`: only rows with `desired_state == Running` get
+    ///    PID/container/status restored ([`Orchestrator::create_services_for_supervisor`]).
+    ///    A row with `desired_state == Stopped` is never attached, even if
+    ///    it's technically still alive and not yet purged.
+    /// 4. For each newly-stale row, re-derives whether it should come back:
+    ///    if `desired_state == Running` and its configured restart policy
+    ///    isn't `No`, drives it through a fresh `manager.start()` (there's
+    ///    nothing alive to "attach" to) and records a restart event, so
+    ///    `restart_history`/circuit-breaker accounting stays consistent with
+    ///    any other crash-restart. A `desired_state == Stopped` newly-stale
+    ///    row is left alone — never resurrected.
+    /// 5. Starts monitoring unconditionally (regardless of output mode),
+    ///    scoped to [`super::monitoring::supervised_service_names`] — this is
+    ///    the one initialize path that must run its health-check loop even
+    ///    in `OutputMode::File`, since backgrounded services are exactly what
+    ///    the supervisor exists to protect.
+    pub async fn initialize_supervisor(&mut self) -> Result<()> {
+        // The builder constructs a supervisor-attach orchestrator via
+        // new_ephemeral (in-memory tracker, never touches .fed/.lock) so
+        // this swap is the first real disk access — see this method's doc
+        // comment.
+        self.state_tracker = Arc::new(tokio::sync::RwLock::new(
+            StateTracker::new_for_supervisor(self.work_dir.clone()).await?,
+        ));
+
+        let newly_stale = self
+            .state_tracker
+            .write()
+            .await
+            .initialize_for_supervisor()
+            .await?;
+
+        self.build_dependency_graph()?;
+
+        // Restore managers, honoring desired_state (never resurrect stopped).
+        self.create_services_for_supervisor().await?;
+
+        // Re-derive whether each newly-stale row should come back. A row
+        // marked stale by mark_dead_services this pass is, by definition,
+        // no longer visible to get_services() — read it back directly via
+        // get_service (which does not filter on status) to recover its
+        // desired_state.
+        for service_id in &newly_stale {
+            let desired_state = {
+                let tracker = self.state_tracker.read().await;
+                tracker
+                    .get_service(service_id)
+                    .await
+                    .map(|s| s.desired_state)
+            };
+
+            if desired_state != Some(DesiredState::Running) {
+                // Either genuinely unknown (shouldn't happen — the row
+                // existed a moment ago) or the user stopped it: never
+                // resurrect.
+                continue;
+            }
+
+            let service_name = service_id.split('/').next_back().unwrap_or(service_id);
+            let restart_policy = self
+                .config
+                .services
+                .get(service_name)
+                .and_then(|s| s.restart.clone())
+                .unwrap_or(RestartPolicy::No);
+
+            if matches!(restart_policy, RestartPolicy::No) {
+                continue;
+            }
+
+            let manager_opt = {
+                let services = self.services.read().await;
+                services.get(service_name).map(Arc::clone)
+            };
+            let Some(manager_arc) = manager_opt else {
+                tracing::warn!(
+                    "Supervisor attach: no manager for newly-stale service '{}', skipping",
+                    service_name
+                );
+                continue;
+            };
+
+            let start_result = {
+                let mut manager = manager_arc.lock().await;
+                manager.start().await
+            };
+
+            match start_result {
+                Ok(_) => {
+                    tracing::info!(
+                        "Supervisor attach: restarted '{}' after discovering it crashed while unsupervised",
+                        service_name
+                    );
+
+                    // LOCK ORDER: state_tracker before service mutex (see
+                    // monitoring.rs's lock_order.rs note).
+                    let mut tracker = self.state_tracker.write().await;
+                    if let Err(e) = tracker.record_restart(service_name).await {
+                        tracing::warn!(
+                            "Supervisor attach: failed to record restart for '{}': {}",
+                            service_name,
+                            e
+                        );
+                    }
+                    let manager = manager_arc.lock().await;
+                    if let Some(pid) = manager.get_pid()
+                        && let Err(e) = tracker.update_service_pid(service_name, pid).await
+                    {
+                        tracing::warn!(
+                            "Supervisor attach: failed to update PID for '{}': {}",
+                            service_name,
+                            e
+                        );
+                    }
+                    if let Some(container_id) = manager.get_container_id()
+                        && let Err(e) = tracker
+                            .update_service_container_id(service_name, container_id)
+                            .await
+                    {
+                        tracing::warn!(
+                            "Supervisor attach: failed to update container ID for '{}': {}",
+                            service_name,
+                            e
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Supervisor attach: failed to restart '{}': {}",
+                        service_name,
+                        e
+                    );
+                }
+            }
+        }
+
+        self.state_tracker.write().await.save().await?;
+
+        // Start monitoring unconditionally — a supervisor exists precisely
+        // to watch backgrounded (File-mode) services, so the output-mode
+        // skip in start_monitoring() must not apply here.
+        self.start_monitoring_for_supervisor().await;
 
         Ok(())
     }
@@ -2012,6 +2190,58 @@ impl Orchestrator {
         tracing::debug!("Cleanup: complete");
     }
 
+    /// Stop monitoring without stopping any service.
+    ///
+    /// This is the narrow shutdown used by every supervisor-exit path
+    /// (SIGTERM from `fed stop`'s teardown check, the watch/tui pre-flight
+    /// handoff, the "nothing supervised left running" self-exit condition —
+    /// `07-supervisor.md` Design §1): cancels the monitoring loop's
+    /// cancellation token and awaits the monitoring task with a timeout, but
+    /// **never** calls [`Orchestrator::stop_all`] and never calls
+    /// `manager.stop()` on anything.
+    ///
+    /// [`Orchestrator::cleanup`] is deliberately not reused here — its own
+    /// doc comment states it stops every running service, which is exactly
+    /// backwards for a supervisor: the supervisor exiting must only ever
+    /// mean "stop watching," never "stop the things I was watching," whether
+    /// the exit is because a foreground `--watch`/`tui` is taking over or a
+    /// SIGTERM arrived.
+    ///
+    /// Uses a guard separate from `cleanup_started` — see that field's doc
+    /// comment for why the two shutdown paths don't share one.
+    ///
+    /// Safe to call multiple times or concurrently — like `cleanup()`, only
+    /// the first caller does the work.
+    pub async fn stop_monitoring_only(&self) {
+        if self
+            .monitoring_stop_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            tracing::debug!("stop_monitoring_only: already stopped or in progress, skipping");
+            return;
+        }
+
+        tracing::debug!("stop_monitoring_only: canceling monitoring loop");
+        self.cancellation_token.cancel();
+
+        let mut task_opt = self.monitoring_task.lock().await;
+        if let Some(handle) = task_opt.take() {
+            drop(task_opt);
+            tracing::debug!("stop_monitoring_only: waiting for monitoring task");
+            match tokio::time::timeout(Duration::from_secs(5), handle).await {
+                Ok(_) => tracing::debug!("stop_monitoring_only: monitoring task completed"),
+                Err(_) => {
+                    tracing::warn!(
+                        "stop_monitoring_only: monitoring task join timed out, continuing"
+                    )
+                }
+            }
+        }
+
+        tracing::debug!("stop_monitoring_only: complete (services left running)");
+    }
+
     /// Pre-pull Docker images needed by the given services.
     ///
     /// Checks which images are missing locally and pulls them in parallel.
@@ -2141,6 +2371,10 @@ impl std::fmt::Debug for Orchestrator {
             .field(
                 "cleanup_started",
                 &self.cleanup_started.load(Ordering::Relaxed),
+            )
+            .field(
+                "monitoring_stop_started",
+                &self.monitoring_stop_started.load(Ordering::Relaxed),
             )
             .field("is_cancelled", &self.is_cancelled())
             .field("resolver", &"<resolver>")
@@ -2452,5 +2686,252 @@ mod tests {
             round_tripped.required_secret_names,
             ctx.required_secret_names
         );
+    }
+
+    // --- initialize_supervisor (07-supervisor.md Design §1) ---
+
+    /// Direct test for the "attach" half of Design §1 step 4: a row that's
+    /// genuinely still alive (not stale) and `desired_state == Running` must
+    /// get its manager restored/attached, while a row with
+    /// `desired_state == Stopped` must not — even though its row still
+    /// exists (not yet purged) and nothing about it looks stale on its own
+    /// (a `Stopped` status with no PID/container is never considered stale
+    /// by `mark_dead_services`).
+    #[tokio::test]
+    async fn test_initialize_supervisor_restores_only_desired_running_rows() {
+        use crate::config::Service;
+        use crate::state::{DesiredState, ServiceState};
+
+        // A real, long-lived child process so mark_dead_services sees it as
+        // genuinely alive (not stale).
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .expect("failed to spawn helper process");
+        let live_pid = child.id();
+
+        let mut config = Config::default();
+        config.services.insert(
+            "alive".to_string(),
+            Service {
+                process: Some("sleep 2".to_string()),
+                ..Default::default()
+            },
+        );
+        config.services.insert(
+            "stopped".to_string(),
+            Service {
+                process: Some("sleep 2".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        {
+            let mut tracker = orchestrator.state_tracker.write().await;
+            tracker.initialize().await.unwrap();
+
+            tracker
+                .register_service(ServiceState {
+                    id: "alive".to_string(),
+                    status: Status::Running,
+                    service_type: ServiceType::Process,
+                    pid: Some(live_pid),
+                    container_id: None,
+                    started_at: chrono::Utc::now(),
+                    external_repo: None,
+                    namespace: "root".to_string(),
+                    restart_count: 0,
+                    last_restart_at: None,
+                    consecutive_failures: 0,
+                    port_allocations: Default::default(),
+                    startup_message: None,
+                    desired_state: DesiredState::Running,
+                })
+                .await
+                .unwrap();
+
+            tracker
+                .register_service(ServiceState {
+                    id: "stopped".to_string(),
+                    status: Status::Stopped,
+                    service_type: ServiceType::Process,
+                    pid: None,
+                    container_id: None,
+                    started_at: chrono::Utc::now(),
+                    external_repo: None,
+                    namespace: "root".to_string(),
+                    restart_count: 0,
+                    last_restart_at: None,
+                    consecutive_failures: 0,
+                    port_allocations: Default::default(),
+                    startup_message: None,
+                    desired_state: DesiredState::Stopped,
+                })
+                .await
+                .unwrap();
+        }
+
+        orchestrator
+            .initialize_supervisor()
+            .await
+            .expect("initialize_supervisor should succeed");
+
+        {
+            let services = orchestrator.services.read().await;
+
+            let alive_manager = services.get("alive").expect("alive manager must exist");
+            let alive_pid = alive_manager.lock().await.get_pid();
+            assert_eq!(
+                alive_pid,
+                Some(live_pid),
+                "desired_state=Running row must have its PID restored/attached"
+            );
+
+            let stopped_manager = services
+                .get("stopped")
+                .expect("stopped manager must exist (a manager object, just not attached)");
+            let stopped_pid = stopped_manager.lock().await.get_pid();
+            assert_eq!(
+                stopped_pid, None,
+                "desired_state=Stopped row must never be restored/attached, \
+                 even though its row still exists and isn't stale"
+            );
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Direct test for the "crash-then-nobody-was-watching" half of Design
+    /// §1 step 3: a row that goes stale *during this very
+    /// `initialize_supervisor()` call* (its PID is dead) must be
+    /// re-derived, not silently lost — restarted if `desired_state ==
+    /// Running` and its restart policy allows it, left alone if
+    /// `desired_state == Stopped` (never resurrected, regardless of restart
+    /// policy).
+    #[tokio::test]
+    async fn test_initialize_supervisor_restarts_newly_stale_running_not_stopped() {
+        use crate::config::{RestartPolicy, Service};
+        use crate::state::{DesiredState, ServiceState};
+
+        // PIDs guaranteed to be dead (the process has already exited).
+        let mut dead1 = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid_restart = dead1.id();
+        dead1.wait().unwrap();
+        let mut dead2 = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid_stopped = dead2.id();
+        dead2.wait().unwrap();
+
+        let mut config = Config::default();
+        config.services.insert(
+            "crash-restart".to_string(),
+            Service {
+                process: Some("sleep 2".to_string()),
+                restart: Some(RestartPolicy::Always),
+                ..Default::default()
+            },
+        );
+        config.services.insert(
+            "crash-no-resurrect".to_string(),
+            Service {
+                process: Some("sleep 2".to_string()),
+                restart: Some(RestartPolicy::Always),
+                ..Default::default()
+            },
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        {
+            let mut tracker = orchestrator.state_tracker.write().await;
+            tracker.initialize().await.unwrap();
+
+            tracker
+                .register_service(ServiceState {
+                    id: "crash-restart".to_string(),
+                    status: Status::Running,
+                    service_type: ServiceType::Process,
+                    pid: Some(dead_pid_restart),
+                    container_id: None,
+                    started_at: chrono::Utc::now(),
+                    external_repo: None,
+                    namespace: "root".to_string(),
+                    restart_count: 0,
+                    last_restart_at: None,
+                    consecutive_failures: 0,
+                    port_allocations: Default::default(),
+                    startup_message: None,
+                    desired_state: DesiredState::Running,
+                })
+                .await
+                .unwrap();
+
+            tracker
+                .register_service(ServiceState {
+                    id: "crash-no-resurrect".to_string(),
+                    status: Status::Running,
+                    service_type: ServiceType::Process,
+                    pid: Some(dead_pid_stopped),
+                    container_id: None,
+                    started_at: chrono::Utc::now(),
+                    external_repo: None,
+                    namespace: "root".to_string(),
+                    restart_count: 0,
+                    last_restart_at: None,
+                    consecutive_failures: 0,
+                    port_allocations: Default::default(),
+                    startup_message: None,
+                    desired_state: DesiredState::Stopped,
+                })
+                .await
+                .unwrap();
+        }
+
+        orchestrator
+            .initialize_supervisor()
+            .await
+            .expect("initialize_supervisor should succeed");
+
+        let restarted_pid = {
+            let services = orchestrator.services.read().await;
+
+            let restart_manager = services
+                .get("crash-restart")
+                .expect("crash-restart manager must exist");
+            let restarted_pid = restart_manager.lock().await.get_pid();
+            assert!(
+                matches!(restarted_pid, Some(pid) if pid != dead_pid_restart),
+                "a newly-stale, desired_state=Running, restart:always service must be \
+                 driven through a fresh start (there's nothing alive to attach to) — got {:?}",
+                restarted_pid
+            );
+
+            let no_resurrect_manager = services
+                .get("crash-no-resurrect")
+                .expect("crash-no-resurrect manager must exist (just never started)");
+            let no_resurrect_pid = no_resurrect_manager.lock().await.get_pid();
+            assert_eq!(
+                no_resurrect_pid, None,
+                "a newly-stale, desired_state=Stopped service must never be \
+                 resurrected, even with restart:always configured"
+            );
+
+            restarted_pid
+        };
+
+        // Clean up the real process spawned by the restart path.
+        if let Some(pid) = restarted_pid {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
     }
 }

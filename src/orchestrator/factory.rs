@@ -81,6 +81,47 @@ impl Orchestrator {
     /// 3. Restores PIDs and container IDs from the state tracker
     /// 4. Validates that restored processes/containers are still running
     pub(super) async fn create_services(&mut self) -> Result<()> {
+        let mut services = self.build_service_managers()?;
+
+        // Restore PIDs and container IDs from state tracker for existing services
+        let state_services = { self.state_tracker.read().await.get_services().await };
+        self.restore_service_state(&mut services, state_services)
+            .await;
+
+        *self.services.write().await = services;
+        Ok(())
+    }
+
+    /// Like [`Orchestrator::create_services`], but restores PID/container/
+    /// status only for rows whose persisted `desired_state` is `Running`.
+    ///
+    /// Used by the supervisor attach path (`Orchestrator::initialize_supervisor`,
+    /// `07-supervisor.md` Design §1): a row the user explicitly stopped
+    /// (`desired_state == Stopped`) must never look "attached" to the
+    /// supervisor, even if it's still technically alive and hasn't been
+    /// purged yet (the design's own words: "rows where desired_state ==
+    /// 'stopped' are left alone entirely — not attached, not restarted").
+    /// Every configured service still gets a fresh manager object (so the
+    /// supervisor can drive a newly-stale, restart-worthy service through
+    /// `manager.start()` afterward) — only the *restoration* step is
+    /// filtered.
+    pub(super) async fn create_services_for_supervisor(&mut self) -> Result<()> {
+        let mut services = self.build_service_managers()?;
+
+        let mut state_services = { self.state_tracker.read().await.get_services().await };
+        state_services.retain(|_, s| s.desired_state == crate::state::DesiredState::Running);
+        self.restore_service_state(&mut services, state_services)
+            .await;
+
+        *self.services.write().await = services;
+        Ok(())
+    }
+
+    /// Build a fresh service manager for every configured service (Gradle
+    /// services sharing a working directory are grouped into one manager).
+    /// Does not restore any persisted PID/container/status — see
+    /// [`Orchestrator::restore_service_state`] for that half.
+    fn build_service_managers(&self) -> Result<HashMap<String, ServiceEntry>> {
         let mut services = HashMap::new();
         let mut gradle_grouped = std::collections::HashSet::new();
 
@@ -115,11 +156,7 @@ impl Orchestrator {
             services.insert(name.clone(), service_entry);
         }
 
-        // Restore PIDs and container IDs from state tracker for existing services
-        self.restore_service_state(&mut services).await;
-
-        *self.services.write().await = services;
-        Ok(())
+        Ok(services)
     }
 
     /// Create a grouped Gradle service for multiple tasks in the same working directory
@@ -285,10 +322,19 @@ impl Orchestrator {
         Box::new(ext_service)
     }
 
-    /// Restore PIDs and container IDs from state tracker for existing services
-    async fn restore_service_state(&self, services: &mut HashMap<String, ServiceEntry>) {
-        let state_services = { self.state_tracker.read().await.get_services().await };
-
+    /// Restore PIDs and container IDs for existing services from a
+    /// caller-supplied snapshot of persisted state.
+    ///
+    /// Taking the snapshot as a parameter (rather than fetching it here)
+    /// lets callers filter it first — [`Orchestrator::create_services_for_supervisor`]
+    /// passes only `desired_state == Running` rows, so a service the user
+    /// explicitly stopped never gets its PID/status restored even if the
+    /// row hasn't been purged yet.
+    async fn restore_service_state(
+        &self,
+        services: &mut HashMap<String, ServiceEntry>,
+        state_services: HashMap<String, crate::state::ServiceState>,
+    ) {
         for (service_id, service_state) in state_services {
             // Extract service name from ID (format: "namespace/name")
             let service_name = service_id.split('/').next_back().unwrap_or(&service_id);
