@@ -247,3 +247,178 @@ services:
 
     fed_stop(&config_path, workdir);
 }
+
+// ============================================================================
+// File-mode wrapper quoting fix (src/service/process.rs) regression coverage
+// ============================================================================
+
+#[test]
+fn test_process_with_embedded_single_quote_starts_healthy() {
+    // Reproduces the exact reported bug through the real `fed` binary
+    // (not just the internal ProcessService API): a `process:` value
+    // containing a single quote used to splice open the wrapper script's
+    // own quoting, so `sh -c 'sleep 5'` ran as a bare `sleep` with the
+    // wrong argument and exited with a usage error instead of sleeping.
+    // Before the fix this made the service report Failing; after the fix
+    // it should start and stay Running/Healthy.
+    let config = r#"
+services:
+  quoted-service:
+    process: "sh -c 'sleep 5'"
+"#;
+    let (temp_dir, config_path) = create_test_config(config);
+    let workdir = temp_dir.path().to_str().unwrap();
+
+    let output = fed_start(&config_path, workdir, "quoted-service");
+    assert_start_success(&output);
+
+    std::thread::sleep(Duration::from_secs(1));
+
+    let status = fed_status(&config_path, workdir);
+    assert!(
+        status.contains("running") || status.contains("healthy"),
+        "Service with an embedded single quote should start and stay \
+         Running/Healthy, not crash with a `sleep` usage error. Got:\n{}",
+        status
+    );
+    assert!(
+        !status.contains("failing"),
+        "Service should not report Failing (the mangled-wrapper symptom). Got:\n{}",
+        status
+    );
+
+    fed_stop(&config_path, workdir);
+}
+
+#[test]
+fn test_double_ampersand_without_quotes_still_works() {
+    // Locks in the shape that "worked" before the fix purely by luck
+    // (plenora's actual config shape has no quote characters, so it never
+    // triggered the wrapper-splicing bug). A correct fix must not regress
+    // this case while fixing the quoted one.
+    let config = r#"
+services:
+  and-service:
+    process: "echo one && echo two && sleep 300"
+"#;
+    let (temp_dir, config_path) = create_test_config(config);
+    let workdir = temp_dir.path().to_str().unwrap();
+
+    let output = fed_start(&config_path, workdir, "and-service");
+    assert_start_success(&output);
+
+    std::thread::sleep(Duration::from_secs(1));
+
+    let logs = fed_logs(&config_path, workdir, "and-service");
+    assert!(
+        logs.contains("one") && logs.contains("two"),
+        "Both && branches should have run. Got:\n{}",
+        logs
+    );
+
+    fed_stop(&config_path, workdir);
+}
+
+/// Returns (pid, pgid) for every live process whose command line contains
+/// `marker`, via `ps` (avoids depending on `pgrep`, which isn't guaranteed
+/// to be installed everywhere `ps` is). `-ww` requests unlimited command
+/// width from `ps` so the marker isn't truncated out of long command
+/// lines; both BSD (macOS) and GNU (Linux) `ps` accept it.
+fn find_processes_by_marker(marker: &str) -> Vec<(String, String)> {
+    let output = Command::new("ps")
+        .args(["-A", "-ww", "-o", "pid,pgid,command"])
+        .output()
+        .expect("Failed to run ps");
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .skip(1) // header row
+        .filter(|line| line.contains(marker))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.to_string();
+            let pgid = fields.next()?.to_string();
+            Some((pid, pgid))
+        })
+        .collect()
+}
+
+/// True if `ps -p pid` reports a live process (a data row beyond the header).
+fn pid_is_alive(pid: &str) -> bool {
+    match Command::new("ps").args(["-p", pid]).output() {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).lines().count() > 1,
+        Err(_) => false,
+    }
+}
+
+#[test]
+fn background_mode_process_tree_fully_stopped() {
+    // Sol's adversarial review (GPT-5.6, macOS bash 3.2.57) found a gap in
+    // the existing test suite: the PID `echo $$` captures is not
+    // guaranteed to be the process-group leader, so `fed stop` must
+    // resolve and signal the whole process group (it already does - see
+    // `ProcessService::get_process_group` / `killpg` in
+    // src/service/process.rs - but nothing exercised that against a real
+    // multi-process tree). This test spawns a launcher that backgrounds a
+    // child and then waits on it, so at least two live PIDs share one
+    // process group once the service reports Running, then confirms
+    // `fed stop` leaves NONE of them behind - not just the originally
+    // captured PID.
+    //
+    // This must pass against both the pre-fix and post-fix wrapper: the
+    // wrapper rewrite is only supposed to change how process_cmd/the log
+    // path are threaded through, not process-group/session structure.
+    //
+    // The marker is a large, distinctive `sleep` duration purely so `ps`
+    // output can be matched unambiguously - it's never meant to actually
+    // elapse (`fed stop` kills it long before then).
+    const MARKER: &str = "194716213";
+    let config = format!(
+        "\nservices:\n  tree:\n    process: |\n      sleep {marker} &\n      wait\n",
+        marker = MARKER
+    );
+    let (temp_dir, config_path) = create_test_config(&config);
+    let workdir = temp_dir.path().to_str().unwrap();
+
+    let output = fed_start(&config_path, workdir, "tree");
+    assert_start_success(&output);
+
+    // Give the backgrounded child a moment to actually appear in `ps`.
+    std::thread::sleep(Duration::from_secs(1));
+
+    let tree_pids = find_processes_by_marker(MARKER);
+    assert!(
+        !tree_pids.is_empty(),
+        "expected to find the backgrounded `sleep {}` process tree via ps \
+         - if this is empty the test fixture itself failed to create \
+         anything to check, not necessarily a fed bug",
+        MARKER
+    );
+
+    // Confirm the fixture actually created a multi-process tree sharing a
+    // single process group (not just one process) - otherwise this test
+    // would pass vacuously even against a broken killpg.
+    let pgids: std::collections::HashSet<&str> =
+        tree_pids.iter().map(|(_, pgid)| pgid.as_str()).collect();
+    assert_eq!(
+        pgids.len(),
+        1,
+        "all tree members should share exactly one process group, got: {:?}",
+        tree_pids
+    );
+
+    fed_stop(&config_path, workdir);
+
+    // Give signal delivery and reaping a moment.
+    std::thread::sleep(Duration::from_secs(1));
+
+    for (pid, _) in &tree_pids {
+        assert!(
+            !pid_is_alive(pid),
+            "PID {} was part of the process tree under the service's \
+             process group and should be gone after `fed stop` - fed stop \
+             must kill the whole tree via killpg, not just the originally \
+             captured PID (Sol review finding)",
+            pid
+        );
+    }
+}

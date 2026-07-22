@@ -89,9 +89,6 @@ rand = "0.8"
 # Async trait
 async-trait = "0.1"
 
-# Shell escaping for secure command execution
-shell-escape = "0.1"
-
 # Environment file parsing
 dotenvy = "0.15"
 

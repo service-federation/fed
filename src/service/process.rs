@@ -167,9 +167,21 @@ impl ProcessService {
         //
         // The config file is the trust boundary - if an attacker can modify it,
         // they already have write access to the project.
+        //
+        // In File mode (below), there's nothing to escape at all: process_cmd and
+        // the log path are never string-interpolated into the wrapper script's
+        // text. They're forwarded as the wrapper's own positional parameters
+        // (`"$1"`, `"$2"`), which bash substitutes as opaque, single-word values
+        // with no re-tokenization. That's what makes embedded quotes, `$VAR`
+        // references, backticks, and newlines in the user's command (or a log
+        // path containing spaces) safe regardless of content: a literal `'` in
+        // either value is just a character in a string by the time it's used —
+        // there's no surrounding wrapper quoting left for it to prematurely
+        // close, because the wrapper text containing quote characters is 100%
+        // static and never contains any of the user's data.
 
         // In File mode, wrap command with nohup to truly detach from terminal
-        let final_cmd = if self.output_mode.is_file() {
+        if self.output_mode.is_file() {
             // PID Capture Strategy:
             // The inner bash first prints its own PID ($$) to stdout, then redirects stdout/stderr
             // to the log file. This ensures we capture the PID of the actual long-running process,
@@ -183,41 +195,45 @@ impl ProcessService {
             // - Single-line commands (e.g., sleep 300)
             // - Multi-line scripts (e.g., YAML | blocks with multiple commands)
             // - Commands with output that needs logging
+            //
+            // The final step execs `bash -c "$1"` rather than the user's command
+            // directly: `bash -c` runs its *entire* string argument as a script
+            // (not just the first line), so multi-line scripts are unaffected,
+            // and `exec` still preserves the PID captured by `echo $$` across the
+            // replacement (it replaces the process image, not the process).
 
-            // Redirect to log file if available, otherwise to /dev/null
-            // Note: Log path is escaped since it may contain spaces
-            let redirect_target = if let Some(log_path) = self.log_capture.log_file_path() {
-                use shell_escape::escape;
-                // Use >> for append mode to preserve logs across restarts
-                let escaped_path = escape(log_path.to_string_lossy());
-                format!(">> {}", escaped_path)
-            } else {
-                "> /dev/null".to_string()
-            };
-
-            // Bash prints its PID, redirects I/O, then runs the user's commands.
+            // Bash prints its PID, redirects I/O, then execs the user's command
+            // (forwarded as "$1") as its entire script.
             // Note: The PGID may differ from the PID due to how nohup/backgrounding works.
             // The stop() method looks up the actual PGID to ensure all children are killed.
-            format!(
-                "nohup bash -c 'echo $$; exec 1{} 2>&1; {}' &",
-                redirect_target, process_cmd
-            )
+            let outer_script: &str = if self.log_capture.log_file_path().is_some() {
+                // "$2" carries the log path (append mode, to preserve logs across restarts).
+                r#"nohup bash -c 'echo $$; exec 1>> "$2" 2>&1; exec bash -c "$1"' bash-wrapper "$1" "$2" &"#
+            } else {
+                r#"nohup bash -c 'echo $$; exec 1>/dev/null 2>&1; exec bash -c "$1"' bash-wrapper "$1" &"#
+            };
+
+            cmd.arg("-ec")
+                .arg(outer_script)
+                .arg("fed-service") // $0 for the outer script, cosmetic (shows in error messages)
+                .arg(process_cmd); // $1 for the outer script
+            if let Some(log_path) = self.log_capture.log_file_path() {
+                cmd.arg(log_path.to_string_lossy().into_owned()); // $2 for the outer script
+            }
         } else if process_cmd.contains('\n') {
             // Non-detached, multi-line script: `exec` would replace the shell with
             // only the FIRST command (the rest of the script would never run, and
             // when that command exited the process would look like it crashed on
             // startup). Run the script directly instead. stop() kills the whole
             // process group (set via process_group(0) below), so children still go.
-            process_cmd.to_string()
+            cmd.arg("-ec").arg(process_cmd);
         } else {
             // Non-detached, single-line: exec replaces the shell so the process's
             // PID is the real command rather than a wrapper bash.
-            format!("exec {}", process_cmd)
-        };
+            cmd.arg("-ec").arg(format!("exec {}", process_cmd));
+        }
 
-        cmd.arg("-ec")
-            .arg(&final_cmd)
-            .current_dir(&work_dir)
+        cmd.current_dir(&work_dir)
             .envs(&environment)
             // Markers for the recursion check in main.rs. Service name
             // is identity for the error message; workspace path lets
@@ -1487,5 +1503,293 @@ mod tests {
             resource_limits::format_bytes(1024 * 1024 * 1024 * 1024),
             "1.0 TB"
         );
+    }
+
+    // ========================================================================
+    // File-mode wrapper quoting tests (spawn_process's `is_file()` branch)
+    //
+    // These exercise the bash wrapper built for `OutputMode::File` (the
+    // `fed start` default), which forwards `process_cmd` and the log file
+    // path as bash positional parameters ("$1", "$2") instead of
+    // interpolating them into a quoted wrapper string. Each test mirrors a
+    // shape called out in the fix's design doc as needing to keep working
+    // (or start working) exactly as the user wrote it.
+    // ========================================================================
+
+    /// Builds a `ProcessService` in `OutputMode::File` with a log file under
+    /// `log_dir`, for tests that need to read back captured stdout/stderr.
+    fn file_mode_service(
+        process_cmd: &str,
+        environment: HashMap<String, String>,
+        log_dir: &std::path::Path,
+    ) -> ProcessService {
+        let config = crate::config::Service {
+            process: Some(process_cmd.to_string()),
+            ..Default::default()
+        };
+        let log_file_path = log_dir.join("service.log");
+        ProcessService::new(
+            "test-service".to_string(),
+            config,
+            environment,
+            log_dir.to_string_lossy().into_owned(),
+            OutputMode::File,
+            Some(log_file_path),
+        )
+    }
+
+    /// Polls `service.logs()` until the joined log text contains `needle` or
+    /// `timeout` elapses, returning whatever text was last read (so a
+    /// failing assertion downstream shows useful context either way).
+    async fn wait_for_log_contains(
+        service: &ProcessService,
+        needle: &str,
+        timeout: Duration,
+    ) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let logs = service.logs(None).await.unwrap_or_default();
+            let joined = logs.join("\n");
+            if joined.contains(needle) || Instant::now() >= deadline {
+                return joined;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_spawn_process_with_embedded_single_quote() {
+        // Mirrors the exact reported bug: a `process:` command whose value
+        // contains a single quote used to splice open the wrapper's own
+        // quoting and corrupt the command (`sh -c 'sleep 1'` used to run
+        // as a bare `sleep` with the wrong argument).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut service = file_mode_service("sh -c 'sleep 1'", HashMap::new(), temp_dir.path());
+
+        service
+            .start()
+            .await
+            .expect("start should succeed with an embedded single quote");
+        assert!(
+            service.health().await.unwrap_or(false),
+            "process should be alive shortly after starting"
+        );
+
+        service.stop().await.expect("stop should succeed");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_spawn_process_with_double_quotes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut service = file_mode_service(
+            r#"echo "hello world"; sleep 2"#,
+            HashMap::new(),
+            temp_dir.path(),
+        );
+
+        service
+            .start()
+            .await
+            .expect("start should succeed with double-quoted output");
+
+        let logs = wait_for_log_contains(&service, "hello world", Duration::from_secs(2)).await;
+        assert!(
+            logs.contains("hello world"),
+            "log should contain the full double-quoted string intact, got: {:?}",
+            logs
+        );
+
+        service.stop().await.expect("stop should succeed");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_spawn_process_with_double_ampersand() {
+        // Locks in the shape that worked before the fix only by luck
+        // (plenora's config shape has no quote characters).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut service = file_mode_service(
+            "echo one && echo two; sleep 2",
+            HashMap::new(),
+            temp_dir.path(),
+        );
+
+        service.start().await.expect("start should succeed with &&");
+
+        let logs = wait_for_log_contains(&service, "two", Duration::from_secs(2)).await;
+        let one_pos = logs.find("one");
+        let two_pos = logs.find("two");
+        assert!(
+            one_pos.is_some() && two_pos.is_some(),
+            "both echo lines should be present, got: {:?}",
+            logs
+        );
+        assert!(
+            one_pos.unwrap() < two_pos.unwrap(),
+            "lines should appear in the order the command ran, got: {:?}",
+            logs
+        );
+
+        service.stop().await.expect("stop should succeed");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_spawn_process_with_dollar_var_not_expanded_at_wrapper_level() {
+        // THE_VAR is part of the service's own configured environment, so
+        // it must be expanded exactly once, at the user's command's own
+        // execution level (the nested `bash -c "$1"`), not by the outer
+        // wrapper script (which is 100% static text and never re-parses
+        // process_cmd's value).
+        let mut environment = HashMap::new();
+        environment.insert("THE_VAR".to_string(), "wrapper-value-42".to_string());
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut service = file_mode_service(
+            "echo LITERAL:$THE_VAR; sleep 2",
+            environment,
+            temp_dir.path(),
+        );
+
+        service.start().await.expect("start should succeed");
+
+        let logs = wait_for_log_contains(&service, "LITERAL:", Duration::from_secs(2)).await;
+        assert!(
+            logs.contains("LITERAL:wrapper-value-42"),
+            "$THE_VAR should expand to the configured value exactly once, got: {:?}",
+            logs
+        );
+        // A variable that is neither part of the service's configured
+        // environment nor referenced by the command must never appear in
+        // its output - confirms the wrapper doesn't do any ambient
+        // expansion of its own (its text contains no such reference at all).
+        assert!(
+            !logs.contains("CONTROL_SHOULD_NOT_LEAK"),
+            "a control value never referenced by the command must not \
+             appear in its output, got: {:?}",
+            logs
+        );
+
+        service.stop().await.expect("stop should succeed");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_spawn_process_multiline_script() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let script = "echo line1\necho line2\necho line3\nsleep 2";
+        let mut service = file_mode_service(script, HashMap::new(), temp_dir.path());
+
+        service
+            .start()
+            .await
+            .expect("start should succeed for a multi-line script");
+
+        let pid_after_start = service.get_pid();
+        assert!(
+            pid_after_start.is_some(),
+            "PID should be captured after start"
+        );
+
+        let logs = wait_for_log_contains(&service, "line3", Duration::from_secs(2)).await;
+        assert!(logs.contains("line1"), "got: {:?}", logs);
+        assert!(logs.contains("line2"), "got: {:?}", logs);
+        assert!(logs.contains("line3"), "got: {:?}", logs);
+
+        // `exec bash -c "$1"` runs the ENTIRE value of $1 as one script, so
+        // all three lines run under the one PID captured at the top -
+        // never a stale wrapper PID from only the first line.
+        assert_eq!(
+            service.get_pid(),
+            pid_after_start,
+            "PID must remain the same detached process throughout the multi-line script"
+        );
+
+        service.stop().await.expect("stop should succeed");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_spawn_process_log_path_with_space() {
+        // Regression test for the second bug found during this
+        // investigation: the log path used to be shell_escape'd and then
+        // interpolated into the same already-single-quoted wrapper as
+        // process_cmd, so a space (forcing quoting) hit the identical
+        // quote-splicing failure - silently truncating the path instead
+        // of crashing.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log_dir = temp_dir.path().join("with space");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let log_path = log_dir.join("service.log");
+
+        let config = crate::config::Service {
+            process: Some("echo hello-from-spaced-path; sleep 2".to_string()),
+            ..Default::default()
+        };
+        let mut service = ProcessService::new(
+            "test-service".to_string(),
+            config,
+            HashMap::new(),
+            temp_dir.path().to_string_lossy().into_owned(),
+            OutputMode::File,
+            Some(log_path.clone()),
+        );
+
+        service
+            .start()
+            .await
+            .expect("start should succeed with a spaced log path");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !log_path.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            log_path.exists(),
+            "log file should exist at the exact spaced path {:?}, not a \
+             truncated path from quote-splicing on the space",
+            log_path
+        );
+
+        let contents = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert!(
+            contents.contains("hello-from-spaced-path"),
+            "log content should be intact, got: {:?}",
+            contents
+        );
+
+        service.stop().await.expect("stop should succeed");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_spawn_process_backtick_and_command_substitution() {
+        // Command substitution is intended shell behavior at the user's
+        // command level (not something to escape away) - confirm it still
+        // runs, since the fix must not shell-escape process_cmd itself.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut service = file_mode_service(
+            "echo `date +%Y` static; sleep 2",
+            HashMap::new(),
+            temp_dir.path(),
+        );
+
+        service
+            .start()
+            .await
+            .expect("start should succeed with backtick command substitution");
+
+        let logs = wait_for_log_contains(&service, "static", Duration::from_secs(2)).await;
+        let year = Utc::now().format("%Y").to_string();
+        assert!(
+            logs.contains(&year) && logs.contains("static"),
+            "backtick command substitution should still run and produce \
+             two words (year + 'static'), got: {:?}",
+            logs
+        );
+
+        service.stop().await.expect("stop should succeed");
     }
 }
