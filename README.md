@@ -1,6 +1,10 @@
 # fed
 
-fed runs your app as a native process and your dependencies as Docker containers, in one dependency graph with healthcheck-gated startup. Each git worktree can get its own ports, containers, and volumes (`fed isolate enable`), so parallel checkouts and coding agents never collide.
+[![Release](https://img.shields.io/github/v/release/service-federation/fed?color=green)](https://github.com/service-federation/fed/releases/latest)
+[![CI](https://github.com/service-federation/fed/actions/workflows/ci.yml/badge.svg)](https://github.com/service-federation/fed/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/github/license/service-federation/fed)](./LICENSE)
+
+`git clone`, `fed start`, and the whole project is running: your app as a native process, your dependencies as Docker containers, one dependency graph, healthcheck-gated startup. Think `docker compose up` — except the app isn't in a container, and every git worktree can run its own isolated copy of the stack.
 
 This README gets you running. Everything else — full command, configuration, and secrets references — lives at **[service-federation.com/docs](https://www.service-federation.com/docs/)**.
 
@@ -53,14 +57,29 @@ services:
 entrypoint: backend
 ```
 
+Then start it. Nothing reports ready until its healthcheck actually passes:
+
+```console
+$ fed start
+Starting: backend (with deps: database)
+
+  database (dependency)... ready
+  backend... ready
+
+All services started successfully!
+
+╭──────────────────────────────╮
+│ API on http://localhost:8080 │
+╰──────────────────────────────╯
+```
+
 ```bash
-fed start        # Start services (waits for healthchecks, backgrounds)
 fed status       # What's running
 fed logs backend # View logs
 fed stop         # Stop all
 ```
 
-That's the whole workflow. `git clone`, add a config, `fed start`, the project is running.
+That's the whole workflow, for you and for the next teammate.
 
 ## In a repo that already uses fed?
 
@@ -75,9 +94,11 @@ Details: [coding agents & isolation](https://www.service-federation.com/docs/iso
 
 ## Why fed
 
-- **One config, one command** — Docker containers, native processes, and Compose services all live in one `fed.yaml`. `fed start` handles dependency ordering and health checks.
-- **Directory-scoped isolation** — Containers, volumes, and state are namespaced by working directory automatically; `fed isolate enable` gives a checkout its own ports too. Git worktrees plus one command = parallel environments.
-- **No Docker Compose sprawl** — Port parameters, templating, profiles, and cross-project packages replace the pile of override files and `.env` juggling.
+**Clone to running, one command.** One `fed.yaml` declares your Docker containers, native processes, and Compose services; `fed start` brings them up in dependency order and holds each service until its dependencies are actually healthy. Onboarding stops being a README of setup steps nobody reruns.
+
+**Parallel checkouts stop fighting.** Containers, volumes, and state are scoped to the working directory automatically, and `fed isolate enable` gives a checkout its own ports too. Five worktrees — yours plus four coding agents — can run five full stacks on one laptop without a single port collision, and nobody kills anybody else's database.
+
+**No more override-file archaeology.** Port parameters, templating, profiles, and cross-project packages replace the `docker-compose.override.yml` pile and the `.env` juggling that grows around every multi-service repo.
 
 ## Highlights
 
@@ -123,6 +144,10 @@ See [`examples/`](./examples):
 - [`docker-compose-example/`](./examples/docker-compose-example) — Docker Compose integration
 - [`profiles-example.yaml`](./examples/profiles-example.yaml) — Profiles
 - [`service-merging/`](./examples/service-merging) — Package imports
+
+## Questions & support
+
+Stuck or found a bug? [Open an issue](https://github.com/service-federation/fed/issues) — for environment problems, include the output of `fed doctor`.
 
 ## Contributing
 

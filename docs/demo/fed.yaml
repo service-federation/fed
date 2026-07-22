@@ -1,0 +1,46 @@
+parameters:
+  API_PORT:
+    type: port
+    default: 18480
+  DB_PORT:
+    type: port
+    default: 18432
+
+  DB_NAME:
+    default: fed_demo
+  DB_USER:
+    default: app
+  DB_PASSWORD:
+    default: local-dev-only
+
+services:
+  database:
+    image: postgres:16-alpine
+    ports: ["{{DB_PORT}}:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    environment:
+      POSTGRES_DB: "{{DB_NAME}}"
+      POSTGRES_USER: "{{DB_USER}}"
+      POSTGRES_PASSWORD: "{{DB_PASSWORD}}"
+    healthcheck:
+      command: "pg_isready -h 127.0.0.1 -U {{DB_USER}} -d {{DB_NAME}}"
+
+  schema:
+    depends_on: [database]
+    migrate: ./scripts/migrate.sh
+    environment:
+      DB_PORT: "{{DB_PORT}}"
+      DB_NAME: "{{DB_NAME}}"
+      DB_USER: "{{DB_USER}}"
+
+  api:
+    process: python3 app.py
+    depends_on: [schema]
+    environment:
+      PORT: "{{API_PORT}}"
+      FED_PROJECT_ID: "{{FED_PROJECT_ID}}"
+    healthcheck:
+      httpGet: "http://localhost:{{API_PORT}}/health"
+    startup_message: "API ready: http://localhost:{{API_PORT}}"
+
+entrypoint: api

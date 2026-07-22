@@ -1,0 +1,19 @@
+$ fed start
+Starting: api (with deps: database, schema)
+
+  database (dependency)...  Waiting for healthcheck on 'database' (timeout: 5s)
+✓ Service 'database' is healthy
+ ready
+  schema (dependency)...  Running migrate command for service 'schema': ./scripts/migrate.sh
+  Successfully completed migrate for service 'schema'
+  Hook-only service 'schema' completed
+ ready
+  api...  Waiting for healthcheck on 'api' (timeout: 5s)
+✓ Service 'api' is healthy
+ ready
+
+All services started successfully!
+
+╭───────────────────────────────────╮
+│ API ready: http://localhost:18480 │
+╰───────────────────────────────────╯
