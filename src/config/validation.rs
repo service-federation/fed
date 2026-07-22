@@ -5,15 +5,6 @@ use std::collections::HashSet;
 impl Config {
     /// Validate the configuration
     pub fn validate(&self) -> Result<()> {
-        // `variables` was an alias for `parameters`; removed in 4.0.
-        if self.legacy_variables.as_ref().is_some_and(|v| !v.is_null()) {
-            return Err(Error::Validation(
-                "Unknown top-level key `variables:`. \
-                 Rename it to `parameters:` — the schema is identical."
-                    .to_string(),
-            ));
-        }
-
         // `FED_PROJECT_ID` is a built-in template variable (a stable, cookie-safe
         // per-project identifier). It is injected automatically and must not be
         // declared as a user parameter.

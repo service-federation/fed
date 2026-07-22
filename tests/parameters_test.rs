@@ -208,46 +208,6 @@ fn test_complex_multi_environment_config() {
     );
 }
 
-/// The `variables:` top-level key was an alias for `parameters:`, removed in
-/// 4.0. A config still using it must fail validation with a migration message
-/// rather than being silently ignored.
-#[test]
-fn test_legacy_variables_key_rejected() {
-    let yaml = r#"
-variables:
-  API_PORT:
-    type: port
-    default: 8080
-services:
-  api:
-    process: "echo hi"
-"#;
-    let config: Config = serde_yaml::from_str(yaml).unwrap();
-    let err = config.validate().unwrap_err().to_string();
-    assert!(
-        err.contains("`variables:`") && err.contains("`parameters:`"),
-        "expected a migration message pointing variables -> parameters, got: {err}"
-    );
-}
-
-/// An empty/absent `variables:` key must not trip the migration error.
-#[test]
-fn test_no_variables_key_is_fine() {
-    let yaml = r#"
-parameters:
-  API_PORT:
-    type: port
-    default: 8080
-services:
-  api:
-    process: "echo hi"
-    startup_message: "http://localhost:{{API_PORT}}"
-entrypoint: api
-"#;
-    let config: Config = serde_yaml::from_str(yaml).unwrap();
-    assert!(config.validate().is_ok());
-}
-
 #[test]
 fn test_environment_from_string() {
     assert_eq!(

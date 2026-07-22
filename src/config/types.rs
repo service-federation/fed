@@ -18,13 +18,6 @@ pub struct Config {
     #[serde(default)]
     pub parameters: HashMap<String, Parameter>,
 
-    /// `variables` was an accepted alias for `parameters`, removed in 4.0.
-    /// Captured here only so [`Config::validate`] can emit a clear migration
-    /// error when an old config still uses the key, instead of silently
-    /// ignoring it. Never read for values.
-    #[serde(default, rename = "variables", skip_serializing)]
-    pub legacy_variables: Option<serde_yaml::Value>,
-
     #[serde(default)]
     pub services: HashMap<String, Service>,
 
@@ -76,7 +69,7 @@ pub struct Config {
 
     /// Unknown top-level keys captured for a non-breaking typo warning (e.g. `service:`
     /// where `services:` was meant). serde routes only genuinely-unknown keys here, so
-    /// recognized fields — including the `variables`/`run` legacy captures — are unaffected.
+    /// recognized fields are unaffected.
     #[serde(flatten)]
     pub unknown_fields: std::collections::BTreeMap<String, serde_yaml::Value>,
 }
@@ -104,7 +97,6 @@ impl Config {
     pub const fn known_top_level_keys() -> &'static [&'static str] {
         &[
             "parameters",
-            "variables",
             "services",
             "templates",
             "dependencies",
