@@ -330,3 +330,104 @@ impl<'a> HealthCheckRunner<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::disallowed_methods)]
+
+    use super::*;
+    use crate::config::Config;
+    use async_trait::async_trait;
+
+    struct AlwaysUnhealthy {
+        timeout: Duration,
+    }
+
+    #[async_trait]
+    impl HealthChecker for AlwaysUnhealthy {
+        async fn check(&self) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn timeout(&self) -> Duration {
+            self.timeout
+        }
+    }
+
+    struct LiveManager;
+
+    #[async_trait]
+    impl ServiceManager for LiveManager {
+        async fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn kill(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn health(&self) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn status(&self) -> Status {
+            Status::Running
+        }
+
+        fn name(&self) -> &str {
+            "service"
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn script_readiness_timeout_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let orchestrator =
+            Orchestrator::new_ephemeral(Config::default(), temp.path().to_path_buf())
+                .await
+                .unwrap();
+        orchestrator.health_checkers.write().await.insert(
+            "service".to_string(),
+            Arc::new(AlwaysUnhealthy {
+                timeout: Duration::from_millis(1),
+            }),
+        );
+
+        let error = HealthCheckRunner::new(&orchestrator)
+            .wait_for_healthy("service", Duration::from_millis(1))
+            .await
+            .expect_err("script dependencies must not run after a readiness timeout");
+
+        assert!(matches!(error, Error::HealthCheckFailed(ref name, _) if name == "service"));
+    }
+
+    #[tokio::test]
+    async fn startup_health_timeout_warns_but_does_not_fail_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let orchestrator =
+            Orchestrator::new_ephemeral(Config::default(), temp.path().to_path_buf())
+                .await
+                .unwrap();
+        orchestrator.health_checkers.write().await.insert(
+            "service".to_string(),
+            Arc::new(AlwaysUnhealthy {
+                timeout: Duration::ZERO,
+            }),
+        );
+        let manager: Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>> =
+            Arc::new(tokio::sync::Mutex::new(Box::new(LiveManager)));
+
+        HealthCheckRunner::new(&orchestrator)
+            .await_healthcheck("service", &manager)
+            .await
+            .expect("a live service missing its startup health timeout remains a warning");
+    }
+}

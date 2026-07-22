@@ -4,134 +4,198 @@
 [![CI](https://github.com/service-federation/fed/actions/workflows/ci.yml/badge.svg)](https://github.com/service-federation/fed/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/github/license/service-federation/fed)](./LICENSE)
 
-`git clone`, `fed start`, and the whole project is running: your app as a native process, your dependencies as Docker containers, one dependency graph, healthcheck-gated startup. Think `docker compose up`, except the app isn't in a container and every git worktree can run its own isolated copy of the stack.
+Run your app natively and its dependencies in Docker from one config file. Then give each agent worktree its own fed-managed runtime state.
 
-![fed demo: editing the config, starting the stack, and running a second isolated stack from a git worktree](docs/fed-demo.gif)
+```console
+$ fed start
+Starting: api (with deps: database, schema)
 
-## Why fed
+  database... ready
+  schema... ready
+  api... ready
 
-- **Your coding agents stop killing each other's databases.** One worktree per agent, one full stack per worktree, zero shared ports.
-- **Onboarding is `git clone`, `fed start`.** No README of setup steps nobody reruns. Dependencies start in order and wait for real healthchecks.
-- **No override-file archaeology.** Port parameters, templates, profiles, and packages replace the `docker-compose.override.yml` pile.
+API ready: http://localhost:8080
+```
 
-## Quick Start
+fed handles the parts of local development that shell scripts and Compose override files usually leave to people:
+
+- Starts native processes, Docker containers, and Compose services in dependency order.
+- Polls configured health checks and reports the result for each service.
+- Allocates stable ports and scopes containers, volumes, and state to each checkout.
+- Runs project commands with the ports and credentials allocated to that checkout.
+- Starts and cleans up throwaway native and image-backed stacks for integration tests.
+
+The CLI is open source, works without an account, and does not replace Docker or Compose. It coordinates them with the processes that should stay on your host.
+
+![fed demo: starting a mixed native and Docker stack, then running an isolated copy from a Git worktree](docs/fed-demo.gif)
+
+## Install
 
 ```bash
 brew install service-federation/tap/fed
 ```
 
-Other installs: [prebuilt binary, cargo](https://www.service-federation.com/docs/).
+macOS and Linux binaries are also available from [GitHub Releases](https://github.com/service-federation/fed/releases/latest). To build the current main branch from source:
 
-Create `fed.yaml` (or run `fed init`). This example assumes a Node backend in `./backend` that reads `PORT` and serves `/health`:
+```bash
+cargo install --git https://github.com/service-federation/fed --locked
+```
+
+Run `fed doctor` after installation to check Docker, Compose, and Git.
+
+## Try a real stack
+
+The repository includes a small Python and PostgreSQL project. It has a native API, a Docker database, a schema migration, and health checks.
+
+```bash
+git clone https://github.com/service-federation/fed.git
+cd fed/docs/demo
+fed start
+curl http://localhost:18480/health
+fed stop
+fed clean
+```
+
+This proves the whole path before you write a config for your own project.
+
+## Add fed to a project
+
+Create `fed.yaml` in the project root. This example runs PostgreSQL in Docker and a Node API on the host:
 
 ```yaml
 parameters:
-  API_PORT:
-    type: port
-    default: 8080
-  DB_PORT:
-    type: port
-    default: 5432
-  DB_PASSWORD:
-    type: secret        # generated on first start, never committed
+  API_PORT: { type: port, default: 8080 }
+  DB_PORT: { type: port, default: 5432 }
+  DB_PASSWORD: { type: secret }
 
 services:
   database:
-    image: postgres:15
+    image: postgres:16-alpine
     ports: ["{{DB_PORT}}:5432"]
     environment:
-      POSTGRES_PASSWORD: '{{DB_PASSWORD}}'
+      POSTGRES_PASSWORD: "{{DB_PASSWORD}}"
       POSTGRES_DB: app
     healthcheck:
       command: pg_isready -U postgres
 
-  backend:
+  api:
     process: npm start
-    cwd: ./backend
     depends_on: [database]
     environment:
-      PORT: '{{API_PORT}}'
-      DATABASE_URL: 'postgres://postgres:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/app'
+      PORT: "{{API_PORT}}"
+      DATABASE_URL: "postgres://postgres:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/app"
     healthcheck:
-      httpGet: 'http://localhost:{{API_PORT}}/health'
+      httpGet: "http://localhost:{{API_PORT}}/health"
+    startup_message: "API ready: http://localhost:{{API_PORT}}"
 
-entrypoint: backend
+entrypoint: api
 ```
 
-Start it:
+Then run:
+
+```bash
+fed validate
+fed start
+fed status
+fed logs api
+fed stop
+```
+
+`fed init` can create a starter file. The [configuration reference](https://www.service-federation.com/docs/configuration/) covers all service types and fields.
+
+## One stack per worktree
+
+Git isolates files. fed isolates the runtime state that usually still collides.
 
 ```console
-$ fed start
-Starting: backend (with deps: database)
+~/app         $ fed start
 
-  database (dependency)... ready
-  backend... ready
+~/app-task-1 $ fed isolate enable
+~/app-task-1 $ fed start
 
-All services started successfully!
-
-╭──────────────────────────────╮
-│ API on http://localhost:8080 │
-╰──────────────────────────────╯
+~/app-task-2 $ fed isolate enable
+~/app-task-2 $ fed start
 ```
 
-Day to day: `fed status`, `fed logs backend`, `fed stop`.
+Each isolated checkout gets its own values for declared `type: port` parameters, direct Docker container names, named volumes, generated secrets, and fed state.
 
-## Built for coding agents
+The qualifier matters: fed cannot remap a port hardcoded inside a command, URL, or Compose file. Declare every host port as a `type: port` parameter. See [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/) for Compose behavior, bind mounts, cookies, cleanup, and the full isolation model.
 
-Claude Code, Cursor, and Codex parallelize with one worktree per task. Without isolation, those worktrees fight over ports and databases: one agent's test run wipes another's schema, and the fix is you, untangling it.
-
-With fed, each worktree runs its own full stack:
-
-```console
-~/app          $ fed start                 # your stack, default ports
-~/app-agent-1  $ fed isolate enable        # its own ports, containers, volumes
-~/app-agent-1  $ fed start
-~/app-agent-2  $ fed isolate enable
-~/app-agent-2  $ fed start                 # three stacks, one laptop, no collisions
-```
-
-Two lines in your `AGENTS.md` make every agent do this unprompted:
+For coding agents, put this in `AGENTS.md` or `CLAUDE.md`:
 
 ```markdown
 Run `fed isolate enable` before any other fed command in a new worktree.
-Run `fed clean` before removing a worktree.
+Run project tasks through fed so they receive this worktree's ports and credentials.
+Run `fed clean` before removing the worktree.
 ```
 
-Scripts complete the story: `fed test:integration` resolves the ports and `DATABASE_URL` *this* worktree was allocated, so agents never guess. [Coding agents & isolation →](https://www.service-federation.com/docs/isolation/#coding-agents)
+No editor plugin or agent integration is required. The boundary is the checkout directory.
 
-## Highlights
+## Project commands and integration tests
 
-- **Startup-gating hooks**: `install:` runs once, `migrate:` runs every start, both before dependents boot. [Docs →](https://www.service-federation.com/docs/configuration/)
-- **Hook-only services**: a node that *is* the migration; everything needing the schema depends on it. [Docs →](https://www.service-federation.com/docs/configuration/#hook-only)
-- **Isolated scripts**: `isolated: true` gives tests a throwaway stack while your dev stack keeps running. [Docs →](https://www.service-federation.com/docs/scripts/#isolated-scripts)
-- **Secrets**: generated locally under `.fed/`, or shared via the team vault. Free for 3 people, €8/seat after. [Generated →](https://www.service-federation.com/docs/generated-secrets/) · [Team →](https://www.service-federation.com/docs/secrets/)
-- **`{{FED_PROJECT_ID}}`**: a per-checkout id for namespacing what parallel stacks would share, like cookie names. [Docs →](https://www.service-federation.com/docs/configuration/#fed-project-id)
+Scripts declared in `fed.yaml` know which services they need:
 
-## Documentation
+```yaml
+scripts:
+  test:integration:
+    depends_on: [database, api]
+    isolated: true
+    environment:
+      DATABASE_URL: "{{DATABASE_URL}}"
+    script: npm run test:integration
+```
 
-`fed --help` is always current. On the site: [Quickstart](https://www.service-federation.com/docs/) · [Configuration](https://www.service-federation.com/docs/configuration/) · [Commands](https://www.service-federation.com/docs/commands/) · [Scripts](https://www.service-federation.com/docs/scripts/) · [Isolation](https://www.service-federation.com/docs/isolation/) · [Generated secrets](https://www.service-federation.com/docs/generated-secrets/) · [Team secrets](https://www.service-federation.com/docs/secrets/)
+```bash
+fed test:integration
+```
 
-## Examples
+fed starts missing dependencies, polls their configured health checks, runs the command with resolved values, and cleans up the services it started. For native and direct image-backed services, an isolated script gets a throwaway stack and leaves your development stack alone. Compose-backed dependencies have the limits described in the guide below.
 
-See [`examples/`](./examples):
+See [Scripts and tests](https://www.service-federation.com/docs/scripts/) for lifecycle rules, argument passing, output modes, and isolation limits.
 
-- [`simple.yaml`](./examples/simple.yaml): basic multi-service setup
-- [`scripts-example.yaml`](./examples/scripts-example.yaml): scripts with dependencies
-- [`env-file/`](./examples/env-file): environment files
-- [`templates-example.yaml`](./examples/templates-example.yaml): service templates
-- [`parameters-example.yaml`](./examples/parameters-example.yaml): parameter types, defaults, and constraints
-- [`resource-limits-example.yaml`](./examples/resource-limits-example.yaml): memory, CPU, file descriptor limits
-- [`docker-compose-example/`](./examples/docker-compose-example): Docker Compose integration
-- [`profiles-example.yaml`](./examples/profiles-example.yaml): profiles
-- [`service-merging/`](./examples/service-merging): package imports
+## Existing Docker Compose projects
 
-## Questions & support
+You do not need to translate every container into fed. A service can point at an existing Compose service while your application stays native:
 
-[Open an issue](https://github.com/service-federation/fed/issues). For environment problems, include `fed doctor` output.
+```yaml
+services:
+  database:
+    composeFile: ./compose.yaml
+    composeService: postgres
 
-## Contributing
+  api:
+    process: npm run dev
+    depends_on: [database]
+```
 
-Issues and PRs welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md).
+Read [Use fed with Docker Compose](https://www.service-federation.com/docs/compose/) before enabling worktree isolation. Compose ports must use environment substitution so fed can allocate them.
+
+## Local and team secrets
+
+`type: secret` creates a stable local development value in a mode-0600, Git-ignored file. This needs no account or network access.
+
+For credentials a team must share, the optional Service Federation Cloud vault can fill `source: manual` values during `fed start`. The first three people in an organization are free, then each additional seat costs €8 per month. It is for development credentials, not production secrets or compliance workloads.
+
+Removing a member blocks new server fetches. It cannot erase values already cached on that person's machine, so rotate credentials after removing someone who had access. Read [Generated secrets](https://www.service-federation.com/docs/generated-secrets/) and [Team secrets](https://www.service-federation.com/docs/secrets/) before choosing either path.
+
+## Documentation and examples
+
+- [Quickstart](https://www.service-federation.com/docs/)
+- [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/)
+- [Use fed with Docker Compose](https://www.service-federation.com/docs/compose/)
+- [Configuration reference](https://www.service-federation.com/docs/configuration/)
+- [Scripts and tests](https://www.service-federation.com/docs/scripts/)
+- [Command reference](https://www.service-federation.com/docs/commands/)
+
+Example configs include [Rails with Sidekiq](./examples/rails-sidekiq.yaml), [FastAPI with Celery](./examples/python-fastapi.yaml), [Go microservices](./examples/go-microservices.yaml), [Node services](./examples/nodejs-microservices.yaml), and [an existing Docker Compose project](./examples/docker-compose-example/).
+
+`fed --help` is the command-line source of truth for the installed version.
+
+## Support and contributing
+
+[Open an issue](https://github.com/service-federation/fed/issues) for bugs, questions, or feature requests. Include `fed doctor` output when the problem depends on the local environment.
+
+Contributions are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## License
 
