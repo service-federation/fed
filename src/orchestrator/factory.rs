@@ -323,7 +323,9 @@ impl Orchestrator {
                     oneshot.restore_status(service_state.status);
                 }
 
-                // Compose services also persist no PID/container id — their
+                // Compose services persist no PID (they have no direct child
+                // process) but DO persist a container id since v7.2.1 (see
+                // `compose.rs`'s post-`compose up` capture) — their
                 // containers live under a compose project name. When the
                 // persisted status says the service was live, verify with a
                 // real `compose ps` and restore Running so a fresh process
