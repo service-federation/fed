@@ -1,5 +1,10 @@
 use crate::output::UserOutput;
-use fed::{Orchestrator, config::Config, service::Status, state::StateTracker};
+use fed::{
+    Orchestrator,
+    config::Config,
+    service::Status,
+    state::{DesiredState, StateTracker},
+};
 use std::path::Path;
 
 use super::lifecycle::{StopResult, remove_orphan_containers_for_workdir, stop_service_by_state};
@@ -12,6 +17,21 @@ pub async fn run_stop(
 ) -> anyhow::Result<()> {
     if services.is_empty() {
         out.status("Stopping all services...");
+
+        // Quiesce every currently-registered service's intent to Stopped in
+        // one upfront batch, before any kill signal goes out below. This
+        // closes the race window where a per-service interleaved
+        // write-then-kill loop could leave some rows still `Running` while
+        // their processes are already being torn down — see
+        // `07-supervisor.md` Design §1. Best-effort: an empty/missing state
+        // DB is not an error here.
+        let _ = orchestrator
+            .state_tracker
+            .write()
+            .await
+            .set_all_desired_state(DesiredState::Stopped)
+            .await;
+
         orchestrator.stop_all().await?;
 
         // If the config changed since services were started, some running services may
@@ -123,6 +143,20 @@ async fn stop_remaining_state_services(orchestrator: &Orchestrator, out: &dyn Us
         return 0;
     }
 
+    // Write the stop intent for every active service *before* any of them
+    // are actually killed below. `stop_service_by_state` has no tracker
+    // access (it only knows PID/container), so its callers own this
+    // responsibility — see `07-supervisor.md` Design §1.
+    {
+        let mut tracker = orchestrator.state_tracker.write().await;
+        for (name, state) in &services {
+            if !state_status_is_active(state.status) {
+                continue;
+            }
+            let _ = tracker.set_desired_state(name, DesiredState::Stopped).await;
+        }
+    }
+
     let mut stopped_names: Vec<String> = Vec::new();
 
     for (name, state) in services {
@@ -196,6 +230,19 @@ pub async fn run_stop_from_state(
         "Stopping {} service(s) from state tracker...",
         services_to_stop.len()
     ));
+
+    // Write the stop intent for every active service *before* any of them
+    // are actually killed below — this closes the config-can't-load
+    // fallback gap: without it, `fed stop` run against a broken config would
+    // still let a restart-policy supervisor resurrect a service, since this
+    // path never goes through `stop_service_impl`. See `07-supervisor.md`
+    // Design §1.
+    for (name, state) in &services_to_stop {
+        if !state_status_is_active(state.status) {
+            continue;
+        }
+        let _ = tracker.set_desired_state(name, DesiredState::Stopped).await;
+    }
 
     let mut failed: Vec<String> = Vec::new();
     for (name, state) in &services_to_stop {

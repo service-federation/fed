@@ -3,7 +3,7 @@ use crate::dependency::{ExternalServiceExpander, Graph};
 use crate::error::{Error, Result};
 use crate::parameter::Resolver;
 use crate::service::{OutputMode, ServiceManager, Status};
-use crate::state::{ServiceState, StateTracker};
+use crate::state::{DesiredState, ServiceState, StateTracker};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 // Using tokio::sync::RwLock for async-aware locking
@@ -1190,6 +1190,16 @@ impl Orchestrator {
             let mut tracker = self.state_tracker.write().await;
             tracker.update_service_status(name, Status::Running).await?;
 
+            // Defensive belt-and-suspenders: `register_service`'s INSERT
+            // already writes `desired_state = Running` for a brand-new row
+            // (see `ServiceState::new`'s default), so this is not
+            // load-bearing for the common case — but it's cheap and keeps
+            // intent explicit at every place a service is confirmed started.
+            // See `07-supervisor.md` Design §1.
+            tracker
+                .set_desired_state(name, DesiredState::Running)
+                .await?;
+
             // Store PID if available (for process services)
             // Store container ID if available (for docker services)
             {
@@ -1432,6 +1442,18 @@ impl Orchestrator {
     /// Returns an error if the kill itself fails or times out — in that case
     /// the state entry is kept so the still-running process remains tracked.
     async fn force_kill_service(&self, name: &str) -> Result<()> {
+        // Persist the stop intent *before* the kill signal goes out. A
+        // separate `fed` process (a future restart-policy supervisor) reads
+        // this column, not this in-process manager's `Status` — see
+        // `07-supervisor.md` Design §1. Best-effort: a missing row (never
+        // registered) is not an error here.
+        let _ = self
+            .state_tracker
+            .write()
+            .await
+            .set_desired_state(name, DesiredState::Stopped)
+            .await;
+
         let manager_arc = {
             let services = self.services.read().await;
             services.get(name).map(Arc::clone)
@@ -1507,6 +1529,16 @@ impl Orchestrator {
 
     /// Implementation of stop_service (separate to allow instrumentation)
     async fn stop_service_impl(&self, name: &str) -> Result<()> {
+        // Persist the stop intent *before* the kill signal goes out, same
+        // reasoning as `force_kill_service` above. Best-effort: a missing
+        // row (never registered) is not an error here.
+        let _ = self
+            .state_tracker
+            .write()
+            .await
+            .set_desired_state(name, DesiredState::Stopped)
+            .await;
+
         // Get Arc clone of manager
         let manager_arc = {
             let services = self.services.read().await;

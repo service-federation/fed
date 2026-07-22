@@ -106,6 +106,7 @@ impl SqliteStateTracker {
         let last_restart_at = service_state.last_restart_at.map(|dt| dt.to_rfc3339());
         let consecutive_failures = service_state.consecutive_failures;
         let startup_message = service_state.startup_message.clone();
+        let desired_state = service_state.desired_state.to_string();
 
         self.conn
             .call(move |conn: &mut rusqlite::Connection| {
@@ -121,16 +122,20 @@ impl SqliteStateTracker {
                     .optional()?;
 
                 if let Some(status_str) = existing_status {
-                    // Service already registered — leave its row untouched.
+                    // Service already registered — leave its row (including
+                    // desired_state) untouched.
                     tx.commit()?;
                     let status = status_str.parse::<Status>().unwrap_or(Status::Starting);
                     return Ok(RegistrationOutcome::AlreadyExists { status });
                 }
 
-                // Insert new service
+                // Insert new service. desired_state is written explicitly
+                // (defaulting to 'running' via ServiceState::new) rather than
+                // relying solely on the column's SQL DEFAULT, so a fresh
+                // registration always marks intent as running.
                 tx.execute(
-                    "INSERT INTO services (id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    "INSERT INTO services (id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     rusqlite::params![
                         &id,
                         &status,
@@ -144,6 +149,7 @@ impl SqliteStateTracker {
                         last_restart_at,
                         consecutive_failures,
                         startup_message.as_deref(),
+                        &desired_state,
                     ],
                 )?;
 
@@ -179,6 +185,61 @@ impl SqliteStateTracker {
         if rows == 0 {
             return Err(Error::ServiceNotFound(service_id));
         }
+
+        Ok(())
+    }
+
+    /// Set a single service's persisted desired state (running/stopped).
+    ///
+    /// This is the intent signal every stop path must write **before** any
+    /// kill signal is sent — see `07-supervisor.md` Design §1. Unlike
+    /// `status`, this is never overwritten by health-check observations; it
+    /// only changes on an explicit stop or (re-)registration.
+    #[must_use = "ignoring this result may cause state loss - the desired_state update will not be persisted"]
+    pub async fn set_desired_state(
+        &mut self,
+        service_id: &str,
+        desired_state: DesiredState,
+    ) -> Result<()> {
+        let service_id = service_id.to_string();
+        let service_id_for_tx = service_id.clone();
+        let desired_state = desired_state.to_string();
+
+        let rows = self
+            .with_transaction(move |tx| {
+                tx.execute(
+                    "UPDATE services SET desired_state = ?1 WHERE id = ?2",
+                    rusqlite::params![&desired_state, &service_id_for_tx],
+                )
+            })
+            .await?;
+
+        if rows == 0 {
+            return Err(Error::ServiceNotFound(service_id));
+        }
+
+        Ok(())
+    }
+
+    /// Set the persisted desired state for every currently-registered
+    /// service in a single transaction.
+    ///
+    /// Used by whole-project `fed stop` to quiesce every service's intent to
+    /// `Stopped` in one batch *before* any kill signal goes out — closing the
+    /// race window where a per-service interleaved write-then-kill loop could
+    /// leave some rows still `Running` while their processes are already
+    /// being torn down (`07-supervisor.md` Design §1).
+    #[must_use = "ignoring this result may cause state loss - the desired_state update will not be persisted"]
+    pub async fn set_all_desired_state(&mut self, desired_state: DesiredState) -> Result<()> {
+        let desired_state = desired_state.to_string();
+
+        self.with_transaction(move |tx| {
+            tx.execute(
+                "UPDATE services SET desired_state = ?1",
+                rusqlite::params![&desired_state],
+            )
+        })
+        .await?;
 
         Ok(())
     }
@@ -398,7 +459,7 @@ impl SqliteStateTracker {
     pub async fn get_services(&self) -> HashMap<String, ServiceState> {
         match self.conn.call(|conn: &mut rusqlite::Connection| {
             let mut stmt = conn.prepare(
-                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message FROM services"
+                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state FROM services"
             )?;
 
             let services_iter = stmt.query_map([], |row| {
@@ -407,6 +468,7 @@ impl SqliteStateTracker {
                 let service_type_str: String = row.get(2)?;
                 let started_at_str: String = row.get(5)?;
                 let last_restart_str: Option<String> = row.get(9)?;
+                let desired_state_str: String = row.get(12)?;
 
                 Ok((
                     id.clone(),
@@ -427,6 +489,7 @@ impl SqliteStateTracker {
                         consecutive_failures: row.get(10)?,
                         port_allocations: HashMap::new(), // Will be populated below
                         startup_message: row.get(11)?,
+                        desired_state: desired_state_str.parse::<DesiredState>().unwrap_or(DesiredState::Running),
                     },
                 ))
             })?;
@@ -497,7 +560,7 @@ impl SqliteStateTracker {
 
         self.conn.call(move |conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<ServiceState>> {
             let service = match conn.query_row(
-                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message FROM services WHERE id = ?1",
+                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state FROM services WHERE id = ?1",
                 rusqlite::params![&service_id],
                 |row| {
                     let id: String = row.get(0)?;
@@ -505,6 +568,7 @@ impl SqliteStateTracker {
                     let service_type_str: String = row.get(2)?;
                     let started_at_str: String = row.get(5)?;
                     let last_restart_str: Option<String> = row.get(9)?;
+                    let desired_state_str: String = row.get(12)?;
 
                     Ok(ServiceState {
                         id,
@@ -520,6 +584,7 @@ impl SqliteStateTracker {
                         consecutive_failures: row.get(10)?,
                         port_allocations: HashMap::new(),
                         startup_message: row.get(11)?,
+                        desired_state: desired_state_str.parse::<DesiredState>().unwrap_or(DesiredState::Running),
                     })
                 }
             ) {
@@ -935,6 +1000,7 @@ mod tests {
             consecutive_failures: 1,
             port_allocations: HashMap::new(),
             startup_message: Some("Running on port 8080".to_string()),
+            desired_state: DesiredState::Running,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1055,6 +1121,7 @@ mod tests {
             consecutive_failures: 0,
             port_allocations: HashMap::new(),
             startup_message: None,
+            desired_state: DesiredState::Running,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1140,6 +1207,7 @@ mod tests {
             consecutive_failures: 0,
             port_allocations: HashMap::new(),
             startup_message: None,
+            desired_state: DesiredState::Running,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1173,6 +1241,7 @@ mod tests {
             consecutive_failures: 0,
             port_allocations: HashMap::new(),
             startup_message: None,
+            desired_state: DesiredState::Running,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1207,6 +1276,7 @@ mod tests {
             consecutive_failures: 0,
             port_allocations: HashMap::new(),
             startup_message: None,
+            desired_state: DesiredState::Running,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1235,6 +1305,7 @@ mod tests {
             consecutive_failures: 0,
             port_allocations: HashMap::new(),
             startup_message: None,
+            desired_state: DesiredState::Running,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1272,6 +1343,7 @@ mod tests {
             consecutive_failures: 0,
             port_allocations: HashMap::new(),
             startup_message: None,
+            desired_state: DesiredState::Running,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1334,6 +1406,7 @@ mod tests {
             consecutive_failures: 0,
             port_allocations: HashMap::new(),
             startup_message: None,
+            desired_state: DesiredState::Running,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1371,6 +1444,7 @@ mod tests {
             consecutive_failures: 0,
             port_allocations: HashMap::new(),
             startup_message: None,
+            desired_state: DesiredState::Running,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1389,6 +1463,7 @@ mod tests {
             consecutive_failures: 0,
             port_allocations: HashMap::new(),
             startup_message: None,
+            desired_state: DesiredState::Running,
         };
         let outcome = tracker.register_service(new_state).await.unwrap();
         assert_eq!(
@@ -1411,5 +1486,157 @@ mod tests {
             Some(12345),
             "register_service must not lose the existing PID"
         );
+    }
+
+    // ========================================================================
+    // desired_state round-trip tests (07-supervisor.md Design §1, Phase 1)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_register_service_defaults_desired_state_running() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let state = make_service_state("svc", ServiceType::Process);
+        tracker.register_service(state).await.unwrap();
+
+        let retrieved = tracker.get_service("svc").await.unwrap();
+        assert_eq!(
+            retrieved.desired_state,
+            DesiredState::Running,
+            "a freshly registered row should default to desired_state='running'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_service_already_exists_leaves_desired_state_untouched() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let state = make_service_state("svc", ServiceType::Process);
+        tracker.register_service(state).await.unwrap();
+
+        // Simulate a prior stop having written 'stopped' for this row.
+        tracker
+            .set_desired_state("svc", DesiredState::Stopped)
+            .await
+            .unwrap();
+
+        // A second registration attempt (e.g. a racing start) must leave the
+        // row — including desired_state — completely untouched.
+        let state2 = make_service_state("svc", ServiceType::Process);
+        let outcome = tracker.register_service(state2).await.unwrap();
+        assert_eq!(
+            outcome,
+            RegistrationOutcome::AlreadyExists {
+                status: Status::Running
+            }
+        );
+
+        let retrieved = tracker.get_service("svc").await.unwrap();
+        assert_eq!(
+            retrieved.desired_state,
+            DesiredState::Stopped,
+            "register_service must not clobber an existing row's desired_state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_desired_state_round_trip() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let state = make_service_state("svc", ServiceType::Process);
+        tracker.register_service(state).await.unwrap();
+        assert_eq!(
+            tracker.get_service("svc").await.unwrap().desired_state,
+            DesiredState::Running
+        );
+
+        tracker
+            .set_desired_state("svc", DesiredState::Stopped)
+            .await
+            .unwrap();
+        assert_eq!(
+            tracker.get_service("svc").await.unwrap().desired_state,
+            DesiredState::Stopped
+        );
+
+        // get_services() (the bulk read site) must agree with get_service()
+        // (the single-row read site) — both are separate SELECT/mapping
+        // sites that must stay in sync.
+        let services = tracker.get_services().await;
+        assert_eq!(
+            services.get("svc").unwrap().desired_state,
+            DesiredState::Stopped
+        );
+
+        tracker
+            .set_desired_state("svc", DesiredState::Running)
+            .await
+            .unwrap();
+        assert_eq!(
+            tracker.get_service("svc").await.unwrap().desired_state,
+            DesiredState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_desired_state_nonexistent_service_errors() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        let result = tracker
+            .set_desired_state("no-such-service", DesiredState::Stopped)
+            .await;
+        assert!(
+            result.is_err(),
+            "setting desired_state on a missing row should error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_all_desired_state_batches_every_row() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        for name in &["alpha", "beta", "gamma"] {
+            let state = make_service_state(name, ServiceType::Process);
+            tracker.register_service(state).await.unwrap();
+        }
+
+        tracker
+            .set_all_desired_state(DesiredState::Stopped)
+            .await
+            .unwrap();
+
+        let services = tracker.get_services().await;
+        assert_eq!(services.len(), 3);
+        for name in &["alpha", "beta", "gamma"] {
+            assert_eq!(
+                services.get(*name).unwrap().desired_state,
+                DesiredState::Stopped,
+                "service '{}' should have been included in the batch write",
+                name
+            );
+        }
+
+        tracker
+            .set_all_desired_state(DesiredState::Running)
+            .await
+            .unwrap();
+        let services = tracker.get_services().await;
+        for name in &["alpha", "beta", "gamma"] {
+            assert_eq!(
+                services.get(*name).unwrap().desired_state,
+                DesiredState::Running
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_all_desired_state_on_empty_db_is_a_noop() {
+        let mut tracker = create_ephemeral_tracker().await;
+
+        // Must not error even though there are no rows to update.
+        tracker
+            .set_all_desired_state(DesiredState::Stopped)
+            .await
+            .unwrap();
     }
 }

@@ -29,7 +29,7 @@ mod sqlite;
 mod types;
 
 pub use sqlite::SqliteStateTracker;
-pub use types::{LockFile, RegistrationOutcome, ServiceState};
+pub use types::{DesiredState, LockFile, RegistrationOutcome, ServiceState};
 
 /// Primary state tracker type, backed by SQLite.
 ///

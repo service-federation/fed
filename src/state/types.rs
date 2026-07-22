@@ -3,6 +3,8 @@ use crate::service::Status;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
 
 /// Lock file format - persisted state of running services
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +82,52 @@ pub struct ServiceState {
     /// Resolved startup message template (for display after start and in status)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_message: Option<String>,
+
+    /// Whether this service is meant to be running or was explicitly stopped.
+    ///
+    /// Independent of `status` (which reflects last-observed reality, e.g.
+    /// `Running`/`Failing`/`Stopping`): `desired_state` is the persisted
+    /// *intent* signal. Every stop path writes `Stopped` here before sending
+    /// any kill signal, so a separate `fed` process sharing only the SQLite
+    /// state file (see `07-supervisor.md` Design §1) can tell an intentional
+    /// stop apart from a crash without relying on an in-process manager
+    /// object it never touched.
+    #[serde(default)]
+    pub desired_state: DesiredState,
+}
+
+/// Persisted intent for whether a service should be running.
+///
+/// See [`ServiceState::desired_state`] for why this is a separate field from
+/// `status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DesiredState {
+    /// The service should be running (default — set on registration).
+    #[default]
+    Running,
+    /// The service was explicitly stopped; nothing should try to bring it
+    /// back until it's started again.
+    Stopped,
+}
+
+impl fmt::Display for DesiredState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DesiredState::Running => write!(f, "running"),
+            DesiredState::Stopped => write!(f, "stopped"),
+        }
+    }
+}
+
+impl FromStr for DesiredState {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "running" => Ok(DesiredState::Running),
+            "stopped" => Ok(DesiredState::Stopped),
+            other => Err(format!("Invalid desired_state: {}", other)),
+        }
+    }
 }
 
 impl ServiceState {
@@ -98,6 +146,7 @@ impl ServiceState {
             last_restart_at: None,
             consecutive_failures: 0,
             startup_message: None,
+            desired_state: DesiredState::Running,
         }
     }
 

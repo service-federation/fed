@@ -55,6 +55,11 @@ impl SqliteStateTracker {
             self.migrate_v5_to_v6().await?;
         }
 
+        // Migration from v6 to v7: Add desired_state column
+        if current_version < 7 {
+            self.migrate_v6_to_v7().await?;
+        }
+
         Ok(())
     }
 
@@ -358,6 +363,62 @@ impl SqliteStateTracker {
         Ok(())
     }
 
+    /// Migration v6 -> v7: Add `desired_state` column to `services`.
+    ///
+    /// Persists whether a service is *meant* to be running, independent of
+    /// `status` (last-observed reality). Every stop path writes `'stopped'`
+    /// here before sending any kill signal; registration defaults new rows to
+    /// `'running'`. See `07-supervisor.md` Design §1 — this is the
+    /// cross-process signal a future restart-policy supervisor consults
+    /// instead of an in-process manager object it never touched.
+    async fn migrate_v6_to_v7(&self) -> Result<()> {
+        debug!("Running migration v6 -> v7: Adding desired_state column");
+
+        self.conn
+            .call(|conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+                let tx = conn.transaction()?;
+
+                let already_applied: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM schema_version WHERE version = 7",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+
+                if already_applied {
+                    return Ok(());
+                }
+
+                let has_column: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM pragma_table_info('services') WHERE name = 'desired_state'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+
+                if !has_column {
+                    tx.execute(
+                        "ALTER TABLE services ADD COLUMN desired_state TEXT NOT NULL DEFAULT 'running'",
+                        [],
+                    )?;
+                }
+
+                tx.execute(
+                    "INSERT INTO schema_version (version, applied_at) VALUES (7, datetime('now'))",
+                    [],
+                )?;
+
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+
+        info!("Migration v6 -> v7 completed successfully");
+        Ok(())
+    }
+
     /// Create database schema
     pub(super) async fn create_schema(&self) -> Result<()> {
         self.conn.call(|conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
@@ -392,7 +453,8 @@ impl SqliteStateTracker {
                     last_restart_at TEXT,
                     consecutive_failures INTEGER NOT NULL DEFAULT 0,
                     circuit_breaker_open_until TEXT,
-                    startup_message TEXT
+                    startup_message TEXT,
+                    desired_state TEXT NOT NULL DEFAULT 'running'
                 );
 
                 -- Indexes for services
@@ -462,5 +524,205 @@ impl SqliteStateTracker {
         }).await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod desired_state_migration_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Hand-write a `lock.db` matching the exact v6 schema (pre-`desired_state`,
+    /// see the pre-migration `create_schema` text in git history) so migrating
+    /// it forward exercises the real ALTER TABLE path rather than a
+    /// freshly-created (already up to date) database.
+    fn write_legacy_v6_db(fed_dir: &std::path::Path, service_id: &str, status: &str) {
+        std::fs::create_dir_all(fed_dir).unwrap();
+        let db_path = fed_dir.join("lock.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+
+            CREATE TABLE lock_file (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                fed_pid INTEGER NOT NULL,
+                work_dir TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE services (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                service_type TEXT NOT NULL,
+                pid INTEGER,
+                container_id TEXT,
+                started_at TEXT NOT NULL,
+                external_repo TEXT,
+                namespace TEXT NOT NULL,
+                restart_count INTEGER NOT NULL DEFAULT 0,
+                last_restart_at TEXT,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                circuit_breaker_open_until TEXT,
+                startup_message TEXT
+            );
+
+            CREATE TABLE port_allocations (
+                service_id TEXT NOT NULL,
+                parameter_name TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                PRIMARY KEY (service_id, parameter_name)
+            );
+
+            CREATE TABLE allocated_ports (
+                port INTEGER PRIMARY KEY,
+                allocated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE persisted_ports (
+                param_name TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                allocated_at TEXT NOT NULL,
+                isolation_id TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (param_name, isolation_id)
+            );
+
+            CREATE TABLE restart_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id TEXT NOT NULL,
+                restarted_at TEXT NOT NULL
+            );
+
+            CREATE TABLE project_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            "#,
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (6, datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO lock_file (id, fed_pid, work_dir, started_at, updated_at) VALUES (1, 999999, 'legacy', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO services (id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, circuit_breaker_open_until, startup_message)
+             VALUES (?1, ?2, 'process', NULL, NULL, datetime('now'), NULL, 'root', 0, NULL, 0, NULL, NULL)",
+            rusqlite::params![service_id, status],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrate_v6_to_v7_adds_desired_state_column_defaulting_to_running() {
+        let temp_dir = TempDir::new().unwrap();
+        let fed_dir = temp_dir.path().join(".fed");
+        write_legacy_v6_db(&fed_dir, "legacy-svc", "stopped");
+
+        let mut tracker = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        tracker
+            .initialize()
+            .await
+            .expect("migrating a v6 db to v7 should succeed");
+
+        // The pre-existing row must have gained the new column with the
+        // documented default, without anything explicitly writing it.
+        let state = tracker
+            .get_service("legacy-svc")
+            .await
+            .expect("legacy row should survive the migration");
+        assert_eq!(
+            state.desired_state,
+            DesiredState::Running,
+            "column added by ALTER TABLE ... DEFAULT 'running' should backfill existing rows"
+        );
+
+        // Schema version must have advanced all the way to current.
+        let conn = rusqlite::Connection::open(fed_dir.join("lock.db")).unwrap();
+        let version: i32 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, 7);
+    }
+
+    #[tokio::test]
+    async fn migrate_v6_to_v7_is_idempotent_on_rerun() {
+        let temp_dir = TempDir::new().unwrap();
+        let fed_dir = temp_dir.path().join(".fed");
+        write_legacy_v6_db(&fed_dir, "legacy-svc", "running");
+
+        // First migration.
+        {
+            let mut tracker = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap();
+            tracker.initialize().await.unwrap();
+        }
+
+        // Re-opening (simulating a second `fed` invocation against an
+        // already-migrated db) must not error on the already-applied guard
+        // or the already-existing column.
+        let mut tracker = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        tracker
+            .initialize()
+            .await
+            .expect("re-running migrations against an already-migrated db should be a no-op");
+
+        let state = tracker.get_service("legacy-svc").await.unwrap();
+        assert_eq!(state.desired_state, DesiredState::Running);
+    }
+
+    /// A brand-new `.fed/` directory (the `create_schema` path, not the
+    /// migration path) must get `desired_state` directly — the "two touch
+    /// points" note in `07-supervisor.md` Design §1: forgetting to also add
+    /// the column to `create_schema` would leave fresh projects one
+    /// migration behind their own schema version.
+    #[tokio::test]
+    async fn fresh_database_has_desired_state_column_without_migrating() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut tracker = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        tracker.initialize().await.unwrap();
+
+        let state = crate::state::ServiceState::new(
+            "fresh-svc".to_string(),
+            crate::config::ServiceType::Process,
+            "root".to_string(),
+        );
+        tracker.register_service(state).await.unwrap();
+
+        let retrieved = tracker.get_service("fresh-svc").await.unwrap();
+        assert_eq!(retrieved.desired_state, DesiredState::Running);
+
+        let conn = rusqlite::Connection::open(temp_dir.path().join(".fed/lock.db")).unwrap();
+        let version: i32 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 }
