@@ -23,7 +23,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/service-federation/fed/
 cargo install --git https://github.com/service-federation/fed
 ```
 
-Create `fed.yaml` (or run `fed init`). The older `service-federation.yaml` name is still fully supported. Adapt the config to your app. This example assumes a Node backend in `./backend` that reads `PORT` and serves `/health`:
+Create `fed.yaml` (or run `fed init`). Adapt the config to your app. This example assumes a Node backend in `./backend` that reads `PORT` and serves `/health`:
 
 ```yaml
 parameters:
@@ -83,7 +83,7 @@ That's the whole workflow. For the next teammate, it's `git clone`, `fed start`.
 
 ## In a repo that already uses fed?
 
-If you found a `fed.yaml` (or `service-federation.yaml`) in a project, and especially if you're a coding agent working in a checkout, these four rules keep you out of trouble:
+If you found a `fed.yaml` in a project, and especially if you're a coding agent working in a checkout, these four rules keep you out of trouble:
 
 1. **New worktree? Isolate first.** Run `fed isolate enable` before any other fed command. It persists: every fed command after it gets this directory's own ports, containers, and volumes.
 2. **Run tasks through fed.** `fed <script>` (like `fed test:integration` or `fed psql`) resolves the ports and `DATABASE_URL` this directory was actually allocated. The same command run bare hits whichever checkout owns the default ports. The `scripts:` section of `fed.yaml` lists what's available.
