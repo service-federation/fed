@@ -4,7 +4,7 @@
 [![CI](https://github.com/service-federation/fed/actions/workflows/ci.yml/badge.svg)](https://github.com/service-federation/fed/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/github/license/service-federation/fed)](./LICENSE)
 
-Run your app natively and its dependencies in Docker from one config file. Then run a full, isolated copy of the stack in every Git worktree: no shared ports, no shared databases.
+Run your app natively and its dependencies in Docker from one config file. Think `docker compose up`, except the app isn't in a container and every Git worktree can run its own isolated copy of the stack.
 
 ```console
 $ fed start
@@ -114,6 +114,8 @@ fed stop
 In `fed status`, `running` means the process is up but no healthcheck has confirmed it; only `healthy` means verified. `fed status --json` reports the same distinction as `"status": "running"` with `"health": "unknown"`.
 
 ## One stack per worktree
+
+Your coding agents stop killing each other's databases. One worktree per agent, one full stack per worktree, zero shared ports.
 
 Git isolates files. fed isolates the runtime state that usually still collides.
 
