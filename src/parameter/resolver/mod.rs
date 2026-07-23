@@ -157,6 +157,11 @@ pub struct Resolver {
     /// any service or external service referencing one is dropped from the
     /// resolved config. See `compute_deferred_params` and `service_should_defer`.
     deferred_params: HashSet<String>,
+    /// Names of sensitive parameters: declared `type: secret` plus everything
+    /// transitively derived from one (see [`super::sensitivity`]). Computed in
+    /// `resolve_parameters` and consumed by [`Self::get_parameter_views`] so
+    /// display surfaces never receive raw secret material.
+    sensitive_params: HashSet<String>,
 }
 
 impl Resolver {
@@ -180,6 +185,7 @@ impl Resolver {
             required_names: None,
             isolation_id: None,
             deferred_params: HashSet::new(),
+            sensitive_params: HashSet::new(),
         }
     }
 
@@ -303,8 +309,15 @@ impl Resolver {
 
     /// Resolve just the parameters (first pass, before external service expansion)
     pub fn resolve_parameters(&mut self, config: &mut Config) -> Result<()> {
-        // Clear any stale resolutions from a previous call (e.g. dry-run then real start)
+        // Clear ALL per-resolution state from a previous call (e.g. dry-run
+        // then real start). resolved_parameters in particular must not carry
+        // over: a stale entry from an earlier config would be re-emitted by
+        // get_parameter_views under the NEW config's sensitivity
+        // classification, which could surface a previously-secret value as
+        // plain. port_parameter_names would accumulate duplicates.
         self.port_resolutions.clear();
+        self.resolved_parameters.clear();
+        self.port_parameter_names.clear();
 
         // Determine which parameters are deferred this run BEFORE anything is
         // resolved — secret resolution's `generate` DAG (below), default
@@ -312,6 +325,11 @@ impl Resolver {
         // value that (transitively) depends on an out-of-scope missing manual
         // secret. Empty for unscoped runs, so nothing below changes there.
         self.deferred_params = self.compute_deferred_params(config);
+
+        // Classify sensitivity from declarations and provenance up front, so
+        // it reflects the config as declared — independent of which values end
+        // up resolved, deferred, or defaulted below.
+        self.sensitive_params = super::sensitivity::sensitive_parameter_names(config);
 
         // Resolve secrets first — may generate .env entries and add ".env" to config.env_file
         self.resolve_secrets(config)?;
@@ -546,9 +564,16 @@ impl Resolver {
                 && let Some(resolved_value) = parameters.get(name)
                 && !param.either.contains(resolved_value)
             {
+                // Never echo a sensitive value back through an error message —
+                // resolver errors reach the terminal before any TUI masking.
+                let shown = if self.sensitive_params.contains(name) {
+                    super::sensitivity::REDACTED_DISPLAY
+                } else {
+                    resolved_value.as_str()
+                };
                 return Err(Error::TemplateResolution(format!(
                     "Parameter '{}' has value '{}' which is not in the allowed values: {:?}",
-                    name, resolved_value, param.either
+                    name, shown, param.either
                 )));
             }
         }
@@ -754,6 +779,28 @@ impl Resolver {
     /// Get resolved parameters
     pub fn get_resolved_parameters(&self) -> &HashMap<String, String> {
         &self.resolved_parameters
+    }
+
+    /// Names of sensitive parameters (declared `type: secret`, transitively
+    /// derived from one, or caught by the name heuristic). Populated by
+    /// [`Self::resolve_parameters`].
+    pub fn get_sensitive_parameter_names(&self) -> &HashSet<String> {
+        &self.sensitive_params
+    }
+
+    /// Resolved parameters as display views, sorted by name.
+    ///
+    /// Sensitive parameters come back as [`super::ParameterValue::Redacted`]
+    /// with no raw material attached — this is the boundary display surfaces
+    /// (the TUI) should consume instead of [`Self::get_resolved_parameters`].
+    pub fn get_parameter_views(&self) -> Vec<super::ParameterView> {
+        let mut views: Vec<super::ParameterView> = self
+            .resolved_parameters
+            .iter()
+            .map(|(name, value)| super::ParameterView::new(name, value, &self.sensitive_params))
+            .collect();
+        views.sort_by(|a, b| a.name.cmp(&b.name));
+        views
     }
 
     /// Cleanup all resources
@@ -1054,6 +1101,165 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not in the allowed values"));
         assert!(err.contains("test"));
+    }
+
+    #[test]
+    fn parameter_views_redact_secrets_and_derived_values() {
+        use crate::config::{Config, Parameter};
+
+        const SENTINEL: &str = "sentinel-raw-secret-4242";
+
+        let mut resolver = Resolver::new();
+        let mut config = Config::default();
+
+        // A declared secret whose name contains no secret-like substring.
+        let mut license = Parameter {
+            param_type: Some("secret".to_string()),
+            ..Default::default()
+        };
+        license.value = Some(SENTINEL.to_string());
+        config.parameters.insert("LICENSE".to_string(), license);
+
+        // A parameter derived from the secret via its default template.
+        config.parameters.insert(
+            "CONNECTION".to_string(),
+            Parameter {
+                default: Some(serde_yaml::Value::String(
+                    "db://user:{{LICENSE}}@localhost".to_string(),
+                )),
+                ..Default::default()
+            },
+        );
+
+        // An ordinary parameter whose name merely contains a KEY token.
+        config.parameters.insert(
+            "KEY_COUNT".to_string(),
+            Parameter {
+                default: Some(serde_yaml::Value::String("7".to_string())),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+
+        let views = resolver.get_parameter_views();
+        let get = |name: &str| views.iter().find(|v| v.name == name).unwrap();
+
+        assert!(get("LICENSE").value.is_sensitive());
+        assert_eq!(get("LICENSE").value.clipboard_payload(), None);
+        assert!(get("CONNECTION").value.is_sensitive());
+        assert_eq!(get("CONNECTION").value.clipboard_payload(), None);
+        assert!(!get("KEY_COUNT").value.is_sensitive());
+        assert_eq!(get("KEY_COUNT").value.clipboard_payload(), Some("7"));
+
+        // Views are sorted by name for deterministic display indexing.
+        let names: Vec<&str> = views.iter().map(|v| v.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+
+        // No view (including its Debug representation) carries the raw value.
+        let debug_dump = format!("{:?}", views);
+        assert!(!debug_dump.contains(SENTINEL));
+    }
+
+    #[test]
+    fn re_resolution_drops_stale_parameters_from_previous_config() {
+        use crate::config::{Config, Parameter};
+
+        const SENTINEL: &str = "stale-secret-value-1337";
+
+        let mut resolver = Resolver::new();
+
+        // First resolution: a declared secret with a raw value.
+        let mut config_a = Config::default();
+        let mut secret = Parameter {
+            param_type: Some("secret".to_string()),
+            ..Default::default()
+        };
+        secret.value = Some(SENTINEL.to_string());
+        config_a.parameters.insert("LICENSE".to_string(), secret);
+        resolver.resolve_parameters(&mut config_a).unwrap();
+
+        // Second resolution: a different config without that parameter.
+        // The stale value must not survive — under the new config's
+        // classification it would no longer be considered sensitive.
+        let mut config_b = Config::default();
+        config_b.parameters.insert(
+            "PLAIN".to_string(),
+            Parameter {
+                default: Some(serde_yaml::Value::String("v".to_string())),
+                ..Default::default()
+            },
+        );
+        resolver.resolve_parameters(&mut config_b).unwrap();
+
+        assert!(resolver.get_resolved_parameters().get("LICENSE").is_none());
+        let dump = format!("{:?}", resolver.get_parameter_views());
+        assert!(!dump.contains(SENTINEL));
+    }
+
+    #[test]
+    fn either_error_redacts_sensitive_values() {
+        use crate::config::{Config, Parameter};
+
+        const SENTINEL: &str = "secret-either-value-77";
+
+        let mut resolver = Resolver::new();
+        let mut config = Config::default();
+        let mut secret = Parameter {
+            param_type: Some("secret".to_string()),
+            either: vec!["a".to_string(), "b".to_string()],
+            ..Default::default()
+        };
+        secret.value = Some(SENTINEL.to_string());
+        config.parameters.insert("LICENSE".to_string(), secret);
+
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not in the allowed values"), "got: {msg}");
+        assert!(
+            !msg.contains(SENTINEL),
+            "either-constraint error leaked a sensitive value: {msg}"
+        );
+    }
+
+    #[test]
+    fn either_error_redacts_tainted_generate_value() {
+        use crate::config::{Config, Parameter};
+
+        // The validation-passing shape of the terminal-leak scenario: the
+        // secret itself has no `either`, but a non-secret generate parameter
+        // derived from it does, and fails it. The error must not echo the
+        // derived value (which embeds the secret).
+        const SENTINEL: &str = "secret-gen-value-88";
+
+        let mut resolver = Resolver::new();
+        let mut config = Config::default();
+
+        let mut secret = Parameter {
+            param_type: Some("secret".to_string()),
+            ..Default::default()
+        };
+        secret.value = Some(SENTINEL.to_string());
+        config.parameters.insert("LICENSE".to_string(), secret);
+
+        config.parameters.insert(
+            "MODE".to_string(),
+            Parameter {
+                generate: Some("printf 'x-{{LICENSE}}'".to_string()),
+                either: vec!["a".to_string(), "b".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not in the allowed values"), "got: {msg}");
+        assert!(
+            !msg.contains(SENTINEL),
+            "either-constraint error leaked a secret through a derived value: {msg}"
+        );
     }
 
     #[test]

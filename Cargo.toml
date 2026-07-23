@@ -104,6 +104,9 @@ unicode-width = "0.1"
 
 [dev-dependencies]
 tempfile = "3.12"
+# For TUI boundary tests: rendering into a TestBackend and synthesizing key events.
+ratatui = "0.28"
+crossterm = "0.28"
 assert_cmd = "2.0"
 predicates = "3.1"
 proptest = "1.5"

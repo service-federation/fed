@@ -103,6 +103,16 @@ fed stop
 
 `fed init` can create a starter file. The [configuration reference](https://www.service-federation.com/docs/configuration/) covers all service types and fields.
 
+### Startup health semantics
+
+`fed start` waits for each service's healthcheck before starting its dependents.
+
+- A healthcheck that passes before startup returns marks the service `healthy`. The `timeout` is evaluated between polling attempts, so a check already in flight at the deadline may still count.
+- A healthcheck that does not pass within its `timeout` (default 5s) is a warning, not an error: the process keeps running, dependents still start, and the run ends with `Services started with N health warning(s)` instead of the success line. The exit code stays 0.
+- A process that dies before its healthcheck passes fails the start with a non-zero exit code.
+
+In `fed status`, `running` means the process is up but no healthcheck has confirmed it; only `healthy` means verified. `fed status --json` reports the same distinction as `"status": "running"` with `"health": "unknown"`.
+
 ## One stack per worktree
 
 Git isolates files. fed isolates the runtime state that usually still collides.

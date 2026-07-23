@@ -135,6 +135,12 @@ async fn resolve_container_name(service_substr: &str) -> String {
         .to_string()
 }
 
+/// Serialize these tests: they share one Docker daemon and several use
+/// fixed container names, so parallel threads race each other's
+/// create/remove cycles under load (same class the compose suite had;
+/// same fix).
+static DOCKER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // ============================================================================
 // Lifecycle Tests
 // ============================================================================
@@ -143,6 +149,7 @@ async fn resolve_container_name(service_substr: &str) -> String {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_basic_lifecycle() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-lifecycle";
     cleanup_container(container_name).await;
@@ -199,6 +206,7 @@ async fn test_docker_service_basic_lifecycle() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_start_idempotent() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-idempotent";
     cleanup_container(container_name).await;
@@ -223,6 +231,7 @@ async fn test_docker_service_start_idempotent() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_kill() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-kill";
     cleanup_container(container_name).await;
@@ -256,6 +265,7 @@ async fn test_docker_service_kill() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_logs_retrieval() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-logs";
     cleanup_container(container_name).await;
@@ -368,6 +378,7 @@ async fn test_docker_service_invalid_port() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_health_check_after_external_removal() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-toctou";
     cleanup_container(container_name).await;
@@ -402,6 +413,7 @@ async fn test_docker_service_health_check_after_external_removal() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_logs_after_removal() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-logs-removed";
     cleanup_container(container_name).await;
@@ -427,6 +439,7 @@ async fn test_docker_service_logs_after_removal() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_orphan_cleanup() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-orphan";
     // A crashed or interrupted previous run leaves this container behind, and
@@ -461,6 +474,7 @@ async fn test_docker_service_orphan_cleanup() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_container_name_format() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-naming";
     cleanup_container(container_name).await;
@@ -493,6 +507,7 @@ async fn test_docker_service_container_name_format() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_container_labels() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-labels";
     cleanup_container(container_name).await;
@@ -529,6 +544,7 @@ async fn test_docker_service_container_labels() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_environment_variables() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-env";
     cleanup_container(container_name).await;
@@ -566,6 +582,7 @@ async fn test_docker_service_environment_variables() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_stop_idempotent() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-stop-idempotent";
     cleanup_container(container_name).await;
@@ -589,6 +606,7 @@ async fn test_docker_service_stop_idempotent() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_service_kill_already_stopped() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-kill-stopped";
     cleanup_container(container_name).await;
@@ -616,6 +634,7 @@ async fn test_docker_service_kill_already_stopped() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_stop_succeeds_when_container_removed() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-stop-success";
     cleanup_container(container_name).await;
@@ -650,6 +669,7 @@ async fn test_stop_succeeds_when_container_removed() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_stop_retries_on_transient_failure() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     // This test verifies the retry logic exists, but we can't easily
     // simulate a transient failure without mocking Docker.
@@ -737,6 +757,7 @@ async fn prune_reaps_only_labeled_fed_volumes() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_native_restart_flag_present_for_restart_always() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-native-restart-always";
     cleanup_container(container_name).await;
@@ -766,6 +787,7 @@ async fn test_docker_native_restart_flag_present_for_restart_always() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_no_native_restart_flag_without_restart_policy() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-native-restart-none";
     cleanup_container(container_name).await;
@@ -799,6 +821,7 @@ async fn test_docker_no_native_restart_flag_without_restart_policy() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_docker_native_restart_omitted_for_onfailure() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-native-restart-onfailure";
     cleanup_container(container_name).await;
@@ -837,6 +860,7 @@ async fn test_docker_native_restart_omitted_for_onfailure() {
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
 async fn test_fed_stop_wins_over_unless_stopped() {
     require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
     let container_name = "fed-test-stop-wins";
     cleanup_container(container_name).await;

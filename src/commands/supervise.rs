@@ -105,6 +105,14 @@ async fn run_until_done(orchestrator: &Orchestrator) {
                 break;
             }
             _ = poll.tick() => {
+                // Reconcile the in-flight-restart race: a restart that
+                // passed the desired-state gate just before a partial
+                // `fed stop` wrote Stopped lands after the kill and leaves
+                // the service alive with desired_state=stopped. The gate
+                // only prevents future restarts of DEAD services; a live
+                // resurrected one must be actively stopped here.
+                orchestrator.stop_supervised_not_desired_running().await;
+
                 if !orchestrator.any_supervised_service_desired_running().await {
                     tracing::info!(
                         "fed supervise: no supervised service remains desired-running, exiting"

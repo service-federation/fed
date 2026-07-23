@@ -534,3 +534,313 @@ fn test_supervisor_single_instance_under_concurrent_spawns() {
         let _ = child.wait();
     }
 }
+
+/// Lock non-monopolization test (hole #4's locking half, from the client
+/// side this time — `test_supervisor_single_instance_under_concurrent_spawns`
+/// above covers the daemon's own `.fed/supervisor.lock` enforcement; this
+/// covers the *other* lock, `.fed/.lock`, which the supervisor must never
+/// touch at all per `SqliteStateTracker::new_for_supervisor`). A live
+/// supervisor holding only `supervisor.lock` must never cause a routine `fed
+/// status`/`fed logs` invocation to print the "another fed instance ...
+/// proceeding anyway" warning (`src/state/sqlite/mod.rs`'s
+/// `try_acquire_lock`, exercised generically — without a supervisor
+/// involved — by `tests/lock_warning_integration_test.rs`). Without the
+/// supervisor's own unlocked tracker construction, every one of these calls
+/// would degrade into that warning path forever, exactly the constant-noise
+/// regression Design §1 calls out.
+#[test]
+fn test_live_supervisor_never_triggers_lock_contention_warning() {
+    const WARNING_TEXT: &str = "Another fed instance (PID";
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let workdir = temp_dir.path();
+    let config_path = create_test_config(&temp_dir, STEADY_ALWAYS_CONFIG);
+
+    let start = run_fed(&config_path, workdir, &["start", "steady"]);
+    assert!(start.status.success(), "start failed: {}", combined(&start));
+
+    let supervisor_pid = wait_for_live_supervisor(workdir, Duration::from_secs(10));
+
+    // Several `fed status`/`fed logs` invocations in a loop while the
+    // supervisor stays alive throughout (holding only `supervisor.lock`).
+    for i in 0..5 {
+        assert!(
+            is_pid_alive(supervisor_pid),
+            "supervisor should still be alive for the whole loop (iteration {})",
+            i
+        );
+
+        let status = run_fed(&config_path, workdir, &["status"]);
+        let status_text = combined(&status);
+        assert!(status.status.success(), "status failed: {}", status_text);
+        assert!(
+            !status_text.contains(WARNING_TEXT),
+            "iteration {}: fed status warned about a competing fed instance \
+             while only the supervisor (holding a separate lock) was alive:\n{}",
+            i,
+            status_text
+        );
+
+        let logs = run_fed(&config_path, workdir, &["logs", "steady"]);
+        let logs_text = combined(&logs);
+        assert!(
+            !logs_text.contains(WARNING_TEXT),
+            "iteration {}: fed logs warned about a competing fed instance \
+             while only the supervisor (holding a separate lock) was alive:\n{}",
+            i,
+            logs_text
+        );
+    }
+
+    let _ = run_fed(&config_path, workdir, &["stop"]);
+}
+
+/// Phase 5 (integration and surfacing) full-cycle soak test: start a
+/// `restart: always` service, crash it repeatedly and confirm supervised
+/// recovery each time, then run a whole-project `fed stop` and confirm the
+/// daemon actually **exits** (not just that resurrection is prevented,
+/// which `test_supervisor_never_resurrects_desired_state_stopped_service`
+/// above already covers using a *second* service kept alive on purpose so
+/// the daemon has a reason to stay up) — here there is nothing left
+/// supervised and desired-running after `fed stop`, so the per-tick
+/// self-exit check (`Orchestrator::any_supervised_service_desired_running`)
+/// combined with `stop.rs`'s `signal_stop_and_wait` teardown call should
+/// bring the whole daemon down, with no resurrection afterward.
+/// Soak-private fixture: `sleep 307` is used by no other test in the
+/// workspace, so the trailing pgrep can't see a parallel sibling's
+/// process (the earlier `sleep 300`/`sleep 301` collision taught this).
+const SOAK_CONFIG: &str = r#"
+services:
+  steady:
+    process: sleep 307
+    restart: always
+"#;
+
+#[test]
+fn test_full_cycle_soak_start_crash_loop_stop_daemon_exits_no_resurrection() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let workdir = temp_dir.path();
+    let config_path = create_test_config(&temp_dir, SOAK_CONFIG);
+
+    let start = run_fed(&config_path, workdir, &["start", "steady"]);
+    assert!(start.status.success(), "start failed: {}", combined(&start));
+
+    let supervisor_pid = wait_for_live_supervisor(workdir, Duration::from_secs(10));
+
+    // Crash the service twice in a row, confirming supervised recovery
+    // (a new, live pid and an incremented restart_count) each time before
+    // crashing it again.
+    let mut last_restart_count = 0;
+    for round in 0..2 {
+        let pid_before = service_pid(workdir, "steady")
+            .unwrap_or_else(|| panic!("steady should have a tracked pid (round {})", round));
+        kill9(pid_before);
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut recovered_pid = None;
+        while Instant::now() < deadline {
+            if let Some(pid) = service_pid(workdir, "steady")
+                && pid != pid_before
+                && is_pid_alive(pid)
+            {
+                recovered_pid = Some(pid);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        assert!(
+            recovered_pid.is_some(),
+            "supervisor should have restarted 'steady' after crash round {}",
+            round
+        );
+        last_restart_count = wait_for_restart_count_above(
+            workdir,
+            "steady",
+            last_restart_count,
+            Duration::from_secs(10),
+        );
+    }
+
+    // Whole-project `fed stop`: quiesces (writes desired_state=Stopped for
+    // the whole batch before killing anything), kills the real process, and
+    // — since nothing supervised remains desired-running — tears the daemon
+    // itself down.
+    let stop = run_fed(&config_path, workdir, &["stop"]);
+    assert!(stop.status.success(), "stop failed: {}", combined(&stop));
+
+    assert!(
+        wait_for_pid_dead(supervisor_pid, Duration::from_secs(15)),
+        "the supervisor daemon should exit once whole-project `fed stop` \
+         leaves nothing supervised desired-running"
+    );
+    assert!(
+        read_supervisor_lock_pid(workdir).is_none_or(|p| !is_pid_alive(p)),
+        "supervisor.lock should not name a live process after full teardown"
+    );
+
+    // Give a would-be (but now-dead) supervisor several health-check
+    // intervals to (incorrectly) resurrect the service, if daemon exit or
+    // the desired_state gate were broken.
+    std::thread::sleep(Duration::from_secs(18));
+
+    assert!(
+        service_pid(workdir, "steady").is_none(),
+        "'steady' must remain stopped and unregistered after the full cycle"
+    );
+    let no_stray_process = Command::new("pgrep")
+        .args(["-f", "sleep 307"])
+        .output()
+        .map(|o| !o.status.success()) // pgrep exits 1 when nothing matches
+        .unwrap_or(true);
+    assert!(
+        no_stray_process,
+        "a 'sleep 307' process is still running after full teardown; the \
+         service was resurrected"
+    );
+    assert!(
+        read_supervisor_lock_pid(workdir).is_none_or(|p| !is_pid_alive(p)),
+        "no supervisor should have respawned itself during the wait"
+    );
+}
+
+/// The direct regression test for the timing half of hole #4 (Design §6):
+/// starting `fed start --watch` in a directory with a live background
+/// supervisor must tear that daemon down *before* the foreground
+/// orchestrator's own in-process monitoring loop starts (the pre-flight
+/// handoff in `main.rs`, run before `Orchestrator::builder()...build()`) —
+/// never racing two live monitoring loops over the same services — and
+/// once the foreground `--watch` session ends (here, abruptly, simulating a
+/// closed terminal), the daemon does not auto-resume: only the next `fed
+/// start`/`fed restart` respawns it, per the scaled-back self-heal promise.
+#[test]
+fn test_watch_handoff_stops_background_supervisor_and_resumes_after() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let workdir = temp_dir.path();
+    let config_path = create_test_config(&temp_dir, STEADY_ALWAYS_CONFIG);
+
+    let start = run_fed(&config_path, workdir, &["start", "steady"]);
+    assert!(start.status.success(), "start failed: {}", combined(&start));
+
+    let background_supervisor_pid = wait_for_live_supervisor(workdir, Duration::from_secs(10));
+
+    // Start `fed start --watch` in the background — in real usage this
+    // blocks in the foreground; here it's a spawned child under our
+    // control so the test can observe both sides of the handoff.
+    let mut watch_child = Command::new(fed_binary())
+        .arg("-c")
+        .arg(&config_path)
+        .arg("-w")
+        .arg(workdir)
+        .args(["start", "--watch", "steady"])
+        .env("FED_NON_INTERACTIVE", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn fed start --watch");
+
+    // The pre-flight handoff must SIGTERM the background daemon before
+    // `--watch`'s own orchestrator ever starts monitoring — the exact
+    // window Design §6 closes (it used to be possible only after
+    // `run_watch_mode` was reached, by which point `initialize()` had
+    // already started the foreground loop).
+    assert!(
+        wait_for_pid_dead(background_supervisor_pid, Duration::from_secs(10)),
+        "the background supervisor should be torn down by the watch \
+         pre-flight handoff"
+    );
+    assert!(
+        matches!(watch_child.try_wait(), Ok(None)),
+        "the --watch process itself should still be running"
+    );
+
+    // The pre-flight handoff (this test's own polling of the *old*
+    // supervisor's liveness) and `--watch`'s own internal build/attach
+    // (which independently waits on the same handoff via a different
+    // liveness primitive, `live_supervisor_pid`'s flock check rather than
+    // `kill -0`) are two separate observers of the same event and are not
+    // guaranteed to settle at the exact same instant. A short buffer here
+    // lets `--watch`'s own `Orchestrator::initialize()`/`create_services()`
+    // finish attaching to the still-alive 'steady' *before* this test
+    // crashes it — otherwise a crash landing in that narrow window would be
+    // absorbed by the plain `start steady` CLI argument's own "start what
+    // was named" semantics (a fresh register, not a monitoring-loop
+    // restart), which is a real but orthogonal pre-existing race (the same
+    // `mark_dead_services` staleness race Design's "Attach/self-heal
+    // reality" section discusses), not what this test exists to check.
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Prove there's exactly one live monitor, not a race window with two:
+    // crash the service once and confirm exactly one restart is recorded —
+    // a second, concurrent monitoring loop racing the same crash would
+    // double-count this.
+    let baseline = restart_count(workdir, "steady");
+    let pid_before = service_pid(workdir, "steady").expect("steady should have a tracked pid");
+    kill9(pid_before);
+    let after_one_restart =
+        wait_for_restart_count_above(workdir, "steady", baseline, Duration::from_secs(20));
+    // Give a hypothetical second (buggy) monitor a further full health-check
+    // tick to also act, then confirm the count didn't move again.
+    std::thread::sleep(Duration::from_secs(7));
+    assert_eq!(
+        restart_count(workdir, "steady"),
+        after_one_restart,
+        "exactly one monitoring loop should be active during --watch — a \
+         second restart in the same window would mean two loops raced"
+    );
+
+    // End the foreground `--watch` session uncleanly (SIGKILL, simulating a
+    // closed terminal rather than a graceful Ctrl+C) — the service itself
+    // must survive (it's a real, independently-detached process the watch
+    // session was only observing, not one it owns), and nothing auto-
+    // respawns supervision once the session is gone.
+    let watch_child_pid = watch_child.id();
+    kill9(watch_child_pid);
+    let _ = watch_child.wait();
+
+    let service_pid_after_watch_exit = service_pid(workdir, "steady")
+        .expect("'steady' should still be running after --watch exits");
+    assert!(
+        is_pid_alive(service_pid_after_watch_exit),
+        "the service must survive the --watch session ending"
+    );
+    assert!(
+        read_supervisor_lock_pid(workdir).is_none_or(|p| !is_pid_alive(p)),
+        "no supervisor should be left running immediately after --watch exits"
+    );
+
+    // The next plain `fed start` (the service is already running) is what
+    // respawns supervision — the scaled-back self-heal promise.
+    let start2 = run_fed(&config_path, workdir, &["start", "steady"]);
+    assert!(
+        start2.status.success(),
+        "second start failed: {}",
+        combined(&start2)
+    );
+    let respawned_supervisor_pid = wait_for_live_supervisor(workdir, Duration::from_secs(10));
+    assert_ne!(
+        background_supervisor_pid, respawned_supervisor_pid,
+        "the respawned supervisor should be a new process"
+    );
+
+    // Confirm it actually resumed real supervision, not just that the lock
+    // file was re-acquired.
+    kill9(service_pid_after_watch_exit);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut recovered = false;
+    while Instant::now() < deadline {
+        if let Some(pid) = service_pid(workdir, "steady")
+            && pid != service_pid_after_watch_exit
+            && is_pid_alive(pid)
+        {
+            recovered = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(
+        recovered,
+        "respawned supervisor should resume restarting 'steady'"
+    );
+
+    let _ = run_fed(&config_path, workdir, &["stop"]);
+}

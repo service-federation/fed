@@ -49,8 +49,10 @@ fn draw_service_info(f: &mut Frame, app: &App, service_name: &str, area: Rect) {
 
     let lines = if let Some(service) = service {
         let status_color = match service.status {
-            Status::Running | Status::Healthy => Color::Green,
-            Status::Completed => Color::Green,
+            Status::Healthy | Status::Completed => Color::Green,
+            // Process is up but no healthcheck has confirmed it — visually
+            // distinct from Healthy so Running never reads as "verified".
+            Status::Running => Color::Cyan,
             Status::Starting => Color::Yellow,
             Status::Failing => Color::Red,
             Status::Stopped => Color::DarkGray,
@@ -58,8 +60,8 @@ fn draw_service_info(f: &mut Frame, app: &App, service_name: &str, area: Rect) {
         };
 
         let status_icon = match service.status {
-            Status::Running | Status::Healthy => "✓",
-            Status::Completed => "✓",
+            Status::Healthy | Status::Completed => "✓",
+            Status::Running => "●",
             Status::Starting => "⋯",
             Status::Failing => "✗",
             Status::Stopped => "○",
