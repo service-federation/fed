@@ -67,6 +67,6 @@ services:
     depends_on:
       - database
     healthcheck:
-      httpGet: 'http://localhost:{{API_PORT}}/'
+      http_get: 'http://localhost:{{API_PORT}}/'
 
 entrypoint: backend

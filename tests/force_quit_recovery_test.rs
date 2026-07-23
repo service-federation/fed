@@ -17,7 +17,7 @@ services:
     process: |
       echo "Service starting"
       sleep 300
-    restart: !onfailure
+    restart: !on_failure
       max_retries: 3
 
   simple-service:
@@ -568,13 +568,13 @@ services:
 
 /// Fixture for the watch-mode restart tests: a service whose process exits
 /// ~1s after starting (past the 300ms startup probe), with or without a
-/// `restart: !onfailure` policy attached.
+/// `restart: !on_failure` policy attached.
 fn create_flaky_service_config(with_restart_policy: bool) -> (TempDir, PathBuf) {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("test-config.yaml");
 
     let restart_block = if with_restart_policy {
-        "    restart: !onfailure\n      max_retries: 3\n"
+        "    restart: !on_failure\n      max_retries: 3\n"
     } else {
         ""
     };
@@ -671,7 +671,7 @@ fn test_restart_on_failure_recovers() {
 
     assert!(
         restart_count > 0,
-        "restart: !onfailure should have triggered at least one restart after \
+        "restart: !on_failure should have triggered at least one restart after \
          the monitored process died, but restart_count was {restart_count}"
     );
 }

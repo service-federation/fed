@@ -65,6 +65,6 @@ services:
       - database
       - cache
     healthcheck:
-      httpGet: "http://localhost:{{WEB_PORT}}/health"
+      http_get: "http://localhost:{{WEB_PORT}}/health"
 
 entrypoint: web

@@ -39,7 +39,7 @@ services:
       PORT: "{{API_PORT}}"
       DATABASE_URL: "postgres://postgres:password@localhost:{{DB_PORT}}/myapp"
     healthcheck:
-      httpGet: "http://localhost:{{API_PORT}}/health"
+      http_get: "http://localhost:{{API_PORT}}/health"
 
 scripts:
   # Database setup scripts - can be chained

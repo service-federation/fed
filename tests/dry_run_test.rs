@@ -343,7 +343,7 @@ services:
   health-checked-service:
     process: "echo service"
     healthcheck:
-      httpGet: "http://localhost:${API_PORT}/health"
+      http_get: "http://localhost:${API_PORT}/health"
       timeout: "30s"
 
 entrypoint: health-checked-service

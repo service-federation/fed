@@ -103,14 +103,17 @@ pub struct Service {
     pub parameters: HashMap<String, String>,
 
     // Gradle task service
-    #[serde(rename = "gradleTask", skip_serializing_if = "Option::is_none")]
+    /// Canonical key: `gradle_task`. `gradleTask` is a legacy spelling, still accepted.
+    #[serde(alias = "gradleTask", skip_serializing_if = "Option::is_none")]
     pub gradle_task: Option<String>,
 
     // Docker Compose service
-    #[serde(rename = "composeFile", skip_serializing_if = "Option::is_none")]
+    /// Canonical key: `compose_file`. `composeFile` is a legacy spelling, still accepted.
+    #[serde(alias = "composeFile", skip_serializing_if = "Option::is_none")]
     pub compose_file: Option<String>,
 
-    #[serde(rename = "composeService", skip_serializing_if = "Option::is_none")]
+    /// Canonical key: `compose_service`. `composeService` is a legacy spelling, still accepted.
+    #[serde(alias = "composeService", skip_serializing_if = "Option::is_none")]
     pub compose_service: Option<String>,
 
     // Common fields
@@ -196,9 +199,9 @@ impl Service {
             "dependency",
             "service",
             "parameters",
-            "gradleTask",
-            "composeFile",
-            "composeService",
+            "gradle_task",
+            "compose_file",
+            "compose_service",
             "environment",
             "healthcheck",
             "depends_on",
@@ -336,7 +339,7 @@ impl Service {
     /// unless-stopped` reboot-survival flag (`07-supervisor.md` Design §3):
     /// image-backed (`ServiceType::Docker`) with `restart: always`.
     ///
-    /// `restart: onfailure` is deliberately **not** included even though it
+    /// `restart: on_failure` is deliberately **not** included even though it
     /// looks like it should map to Docker's `--restart on-failure:N`: the
     /// two aren't a 1:1 mapping. Docker's `on-failure` only restarts on a
     /// non-zero container exit, while fed's own liveness check treats any
@@ -347,7 +350,7 @@ impl Service {
     /// silently exhaust Docker's own safety net during ordinary operation,
     /// well before the host-reboot scenario the native flag exists to
     /// protect against. fed's own supervisor already fully implements
-    /// `onfailure` semantics whenever any fed process is alive (Design §3);
+    /// `on_failure` semantics whenever any fed process is alive (Design §3);
     /// only `always`, whose native counterpart has no such cap, gets the
     /// extra native flag. `DockerService::start()` reads this to decide the
     /// `docker run` args; the supervisor's stale-row grace period
@@ -381,6 +384,58 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_canonical_snake_case_service_keys() {
+        let yaml = r#"
+gradle_task: ":app:bootRun"
+compose_file: docker-compose.yml
+compose_service: db
+"#;
+        let svc: Service = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(svc.gradle_task.as_deref(), Some(":app:bootRun"));
+        assert_eq!(svc.compose_file.as_deref(), Some("docker-compose.yml"));
+        assert_eq!(svc.compose_service.as_deref(), Some("db"));
+        assert!(svc.unknown_fields.is_empty());
+    }
+
+    // Legacy camelCase spellings must keep parsing via serde aliases, and must
+    // NOT leak into `unknown_fields` (the `flatten` catch-all only receives
+    // keys serde doesn't recognize — aliases count as recognized).
+    #[test]
+    fn test_legacy_camelcase_service_keys_still_accepted() {
+        let yaml = r#"
+gradleTask: ":app:bootRun"
+composeFile: docker-compose.yml
+composeService: db
+"#;
+        let svc: Service = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(svc.gradle_task.as_deref(), Some(":app:bootRun"));
+        assert_eq!(svc.compose_file.as_deref(), Some("docker-compose.yml"));
+        assert_eq!(svc.compose_service.as_deref(), Some("db"));
+        assert!(
+            svc.unknown_fields.is_empty(),
+            "legacy spellings must be consumed by aliases, not captured as unknown: {:?}",
+            svc.unknown_fields.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_service_serializes_snake_case() {
+        let svc = Service {
+            gradle_task: Some(":app:bootRun".to_string()),
+            compose_file: Some("docker-compose.yml".to_string()),
+            compose_service: Some("db".to_string()),
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&svc).unwrap();
+        assert!(yaml.contains("gradle_task"));
+        assert!(yaml.contains("compose_file"));
+        assert!(yaml.contains("compose_service"));
+        assert!(!yaml.contains("gradleTask"));
+        assert!(!yaml.contains("composeFile"));
+        assert!(!yaml.contains("composeService"));
+    }
 
     #[test]
     fn test_build_config_deserialize_command_string() {

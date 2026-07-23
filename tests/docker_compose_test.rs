@@ -9,7 +9,7 @@ mod support;
 /// Absolute path to the shared compose fixture.
 ///
 /// These tests construct the orchestrator with a temp dir as its work_dir, and
-/// a service's `composeFile` is resolved against that work_dir. A repo-relative
+/// a service's `compose_file` is resolved against that work_dir. A repo-relative
 /// path would therefore be looked up under the temp dir and not found, so the
 /// fixtures use this absolute path (built from the crate root at compile time).
 const COMPOSE_FIXTURE: &str = concat!(
@@ -113,8 +113,8 @@ async fn test_compose_file_not_found() {
     let yaml = r#"
 services:
   test:
-    composeFile: ./nonexistent.yml
-    composeService: nginx
+    compose_file: ./nonexistent.yml
+    compose_service: nginx
 "#;
 
     let parser = Parser::new();
@@ -148,8 +148,8 @@ async fn test_compose_service_not_found() {
     let yaml = r#"
 services:
   test:
-    composeFile: tests/fixtures/compose/test-services.yml
-    composeService: nonexistent_service
+    compose_file: tests/fixtures/compose/test-services.yml
+    compose_service: nonexistent_service
 "#;
 
     let parser = Parser::new();
@@ -192,8 +192,8 @@ async fn test_compose_basic_lifecycle() {
     let yaml = r#"
 services:
   nginx:
-    composeFile: tests/fixtures/compose/test-services.yml
-    composeService: nginx
+    compose_file: tests/fixtures/compose/test-services.yml
+    compose_service: nginx
 "#;
 
     let parser = Parser::new();
@@ -258,8 +258,8 @@ parameters:
 
 services:
   busybox:
-    composeFile: tests/fixtures/compose/test-services.yml
-    composeService: busybox
+    compose_file: tests/fixtures/compose/test-services.yml
+    compose_service: busybox
     environment:
       TEST_VAR: '{{TEST_VALUE}}'
 "#;
@@ -313,8 +313,8 @@ async fn test_compose_with_process_dependency() {
     let yaml = r#"
 services:
   redis:
-    composeFile: tests/fixtures/compose/test-services.yml
-    composeService: redis
+    compose_file: tests/fixtures/compose/test-services.yml
+    compose_service: redis
 
   app:
     process: |
@@ -399,8 +399,8 @@ services:
         r#"
 services:
   nginx1:
-    composeFile: {}
-    composeService: test
+    compose_file: {}
+    compose_service: test
 "#,
         compose1_path.display()
     );
@@ -409,8 +409,8 @@ services:
         r#"
 services:
   nginx2:
-    composeFile: {}
-    composeService: test
+    compose_file: {}
+    compose_service: test
 "#,
         compose2_path.display()
     );
@@ -475,8 +475,8 @@ async fn test_compose_idempotent_start() {
     let yaml = r#"
 services:
   nginx:
-    composeFile: tests/fixtures/compose/test-services.yml
-    composeService: nginx
+    compose_file: tests/fixtures/compose/test-services.yml
+    compose_service: nginx
 "#;
 
     let parser = Parser::new();
@@ -522,8 +522,8 @@ async fn test_compose_health_check() {
     let yaml = r#"
 services:
   nginx:
-    composeFile: tests/fixtures/compose/test-services.yml
-    composeService: nginx
+    compose_file: tests/fixtures/compose/test-services.yml
+    compose_service: nginx
 "#;
 
     let parser = Parser::new();
@@ -576,8 +576,8 @@ async fn test_compose_port_conflict() {
     let yaml1 = r#"
 services:
   nginx1:
-    composeFile: tests/fixtures/compose/test-services.yml
-    composeService: nginx
+    compose_file: tests/fixtures/compose/test-services.yml
+    compose_service: nginx
 "#;
 
     let parser = Parser::new();

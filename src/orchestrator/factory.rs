@@ -545,23 +545,23 @@ services:
     image: postgres:15
 
   auth-service:
-    gradleTask: ':auth-service:bootRun'
+    gradle_task: ':auth-service:bootRun'
     depends_on:
       - database
 
   user-service:
-    gradleTask: ':user-service:bootRun'
+    gradle_task: ':user-service:bootRun'
     depends_on:
       - database
 
   notification-service:
-    gradleTask: ':notification:bootRun'
+    gradle_task: ':notification:bootRun'
     cwd: 'services/notification'
     depends_on:
       - user-service
 
   analytics-service:
-    gradleTask: ':analytics:bootRun'
+    gradle_task: ':analytics:bootRun'
     depends_on:
       - user-service
 "#,
@@ -611,23 +611,23 @@ services:
     image: postgres:15
 
   auth-service:
-    gradleTask: ':auth-service:bootRun'
+    gradle_task: ':auth-service:bootRun'
     depends_on:
       - database
 
   user-service:
-    gradleTask: ':user-service:bootRun'
+    gradle_task: ':user-service:bootRun'
     depends_on:
       - database
 
   notification-service:
-    gradleTask: ':notification:bootRun'
+    gradle_task: ':notification:bootRun'
     cwd: 'services/notification'
     depends_on:
       - user-service
 
   analytics-service:
-    gradleTask: ':analytics:bootRun'
+    gradle_task: ':analytics:bootRun'
     depends_on:
       - user-service
 "#,
@@ -654,7 +654,7 @@ services:
             r#"
 services:
   app:
-    gradleTask: ':app:bootRun'
+    gradle_task: ':app:bootRun'
 "#,
         )
         .await;
@@ -694,9 +694,9 @@ services:
             r#"
 services:
   svc-a:
-    gradleTask: ':a:run'
+    gradle_task: ':a:run'
   svc-b:
-    gradleTask: ':b:run'
+    gradle_task: ':b:run'
     cwd: '/tmp/other-project'
 "#,
         )

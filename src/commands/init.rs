@@ -58,7 +58,7 @@ services:
       PORT: '{{API_PORT}}'
       DATABASE_URL: 'postgres://{{DB_USER}}:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/{{DB_NAME}}'
     healthcheck:
-      httpGet: 'http://localhost:{{API_PORT}}/health'
+      http_get: 'http://localhost:{{API_PORT}}/health'
 
   frontend:
     process: npm run dev

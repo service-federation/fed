@@ -809,25 +809,25 @@ async fn test_docker_no_native_restart_flag_without_restart_policy() {
     service.stop().await.ok();
 }
 
-/// `restart: onfailure` deliberately does NOT map to Docker's native
+/// `restart: on_failure` deliberately does NOT map to Docker's native
 /// `--restart on-failure:N` — see `Service::docker_native_restart_enabled`'s
 /// doc comment: Docker's on-failure only reacts to a non-zero exit and its
 /// retry counter never resets on a healthy run, unlike fed's own
 /// `consecutive_failures`, so passing `max_retries` straight through as
 /// Docker's `N` would not be a 1:1 mapping. Only `always` gets the native
-/// flag; fed's own supervisor fully handles `onfailure` on its own whenever
+/// flag; fed's own supervisor fully handles `on_failure` on its own whenever
 /// any fed process is alive.
 #[tokio::test]
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
-async fn test_docker_native_restart_omitted_for_onfailure() {
+async fn test_docker_native_restart_omitted_for_on_failure() {
     require_docker!();
     let _docker_guard = DOCKER_TEST_LOCK.lock().await;
 
-    let container_name = "fed-test-native-restart-onfailure";
+    let container_name = "fed-test-native-restart-on_failure";
     cleanup_container(container_name).await;
 
     let mut service = create_test_service_with_restart(
-        "native-restart-onfailure",
+        "native-restart-on_failure",
         "alpine:latest",
         Some(RestartPolicy::OnFailure {
             max_retries: Some(3),
@@ -837,11 +837,11 @@ async fn test_docker_native_restart_omitted_for_onfailure() {
     service.start().await.expect("Start should succeed");
     sleep(Duration::from_millis(500)).await;
 
-    let real_name = resolve_container_name("native-restart-onfailure").await;
+    let real_name = resolve_container_name("native-restart-on_failure").await;
     let policy = docker_restart_policy_name(&real_name).await;
     assert_eq!(
         policy, "no",
-        "restart: onfailure must not get a native Docker restart flag — not a 1:1 mapping \
+        "restart: on_failure must not get a native Docker restart flag — not a 1:1 mapping \
          with Docker's own on-failure:N semantics (docker inspect reports the absence of a \
          restart policy as \"no\")"
     );

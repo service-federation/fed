@@ -25,8 +25,8 @@ services:
     let fed_yaml = r#"
 services:
   kv:
-    composeFile: ./docker-compose.yml
-    composeService: kv
+    compose_file: ./docker-compose.yml
+    compose_service: kv
 "#;
     fs::write(temp_dir.path().join("fed.yaml"), fed_yaml).unwrap();
 }

@@ -13,16 +13,16 @@ parameters:
 
 services:
   auth-service:
-    gradleTask: ':auth-service:bootRun'
+    gradle_task: ':auth-service:bootRun'
     environment:
       SERVER_PORT: '{{AUTH_SERVICE_PORT}}'
       LOG_LEVEL: '{{LOG_LEVEL}}'
       SERVICE_NAME: 'auth-service'
     healthcheck:
-      httpGet: 'http://localhost:{{AUTH_SERVICE_PORT}}/health'
+      http_get: 'http://localhost:{{AUTH_SERVICE_PORT}}/health'
 
   user-service:
-    gradleTask: ':user-service:bootRun'
+    gradle_task: ':user-service:bootRun'
     cwd: 'services/user'
     environment:
       SERVER_PORT: '{{USER_SERVICE_PORT}}'
@@ -30,7 +30,7 @@ services:
       LOG_LEVEL: '{{LOG_LEVEL}}'
       SERVICE_NAME: 'user-service'
     healthcheck:
-      httpGet: 'http://localhost:{{USER_SERVICE_PORT}}/health'
+      http_get: 'http://localhost:{{USER_SERVICE_PORT}}/health'
     depends_on:
       - auth-service
 

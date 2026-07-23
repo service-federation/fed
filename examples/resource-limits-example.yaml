@@ -67,7 +67,7 @@ services:
       # File descriptor limit
       nofile: 4096
     healthcheck:
-      httpGet: "http://localhost:{{API_PORT}}/health"
+      http_get: "http://localhost:{{API_PORT}}/health"
 
   # Worker process with tighter limits
   # Workers typically do background tasks, so they get fewer resources

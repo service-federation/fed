@@ -85,7 +85,7 @@ services:
       PORT: "{{API_PORT}}"
       DATABASE_URL: "postgres://postgres:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/app"
     healthcheck:
-      httpGet: "http://localhost:{{API_PORT}}/health"
+      http_get: "http://localhost:{{API_PORT}}/health"
     startup_message: "API ready: http://localhost:{{API_PORT}}"
 
 entrypoint: api
@@ -172,8 +172,8 @@ You do not need to translate every container into fed. A service can point at an
 ```yaml
 services:
   database:
-    composeFile: ./compose.yaml
-    composeService: postgres
+    compose_file: ./compose.yaml
+    compose_service: postgres
 
   api:
     process: npm run dev

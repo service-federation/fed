@@ -1,4 +1,4 @@
-use super::Config;
+use super::{Config, LegacyKeyUsage};
 use crate::error::{Error, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -98,11 +98,71 @@ impl Parser {
 
     /// Parse config from YAML string
     pub fn parse_config(&self, content: &str) -> Result<Config> {
-        let config: Config = serde_yaml::from_str(content)
+        let mut config: Config = serde_yaml::from_str(content)
             .map_err(|e| Error::Parse(format!("Failed to parse YAML config: {}", e)))?;
+
+        // Second lightweight parse to a raw Value: serde aliases consume the
+        // legacy-cased keys (httpGet, gradleTask, ...) without a trace, so the
+        // soft deprecation notice has to come from the raw document.
+        if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(content) {
+            config.legacy_key_usages = scan_legacy_spellings(&doc);
+        }
 
         Ok(config)
     }
+}
+
+/// Find legacy-cased keys in the raw YAML document. Both spellings parse fine —
+/// this only feeds the non-fatal "prefer snake_case" notice at validate/start.
+fn scan_legacy_spellings(doc: &serde_yaml::Value) -> Vec<LegacyKeyUsage> {
+    const LEGACY_SERVICE_KEYS: &[(&str, &str)] = &[
+        ("gradleTask", "gradle_task"),
+        ("composeFile", "compose_file"),
+        ("composeService", "compose_service"),
+    ];
+
+    let mut out = Vec::new();
+    for (section, label) in [("services", "service"), ("templates", "template")] {
+        let Some(map) = doc.get(section).and_then(serde_yaml::Value::as_mapping) else {
+            continue;
+        };
+        for (name, service) in map {
+            let Some(fields) = service.as_mapping() else {
+                continue;
+            };
+            let location = format!("{label} '{}'", name.as_str().unwrap_or("?"));
+            for &(legacy, canonical) in LEGACY_SERVICE_KEYS {
+                if fields.contains_key(legacy) {
+                    out.push(LegacyKeyUsage {
+                        location: location.clone(),
+                        legacy,
+                        canonical,
+                    });
+                }
+            }
+            if let Some(hc) = fields
+                .get("healthcheck")
+                .and_then(serde_yaml::Value::as_mapping)
+                && hc.contains_key("httpGet")
+            {
+                out.push(LegacyKeyUsage {
+                    location: location.clone(),
+                    legacy: "httpGet",
+                    canonical: "http_get",
+                });
+            }
+            if let Some(serde_yaml::Value::Tagged(tagged)) = fields.get("restart")
+                && tagged.tag == "onfailure"
+            {
+                out.push(LegacyKeyUsage {
+                    location,
+                    legacy: "!onfailure",
+                    canonical: "!on_failure",
+                });
+            }
+        }
+    }
+    out
 }
 
 impl Default for Parser {
@@ -142,5 +202,84 @@ entrypoint: backend
         assert_eq!(config.services.len(), 2);
         assert_eq!(config.entrypoint, Some("backend".to_string()));
         assert!(config.parameters.contains_key("PORT"));
+        assert!(config.legacy_key_usages.is_empty());
+    }
+
+    // End-to-end legacy-casing coverage: a config written entirely in the old
+    // camelCase spellings must (a) parse into the same fields as snake_case,
+    // (b) leak nothing into unknown_fields, and (c) be flagged for the soft
+    // deprecation notice.
+    #[test]
+    fn test_parse_config_with_legacy_spellings() {
+        let yaml = r#"
+services:
+  worker:
+    gradleTask: ":worker:bootRun"
+    healthcheck:
+      httpGet: "http://localhost:8080/health"
+    restart: !onfailure
+      max_retries: 3
+  db:
+    composeFile: docker-compose.yml
+    composeService: postgres
+"#;
+        let config = Parser::new().parse_config(yaml).unwrap();
+
+        let worker = &config.services["worker"];
+        assert_eq!(worker.gradle_task.as_deref(), Some(":worker:bootRun"));
+        assert_eq!(
+            worker.healthcheck.as_ref().and_then(|h| h.get_http_url()),
+            Some("http://localhost:8080/health")
+        );
+        assert!(matches!(
+            worker.restart,
+            Some(crate::config::RestartPolicy::OnFailure {
+                max_retries: Some(3)
+            })
+        ));
+        let db = &config.services["db"];
+        assert_eq!(db.compose_file.as_deref(), Some("docker-compose.yml"));
+        assert_eq!(db.compose_service.as_deref(), Some("postgres"));
+        assert!(worker.unknown_fields.is_empty());
+        assert!(db.unknown_fields.is_empty());
+
+        let mut flagged: Vec<(&str, &str)> = config
+            .legacy_key_usages
+            .iter()
+            .map(|u| (u.location.as_str(), u.legacy))
+            .collect();
+        flagged.sort();
+        assert_eq!(
+            flagged,
+            vec![
+                ("service 'db'", "composeFile"),
+                ("service 'db'", "composeService"),
+                ("service 'worker'", "!onfailure"),
+                ("service 'worker'", "gradleTask"),
+                ("service 'worker'", "httpGet"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_canonical_config_reports_no_legacy_usage() {
+        let yaml = r#"
+services:
+  worker:
+    gradle_task: ":worker:bootRun"
+    healthcheck:
+      http_get: "http://localhost:8080/health"
+    restart: !on_failure
+      max_retries: 3
+  db:
+    compose_file: docker-compose.yml
+    compose_service: postgres
+"#;
+        let config = Parser::new().parse_config(yaml).unwrap();
+        assert!(config.legacy_key_usages.is_empty());
+        assert_eq!(
+            config.services["db"].compose_service.as_deref(),
+            Some("postgres")
+        );
     }
 }

@@ -101,12 +101,12 @@ impl DockerComposeService {
         let compose_file = config
             .compose_file
             .as_ref()
-            .ok_or_else(|| Error::DockerCompose("No composeFile specified".to_string()))?;
+            .ok_or_else(|| Error::DockerCompose("No compose_file specified".to_string()))?;
 
         let compose_service = config
             .compose_service
             .as_ref()
-            .ok_or_else(|| Error::DockerCompose("No composeService specified".to_string()))?
+            .ok_or_else(|| Error::DockerCompose("No compose_service specified".to_string()))?
             .clone();
 
         // Resolve compose file path relative to work_dir

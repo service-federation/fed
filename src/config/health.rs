@@ -17,7 +17,7 @@ const DEFAULT_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// ```yaml
 /// # HTTP health check with timeout
 /// healthcheck:
-///   httpGet: "http://localhost:8080/health"
+///   http_get: "http://localhost:8080/health"
 ///   timeout: "30s"
 ///
 /// # Command health check with timeout
@@ -42,9 +42,10 @@ const DEFAULT_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum HealthCheck {
-    /// HTTP GET health check with optional timeout
+    /// HTTP GET health check with optional timeout.
+    /// Canonical key: `http_get`. `httpGet` is a legacy spelling, still accepted.
     HttpGet {
-        #[serde(rename = "httpGet")]
+        #[serde(alias = "httpGet")]
         http_get: String,
         /// Timeout duration (e.g., "5s", "30s", "1m")
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,7 +123,9 @@ pub enum RestartPolicy {
     No,
     /// Always restart on failure
     Always,
-    /// Restart on failure with specified max retries
+    /// Restart on failure with specified max retries.
+    /// Canonical YAML tag: `!on_failure`. `!onfailure` is a legacy spelling, still accepted.
+    #[serde(rename = "on_failure", alias = "onfailure")]
     OnFailure { max_retries: Option<u32> },
 }
 
@@ -208,7 +211,7 @@ mod tests {
     #[test]
     fn test_http_healthcheck_with_timeout() {
         let yaml = r#"
-httpGet: "http://localhost:8080/health"
+http_get: "http://localhost:8080/health"
 timeout: "30s"
 "#;
         let health: HealthCheck = serde_yaml::from_str(yaml).unwrap();
@@ -221,12 +224,28 @@ timeout: "30s"
     #[test]
     fn test_http_healthcheck_without_timeout() {
         let yaml = r#"
-httpGet: "http://localhost:8080/health"
+http_get: "http://localhost:8080/health"
 "#;
         let health: HealthCheck = serde_yaml::from_str(yaml).unwrap();
 
         assert_eq!(health.health_check_type(), HealthCheckType::Http);
         assert_eq!(health.get_timeout(), Duration::from_secs(5)); // Default
+    }
+
+    // The legacy camelCase spelling must keep working through the untagged
+    // enum: serde buffers the mapping and matches variant fields including
+    // aliases, so `httpGet` still selects the HttpGet variant.
+    #[test]
+    fn test_http_healthcheck_legacy_camelcase_spelling() {
+        let yaml = r#"
+http_get: "http://localhost:8080/health"
+timeout: "30s"
+"#;
+        let health: HealthCheck = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(health.health_check_type(), HealthCheckType::Http);
+        assert_eq!(health.get_http_url(), Some("http://localhost:8080/health"));
+        assert_eq!(health.get_timeout(), Duration::from_secs(30));
     }
 
     #[test]
@@ -267,7 +286,7 @@ command: "curl -f http://localhost:3000"
     #[test]
     fn test_timeout_minutes() {
         let yaml = r#"
-httpGet: "http://localhost:8080/health"
+http_get: "http://localhost:8080/health"
 timeout: "2m"
 "#;
         let health: HealthCheck = serde_yaml::from_str(yaml).unwrap();
@@ -277,7 +296,7 @@ timeout: "2m"
     #[test]
     fn test_timeout_milliseconds() {
         let yaml = r#"
-httpGet: "http://localhost:8080/health"
+http_get: "http://localhost:8080/health"
 timeout: "500ms"
 "#;
         let health: HealthCheck = serde_yaml::from_str(yaml).unwrap();
@@ -287,7 +306,7 @@ timeout: "500ms"
     #[test]
     fn test_invalid_timeout_uses_default() {
         let yaml = r#"
-httpGet: "http://localhost:8080/health"
+http_get: "http://localhost:8080/health"
 timeout: "invalid"
 "#;
         let health: HealthCheck = serde_yaml::from_str(yaml).unwrap();
@@ -304,7 +323,42 @@ timeout: "invalid"
         let yaml = serde_yaml::to_string(&health).unwrap();
         // timeout should be skipped when None
         assert!(!yaml.contains("timeout"));
-        assert!(yaml.contains("httpGet"));
+        assert!(yaml.contains("http_get"));
+        assert!(!yaml.contains("httpGet"));
+    }
+
+    #[test]
+    fn test_restart_policy_canonical_on_failure_tag() {
+        let yaml = "!on_failure\nmax_retries: 3\n";
+        let policy: RestartPolicy = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(
+            policy,
+            RestartPolicy::OnFailure {
+                max_retries: Some(3)
+            }
+        ));
+    }
+
+    #[test]
+    fn test_restart_policy_legacy_onfailure_tag_still_accepted() {
+        let yaml = "!onfailure\nmax_retries: 3\n";
+        let policy: RestartPolicy = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(
+            policy,
+            RestartPolicy::OnFailure {
+                max_retries: Some(3)
+            }
+        ));
+    }
+
+    #[test]
+    fn test_restart_policy_serializes_canonical_tag() {
+        let yaml = serde_yaml::to_string(&RestartPolicy::OnFailure {
+            max_retries: Some(3),
+        })
+        .unwrap();
+        assert!(yaml.contains("on_failure"), "got: {yaml}");
+        assert!(!yaml.contains("!onfailure"), "got: {yaml}");
     }
 
     #[test]

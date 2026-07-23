@@ -63,7 +63,7 @@ services:
       RAILS_ENV: 'development'
       RAILS_MAX_THREADS: '5'
     healthcheck:
-      httpGet: 'http://localhost:{{RAILS_PORT}}/up'
+      http_get: 'http://localhost:{{RAILS_PORT}}/up'
     install: |
       bundle install
       yarn install
@@ -89,7 +89,7 @@ services:
       WEBPACKER_DEV_SERVER_HOST: 'localhost'
       WEBPACKER_DEV_SERVER_PORT: '{{WEBPACKER_PORT}}'
     healthcheck:
-      httpGet: 'http://localhost:{{WEBPACKER_PORT}}'
+      http_get: 'http://localhost:{{WEBPACKER_PORT}}'
     install: |
       yarn install
 

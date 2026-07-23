@@ -65,4 +65,10 @@ pub fn emit_config_warnings(config: &fed::Config, out: &dyn crate::output::UserO
             w.candidates.iter().copied(),
         ));
     }
+    for u in &config.legacy_key_usages {
+        out.warning(&format!(
+            "{}: '{}' is a legacy spelling — prefer '{}' (both are accepted)",
+            u.location, u.legacy, u.canonical
+        ));
+    }
 }

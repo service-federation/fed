@@ -308,7 +308,7 @@ services:
   my-service:
     extends: "health.service"
     healthcheck:
-      httpGet: "http://localhost:8080/health"
+      http_get: "http://localhost:8080/health"
 "#,
     )
     .unwrap();
@@ -794,7 +794,7 @@ services:
       - db
       - redis
     healthcheck:
-      httpGet: "http://localhost:3001/health"
+      http_get: "http://localhost:3001/health"
   db:
     image: postgres:latest
   redis:

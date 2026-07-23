@@ -46,7 +46,7 @@ fn record_warnings(source: &str, label: &str, offenders: &mut Vec<Offender>) {
     // either an intentional malformed-YAML negative test, or (for the
     // `tests/*.rs` raw-string scan) a block whose shape our extractor can't
     // turn into valid YAML on its own (e.g. a `format!` placeholder like
-    // `composeFile: {}`) — the real fed-config blocks in the same test files
+    // `compose_file: {}`) — the real fed-config blocks in the same test files
     // parse cleanly and are what this test actually checks.
     let Ok(config) = fed::config::Parser::new().parse_config(source) else {
         return;
@@ -56,6 +56,17 @@ fn record_warnings(source: &str, label: &str, offenders: &mut Vec<Offender>) {
             location: format!("{label} ({})", w.location),
             key: w.key,
             candidates: w.candidates.iter().map(|s| s.to_string()).collect(),
+        });
+    }
+    // Legacy-cased spellings (httpGet, gradleTask, composeFile, composeService,
+    // !onfailure) still parse via serde aliases, but our own fixtures must use
+    // the canonical snake_case forms. Intentional legacy-spelling coverage
+    // lives in src/config unit tests, which this audit does not scan.
+    for u in &config.legacy_key_usages {
+        offenders.push(Offender {
+            location: format!("{label} ({})", u.location),
+            key: format!("{} (legacy spelling)", u.legacy),
+            candidates: vec![u.canonical.to_string()],
         });
     }
 }

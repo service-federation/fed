@@ -533,7 +533,7 @@ impl ServiceManager for DockerService {
         // service's own `stop()`, below) is honored instead of the
         // container being immediately resurrected by the daemon.
         //
-        // `restart: onfailure` is deliberately NOT mapped to Docker's
+        // `restart: on_failure` is deliberately NOT mapped to Docker's
         // `--restart on-failure:N` — see
         // `Service::docker_native_restart_enabled`'s doc comment for why
         // that would not be a 1:1 mapping.

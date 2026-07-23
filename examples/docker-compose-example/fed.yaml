@@ -30,8 +30,8 @@ parameters:
 services:
   # Reference individual services from docker-compose.yml
   postgres:
-    composeFile: ./docker-compose.yml
-    composeService: postgres
+    compose_file: ./docker-compose.yml
+    compose_service: postgres
     environment:
       POSTGRES_PASSWORD: '{{DB_PASSWORD}}'
       POSTGRES_DB: '{{DB_NAME}}'
@@ -40,8 +40,8 @@ services:
       command: pg_isready -U postgres
 
   redis:
-    composeFile: ./docker-compose.yml
-    composeService: redis
+    compose_file: ./docker-compose.yml
+    compose_service: redis
     environment:
       REDIS_PORT: '{{REDIS_PORT}}'
     depends_on:
@@ -69,8 +69,8 @@ services:
 
   # Another compose service depending on the API
   elasticsearch:
-    composeFile: ./docker-compose.yml
-    composeService: elasticsearch
+    compose_file: ./docker-compose.yml
+    compose_service: elasticsearch
     environment:
       ES_PORT: '{{ES_PORT}}'
     depends_on:

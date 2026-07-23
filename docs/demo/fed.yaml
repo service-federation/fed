@@ -40,7 +40,7 @@ services:
       PORT: "{{API_PORT}}"
       FED_PROJECT_ID: "{{FED_PROJECT_ID}}"
     healthcheck:
-      httpGet: "http://localhost:{{API_PORT}}/health"
+      http_get: "http://localhost:{{API_PORT}}/health"
     startup_message: "API ready: http://localhost:{{API_PORT}}"
 
 entrypoint: api

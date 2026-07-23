@@ -79,7 +79,7 @@ services:
       JWT_SECRET: 'dev-secret-change-in-production'
       ENV: 'development'
     healthcheck:
-      httpGet: 'http://localhost:{{AUTH_PORT}}/health'
+      http_get: 'http://localhost:{{AUTH_PORT}}/health'
     install: |
       go mod download
       go mod tidy
@@ -97,7 +97,7 @@ services:
       AUTH_SERVICE_ADDR: 'localhost:{{AUTH_GRPC_PORT}}'
       ENV: 'development'
     healthcheck:
-      httpGet: 'http://localhost:{{USER_PORT}}/health'
+      http_get: 'http://localhost:{{USER_PORT}}/health'
     install: |
       go mod download
       go mod tidy
@@ -113,7 +113,7 @@ services:
       USER_SERVICE_ADDR: 'localhost:{{USER_GRPC_PORT}}'
       ENV: 'development'
     healthcheck:
-      httpGet: 'http://localhost:{{GATEWAY_PORT}}/health'
+      http_get: 'http://localhost:{{GATEWAY_PORT}}/health'
     install: |
       go mod download
       go mod tidy

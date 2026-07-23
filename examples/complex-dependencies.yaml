@@ -56,7 +56,7 @@ services:
     depends_on:
       - middleware
     healthcheck:
-      httpGet: 'http://localhost:{{MAIN_PORT}}/health'
+      http_get: 'http://localhost:{{MAIN_PORT}}/health'
 
   # Middleware service from external dependency
   middleware:

@@ -73,7 +73,7 @@ impl Config {
         for (name, service) in &self.services {
             if service.service_type() == ServiceType::Undefined {
                 return Err(Error::Validation(format!(
-                    "Service '{}' has no type defined. Add one of: process, image, gradleTask, composeFile + composeService, or make it a hook-only node with install and/or migrate.",
+                    "Service '{}' has no type defined. Add one of: process, image, gradle_task, compose_file + compose_service, or make it a hook-only node with install and/or migrate.",
                     name
                 )));
             }
@@ -503,7 +503,7 @@ impl Config {
                  \x20     type: port\n\
                  \x20     default: 4321\n\
                  \x20 healthcheck:\n\
-                 \x20   httpGet: \"http://localhost:{{{{APP_PORT}}}}/health\"",
+                 \x20   http_get: \"http://localhost:{{{{APP_PORT}}}}/health\"",
                 findings.join(", service ")
             );
             eprintln!("{}", msg);
@@ -511,7 +511,7 @@ impl Config {
     }
 
     /// Warn (once, aggregated) when a docker-compose-backed service
-    /// (`composeFile` + `composeService`) also sets `restart:`.
+    /// (`compose_file` + `compose_service`) also sets `restart:`.
     /// `07-supervisor.md` Design §3: fed does not rewrite a user-owned
     /// `docker-compose.yml`, so this `restart:` has no native-mapping
     /// effect the way it does for `image`-backed services (which get

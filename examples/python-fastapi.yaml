@@ -64,7 +64,7 @@ services:
       CELERY_RESULT_BACKEND: 'redis://localhost:{{REDIS_PORT}}/0'
       PYTHONUNBUFFERED: '1'
     healthcheck:
-      httpGet: 'http://localhost:{{API_PORT}}/health'
+      http_get: 'http://localhost:{{API_PORT}}/health'
     install: |
       python -m venv venv
       source venv/bin/activate
@@ -106,7 +106,7 @@ services:
       CELERY_BROKER_URL: 'redis://localhost:{{REDIS_PORT}}/0'
       PYTHONUNBUFFERED: '1'
     healthcheck:
-      httpGet: 'http://localhost:{{FLOWER_PORT}}'
+      http_get: 'http://localhost:{{FLOWER_PORT}}'
     install: |
       source venv/bin/activate
       pip install flower

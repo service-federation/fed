@@ -37,29 +37,29 @@ services:
   # These should be GROUPED into a single gradle command:
   # ./gradlew :auth-service:bootRun :user-service:bootRun
   auth-service:
-    gradleTask: ':auth-service:bootRun'
+    gradle_task: ':auth-service:bootRun'
     environment:
       SERVER_PORT: '{{AUTH_PORT}}'
       DB_URL: 'postgresql://localhost:{{DB_PORT}}/mydb'
     depends_on:
       - database
     healthcheck:
-      httpGet: 'http://localhost:{{AUTH_PORT}}/health'
+      http_get: 'http://localhost:{{AUTH_PORT}}/health'
 
   user-service:
-    gradleTask: ':user-service:bootRun'
+    gradle_task: ':user-service:bootRun'
     environment:
       SERVER_PORT: '{{USER_PORT}}'
       DB_URL: 'postgresql://localhost:{{DB_PORT}}/mydb'
     depends_on:
       - database
     healthcheck:
-      httpGet: 'http://localhost:{{USER_PORT}}/health'
+      http_get: 'http://localhost:{{USER_PORT}}/health'
 
   # Notification service - different CWD
   # Will NOT be grouped with auth/user services
   notification-service:
-    gradleTask: ':notification:bootRun'
+    gradle_task: ':notification:bootRun'
     cwd: 'services/notification'
     environment:
       SERVER_PORT: '{{NOTIFICATION_PORT}}'
@@ -67,20 +67,20 @@ services:
     depends_on:
       - user-service
     healthcheck:
-      httpGet: 'http://localhost:{{NOTIFICATION_PORT}}/health'
+      http_get: 'http://localhost:{{NOTIFICATION_PORT}}/health'
 
   # Analytics service - depends on user-service
   # Will NOT be grouped with user-service because of dependency
   # But could be grouped with other services in the same parallel group
   analytics-service:
-    gradleTask: ':analytics:bootRun'
+    gradle_task: ':analytics:bootRun'
     environment:
       SERVER_PORT: '{{ANALYTICS_PORT}}'
       USER_SERVICE_URL: 'http://localhost:{{USER_PORT}}'
     depends_on:
       - user-service
     healthcheck:
-      httpGet: 'http://localhost:{{ANALYTICS_PORT}}/health'
+      http_get: 'http://localhost:{{ANALYTICS_PORT}}/health'
 
 entrypoint: notification-service
 

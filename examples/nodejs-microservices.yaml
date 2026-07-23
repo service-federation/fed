@@ -71,7 +71,7 @@ services:
       JWT_SECRET: 'dev-secret-change-in-production'
       NODE_ENV: 'development'
     healthcheck:
-      httpGet: 'http://localhost:{{AUTH_PORT}}/health'
+      http_get: 'http://localhost:{{AUTH_PORT}}/health'
     install: |
       npm install
 
@@ -86,7 +86,7 @@ services:
       REDIS_URL: 'redis://localhost:{{REDIS_PORT}}'
       NODE_ENV: 'development'
     healthcheck:
-      httpGet: 'http://localhost:{{API_PORT}}/health'
+      http_get: 'http://localhost:{{API_PORT}}/health'
     install: |
       npm install
 
@@ -112,7 +112,7 @@ services:
       NEXT_PUBLIC_API_URL: 'http://localhost:{{API_PORT}}'
       NODE_ENV: 'development'
     healthcheck:
-      httpGet: 'http://localhost:{{FRONTEND_PORT}}'
+      http_get: 'http://localhost:{{FRONTEND_PORT}}'
     install: |
       npm install
 

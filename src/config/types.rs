@@ -64,6 +64,13 @@ pub struct Config {
     /// recognized fields are unaffected.
     #[serde(flatten)]
     pub unknown_fields: std::collections::BTreeMap<String, serde_yaml::Value>,
+
+    /// Legacy-cased keys (`httpGet`, `gradleTask`, `composeFile`, `composeService`,
+    /// `!onfailure`) found in the source YAML. serde aliases consume these silently,
+    /// so the parser records them here from a raw scan of the document; surfaced as
+    /// soft deprecation notices at validate/start time, never an error.
+    #[serde(skip)]
+    pub legacy_key_usages: Vec<LegacyKeyUsage>,
 }
 
 /// A single unrecognized config key, with the candidate names to suggest. Non-fatal:
@@ -72,6 +79,16 @@ pub struct UnknownKey {
     pub location: String,
     pub key: String,
     pub candidates: &'static [&'static str],
+}
+
+/// A legacy-cased key found in the source YAML (e.g. `httpGet` where `http_get`
+/// is canonical). Both spellings parse; this exists only to nudge configs toward
+/// the canonical snake_case form.
+#[derive(Debug, Clone)]
+pub struct LegacyKeyUsage {
+    pub location: String,
+    pub legacy: &'static str,
+    pub canonical: &'static str,
 }
 
 impl Config {

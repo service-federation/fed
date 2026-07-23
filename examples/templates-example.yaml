@@ -61,7 +61,7 @@ services:
       DATABASE_URL: 'postgres://postgres:password@localhost:{{PG_PORT}}/myapp'
       SERVICE_NAME: 'auth-service'
     healthcheck:
-      httpGet: 'http://localhost:{{AUTH_PORT}}/actuator/health'
+      http_get: 'http://localhost:{{AUTH_PORT}}/actuator/health'
     # Inherits: image, JAVA_OPTS, restart, volumes
 
   # User service also extends java-microservice template
@@ -75,7 +75,7 @@ services:
       AUTH_SERVICE_URL: 'http://localhost:{{AUTH_PORT}}'
       SERVICE_NAME: 'user-service'
     healthcheck:
-      httpGet: 'http://localhost:{{USER_PORT}}/actuator/health'
+      http_get: 'http://localhost:{{USER_PORT}}/actuator/health'
     # Inherits: image, JAVA_OPTS, restart, volumes
 
   # Payment service extends java-microservice template
@@ -89,7 +89,7 @@ services:
       AUTH_SERVICE_URL: 'http://localhost:{{AUTH_PORT}}'
       SERVICE_NAME: 'payment-service'
     healthcheck:
-      httpGet: 'http://localhost:{{PAYMENT_PORT}}/actuator/health'
+      http_get: 'http://localhost:{{PAYMENT_PORT}}/actuator/health'
     # Inherits: image, JAVA_OPTS, restart, volumes
 
   # Frontend extends node-service template
@@ -102,7 +102,7 @@ services:
       API_BASE_URL: 'http://localhost:{{AUTH_PORT}}'
       USER_SERVICE_URL: 'http://localhost:{{USER_PORT}}'
     healthcheck:
-      httpGet: 'http://localhost:{{WEB_PORT}}/health'
+      http_get: 'http://localhost:{{WEB_PORT}}/health'
     # Inherits: image, NODE_ENV, restart
 
 entrypoint: frontend
