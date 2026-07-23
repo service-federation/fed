@@ -617,7 +617,7 @@ impl Orchestrator {
     /// directly by CLI commands.
     ///
     /// Unlike every other `initialize*` variant, this one must never let
-    /// [`Orchestrator::mark_dead_services`]'s stale-row filtering silently
+    /// [`crate::state::SqliteStateTracker::mark_dead_services`]'s stale-row filtering silently
     /// swallow a service that crashed while genuinely unsupervised (the
     /// exact case this whole feature exists for — see the module-level
     /// "Attach/self-heal reality" note in `07-supervisor.md`). It:
@@ -634,7 +634,7 @@ impl Orchestrator {
     ///    invisible to `get_services()`.
     /// 3. Builds the dependency graph and creates service managers, honoring
     ///    `desired_state`: only rows with `desired_state == Running` get
-    ///    PID/container/status restored ([`Orchestrator::create_services_for_supervisor`]).
+    ///    PID/container/status restored (`Orchestrator::create_services_for_supervisor`).
     ///    A row with `desired_state == Stopped` is never attached, even if
     ///    it's technically still alive and not yet purged.
     /// 4. For each newly-stale row, re-derives whether it should come back:
@@ -2017,6 +2017,15 @@ impl Orchestrator {
     /// Use [`Self::get_resolved_parameters`] instead if you only need to read the parameters.
     pub fn get_resolved_parameters_owned(&self) -> HashMap<String, String> {
         self.resolver.get_resolved_parameters().clone()
+    }
+
+    /// Resolved parameters as display views, sorted by name, with sensitive
+    /// values redacted at the boundary (no raw secret material attached).
+    ///
+    /// Display surfaces (the TUI) must use this instead of
+    /// [`Self::get_resolved_parameters_owned`].
+    pub fn get_parameter_views(&self) -> Vec<crate::parameter::ParameterView> {
+        self.resolver.get_parameter_views()
     }
 
     /// Get port resolution decisions for display in dry-run and status commands.

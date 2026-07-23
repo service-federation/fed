@@ -203,7 +203,7 @@ async fn check_all_services(
 /// restart-policy services" and is a case a future maintainer could
 /// plausibly "simplify" back into the parity gap above — don't.
 ///
-/// [`handle_dependency_health_propagation`] itself is unaffected by this
+/// `handle_dependency_health_propagation` itself is unaffected by this
 /// function and continues to act on the full dependent set regardless of a
 /// dependent's own restart policy — narrowing *that* too would break the
 /// existing, shipped `on_failure` feature for services with `restart: no`.
