@@ -3,9 +3,11 @@ mod port;
 mod resolver;
 pub mod scanner;
 pub mod secret;
+pub mod sensitivity;
 
 pub use port::*;
 pub use resolver::*;
+pub use sensitivity::{ParameterValue, ParameterView};
 
 use std::path::{Path, PathBuf};
 

@@ -31,6 +31,17 @@ pub enum StatusLevel {
     Error,
 }
 
+/// Outcome of a parameter copy request, decided before any clipboard I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyDecision {
+    /// Non-sensitive row: this exact payload goes to the clipboard.
+    Copy { name: String, payload: String },
+    /// Sensitive row: nothing is copied and the user is told why.
+    Sensitive { name: String },
+    /// No row selected (empty or over-filtered list).
+    NoSelection,
+}
+
 pub struct App {
     /// Shared orchestrator
     pub orchestrator: Arc<RwLock<Orchestrator>>,
@@ -84,8 +95,12 @@ pub struct App {
     /// Cached dependency graph (for synchronous drawing functions)
     pub dep_graph_cache: crate::dependency::Graph,
 
-    /// Cached resolved parameters (for synchronous drawing functions)
-    pub parameters_cache: HashMap<String, String>,
+    /// Cached parameter display views (for synchronous drawing functions).
+    ///
+    /// Deliberately NOT the raw resolved parameters: sensitive entries are
+    /// `ParameterValue::Redacted` and carry no secret material, so nothing in
+    /// the TUI can render or copy a value it was never given. Sorted by name.
+    pub parameters_cache: Vec<crate::parameter::ParameterView>,
 
     /// Status message (transient)
     pub status_message: Option<StatusMessage>,
@@ -169,7 +184,7 @@ impl App {
     pub fn new(orchestrator: Orchestrator) -> Self {
         // Get dependency graph and parameters before wrapping in Arc<RwLock>
         let dep_graph = orchestrator.get_dependency_graph().clone();
-        let parameters = orchestrator.get_resolved_parameters_owned();
+        let parameters = orchestrator.get_parameter_views();
 
         let orchestrator = Arc::new(RwLock::new(orchestrator));
 
@@ -636,60 +651,87 @@ impl App {
                 self.params_selected = 0;
             }
 
-            // Copy value to clipboard (via OSC 52 escape sequence)
-            KeyCode::Char('y') | KeyCode::Enter => {
-                if let Some((key, value)) = filtered_params.get(self.params_selected) {
-                    // Use OSC 52 escape sequence for clipboard copy
-                    // This works in most modern terminals
-                    let encoded = base64_encode(value.as_bytes());
-                    print!("\x1b]52;c;{}\x07", encoded);
-                    self.set_status(
-                        &format!("Copied '{}' value to clipboard", key),
-                        StatusLevel::Success,
-                        3,
-                    );
-                }
-            }
-
-            // Copy key=value
-            KeyCode::Char('Y') => {
-                if let Some((key, value)) = filtered_params.get(self.params_selected) {
-                    let full = format!("{}={}", key, value);
-                    let encoded = base64_encode(full.as_bytes());
-                    print!("\x1b]52;c;{}\x07", encoded);
-                    self.set_status(
-                        &format!("Copied '{}=...' to clipboard", key),
-                        StatusLevel::Success,
-                        3,
-                    );
-                }
-            }
+            // Copy to clipboard (via OSC 52 escape sequence)
+            KeyCode::Char('y') | KeyCode::Enter => self.copy_selected_param(false),
+            KeyCode::Char('Y') => self.copy_selected_param(true),
 
             _ => {}
         }
         Ok(())
     }
 
-    /// Get filtered parameters list, sorted by key.
+    /// Copy the selected parameter to the clipboard, or refuse with a visible
+    /// warning when the row is sensitive. Never silently copies a masked value.
+    fn copy_selected_param(&mut self, include_key: bool) {
+        match self.selected_param_copy_payload(include_key) {
+            CopyDecision::Copy { name, payload } => {
+                // OSC 52 escape sequence — works in most modern terminals.
+                let encoded = base64_encode(payload.as_bytes());
+                print!("\x1b]52;c;{}\x07", encoded);
+                let what = if include_key { "=..." } else { " value" };
+                self.set_status(
+                    &format!("Copied '{}{}' to clipboard", name, what),
+                    StatusLevel::Success,
+                    3,
+                );
+            }
+            CopyDecision::Sensitive { name } => {
+                self.set_status(
+                    &format!("'{}' is sensitive — copying is disabled", name),
+                    StatusLevel::Warning,
+                    5,
+                );
+            }
+            CopyDecision::NoSelection => {}
+        }
+    }
+
+    /// The clipboard payload the copy shortcut would emit for the selected
+    /// row, without side effects. Sensitive rows carry no raw material
+    /// (`ParameterValue::Redacted`), so a payload cannot be produced for them.
+    pub fn selected_param_copy_payload(&self, include_key: bool) -> CopyDecision {
+        let params = self.get_filtered_params();
+        let Some(view) = params.get(self.params_selected) else {
+            return CopyDecision::NoSelection;
+        };
+        match view.value.clipboard_payload() {
+            Some(value) => CopyDecision::Copy {
+                name: view.name.clone(),
+                payload: if include_key {
+                    format!("{}={}", view.name, value)
+                } else {
+                    value.to_string()
+                },
+            },
+            None => CopyDecision::Sensitive {
+                name: view.name.clone(),
+            },
+        }
+    }
+
+    /// Get filtered parameters list (already sorted by name at cache time).
     ///
     /// The order must be deterministic and match the renderer exactly: this
     /// list is indexed by `params_selected` for navigation and clipboard copy.
-    pub fn get_filtered_params(&self) -> Vec<(&String, &String)> {
+    ///
+    /// The filter matches names always, and values only for non-sensitive
+    /// rows — a redacted row has no raw value to match against, so the filter
+    /// cannot be used to probe a secret's content.
+    pub fn get_filtered_params(&self) -> Vec<&crate::parameter::ParameterView> {
         let filter_lower = self.params_filter.to_lowercase();
-        let mut params: Vec<_> = self
-            .parameters_cache
+        self.parameters_cache
             .iter()
-            .filter(|(k, v)| {
+            .filter(|view| {
                 if filter_lower.is_empty() {
-                    true
-                } else {
-                    k.to_lowercase().contains(&filter_lower)
-                        || v.to_lowercase().contains(&filter_lower)
+                    return true;
                 }
+                view.name.to_lowercase().contains(&filter_lower)
+                    || view
+                        .value
+                        .clipboard_payload()
+                        .is_some_and(|v| v.to_lowercase().contains(&filter_lower))
             })
-            .collect();
-        params.sort_by_key(|(k, _)| k.as_str());
-        params
+            .collect()
     }
 
     /// Called on each tick (e.g., every 250ms)
@@ -785,6 +827,15 @@ impl App {
     }
 
     async fn fetch_logs(&mut self) -> anyhow::Result<()> {
+        // SECURITY BOUNDARY: child-process logs are rendered verbatim. Services
+        // receive raw secret values in their environment by design, and anything
+        // they choose to print (echoed config, connection strings, panics) is
+        // their own output — fed has no reliable provenance for it, and
+        // best-effort substring scrubbing would only mask the exact byte
+        // sequence while missing encodings, substrings, and derived forms. Log
+        // redaction is therefore explicitly out of scope; the parameter view is
+        // the surface fed guarantees never shows raw secrets.
+        //
         // Only fetch logs for the service currently being viewed to avoid
         // spawning docker/compose subprocesses for ALL services every tick
         let service_to_fetch = match &self.view {

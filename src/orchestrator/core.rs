@@ -1997,6 +1997,15 @@ impl Orchestrator {
         self.resolver.get_resolved_parameters().clone()
     }
 
+    /// Resolved parameters as display views, sorted by name, with sensitive
+    /// values redacted at the boundary (no raw secret material attached).
+    ///
+    /// Display surfaces (the TUI) must use this instead of
+    /// [`Self::get_resolved_parameters_owned`].
+    pub fn get_parameter_views(&self) -> Vec<crate::parameter::ParameterView> {
+        self.resolver.get_parameter_views()
+    }
+
     /// Get port resolution decisions for display in dry-run and status commands.
     pub fn get_port_resolutions(&self) -> &[crate::parameter::PortResolution] {
         self.resolver.get_port_resolutions()

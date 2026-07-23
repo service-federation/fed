@@ -94,22 +94,15 @@ fn draw_parameters(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = params
         .iter()
         .enumerate()
-        .map(|(i, (key, value))| {
-            // Determine if value looks like a sensitive parameter
-            let is_sensitive = key.to_lowercase().contains("password")
-                || key.to_lowercase().contains("secret")
-                || key.to_lowercase().contains("token")
-                || key.to_lowercase().contains("key");
+        .map(|(i, view)| {
+            // Sensitivity was decided at the resolution boundary (declared
+            // `type: secret` + transitive provenance); a sensitive view holds
+            // no raw value, only the redacted display string.
+            let display_value = view.value.display().to_string();
 
-            let display_value = if is_sensitive && !value.is_empty() {
-                "********".to_string()
-            } else {
-                value.to_string()
-            };
-
-            let value_color = if is_sensitive {
+            let value_color = if view.value.is_sensitive() {
                 Color::Red
-            } else if value.is_empty() {
+            } else if display_value.is_empty() {
                 Color::DarkGray
             } else {
                 Color::Green
@@ -127,7 +120,7 @@ fn draw_parameters(f: &mut Frame, app: &App, area: Rect) {
 
             let line = Line::from(vec![
                 Span::raw(marker),
-                Span::styled(format!("{:<30}", key), key_style),
+                Span::styled(format!("{:<30}", view.name), key_style),
                 Span::styled(" = ", Style::default().fg(Color::DarkGray)),
                 Span::styled(display_value, Style::default().fg(value_color)),
             ]);
