@@ -1077,9 +1077,17 @@ mod tests {
         std::thread::spawn(move || {
             use std::io::{Read, Write};
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+                // Read until end-of-headers: a single read may legally return
+                // only a prefix, which would drop headers from the capture.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
