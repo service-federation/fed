@@ -617,7 +617,7 @@ impl Orchestrator {
     /// directly by CLI commands.
     ///
     /// Unlike every other `initialize*` variant, this one must never let
-    /// [`Orchestrator::mark_dead_services`]'s stale-row filtering silently
+    /// [`crate::state::SqliteStateTracker::mark_dead_services`]'s stale-row filtering silently
     /// swallow a service that crashed while genuinely unsupervised (the
     /// exact case this whole feature exists for — see the module-level
     /// "Attach/self-heal reality" note in `07-supervisor.md`). It:
@@ -634,7 +634,7 @@ impl Orchestrator {
     ///    invisible to `get_services()`.
     /// 3. Builds the dependency graph and creates service managers, honoring
     ///    `desired_state`: only rows with `desired_state == Running` get
-    ///    PID/container/status restored ([`Orchestrator::create_services_for_supervisor`]).
+    ///    PID/container/status restored (`Orchestrator::create_services_for_supervisor`).
     ///    A row with `desired_state == Stopped` is never attached, even if
     ///    it's technically still alive and not yet purged.
     /// 4. For each newly-stale row, re-derives whether it should come back:
