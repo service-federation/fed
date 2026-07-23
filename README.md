@@ -4,7 +4,7 @@
 [![CI](https://github.com/service-federation/fed/actions/workflows/ci.yml/badge.svg)](https://github.com/service-federation/fed/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/github/license/service-federation/fed)](./LICENSE)
 
-Run your app natively and its dependencies in Docker from one config file. Then run a full, isolated copy of the stack in every Git worktree: no shared ports, no shared databases.
+Run your app natively and its dependencies in Docker from one config file. Think `docker compose up`, except the app isn't in a container and every Git worktree can run its own isolated copy of the stack.
 
 ```console
 $ fed start
@@ -115,6 +115,8 @@ In `fed status`, `running` means the process is up but no healthcheck has confir
 
 ## One stack per worktree
 
+Your coding agents stop killing each other's databases. One worktree per agent, one full stack per worktree, zero shared ports.
+
 Git isolates files. fed isolates the runtime state that usually still collides.
 
 ```console
@@ -129,7 +131,7 @@ Git isolates files. fed isolates the runtime state that usually still collides.
 
 Each isolated checkout gets its own values for declared `type: port` parameters, direct Docker container names, named volumes, generated secrets, and fed state.
 
-One rule: fed cannot remap a port hardcoded inside a command, URL, or Compose file. Declare every host port as a `type: port` parameter. See [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/) for Compose behavior, bind mounts, cookies, cleanup, and the full isolation model.
+Caveat: fed cannot remap a port hardcoded inside a command, URL, or Compose file. Declare every host port as a `type: port` parameter. See [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/) for Compose behavior, bind mounts, cookies, cleanup, and the full isolation model.
 
 For coding agents, put this in `AGENTS.md` or `CLAUDE.md`:
 
@@ -151,7 +153,7 @@ scripts:
     depends_on: [database, api]
     isolated: true
     environment:
-      DATABASE_URL: "{{DATABASE_URL}}"
+      DATABASE_URL: "postgres://postgres:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/app"
     script: npm run test:integration
 ```
 
@@ -178,7 +180,7 @@ services:
     depends_on: [database]
 ```
 
-Read [Use fed with Docker Compose](https://www.service-federation.com/docs/compose/) before enabling worktree isolation. Compose ports must use environment substitution so fed can allocate them.
+Read [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/) before enabling worktree isolation. Compose ports must use environment substitution so fed can allocate them.
 
 ## Local and team secrets
 
@@ -192,7 +194,6 @@ Removing a member blocks new server fetches. It cannot erase values already cach
 
 - [Quickstart](https://www.service-federation.com/docs/)
 - [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/)
-- [Use fed with Docker Compose](https://www.service-federation.com/docs/compose/)
 - [Configuration reference](https://www.service-federation.com/docs/configuration/)
 - [Scripts and tests](https://www.service-federation.com/docs/scripts/)
 - [Command reference](https://www.service-federation.com/docs/commands/)
