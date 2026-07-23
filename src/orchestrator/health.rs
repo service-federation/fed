@@ -15,6 +15,85 @@ use std::time::Duration;
 
 use super::core::Orchestrator;
 
+/// Outcome of the startup health wait for a single service.
+///
+/// A healthcheck timeout during `fed start` is non-fatal — the process is
+/// alive and dependents may proceed — but callers must still be able to tell
+/// "verified healthy" from "started, health never confirmed". This type
+/// carries that distinction as data instead of a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartHealth {
+    /// The configured healthcheck passed before startup returned. The
+    /// timeout is evaluated between polling attempts, so a check already in
+    /// flight at the deadline may still complete and count as healthy.
+    Healthy,
+    /// The configured healthcheck did not pass within its timeout; the
+    /// process/container was still alive, so startup continued.
+    TimedOut {
+        /// The configured healthcheck timeout that elapsed.
+        timeout: Duration,
+    },
+    /// Nothing was verified this call: no healthcheck is configured, the
+    /// service was already running, or the node is a hook-only oneshot.
+    Unchecked,
+}
+
+/// Per-service [`StartHealth`] outcomes collected by a start call, in start
+/// order.
+#[derive(Debug, Clone, Default)]
+pub struct StartOutcome {
+    health: Vec<(String, StartHealth)>,
+}
+
+impl StartOutcome {
+    /// Record `health` for `service`. The latest real observation
+    /// (`Healthy`/`TimedOut`) wins — a service restarted twice in one
+    /// command must report its final wait, not a stale earlier one. Only a
+    /// later `Unchecked` (a deduplicated no-op start) never downgrades a
+    /// real observation.
+    pub fn record(&mut self, service: &str, health: StartHealth) {
+        match self.health.iter_mut().find(|(name, _)| name == service) {
+            Some((_, existing)) => {
+                if health != StartHealth::Unchecked {
+                    *existing = health;
+                }
+            }
+            None => self.health.push((service.to_string(), health)),
+        }
+    }
+
+    /// Fold another outcome (e.g. from a dependency's start call) into this one.
+    pub fn merge(&mut self, other: StartOutcome) {
+        for (name, health) in other.health {
+            self.record(&name, health);
+        }
+    }
+
+    /// The recorded outcome for `service`, if it was part of this start.
+    pub fn get(&self, service: &str) -> Option<StartHealth> {
+        self.health
+            .iter()
+            .find(|(name, _)| name == service)
+            .map(|(_, health)| *health)
+    }
+
+    /// Services whose configured healthcheck did not pass during startup,
+    /// with the timeout that elapsed, in start order.
+    pub fn warnings(&self) -> impl Iterator<Item = (&str, Duration)> {
+        self.health
+            .iter()
+            .filter_map(|(name, health)| match health {
+                StartHealth::TimedOut { timeout } => Some((name.as_str(), *timeout)),
+                _ => None,
+            })
+    }
+
+    /// True if any service's healthcheck timed out during startup.
+    pub fn has_warnings(&self) -> bool {
+        self.warnings().next().is_some()
+    }
+}
+
 /// Type alias for the health checker registry.
 /// Uses `Arc` so checkers can be cloned out without holding the read lock.
 pub(super) type HealthCheckerRegistry = HashMap<String, Arc<dyn HealthChecker>>;
@@ -216,13 +295,14 @@ impl<'a> HealthCheckRunner<'a> {
         &self,
         name: &str,
         manager_arc: &Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>>,
-    ) -> Result<()> {
+    ) -> Result<StartHealth> {
         // Clone the Arc and drop the read lock immediately
         let checker = {
             let health_checkers = self.orchestrator.health_checkers.read().await;
             match health_checkers.get(name) {
                 Some(c) => Arc::clone(c),
-                None => return Ok(()), // No healthcheck configured -- nothing to wait for
+                // No healthcheck configured -- nothing to wait for
+                None => return Ok(StartHealth::Unchecked),
             }
         };
 
@@ -257,26 +337,6 @@ impl<'a> HealthCheckRunner<'a> {
                 start.elapsed().as_secs(),
                 timeout.as_secs()
             ));
-
-            if start.elapsed() >= timeout {
-                if has_progress_line {
-                    tracing::debug!(
-                        "Service '{}' did not become healthy within {:?}",
-                        name,
-                        timeout
-                    );
-                } else {
-                    tracing::warn!(
-                        "Service '{}' did not become healthy within {:?}",
-                        name,
-                        timeout
-                    );
-                }
-                // Don't fail the start -- the service process is running, just not
-                // healthy yet. The caller (fed start) reports the outcome per
-                // service; TUI/status show the accurate state afterwards.
-                return Ok(());
-            }
 
             // Respond to Ctrl-C promptly instead of waiting for timeout
             if self.orchestrator.cancellation_token.is_cancelled() {
@@ -336,6 +396,30 @@ impl<'a> HealthCheckRunner<'a> {
                 }
             }
 
+            // Deadline check AFTER the liveness checks above: a process that
+            // died during the final poll sleep must surface as a fatal start
+            // error, never be misreported as a non-fatal timeout warning.
+            if start.elapsed() >= timeout {
+                if has_progress_line {
+                    // fed start owns the reporting (⚠ outcome line + summary)
+                    tracing::debug!(
+                        "Service '{}' did not become healthy within {:?}",
+                        name,
+                        timeout
+                    );
+                } else {
+                    tracing::warn!(
+                        "Service '{}' did not become healthy within {:?}",
+                        name,
+                        timeout
+                    );
+                }
+                // Don't fail the start -- the service process is running, just
+                // not healthy yet. Return the timeout as data so the command
+                // layer can surface it instead of claiming full success.
+                return Ok(StartHealth::TimedOut { timeout });
+            }
+
             // Poll the healthcheck
             match checker.check().await {
                 Ok(true) => {
@@ -372,7 +456,7 @@ impl<'a> HealthCheckRunner<'a> {
                     let mut tracker = self.orchestrator.state_tracker.write().await;
                     tracker.update_service_status(name, Status::Healthy).await?;
                     tracker.save().await?;
-                    return Ok(());
+                    return Ok(StartHealth::Healthy);
                 }
                 Ok(false) => {
                     tracing::debug!("Service '{}' not healthy yet, waiting...", name);
@@ -481,9 +565,157 @@ mod tests {
         let manager: Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>> =
             Arc::new(tokio::sync::Mutex::new(Box::new(LiveManager)));
 
-        HealthCheckRunner::new(&orchestrator)
+        let outcome = HealthCheckRunner::new(&orchestrator)
             .await_healthcheck("service", &manager)
             .await
             .expect("a live service missing its startup health timeout remains a warning");
+        assert_eq!(
+            outcome,
+            StartHealth::TimedOut {
+                timeout: Duration::ZERO
+            },
+            "the timeout must surface as structured data, not just a log line"
+        );
+    }
+
+    struct DeadPidManager {
+        pid: u32,
+    }
+
+    #[async_trait]
+    impl ServiceManager for DeadPidManager {
+        async fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn kill(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn health(&self) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn status(&self) -> Status {
+            Status::Running
+        }
+
+        fn name(&self) -> &str {
+            "service"
+        }
+
+        fn get_pid(&self) -> Option<u32> {
+            Some(self.pid)
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A process that died right before the health deadline must fail the
+    /// start, not be misreported as a non-fatal timeout warning: the liveness
+    /// check runs before the deadline check.
+    #[tokio::test]
+    async fn process_death_at_health_deadline_is_fatal_not_a_timeout_warning() {
+        // Reap a real child so its PID is known-dead.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap child");
+
+        let temp = tempfile::tempdir().unwrap();
+        let orchestrator =
+            Orchestrator::new_ephemeral(Config::default(), temp.path().to_path_buf())
+                .await
+                .unwrap();
+        {
+            let mut tracker = orchestrator.state_tracker.write().await;
+            tracker.initialize().await.unwrap();
+            tracker
+                .register_service(crate::state::ServiceState::new(
+                    "service".to_string(),
+                    crate::config::ServiceType::Process,
+                    String::new(),
+                ))
+                .await
+                .unwrap();
+        }
+        orchestrator.health_checkers.write().await.insert(
+            "service".to_string(),
+            Arc::new(AlwaysUnhealthy {
+                timeout: Duration::ZERO,
+            }),
+        );
+        let manager: Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>> =
+            Arc::new(tokio::sync::Mutex::new(Box::new(DeadPidManager { pid })));
+
+        let error = HealthCheckRunner::new(&orchestrator)
+            .await_healthcheck("service", &manager)
+            .await
+            .expect_err("a dead process must fail the start even at the deadline");
+        assert!(
+            matches!(error, Error::ServiceStartFailed(ref name, _) if name == "service"),
+            "expected ServiceStartFailed, got {:?}",
+            error
+        );
+    }
+
+    #[test]
+    fn start_outcome_real_observation_replaces_unchecked_and_never_downgrades() {
+        let mut outcome = StartOutcome::default();
+        outcome.record("api", StartHealth::Unchecked);
+        outcome.record(
+            "api",
+            StartHealth::TimedOut {
+                timeout: Duration::from_secs(5),
+            },
+        );
+        // A later deduplicated start (already running) reports Unchecked —
+        // it must not erase the recorded timeout.
+        outcome.record("api", StartHealth::Unchecked);
+
+        assert_eq!(
+            outcome.get("api"),
+            Some(StartHealth::TimedOut {
+                timeout: Duration::from_secs(5)
+            })
+        );
+        assert!(outcome.has_warnings());
+        let warnings: Vec<_> = outcome.warnings().collect();
+        assert_eq!(warnings, vec![("api", Duration::from_secs(5))]);
+    }
+
+    /// The latest real observation wins: a service restarted twice in one
+    /// command reports its final health wait, in either direction.
+    #[test]
+    fn start_outcome_latest_real_observation_wins() {
+        let timed_out = StartHealth::TimedOut {
+            timeout: Duration::from_secs(5),
+        };
+
+        let mut outcome = StartOutcome::default();
+        outcome.record("api", StartHealth::Healthy);
+        outcome.record("api", timed_out);
+        assert_eq!(
+            outcome.get("api"),
+            Some(timed_out),
+            "a later timeout must not be masked by an earlier Healthy"
+        );
+
+        let mut outcome = StartOutcome::default();
+        outcome.record("api", timed_out);
+        outcome.record("api", StartHealth::Healthy);
+        assert_eq!(
+            outcome.get("api"),
+            Some(StartHealth::Healthy),
+            "a later healthy wait must clear an earlier stale warning"
+        );
+        assert!(!outcome.has_warnings());
     }
 }

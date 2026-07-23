@@ -60,8 +60,9 @@ fn draw_services_list(f: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(idx, service)| {
             let status_icon = match service.status {
-                Status::Running | Status::Healthy => "✓",
-                Status::Completed => "✓",
+                Status::Healthy | Status::Completed => "✓",
+                // Up but health not verified — never rendered as ✓
+                Status::Running => "●",
                 Status::Starting => "⋯",
                 Status::Failing => "✗",
                 Status::Stopped => "○",
@@ -69,8 +70,8 @@ fn draw_services_list(f: &mut Frame, app: &App, area: Rect) {
             };
 
             let status_color = match service.status {
-                Status::Running | Status::Healthy => Color::Green,
-                Status::Completed => Color::Green,
+                Status::Healthy | Status::Completed => Color::Green,
+                Status::Running => Color::Cyan,
                 Status::Starting => Color::Yellow,
                 Status::Failing => Color::Red,
                 Status::Stopped => Color::DarkGray,

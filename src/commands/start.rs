@@ -1,6 +1,6 @@
 use crate::output::UserOutput;
 use fed::{
-    Error as FedError, Orchestrator, WatchMode,
+    Error as FedError, Orchestrator, StartHealth, WatchMode,
     config::{Config, ServiceType},
     parameter::PortResolutionReason,
     port::PortConflict,
@@ -242,7 +242,8 @@ pub async fn run_start(
 
     // Track which services we've already started (to avoid duplicate messages)
     let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut warnings: Vec<String> = Vec::new();
+    // (service, warning text) for services whose healthcheck never passed
+    let mut warnings: Vec<(String, String)> = Vec::new();
     let startup_timer = std::time::Instant::now();
 
     // Group the plan into dependency levels. Services within a level start
@@ -340,28 +341,26 @@ pub async fn run_start(
         }
     }
 
+    // The unconditional success line is reserved for fully healthy starts.
+    // Healthcheck timeouts are non-fatal (processes are up, dependents
+    // proceeded), so `fed start` still exits 0 — but the summary must say
+    // which services were never verified healthy.
     let elapsed = fmt_duration(startup_timer.elapsed());
     if warnings.is_empty() {
         out.success(&format!(
-            "\nAll {} services started in {}",
+            "\nAll services started successfully! ({} services in {})",
             started.len(),
             elapsed
         ));
     } else {
-        let warning_word = if warnings.len() == 1 {
-            "warning"
-        } else {
-            "warnings"
-        };
-        out.status(&format!(
-            "\nStarted {} services in {} — {} {}:",
-            started.len(),
-            elapsed,
+        out.warning(&format!(
+            "\nServices started with {} health warning(s) ({} services in {}):",
             warnings.len(),
-            warning_word
+            started.len(),
+            elapsed
         ));
-        for warning in &warnings {
-            out.warning(&format!("  ⚠ {}", warning));
+        for (_, warning) in &warnings {
+            out.warning(&format!("  - {}", warning));
         }
     }
 
@@ -385,7 +384,22 @@ pub async fn run_start(
     status_entries.sort_by(|a, b| a.0.cmp(b.0));
     for (name, stat) in status_entries {
         let status_str = match stat {
-            Status::Running => "Running",
+            // Running means "process up, health not verified" — say so
+            // explicitly whenever a healthcheck exists, instead of letting
+            // Running read as success.
+            Status::Running => {
+                if warnings.iter().any(|(warned, _)| warned == name) {
+                    "Running (healthcheck timed out)"
+                } else if config
+                    .services
+                    .get(name)
+                    .is_some_and(|s| s.healthcheck.is_some())
+                {
+                    "Running (health unverified)"
+                } else {
+                    "Running"
+                }
+            }
             Status::Healthy => "Healthy",
             Status::Failing => "Failing",
             Status::Stopped => "Stopped",
@@ -630,8 +644,10 @@ fn fmt_duration(d: std::time::Duration) -> String {
 /// line is printed when done (parallel groups, where several services share
 /// the terminal).
 ///
-/// Returns `Ok(Some(warning))` when the service started but deserves a
-/// warning in the summary (e.g. healthcheck timed out).
+/// The outcome comes from the [`StartOutcome`] the orchestrator returns —
+/// structured healthcheck data, never derived from log text or polled
+/// status. Returns `Ok(Some((service, warning)))` when the service started
+/// but its healthcheck never passed.
 async fn start_one_service(
     orchestrator: &Orchestrator,
     config: &Config,
@@ -639,7 +655,7 @@ async fn start_one_service(
     name_width: usize,
     inline_progress: bool,
     out: &dyn UserOutput,
-) -> Result<Option<String>, FedError> {
+) -> Result<Option<(String, String)>, FedError> {
     let timer = std::time::Instant::now();
     if inline_progress {
         out.progress(&format!(
@@ -650,64 +666,45 @@ async fn start_one_service(
     }
 
     match orchestrator.start(name).await {
-        Ok(_) => {
+        Ok(start_outcome) => {
             let elapsed = fmt_duration(timer.elapsed());
-            // Healthcheck results are recorded in the state tracker (the
-            // manager's in-memory status stays Running), so read the tracker
-            // first and fall back to the live manager status.
-            let status = {
-                let tracked = {
-                    let tracker = orchestrator.state_tracker.read().await;
-                    tracker.get_service(name).await.map(|s| s.status)
-                };
-                match tracked {
-                    Some(status) => Some(status),
-                    None => orchestrator.get_service(name).await,
-                }
-            };
-            let has_healthcheck = config
+            let is_oneshot = config
                 .services
                 .get(name)
-                .map(|s| s.healthcheck.is_some())
+                .map(|s| s.service_type().is_hook_only())
                 .unwrap_or(false);
 
-            let (line, warning) = match status {
-                Some(Status::Healthy) => (
+            let (line, warning) = match start_outcome.get(name) {
+                Some(StartHealth::Healthy) => (
                     format!("  ✓ {:<w$}  healthy in {}", name, elapsed, w = name_width),
                     None,
                 ),
-                Some(Status::Completed) => (
+                Some(StartHealth::TimedOut { timeout }) => (
+                    format!(
+                        "  ⚠ {:<w$}  started, healthcheck timed out after {}",
+                        name,
+                        fmt_duration(timeout),
+                        w = name_width
+                    ),
+                    Some((
+                        name.to_string(),
+                        format!(
+                            "{}: healthcheck did not pass within {} (process is running, \
+                             health unverified) — see 'fed logs {}'",
+                            name,
+                            fmt_duration(timeout),
+                            name
+                        ),
+                    )),
+                ),
+                // Unchecked or absent: no healthcheck configured, an
+                // already-running dedup, or a hook-only oneshot.
+                _ if is_oneshot => (
                     format!("  ✓ {:<w$}  completed in {}", name, elapsed, w = name_width),
                     None,
                 ),
-                Some(Status::Running) if has_healthcheck => (
-                    format!(
-                        "  ⚠ {:<w$}  started, but not healthy after {}",
-                        name,
-                        elapsed,
-                        w = name_width
-                    ),
-                    Some(format!(
-                        "'{}' has not passed its healthcheck — see 'fed logs {}'",
-                        name, name
-                    )),
-                ),
-                Some(Status::Running) => (
+                _ => (
                     format!("  ✓ {:<w$}  running ({})", name, elapsed, w = name_width),
-                    None,
-                ),
-                Some(other) => (
-                    format!(
-                        "  ⚠ {:<w$}  {} after {}",
-                        name,
-                        other,
-                        elapsed,
-                        w = name_width
-                    ),
-                    Some(format!("'{}' is {} after startup", name, other)),
-                ),
-                None => (
-                    format!("  ✓ {:<w$}  started ({})", name, elapsed, w = name_width),
                     None,
                 ),
             };
@@ -938,6 +935,12 @@ async fn run_watch_mode(
                     match orchestrator.stop(&event.service_name).await {
                         Ok(_) => {
                             match orchestrator.start(&event.service_name).await {
+                                Ok(restart_outcome) if restart_outcome.has_warnings() => {
+                                    out.warning(&format!(
+                                        "  {} restarted, but its healthcheck did not pass in time",
+                                        event.service_name
+                                    ));
+                                }
                                 Ok(_) => {
                                     out.success(&format!("  {} restarted successfully", event.service_name));
                                 }
