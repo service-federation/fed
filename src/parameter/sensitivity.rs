@@ -30,25 +30,21 @@ pub const REDACTED_DISPLAY: &str = "********";
 pub fn sensitive_parameter_names(config: &Config) -> HashSet<String> {
     let params = config.get_effective_parameters();
 
-    let declared: HashSet<String> = params
+    // Seed with declared secrets AND heuristic matches, so the taint closure
+    // also covers values derived from a heuristic-only secret (e.g. a plain
+    // parameter interpolating an undeclared API_TOKEN).
+    let seed: HashSet<String> = params
         .iter()
-        .filter(|(_, p)| p.is_secret_type())
+        .filter(|(name, p)| p.is_secret_type() || name_suggests_secret(name))
         .map(|(name, _)| name.clone())
         .collect();
 
-    let mut sensitive = if declared.is_empty() {
+    let mut sensitive = if seed.is_empty() {
         HashSet::new()
     } else {
-        crate::parameter::scanner::parameters_tainted_by(config, &declared)
+        crate::parameter::scanner::parameters_tainted_by(config, &seed)
     };
-    sensitive.extend(declared);
-
-    for name in params.keys() {
-        if name_suggests_secret(name) {
-            sensitive.insert(name.clone());
-        }
-    }
-
+    sensitive.extend(seed);
     sensitive
 }
 
@@ -224,6 +220,23 @@ mod tests {
             },
         );
         assert!(sensitive_parameter_names(&config).contains("DERIVED"));
+    }
+
+    #[test]
+    fn parameter_derived_from_heuristic_only_secret_is_sensitive() {
+        // API_TOKEN is not declared `type: secret` — only the name heuristic
+        // flags it. Values derived from it must still be tainted.
+        let mut config = Config::default();
+        config
+            .parameters
+            .insert("API_TOKEN".to_string(), plain_param("tok-123"));
+        config.parameters.insert(
+            "AUTH_HEADER".to_string(),
+            plain_param("Bearer {{API_TOKEN}}"),
+        );
+        let sensitive = sensitive_parameter_names(&config);
+        assert!(sensitive.contains("API_TOKEN"));
+        assert!(sensitive.contains("AUTH_HEADER"));
     }
 
     #[test]

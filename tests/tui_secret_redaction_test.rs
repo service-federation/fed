@@ -153,6 +153,15 @@ async fn copy_is_disabled_for_sensitive_rows_and_works_for_plain_rows() {
     );
     assert!(!status.text.contains(SECRET_SENTINEL));
 
+    // The refusal is actually rendered on the parameters screen (status bar),
+    // and the post-keypress frame still contains no secret material.
+    let rendered = render_to_string(&app);
+    assert!(
+        rendered.contains("copying is disabled"),
+        "refusal must be visible in the rendered frame"
+    );
+    assert!(!rendered.contains(SECRET_SENTINEL));
+
     // Plain row: copy produces exactly the raw payload.
     select_param(&mut app, "KEY_COUNT");
     match app.selected_param_copy_payload(false) {

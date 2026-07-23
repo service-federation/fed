@@ -19,7 +19,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     draw_title(f, chunks[0]);
     draw_parameters(f, app, chunks[1]);
-    draw_status_bar(f, chunks[2]);
+    draw_status_bar(f, app, chunks[2]);
 }
 
 fn draw_title(f: &mut Frame, area: Rect) {
@@ -154,7 +154,26 @@ fn draw_parameters(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_status_bar(f: &mut Frame, area: Rect) {
+fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
+    // A status message (e.g. the refusal to copy a sensitive value) takes
+    // priority over the shortcut hints — same behavior as the dashboard.
+    if let Some(ref msg) = app.status_message {
+        let color = match msg.level {
+            crate::tui::app::StatusLevel::Info => Color::Blue,
+            crate::tui::app::StatusLevel::Success => Color::Green,
+            crate::tui::app::StatusLevel::Warning => Color::Yellow,
+            crate::tui::app::StatusLevel::Error => Color::Red,
+        };
+        let paragraph = Paragraph::new(msg.text.as_str()).style(
+            Style::default()
+                .fg(color)
+                .add_modifier(Modifier::BOLD)
+                .bg(Color::DarkGray),
+        );
+        f.render_widget(paragraph, area);
+        return;
+    }
+
     let shortcuts = vec![
         Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
         Span::raw(" navigate "),

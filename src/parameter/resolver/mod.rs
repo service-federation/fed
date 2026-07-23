@@ -309,8 +309,15 @@ impl Resolver {
 
     /// Resolve just the parameters (first pass, before external service expansion)
     pub fn resolve_parameters(&mut self, config: &mut Config) -> Result<()> {
-        // Clear any stale resolutions from a previous call (e.g. dry-run then real start)
+        // Clear ALL per-resolution state from a previous call (e.g. dry-run
+        // then real start). resolved_parameters in particular must not carry
+        // over: a stale entry from an earlier config would be re-emitted by
+        // get_parameter_views under the NEW config's sensitivity
+        // classification, which could surface a previously-secret value as
+        // plain. port_parameter_names would accumulate duplicates.
         self.port_resolutions.clear();
+        self.resolved_parameters.clear();
+        self.port_parameter_names.clear();
 
         // Determine which parameters are deferred this run BEFORE anything is
         // resolved — secret resolution's `generate` DAG (below), default
@@ -557,9 +564,16 @@ impl Resolver {
                 && let Some(resolved_value) = parameters.get(name)
                 && !param.either.contains(resolved_value)
             {
+                // Never echo a sensitive value back through an error message —
+                // resolver errors reach the terminal before any TUI masking.
+                let shown = if self.sensitive_params.contains(name) {
+                    super::sensitivity::REDACTED_DISPLAY
+                } else {
+                    resolved_value.as_str()
+                };
                 return Err(Error::TemplateResolution(format!(
                     "Parameter '{}' has value '{}' which is not in the allowed values: {:?}",
-                    name, resolved_value, param.either
+                    name, shown, param.either
                 )));
             }
         }
@@ -1147,6 +1161,67 @@ mod tests {
         // No view (including its Debug representation) carries the raw value.
         let debug_dump = format!("{:?}", views);
         assert!(!debug_dump.contains(SENTINEL));
+    }
+
+    #[test]
+    fn re_resolution_drops_stale_parameters_from_previous_config() {
+        use crate::config::{Config, Parameter};
+
+        const SENTINEL: &str = "stale-secret-value-1337";
+
+        let mut resolver = Resolver::new();
+
+        // First resolution: a declared secret with a raw value.
+        let mut config_a = Config::default();
+        let mut secret = Parameter {
+            param_type: Some("secret".to_string()),
+            ..Default::default()
+        };
+        secret.value = Some(SENTINEL.to_string());
+        config_a.parameters.insert("LICENSE".to_string(), secret);
+        resolver.resolve_parameters(&mut config_a).unwrap();
+
+        // Second resolution: a different config without that parameter.
+        // The stale value must not survive — under the new config's
+        // classification it would no longer be considered sensitive.
+        let mut config_b = Config::default();
+        config_b.parameters.insert(
+            "PLAIN".to_string(),
+            Parameter {
+                default: Some(serde_yaml::Value::String("v".to_string())),
+                ..Default::default()
+            },
+        );
+        resolver.resolve_parameters(&mut config_b).unwrap();
+
+        assert!(resolver.get_resolved_parameters().get("LICENSE").is_none());
+        let dump = format!("{:?}", resolver.get_parameter_views());
+        assert!(!dump.contains(SENTINEL));
+    }
+
+    #[test]
+    fn either_error_redacts_sensitive_values() {
+        use crate::config::{Config, Parameter};
+
+        const SENTINEL: &str = "secret-either-value-77";
+
+        let mut resolver = Resolver::new();
+        let mut config = Config::default();
+        let mut secret = Parameter {
+            param_type: Some("secret".to_string()),
+            either: vec!["a".to_string(), "b".to_string()],
+            ..Default::default()
+        };
+        secret.value = Some(SENTINEL.to_string());
+        config.parameters.insert("LICENSE".to_string(), secret);
+
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not in the allowed values"), "got: {msg}");
+        assert!(
+            !msg.contains(SENTINEL),
+            "either-constraint error leaked a sensitive value: {msg}"
+        );
     }
 
     #[test]
