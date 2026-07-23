@@ -131,7 +131,7 @@ Git isolates files. fed isolates the runtime state that usually still collides.
 
 Each isolated checkout gets its own values for declared `type: port` parameters, direct Docker container names, named volumes, generated secrets, and fed state.
 
-One rule: fed cannot remap a port hardcoded inside a command, URL, or Compose file. Declare every host port as a `type: port` parameter. See [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/) for Compose behavior, bind mounts, cookies, cleanup, and the full isolation model.
+Caveat: fed cannot remap a port hardcoded inside a command, URL, or Compose file. Declare every host port as a `type: port` parameter. See [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/) for Compose behavior, bind mounts, cookies, cleanup, and the full isolation model.
 
 For coding agents, put this in `AGENTS.md` or `CLAUDE.md`:
 
@@ -153,7 +153,7 @@ scripts:
     depends_on: [database, api]
     isolated: true
     environment:
-      DATABASE_URL: "{{DATABASE_URL}}"
+      DATABASE_URL: "postgres://postgres:{{DB_PASSWORD}}@localhost:{{DB_PORT}}/app"
     script: npm run test:integration
 ```
 
@@ -180,7 +180,7 @@ services:
     depends_on: [database]
 ```
 
-Read [Use fed with Docker Compose](https://www.service-federation.com/docs/compose/) before enabling worktree isolation. Compose ports must use environment substitution so fed can allocate them.
+Read [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/) before enabling worktree isolation. Compose ports must use environment substitution so fed can allocate them.
 
 ## Local and team secrets
 
@@ -194,7 +194,6 @@ Removing a member blocks new server fetches. It cannot erase values already cach
 
 - [Quickstart](https://www.service-federation.com/docs/)
 - [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/)
-- [Use fed with Docker Compose](https://www.service-federation.com/docs/compose/)
 - [Configuration reference](https://www.service-federation.com/docs/configuration/)
 - [Scripts and tests](https://www.service-federation.com/docs/scripts/)
 - [Command reference](https://www.service-federation.com/docs/commands/)
