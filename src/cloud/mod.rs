@@ -323,7 +323,8 @@ pub fn vault_ttl() -> Duration {
 
 /// Header carrying this CLI's version on every cloud request. The server
 /// compares it against its minimum supported protocol version and answers
-/// `426 Upgrade Required` to clients that are too old — see [`api_error`].
+/// `426 Upgrade Required` to clients that are too old — see `api_error`
+/// (private helper below, which maps that status to an upgrade error).
 /// Clients ≤ 7.2.0 predate this header; the server must treat its absence as
 /// "too old to say".
 pub const VERSION_HEADER: &str = "x-fed-version";

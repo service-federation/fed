@@ -1063,7 +1063,7 @@ services:
   api:
     process: "sleep 1"
     healthcheck:
-      httpGet: "not a valid url"
+      http_get: "not a valid url"
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let temp = tempfile::tempdir().unwrap();

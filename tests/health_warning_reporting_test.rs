@@ -374,7 +374,7 @@ services:
   bad-url:
     process: "sleep 300"
     healthcheck:
-      httpGet: "not a valid url"
+      http_get: "not a valid url"
       timeout: "1s"
 "#,
         &["bad-url"],
