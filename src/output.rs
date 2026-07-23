@@ -87,6 +87,60 @@ impl UserOutput for CliOutput {
     }
 }
 
+/// Test double that records everything a flow would show the user, so tests
+/// can assert both on what IS printed and — for secret material like tokens,
+/// exchange codes, and callback URLs — on what is NOT.
+#[cfg(test)]
+pub struct RecordingOutput {
+    lines: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl RecordingOutput {
+    pub fn new() -> Self {
+        Self {
+            lines: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Everything recorded, joined with newlines — one haystack for
+    /// "contains"/"does not contain" assertions across all output kinds.
+    pub fn combined(&self) -> String {
+        self.lines.lock().unwrap().join("\n")
+    }
+}
+
+#[cfg(test)]
+impl UserOutput for RecordingOutput {
+    fn status(&self, message: &str) {
+        self.lines.lock().unwrap().push(message.to_string());
+    }
+
+    fn success(&self, message: &str) {
+        self.lines.lock().unwrap().push(message.to_string());
+    }
+
+    fn warning(&self, message: &str) {
+        self.lines.lock().unwrap().push(message.to_string());
+    }
+
+    fn error(&self, message: &str) {
+        self.lines.lock().unwrap().push(message.to_string());
+    }
+
+    fn progress(&self, message: &str) {
+        self.lines.lock().unwrap().push(message.to_string());
+    }
+
+    fn finish_progress(&self, result: &str) {
+        self.lines.lock().unwrap().push(result.to_string());
+    }
+
+    fn blank(&self) {
+        self.lines.lock().unwrap().push(String::new());
+    }
+}
+
 // ── Custom tracing formatter for CLI output ─────────────────────────
 
 /// Extracts the `message` field from a tracing event.

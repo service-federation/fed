@@ -257,8 +257,14 @@ async fn run() -> anyhow::Result<()> {
         Commands::Workspace(ws_cmd) => {
             return commands::run_workspace(ws_cmd, &out).await;
         }
-        Commands::Login { no_browser, url } => {
-            return commands::run_login(*no_browser, url.clone(), &out).await;
+        Commands::Login {
+            no_browser,
+            print_url,
+            label,
+            url,
+        } => {
+            return commands::run_login(*no_browser, *print_url, label.clone(), url.clone(), &out)
+                .await;
         }
         Commands::Logout => {
             return commands::run_logout(cli.offline, &out).await;
