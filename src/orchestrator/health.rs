@@ -9,6 +9,7 @@ use crate::config::HealthCheckType;
 use crate::error::{Error, Result};
 use crate::healthcheck::{CommandChecker, DockerCommandChecker, HealthChecker, HttpChecker};
 use crate::service::{ServiceManager, Status};
+use crate::state::DesiredState;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -464,6 +465,43 @@ impl<'a> HealthCheckRunner<'a> {
                 }
             }
 
+            // Validate against the state DB every iteration, BEFORE any
+            // terminal return. Liveness alone cannot catch a concurrent
+            // stop: a cross-process waiter (`await_concurrent_start` loser)
+            // has no PID/container to probe, and a normal stop persists
+            // `desired_state = stopped` first while the status still reads
+            // Running until the manager finishes. Without this, a loser
+            // whose winner got stopped mid-wait would poll to the deadline
+            // and report a non-fatal TimedOut — exit 0, dependents released,
+            // service gone.
+            {
+                let row = {
+                    let tracker = self.orchestrator.state_tracker.read().await;
+                    tracker.get_service(name).await
+                };
+                let gone_reason = match row {
+                    None => Some("its state row was removed by a concurrent command"),
+                    Some(ref s) if s.desired_state != DesiredState::Running => {
+                        Some("a concurrent command requested it stopped")
+                    }
+                    Some(ref s)
+                        if !matches!(
+                            s.status,
+                            Status::Running | Status::Failing | Status::Healthy
+                        ) =>
+                    {
+                        Some("it is no longer running")
+                    }
+                    Some(_) => None,
+                };
+                if let Some(reason) = gone_reason {
+                    return Err(Error::ServiceStartFailed(
+                        name.to_string(),
+                        format!("Service '{}' did not complete startup: {}", name, reason),
+                    ));
+                }
+            }
+
             // Deadline check AFTER the liveness checks above: a process that
             // died during the final poll sleep must surface as a fatal start
             // error, never be misreported as a non-fatal timeout warning.
@@ -531,6 +569,7 @@ impl<'a> HealthCheckRunner<'a> {
                         .try_transition_service_status(
                             name,
                             &[Status::Running, Status::Failing, Status::Healthy],
+                            DesiredState::Running,
                             Status::Healthy,
                         )
                         .await?;
@@ -645,6 +684,19 @@ mod tests {
             Orchestrator::new_ephemeral(Config::default(), temp.path().to_path_buf())
                 .await
                 .unwrap();
+        {
+            // The wait validates the state row every iteration; a live
+            // Running row (desired Running) is the normal mid-start shape.
+            let mut tracker = orchestrator.state_tracker.write().await;
+            tracker.initialize().await.unwrap();
+            let mut state = crate::state::ServiceState::new(
+                "service".to_string(),
+                crate::config::ServiceType::Process,
+                String::new(),
+            );
+            state.status = Status::Running;
+            tracker.register_service(state).await.unwrap();
+        }
         orchestrator.health_checkers.write().await.insert(
             "service".to_string(),
             HealthCheckerEntry::Ready(Arc::new(AlwaysUnhealthy {
@@ -944,6 +996,60 @@ mod tests {
             status,
             Some(Status::Stopping),
             "the concurrent stop's status must survive the health wait"
+        );
+    }
+
+    /// A waiter whose service got a persisted stop intent mid-wait (the real
+    /// `fed stop` window: `desired_state = stopped` while status still reads
+    /// Running) must fail the wait — never poll to the deadline and report a
+    /// non-fatal TimedOut for a service that is being taken down.
+    #[tokio::test]
+    async fn stop_intent_mid_wait_fails_instead_of_timing_out() {
+        let temp = tempfile::tempdir().unwrap();
+        let orchestrator =
+            Orchestrator::new_ephemeral(Config::default(), temp.path().to_path_buf())
+                .await
+                .unwrap();
+        {
+            let mut tracker = orchestrator.state_tracker.write().await;
+            tracker.initialize().await.unwrap();
+            let mut state = crate::state::ServiceState::new(
+                "service".to_string(),
+                crate::config::ServiceType::Process,
+                String::new(),
+            );
+            state.status = Status::Running;
+            tracker.register_service(state).await.unwrap();
+            tracker
+                .set_desired_state("service", crate::state::DesiredState::Stopped)
+                .await
+                .unwrap();
+        }
+        // Long checker timeout: the wait must abort on the stop intent, not
+        // run anywhere near this deadline.
+        orchestrator.health_checkers.write().await.insert(
+            "service".to_string(),
+            HealthCheckerEntry::Ready(Arc::new(AlwaysUnhealthy {
+                timeout: Duration::from_secs(30),
+            })),
+        );
+        let manager: Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>> =
+            Arc::new(tokio::sync::Mutex::new(Box::new(LiveManager)));
+
+        let started = std::time::Instant::now();
+        let error = HealthCheckRunner::new(&orchestrator)
+            .await_healthcheck("service", &manager)
+            .await
+            .expect_err("a stop intent mid-wait must fail the wait, not time out");
+        assert!(
+            matches!(error, Error::ServiceStartFailed(ref name, _) if name == "service"),
+            "expected ServiceStartFailed, got {:?}",
+            error
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the wait must abort promptly on the stop intent, not poll out \
+             the checker deadline"
         );
     }
 

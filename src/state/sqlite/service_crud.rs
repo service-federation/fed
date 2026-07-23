@@ -196,34 +196,40 @@ impl SqliteStateTracker {
     }
 
     /// Set `status` only if the row's current status is one of
-    /// `allowed_from`, atomically (single SQL UPDATE, so it holds across
-    /// processes too). Returns whether the transition applied.
+    /// `allowed_from` AND its desired state is `required_desired_state`,
+    /// atomically (single SQL UPDATE, so it holds across processes too).
+    /// Returns whether the transition applied.
     ///
     /// This exists for writers that observed a status earlier and must not
     /// clobber a transition that happened since — e.g. the startup health
-    /// wait writing `Healthy` must not overwrite a concurrent `fed stop`'s
-    /// `Stopping`/`Stopped`.
+    /// wait writing `Healthy`. Status alone is not enough: a normal stop
+    /// persists `desired_state = stopped` first and only updates/removes the
+    /// row after the manager finishes stopping, so during that window the
+    /// status still reads `Running`. Guarding on desired state closes it.
     pub async fn try_transition_service_status(
         &mut self,
         service_id: &str,
         allowed_from: &[Status],
+        required_desired_state: DesiredState,
         to: Status,
     ) -> Result<bool> {
         let service_id = service_id.to_string();
         let to = to.to_string();
+        let desired = required_desired_state.to_string();
         let from: Vec<String> = allowed_from.iter().map(|s| s.to_string()).collect();
 
         let rows = self
             .with_transaction(move |tx| {
                 let placeholders = (0..from.len())
-                    .map(|i| format!("?{}", i + 3))
+                    .map(|i| format!("?{}", i + 4))
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!(
-                    "UPDATE services SET status = ?1 WHERE id = ?2 AND status IN ({})",
+                    "UPDATE services SET status = ?1 \
+                     WHERE id = ?2 AND desired_state = ?3 AND status IN ({})",
                     placeholders
                 );
-                let mut params: Vec<&dyn rusqlite::ToSql> = vec![&to, &service_id];
+                let mut params: Vec<&dyn rusqlite::ToSql> = vec![&to, &service_id, &desired];
                 for status in &from {
                     params.push(status);
                 }
@@ -1720,8 +1726,9 @@ mod tests {
         );
     }
 
-    /// `try_transition_service_status` applies only from an allowed status,
-    /// atomically, and reports whether it did.
+    /// `try_transition_service_status` applies only from an allowed status
+    /// with the required desired state, atomically, and reports whether it
+    /// did.
     #[tokio::test]
     async fn test_try_transition_service_status() {
         let mut tracker = create_ephemeral_tracker().await;
@@ -1732,7 +1739,12 @@ mod tests {
 
         // Current status (Starting) not in allowed_from → not applied.
         let applied = tracker
-            .try_transition_service_status("svc", &[Status::Running], Status::Healthy)
+            .try_transition_service_status(
+                "svc",
+                &[Status::Running],
+                DesiredState::Running,
+                Status::Healthy,
+            )
             .await
             .unwrap();
         assert!(
@@ -1745,15 +1757,47 @@ mod tests {
             "status must be untouched after a refused transition"
         );
 
-        // Allowed → applied.
+        // Allowed status but a stop already persisted its intent
+        // (desired_state = stopped while status still reads Running — the
+        // real `fed stop` window) → not applied.
         tracker
             .update_service_status("svc", Status::Running)
+            .await
+            .unwrap();
+        tracker
+            .set_desired_state("svc", DesiredState::Stopped)
             .await
             .unwrap();
         let applied = tracker
             .try_transition_service_status(
                 "svc",
                 &[Status::Running, Status::Failing],
+                DesiredState::Running,
+                Status::Healthy,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !applied,
+            "a persisted stop intent must refuse the transition even while \
+             the status still reads Running"
+        );
+        assert_eq!(
+            tracker.get_service("svc").await.unwrap().status,
+            Status::Running,
+            "status must be untouched when desired_state refuses the transition"
+        );
+
+        // Allowed status and desired state → applied.
+        tracker
+            .set_desired_state("svc", DesiredState::Running)
+            .await
+            .unwrap();
+        let applied = tracker
+            .try_transition_service_status(
+                "svc",
+                &[Status::Running, Status::Failing],
+                DesiredState::Running,
                 Status::Healthy,
             )
             .await
@@ -1766,7 +1810,12 @@ mod tests {
 
         // Missing row → not applied, not an error.
         let applied = tracker
-            .try_transition_service_status("ghost", &[Status::Running], Status::Healthy)
+            .try_transition_service_status(
+                "ghost",
+                &[Status::Running],
+                DesiredState::Running,
+                Status::Healthy,
+            )
             .await
             .unwrap();
         assert!(!applied);

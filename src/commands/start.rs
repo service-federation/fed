@@ -699,7 +699,8 @@ async fn start_one_service(
                 Some(StartHealth::CheckerInvalid { reason }) => (
                     format!(
                         "  ⚠ {:<w$}  started, healthcheck invalid ({})",
-                        name, elapsed,
+                        name,
+                        elapsed,
                         w = name_width
                     ),
                     Some((name.to_string(), StartHealth::CheckerInvalid { reason })),

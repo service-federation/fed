@@ -1434,8 +1434,25 @@ impl Orchestrator {
             // and would report success even if that start ultimately fails.
             // Wait for the winning attempt to resolve and report what
             // actually happened.
+            //
+            // The wait deadline is capped just under this service's startup
+            // timeout: `start_service_with_timeout` wraps this whole call in
+            // that timeout, and hitting it yields a generic Timeout error —
+            // the deadline must fire first so the user gets the actionable
+            // stuck-Starting message instead. Floor of 1s so a tiny
+            // configured startup timeout can't turn the wait into an
+            // instant misleading error.
+            let startup_timeout = self
+                .config
+                .services
+                .get(name)
+                .and_then(|s| s.get_startup_timeout())
+                .unwrap_or(self.startup_timeout);
+            let deadline = CONCURRENT_START_WAIT_TIMEOUT
+                .min(startup_timeout.saturating_sub(Duration::from_secs(5)))
+                .max(Duration::from_secs(1));
             return self
-                .await_concurrent_start(name, &manager_arc, CONCURRENT_START_WAIT_TIMEOUT)
+                .await_concurrent_start(name, &manager_arc, deadline)
                 .instrument(tracing::info_span!("await_concurrent_start"))
                 .await;
         };
@@ -1587,13 +1604,31 @@ impl Orchestrator {
             };
 
             match status {
-                None | Some(Status::Stopped) | Some(Status::Stopping) => {
+                // Winner failed and its guard cleaned the row up — a plain
+                // retry can win the registration next time.
+                None => {
                     return Err(Error::ServiceStartFailed(
                         name.to_string(),
                         format!(
-                            "a concurrent start of '{}' failed or did not leave it \
-                             running; see that command's output for the reason, then retry",
+                            "a concurrent start of '{}' failed; see that command's \
+                             output for the reason, then retry",
                             name
+                        ),
+                    ));
+                }
+                // A Stopped/Stopping row can outlive its failed start (e.g.
+                // the process died during the healthcheck wait after the
+                // registration committed) and would send every retry down
+                // this same path — the remedy is clearing the row, not
+                // retrying.
+                Some(Status::Stopped) | Some(Status::Stopping) => {
+                    return Err(Error::ServiceStartFailed(
+                        name.to_string(),
+                        format!(
+                            "'{}' is registered but not running — likely a previous \
+                             start failed after registering, or a concurrent stop won. \
+                             Run `fed stop {}` to clear its state, then start again",
+                            name, name
                         ),
                     ));
                 }
@@ -3426,6 +3461,13 @@ mod tests {
         };
         // Let the loser lose the race and settle into polling the winner.
         tokio::time::sleep(Duration::from_millis(600)).await;
+        // Guard against a vacuous pass: if the starter already returned
+        // (e.g. failed before ever losing the race), cancellation would
+        // trivially "leave the row alone" without exercising the loser path.
+        assert!(
+            !starter.is_finished(),
+            "starter must still be waiting on the winner when we cancel"
+        );
         orch.cancellation_token.cancel();
 
         let result = starter.await.unwrap();
