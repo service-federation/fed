@@ -26,8 +26,10 @@ pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a start that lost the registration race waits for the winning
 /// attempt to resolve. Generous, because the winner may be running install/
 /// migrate hooks; bounded, because a hard-killed winner leaves a `Starting`
-/// row behind that would otherwise hang us forever.
-const CONCURRENT_START_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
+/// row behind that would otherwise hang us forever. Deliberately the same
+/// constant liveness sweeps use to exempt young `Starting` rows: past this
+/// age both the waiter and the sweeper agree the row is dead.
+const CONCURRENT_START_WAIT_TIMEOUT: Duration = crate::state::STARTING_STALE_GRACE;
 
 /// Type alias for the shared service registry
 pub(super) type SharedServiceManager = Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>>;
@@ -1257,21 +1259,33 @@ impl Orchestrator {
             }
         };
 
+        // Set by the start future once THIS attempt owns the service (won
+        // the registration race, or entered the oneshot path). Until then
+        // there is nothing of ours to clean up — and cleaning up anyway
+        // would force-kill and unregister a registration owned by a
+        // concurrent winning attempt this call is merely waiting on
+        // (`await_concurrent_start`), whose row must survive our
+        // cancellation or timeout.
+        let attempt_owns_service = Arc::new(AtomicBool::new(false));
+
         tokio::select! {
             biased;
 
             _ = cancel_token.cancelled() => {
-                if !was_active_before {
+                if !was_active_before && attempt_owns_service.load(Ordering::SeqCst) {
                     self.stop_interrupted_start(name).await;
                 }
                 Err(Error::Cancelled(name.to_string()))
             }
 
-            result = tokio::time::timeout(timeout, self.start_service(name)) => {
+            result = tokio::time::timeout(
+                timeout,
+                self.start_service(name, Arc::clone(&attempt_owns_service)),
+            ) => {
                 match result {
                     Ok(inner_result) => inner_result,
                     Err(_elapsed) => {
-                        if !was_active_before {
+                        if !was_active_before && attempt_owns_service.load(Ordering::SeqCst) {
                             self.stop_interrupted_start(name).await;
                         }
                         Err(Error::Timeout(name.to_string()))
@@ -1301,14 +1315,22 @@ impl Orchestrator {
     }
 
     /// Start a single service
-    async fn start_service(&self, name: &str) -> Result<StartHealth> {
-        self.start_service_impl(name)
+    async fn start_service(
+        &self,
+        name: &str,
+        attempt_owns_service: Arc<AtomicBool>,
+    ) -> Result<StartHealth> {
+        self.start_service_impl(name, attempt_owns_service)
             .instrument(tracing::info_span!("start_service", service.name = %name))
             .await
     }
 
     /// Implementation of start_service (separate to allow instrumentation)
-    async fn start_service_impl(&self, name: &str) -> Result<StartHealth> {
+    async fn start_service_impl(
+        &self,
+        name: &str,
+        attempt_owns_service: Arc<AtomicBool>,
+    ) -> Result<StartHealth> {
         // Get Arc clone of manager
         let manager_arc = {
             let services = self.services.read().await;
@@ -1338,6 +1360,9 @@ impl Orchestrator {
             .map(|s| s.service_type() == ServiceType::Oneshot)
             .unwrap_or(false)
         {
+            // The oneshot path runs hooks this attempt owns — an
+            // interruption may leave their processes behind for cleanup.
+            attempt_owns_service.store(true, Ordering::SeqCst);
             return self
                 .run_oneshot(name, &manager_arc)
                 .await
@@ -1415,6 +1440,10 @@ impl Orchestrator {
                 .await;
         };
 
+        // Registration won: from here on this attempt may spawn a process/
+        // container, so an interrupted start must clean up after itself.
+        attempt_owns_service.store(true, Ordering::SeqCst);
+
         // All ? from here to commit() are safe — the guard cleans up on drop.
 
         self.run_install_if_needed(name)
@@ -1453,20 +1482,17 @@ impl Orchestrator {
         // when multiple services start concurrently
         async {
             let mut tracker = self.state_tracker.write().await;
-            tracker.update_service_status(name, Status::Running).await?;
-
-            // Defensive belt-and-suspenders: `register_service`'s INSERT
-            // already writes `desired_state = Running` for a brand-new row
-            // (see `ServiceState::new`'s default), so this is not
-            // load-bearing for the common case — but it's cheap and keeps
-            // intent explicit at every place a service is confirmed started.
-            // See `07-supervisor.md` Design §1.
-            tracker
-                .set_desired_state(name, DesiredState::Running)
-                .await?;
 
             // Store PID if available (for process services)
             // Store container ID if available (for docker services)
+            //
+            // Written BEFORE the status flips to Running: each update
+            // commits its own SQLite transaction, so a concurrent `fed`
+            // process polling the row (`await_concurrent_start`) may observe
+            // any prefix of this block. Running is the signal that the start
+            // is committed — it must be the last thing an observer can see,
+            // never a state where the PID/ports are still missing or a
+            // later write in this block can still fail.
             {
                 let manager = manager_arc.lock().await;
                 if let Some(pid) = manager.get_pid() {
@@ -1485,6 +1511,18 @@ impl Orchestrator {
                         .await?;
                 }
             }
+
+            // Defensive belt-and-suspenders: `register_service`'s INSERT
+            // already writes `desired_state = Running` for a brand-new row
+            // (see `ServiceState::new`'s default), so this is not
+            // load-bearing for the common case — but it's cheap and keeps
+            // intent explicit at every place a service is confirmed started.
+            // See `07-supervisor.md` Design §1.
+            tracker
+                .set_desired_state(name, DesiredState::Running)
+                .await?;
+
+            tracker.update_service_status(name, Status::Running).await?;
 
             // Save while holding the write lock to ensure atomicity
             tracker.save().await?;
@@ -3332,6 +3370,81 @@ mod tests {
             error
         );
         winner.await.unwrap();
+    }
+
+    /// A start that loses the registration race and is then cancelled while
+    /// waiting on the winner must NOT run interrupted-start cleanup — that
+    /// would force-kill and unregister the WINNER's registration.
+    #[tokio::test]
+    async fn cancelled_loser_leaves_winners_registration_alone() {
+        use crate::service::ProcessService;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.services.insert(
+            "svc".to_string(),
+            crate::config::Service {
+                process: Some("sleep 300".to_string()),
+                ..Default::default()
+            },
+        );
+        let orchestrator = Orchestrator::new(config.clone(), temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        {
+            let mut tracker = orchestrator.state_tracker.write().await;
+            tracker.initialize().await.unwrap();
+            // The "winner": a concurrent attempt's registration, mid-hooks.
+            tracker
+                .register_service(ServiceState::new(
+                    "svc".to_string(),
+                    ServiceType::Process,
+                    "root".to_string(),
+                ))
+                .await
+                .unwrap();
+        }
+        {
+            let manager = ProcessService::new(
+                "svc".into(),
+                config.services.get("svc").unwrap().clone(),
+                HashMap::new(),
+                temp_dir.path().to_string_lossy().into_owned(),
+                OutputMode::Captured,
+                None,
+            );
+            orchestrator.services.write().await.insert(
+                "svc".to_string(),
+                Arc::new(tokio::sync::Mutex::new(Box::new(manager))),
+            );
+        }
+
+        let orch = Arc::new(orchestrator);
+        let starter = {
+            let orch = Arc::clone(&orch);
+            tokio::spawn(async move { orch.start_service_with_timeout("svc").await })
+        };
+        // Let the loser lose the race and settle into polling the winner.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        orch.cancellation_token.cancel();
+
+        let result = starter.await.unwrap();
+        assert!(
+            matches!(result, Err(Error::Cancelled(_))),
+            "the loser must report cancellation, got {:?}",
+            result
+        );
+
+        // Give any (buggy) cleanup task time to run before checking.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let row = {
+            let tracker = orch.state_tracker.read().await;
+            tracker.get_service("svc").await
+        };
+        assert!(
+            matches!(row.map(|s| s.status), Some(Status::Starting)),
+            "the winner's Starting registration must survive the loser's cancellation"
+        );
     }
 
     /// A row stuck in `Starting` (winner hard-killed without cleanup) must

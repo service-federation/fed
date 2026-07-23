@@ -195,6 +195,45 @@ impl SqliteStateTracker {
         Ok(())
     }
 
+    /// Set `status` only if the row's current status is one of
+    /// `allowed_from`, atomically (single SQL UPDATE, so it holds across
+    /// processes too). Returns whether the transition applied.
+    ///
+    /// This exists for writers that observed a status earlier and must not
+    /// clobber a transition that happened since — e.g. the startup health
+    /// wait writing `Healthy` must not overwrite a concurrent `fed stop`'s
+    /// `Stopping`/`Stopped`.
+    pub async fn try_transition_service_status(
+        &mut self,
+        service_id: &str,
+        allowed_from: &[Status],
+        to: Status,
+    ) -> Result<bool> {
+        let service_id = service_id.to_string();
+        let to = to.to_string();
+        let from: Vec<String> = allowed_from.iter().map(|s| s.to_string()).collect();
+
+        let rows = self
+            .with_transaction(move |tx| {
+                let placeholders = (0..from.len())
+                    .map(|i| format!("?{}", i + 3))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "UPDATE services SET status = ?1 WHERE id = ?2 AND status IN ({})",
+                    placeholders
+                );
+                let mut params: Vec<&dyn rusqlite::ToSql> = vec![&to, &service_id];
+                for status in &from {
+                    params.push(status);
+                }
+                tx.execute(&sql, params.as_slice())
+            })
+            .await?;
+
+        Ok(rows > 0)
+    }
+
     /// Set a single service's persisted desired state (running/stopped).
     ///
     /// This is the intent signal every stop path must write **before** any
@@ -741,6 +780,15 @@ impl SqliteStateTracker {
                     // Daemon unhealthy - assume container is running to avoid spurious cleanup
                     false
                 }
+            } else if service_state.status == Status::Starting {
+                // No PID/container plus `Starting` is what a live concurrent
+                // start looks like while it runs install/migrate hooks —
+                // don't mark it stale until the grace window has passed
+                // (see `STARTING_STALE_GRACE` docs).
+                Utc::now()
+                    .signed_duration_since(service_state.started_at)
+                    .to_std()
+                    .is_ok_and(|age| age >= crate::state::STARTING_STALE_GRACE)
             } else {
                 // Service has no PID and no container_id.
                 // Only consider stale if its status indicates it SHOULD be running.
@@ -1598,22 +1646,16 @@ mod tests {
         assert!(!tracker.is_service_registered("svc").await);
     }
 
-    // --- Bug: Starting status not marked stale ---
+    // --- Starting rows: stale only after the grace window ---
 
-    #[tokio::test]
-    async fn test_mark_dead_services_starting_no_pid_is_stale() {
-        let mut tracker = create_ephemeral_tracker().await;
-
-        // A service with Starting status but no PID and no container_id
-        // is clearly stale — the process was never spawned (start failed
-        // between registration and actual process creation).
-        let state = ServiceState {
-            id: "stuck-starting".to_string(),
+    fn starting_row_no_pid(id: &str, started_at: chrono::DateTime<Utc>) -> ServiceState {
+        ServiceState {
+            id: id.to_string(),
             status: Status::Starting,
             service_type: ServiceType::Process,
             pid: None,
             container_id: None,
-            started_at: Utc::now(),
+            started_at,
             external_repo: None,
             namespace: "test".to_string(),
             restart_count: 0,
@@ -1623,14 +1665,52 @@ mod tests {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
-        };
-        tracker.register_service(state).await.unwrap();
+        }
+    }
+
+    /// A fresh `Starting` row with no PID is what a live concurrent start
+    /// looks like while it runs install/migrate hooks — another `fed`
+    /// process initializing must NOT mark it stale, or the loser of a
+    /// registration race would misread the winner as failed.
+    #[tokio::test]
+    async fn test_mark_dead_services_young_starting_no_pid_kept() {
+        let mut tracker = create_ephemeral_tracker().await;
+        tracker
+            .register_service(starting_row_no_pid("mid-start", Utc::now()))
+            .await
+            .unwrap();
+
+        let marked = tracker.mark_dead_services().await.unwrap();
+        assert!(
+            marked.is_empty(),
+            "a Starting row inside the grace window must be left alone"
+        );
+        assert!(
+            tracker.get_services().await.contains_key("mid-start"),
+            "the live concurrent start's row must survive the sweep"
+        );
+    }
+
+    /// A `Starting` row older than the grace window is a starter that died
+    /// without cleanup — that one IS stale.
+    #[tokio::test]
+    async fn test_mark_dead_services_old_starting_no_pid_is_stale() {
+        let mut tracker = create_ephemeral_tracker().await;
+        let stale_age = chrono::Duration::from_std(crate::state::STARTING_STALE_GRACE).unwrap()
+            + chrono::Duration::seconds(1);
+        tracker
+            .register_service(starting_row_no_pid(
+                "stuck-starting",
+                Utc::now() - stale_age,
+            ))
+            .await
+            .unwrap();
 
         let marked = tracker.mark_dead_services().await.unwrap();
         assert_eq!(
             marked.len(),
             1,
-            "Service with Starting status and no PID should be marked stale"
+            "Service stuck in Starting past the grace window should be marked stale"
         );
 
         let services = tracker.get_services().await;
@@ -1638,6 +1718,58 @@ mod tests {
             services.is_empty(),
             "Stale Starting service should be filtered from get_services()"
         );
+    }
+
+    /// `try_transition_service_status` applies only from an allowed status,
+    /// atomically, and reports whether it did.
+    #[tokio::test]
+    async fn test_try_transition_service_status() {
+        let mut tracker = create_ephemeral_tracker().await;
+        tracker
+            .register_service(starting_row_no_pid("svc", Utc::now()))
+            .await
+            .unwrap();
+
+        // Current status (Starting) not in allowed_from → not applied.
+        let applied = tracker
+            .try_transition_service_status("svc", &[Status::Running], Status::Healthy)
+            .await
+            .unwrap();
+        assert!(
+            !applied,
+            "transition from a disallowed status must not apply"
+        );
+        assert_eq!(
+            tracker.get_service("svc").await.unwrap().status,
+            Status::Starting,
+            "status must be untouched after a refused transition"
+        );
+
+        // Allowed → applied.
+        tracker
+            .update_service_status("svc", Status::Running)
+            .await
+            .unwrap();
+        let applied = tracker
+            .try_transition_service_status(
+                "svc",
+                &[Status::Running, Status::Failing],
+                Status::Healthy,
+            )
+            .await
+            .unwrap();
+        assert!(applied);
+        assert_eq!(
+            tracker.get_service("svc").await.unwrap().status,
+            Status::Healthy
+        );
+
+        // Missing row → not applied, not an error.
+        let applied = tracker
+            .try_transition_service_status("ghost", &[Status::Running], Status::Healthy)
+            .await
+            .unwrap();
+        assert!(!applied);
     }
 
     // --- 07-supervisor.md Design §3: native-restart stale-grace period ---

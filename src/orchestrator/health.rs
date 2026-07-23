@@ -522,7 +522,28 @@ impl<'a> HealthCheckRunner<'a> {
                         tracing::info!("Service '{}' is healthy", name);
                     }
                     let mut tracker = self.orchestrator.state_tracker.write().await;
-                    tracker.update_service_status(name, Status::Healthy).await?;
+                    // Conditional write: a concurrent `fed stop` (or a
+                    // failed winning start unregistering its row) may have
+                    // moved the service on since the last poll — Healthy
+                    // must never overwrite that. Atomic in SQL, so it holds
+                    // against other processes too.
+                    let applied = tracker
+                        .try_transition_service_status(
+                            name,
+                            &[Status::Running, Status::Failing, Status::Healthy],
+                            Status::Healthy,
+                        )
+                        .await?;
+                    if !applied {
+                        return Err(Error::ServiceStartFailed(
+                            name.to_string(),
+                            format!(
+                                "Service '{}' was stopped or removed by a concurrent \
+                                 command during its startup health wait",
+                                name
+                            ),
+                        ));
+                    }
                     tracker.save().await?;
                     return Ok(StartHealth::Healthy);
                 }
@@ -860,6 +881,69 @@ mod tests {
                 if name == "service" && reason.contains("invalid URL scheme")),
             "expected HealthCheckFailed with the construction reason, got {:?}",
             error
+        );
+    }
+
+    struct AlwaysHealthyChecker;
+
+    #[async_trait]
+    impl HealthChecker for AlwaysHealthyChecker {
+        async fn check(&self) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn timeout(&self) -> Duration {
+            Duration::from_secs(5)
+        }
+    }
+
+    /// The startup health wait's Healthy write must not clobber a concurrent
+    /// stop: if the row moved to Stopping since the last poll, the wait
+    /// fails instead of resurrecting the status.
+    #[tokio::test]
+    async fn healthy_write_does_not_clobber_concurrent_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let orchestrator =
+            Orchestrator::new_ephemeral(Config::default(), temp.path().to_path_buf())
+                .await
+                .unwrap();
+        {
+            let mut tracker = orchestrator.state_tracker.write().await;
+            tracker.initialize().await.unwrap();
+            // A concurrent `fed stop` already moved the row to Stopping.
+            let mut state = crate::state::ServiceState::new(
+                "service".to_string(),
+                crate::config::ServiceType::Process,
+                String::new(),
+            );
+            state.status = Status::Stopping;
+            tracker.register_service(state).await.unwrap();
+        }
+        orchestrator.health_checkers.write().await.insert(
+            "service".to_string(),
+            HealthCheckerEntry::Ready(Arc::new(AlwaysHealthyChecker)),
+        );
+        let manager: Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>> =
+            Arc::new(tokio::sync::Mutex::new(Box::new(LiveManager)));
+
+        let error = HealthCheckRunner::new(&orchestrator)
+            .await_healthcheck("service", &manager)
+            .await
+            .expect_err("Healthy must not overwrite a concurrent stop");
+        assert!(
+            matches!(error, Error::ServiceStartFailed(ref name, _) if name == "service"),
+            "expected ServiceStartFailed, got {:?}",
+            error
+        );
+
+        let status = {
+            let tracker = orchestrator.state_tracker.read().await;
+            tracker.get_service("service").await.map(|s| s.status)
+        };
+        assert_eq!(
+            status,
+            Some(Status::Stopping),
+            "the concurrent stop's status must survive the health wait"
         );
     }
 
