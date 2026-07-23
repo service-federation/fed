@@ -617,7 +617,7 @@ impl Orchestrator {
     /// directly by CLI commands.
     ///
     /// Unlike every other `initialize*` variant, this one must never let
-    /// `mark_dead_services`'s stale-row filtering silently
+    /// [`crate::state::SqliteStateTracker::mark_dead_services`]'s stale-row filtering silently
     /// swallow a service that crashed while genuinely unsupervised (the
     /// exact case this whole feature exists for — see the module-level
     /// "Attach/self-heal reality" note in `07-supervisor.md`). It:
