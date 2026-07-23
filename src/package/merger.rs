@@ -116,6 +116,24 @@ impl ServiceMerger {
             Self::merge_service(local_service, base_service)?;
         }
 
+        // Package configs are parsed with the same legacy-spelling scan as the
+        // main config, but only the main config's records reach the soft
+        // "prefer snake_case" notice — carry the packages' records over, with
+        // the package identity prefixed. Sorted so warning order is stable.
+        let mut aliases: Vec<&String> = packages.keys().collect();
+        aliases.sort();
+        for alias in aliases {
+            for u in &packages[alias].config.legacy_key_usages {
+                main_config
+                    .legacy_key_usages
+                    .push(crate::config::LegacyKeyUsage {
+                        location: format!("package '{}': {}", alias, u.location),
+                        legacy: u.legacy,
+                        canonical: u.canonical,
+                    });
+            }
+        }
+
         Ok(())
     }
 
@@ -734,6 +752,65 @@ mod tests {
             matches!(result.unwrap_err(), Error::CircularPackageDependency),
             "Should return CircularPackageDependency error"
         );
+    }
+
+    // Legacy-spelling records found while parsing a package's own fed.yaml
+    // must surface through the main config's warning list (with the package
+    // identity prefixed), since only that list feeds the validate/start notice.
+    #[test]
+    fn test_merge_packages_propagates_legacy_key_usages() {
+        let mut main_config = Config::default();
+        main_config.services.insert(
+            "my-db".to_string(),
+            Service {
+                extends: Some("db-pkg.postgres".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut pkg_config = Config::default();
+        pkg_config.services.insert(
+            "postgres".to_string(),
+            Service {
+                image: Some("postgres:15".to_string()),
+                expose: true,
+                ..Default::default()
+            },
+        );
+        pkg_config
+            .legacy_key_usages
+            .push(crate::config::LegacyKeyUsage {
+                location: "service 'postgres'".to_string(),
+                legacy: "httpGet",
+                canonical: "http_get",
+            });
+
+        let package = Package {
+            alias: "db-pkg".to_string(),
+            source: crate::package::PackageSource::Local {
+                path: std::path::PathBuf::from("/fake/path"),
+            },
+            config: pkg_config,
+            path: std::path::PathBuf::from("/fake/path"),
+            metadata: crate::package::PackageMetadata {
+                name: None,
+                description: None,
+                version: None,
+                updated_at: chrono::Utc::now(),
+                checksum: None,
+            },
+        };
+
+        let mut packages = HashMap::new();
+        packages.insert("db-pkg".to_string(), package);
+
+        ServiceMerger::merge_packages(&mut main_config, &packages).unwrap();
+
+        assert_eq!(main_config.legacy_key_usages.len(), 1);
+        let u = &main_config.legacy_key_usages[0];
+        assert_eq!(u.location, "package 'db-pkg': service 'postgres'");
+        assert_eq!(u.legacy, "httpGet");
+        assert_eq!(u.canonical, "http_get");
     }
 
     #[test]

@@ -238,7 +238,7 @@ http_get: "http://localhost:8080/health"
     #[test]
     fn test_http_healthcheck_legacy_camelcase_spelling() {
         let yaml = r#"
-http_get: "http://localhost:8080/health"
+httpGet: "http://localhost:8080/health"
 timeout: "30s"
 "#;
         let health: HealthCheck = serde_yaml::from_str(yaml).unwrap();
