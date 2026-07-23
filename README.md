@@ -4,7 +4,7 @@
 [![CI](https://github.com/service-federation/fed/actions/workflows/ci.yml/badge.svg)](https://github.com/service-federation/fed/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/github/license/service-federation/fed)](./LICENSE)
 
-Run your app natively and its dependencies in Docker from one config file. Then give each agent worktree its own fed-managed runtime state.
+Run your app natively and its dependencies in Docker from one config file. Then run a full, isolated copy of the stack in every Git worktree: no shared ports, no shared databases.
 
 ```console
 $ fed start
@@ -129,7 +129,7 @@ Git isolates files. fed isolates the runtime state that usually still collides.
 
 Each isolated checkout gets its own values for declared `type: port` parameters, direct Docker container names, named volumes, generated secrets, and fed state.
 
-The qualifier matters: fed cannot remap a port hardcoded inside a command, URL, or Compose file. Declare every host port as a `type: port` parameter. See [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/) for Compose behavior, bind mounts, cookies, cleanup, and the full isolation model.
+One rule: fed cannot remap a port hardcoded inside a command, URL, or Compose file. Declare every host port as a `type: port` parameter. See [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/) for Compose behavior, bind mounts, cookies, cleanup, and the full isolation model.
 
 For coding agents, put this in `AGENTS.md` or `CLAUDE.md`:
 
