@@ -321,6 +321,28 @@ pub fn vault_ttl() -> Duration {
 
 // ── API client ────────────────────────────────────────────────────────
 
+/// Header carrying this CLI's version on every cloud request. The server
+/// compares it against its minimum supported protocol version and answers
+/// `426 Upgrade Required` to clients that are too old — see [`api_error`].
+/// Clients ≤ 7.2.0 predate this header; the server must treat its absence as
+/// "too old to say".
+pub const VERSION_HEADER: &str = "x-fed-version";
+
+/// Builder with everything both cloud clients share: the version header (so
+/// the server can enforce a minimum CLI version) and a matching user agent.
+/// Callers add their own timeout — the vault client and the logout revoke
+/// client budget very differently.
+fn client_builder() -> reqwest::ClientBuilder {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        VERSION_HEADER,
+        reqwest::header::HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+    );
+    reqwest::Client::builder()
+        .user_agent(concat!("fed/", env!("CARGO_PKG_VERSION")))
+        .default_headers(headers)
+}
+
 fn client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     // The timeout is the blocking budget — long enough to ride out a cold
@@ -329,7 +351,7 @@ fn client() -> &'static reqwest::Client {
     // block. Read from the env here (rather than a hardcoded constant) so
     // FED_VAULT_TIMEOUT tunes both in one place (D6).
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        client_builder()
             .timeout(vault_timeout())
             .build()
             .expect("building HTTP client")
@@ -341,10 +363,11 @@ fn api_error(status: reqwest::StatusCode, context: &str) -> Error {
         401 => " — your token is invalid or revoked; run `fed login`",
         403 => " — you no longer have access; ask an org admin",
         404 => " — org or project not found; check `fed link`",
-        // The server's signal that this CLI speaks a protocol it no longer
-        // accepts (HTTP 426 Upgrade Required). Reserved for future breaking
-        // changes to the login/API contract.
-        426 => " — this version of fed is too old for the server; upgrade fed and try again",
+        // The server saw our x-fed-version header (or its absence) and refused:
+        // this build no longer speaks the protocol it requires.
+        426 => {
+            " — this version of fed is too old for the server; upgrade fed (`brew upgrade fed`) and retry"
+        }
         429 => " — rate limited; try again in a minute",
         _ => "",
     };
@@ -806,10 +829,7 @@ pub enum Revocation {
 /// so a booting backend is not worth the vault budget here — a modest ~10s cap,
 /// and connect failures (`is_connect`) fail fast rather than waiting it out.
 pub async fn revoke_current_token(creds: &Credentials) -> Revocation {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
+    let client = match client_builder().timeout(Duration::from_secs(10)).build() {
         Ok(client) => client,
         Err(e) => return Revocation::Failed(format!("cloud client: {}", e)),
     };
@@ -832,6 +852,9 @@ pub async fn revoke_current_token(creds: &Credentials) -> Revocation {
         // failure — reporting it as a confirmed revocation would be unsafe.
         200 => Revocation::Revoked,
         401 => Revocation::Failed("server rejected the token (401)".to_string()),
+        426 => Revocation::Failed(
+            "this version of fed is too old for the server; upgrade fed".to_string(),
+        ),
         429 => Revocation::Failed("rate limited".to_string()),
         _ => Revocation::Failed(format!("server returned {}", res.status())),
     }
@@ -1026,6 +1049,111 @@ mod tests {
         Credentials {
             url,
             token: "super-secret-token".to_string(),
+        }
+    }
+
+    /// A vault request answered with 426 Upgrade Required must tell the user
+    /// their fed is too old and how to upgrade — not just echo the status.
+    #[tokio::test]
+    async fn vault_426_tells_user_to_upgrade_fed() {
+        let url = spawn_one_shot("426 Upgrade Required", "{}");
+        let err = match whoami(&creds_at(url)).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a 426 response must surface as an error"),
+        };
+        assert!(
+            err.contains("too old") && err.contains("brew upgrade fed"),
+            "426 must explain the upgrade path, got: {}",
+            err
+        );
+    }
+
+    /// One-shot server that captures the raw request and hands it back over a
+    /// channel, then answers 200 with `body`. For asserting what we send.
+    fn spawn_capturing(body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Read until end-of-headers: a single read may legally return
+                // only a prefix, which would drop headers from the capture.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://127.0.0.1:{}", port), rx)
+    }
+
+    /// Every cloud request must carry this build's version in `x-fed-version`
+    /// — that header is what lets the server answer 426 to outdated clients.
+    #[tokio::test]
+    async fn cloud_requests_send_version_header() {
+        let (url, rx) = spawn_capturing("{\"user\":{\"name\":null,\"email\":null},\"orgs\":[]}");
+        whoami(&creds_at(url)).await.unwrap();
+        let request = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server captured a request")
+            .to_lowercase();
+        let expected = format!("{}: {}", VERSION_HEADER, env!("CARGO_PKG_VERSION"));
+        assert!(
+            request.contains(&expected),
+            "request must carry `{}`, got:\n{}",
+            expected,
+            request
+        );
+        assert!(
+            request.contains(concat!("fed/", env!("CARGO_PKG_VERSION"))),
+            "user agent should also name fed and its version:\n{}",
+            request
+        );
+    }
+
+    /// The revoke client is built separately from the vault client, but shares
+    /// `client_builder()` — it must send the version header too.
+    #[tokio::test]
+    async fn revoke_requests_send_version_header() {
+        let (url, rx) = spawn_capturing("{\"revoked\":true}");
+        let outcome = revoke_current_token(&creds_at(url)).await;
+        assert!(matches!(outcome, Revocation::Revoked));
+        let request = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server captured a request")
+            .to_lowercase();
+        let expected = format!("{}: {}", VERSION_HEADER, env!("CARGO_PKG_VERSION"));
+        assert!(
+            request.contains(&expected),
+            "revoke request must carry `{}`, got:\n{}",
+            expected,
+            request
+        );
+    }
+
+    /// A 426 on revoke is a failed revoke that names the version problem.
+    #[tokio::test]
+    async fn revoke_426_is_failed_with_upgrade_hint() {
+        let url = spawn_one_shot("426 Upgrade Required", "{}");
+        match revoke_current_token(&creds_at(url)).await {
+            Revocation::Failed(reason) => assert!(
+                reason.contains("too old"),
+                "426 revoke should mention the version problem, got: {}",
+                reason
+            ),
+            Revocation::Revoked => panic!("426 must not classify as revoked"),
         }
     }
 
