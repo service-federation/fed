@@ -13,6 +13,7 @@ pub mod supervisor;
 
 pub use builder::OrchestratorBuilder;
 pub use core::*;
+pub use health::{StartHealth, StartOutcome};
 pub use lifecycle::ServiceLifecycleCommands;
 /// Re-exported for `fed status --json`'s `supervised_by` field
 /// (`07-supervisor.md` Design §4) — see the doc comment on the function

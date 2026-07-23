@@ -28,6 +28,17 @@ const DEFAULT_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// # Simple command (no timeout, uses default)
 /// healthcheck: "curl -f http://localhost:3000"
 /// ```
+///
+/// # Startup semantics
+///
+/// `fed start` polls the healthcheck before dependents boot. Passing before
+/// startup returns marks the service `Healthy` (the timeout is evaluated
+/// between polling attempts, so a check in flight at the deadline may still
+/// count). Not passing within `timeout` while the process is
+/// still alive is non-fatal: the service stays `Running` (health unverified),
+/// dependents proceed, and the timeout is reported as a startup health
+/// warning (`StartHealth::TimedOut`) rather than an error. The process dying
+/// before the healthcheck passes fails the start.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum HealthCheck {

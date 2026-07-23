@@ -1,6 +1,31 @@
 use crate::output::UserOutput;
-use fed::{Orchestrator, config::Config};
+use fed::{Orchestrator, StartOutcome, config::Config};
 use std::path::Path;
+
+/// Print the post-restart summary: reserve the unconditional success line for
+/// fully healthy restarts, list healthcheck timeouts otherwise (non-fatal —
+/// the processes are up, so the command still exits 0).
+fn report_restart_outcome(outcome: &StartOutcome, all: bool, out: &dyn UserOutput) {
+    let warnings: Vec<_> = outcome.warnings().collect();
+    if warnings.is_empty() {
+        if all {
+            out.success("All services restarted successfully!");
+        } else {
+            out.success("Services restarted successfully!");
+        }
+    } else {
+        out.warning(&format!(
+            "Services restarted with {} health warning(s):",
+            warnings.len()
+        ));
+        for (name, timeout) in warnings {
+            out.warning(&format!(
+                "  - {}: healthcheck did not pass within {:?} (process is running, health unverified)",
+                name, timeout
+            ));
+        }
+    }
+}
 
 pub async fn run_restart(
     orchestrator: &mut Orchestrator,
@@ -13,8 +38,8 @@ pub async fn run_restart(
 ) -> anyhow::Result<()> {
     let restarted_names: Vec<String> = if services.is_empty() {
         out.status("Restarting all services in dependency-aware order...");
-        orchestrator.restart_all().await?;
-        out.success("All services restarted successfully!");
+        let outcome = orchestrator.restart_all().await?;
+        report_restart_outcome(&outcome, true, out);
         config.services.keys().cloned().collect()
     } else {
         // Expand tag references (e.g., @backend) into service names
@@ -29,11 +54,21 @@ pub async fn run_restart(
         // service AND brings its dependents back (a plain stop/start pair would
         // leave them stranded — see Orchestrator::restart docs).
         let mut errors: Vec<(String, String)> = Vec::new();
+        let mut outcome = StartOutcome::default();
 
         for service in &services_to_restart {
             out.progress(&format!("  Restarting {}...", service));
             match orchestrator.restart(service).await {
-                Ok(_) => out.finish_progress(" done"),
+                Ok(service_outcome) => {
+                    let suffix = match service_outcome.get(service) {
+                        Some(fed::StartHealth::TimedOut { timeout }) => {
+                            format!(" done (healthcheck timed out after {:?})", timeout)
+                        }
+                        _ => " done".to_string(),
+                    };
+                    outcome.merge(service_outcome);
+                    out.finish_progress(&suffix);
+                }
                 Err(e) => {
                     out.finish_progress(&format!(" failed ({})", e));
                     errors.push((service.clone(), e.to_string()));
@@ -55,7 +90,7 @@ pub async fn run_restart(
         }
 
         out.blank();
-        out.success("Services restarted successfully!");
+        report_restart_outcome(&outcome, false, out);
         services_to_restart
     };
 

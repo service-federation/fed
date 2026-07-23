@@ -1,4 +1,4 @@
-use crate::orchestrator::Orchestrator;
+use crate::orchestrator::{Orchestrator, StartOutcome};
 use crate::service::Status;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use std::collections::{HashMap, VecDeque};
@@ -254,6 +254,13 @@ impl App {
         };
 
         match result {
+            Ok(outcome) if outcome.has_warnings() => {
+                let msg = format!(
+                    "⚠ '{}' restarted, but a healthcheck did not pass in time",
+                    service_name
+                );
+                self.set_status(&msg, StatusLevel::Warning, 5);
+            }
             Ok(_) => {
                 let msg = format!("✓ '{}' restarted successfully", service_name);
                 self.set_status(&msg, StatusLevel::Success, 3);
@@ -440,20 +447,15 @@ impl App {
                     let result = {
                         let orch = self.orchestrator.write().await;
                         match status {
-                            Status::Running | Status::Healthy | Status::Failing => {
-                                orch.stop(&service_name).await
-                            }
+                            Status::Running | Status::Healthy | Status::Failing => orch
+                                .stop(&service_name)
+                                .await
+                                .map(|()| StartOutcome::default()),
                             Status::Stopped => orch.start(&service_name).await,
-                            _ => Ok(()),
+                            _ => Ok(StartOutcome::default()),
                         }
                     };
-                    if let Err(e) = result {
-                        self.set_status(
-                            &format!("Failed to toggle '{}': {}", service_name, e),
-                            StatusLevel::Error,
-                            5,
-                        );
-                    }
+                    self.report_start_result("toggle", "started", &service_name, result);
                 }
             }
             KeyCode::Char('r') => {
@@ -463,13 +465,7 @@ impl App {
                     let _ = orch.stop(&service_name).await;
                     orch.start(&service_name).await
                 };
-                if let Err(e) = result {
-                    self.set_status(
-                        &format!("Failed to restart '{}': {}", service_name, e),
-                        StatusLevel::Error,
-                        5,
-                    );
-                }
+                self.report_start_result("restart", "restarted", &service_name, result);
             }
             KeyCode::Char('l') => {
                 // View logs
@@ -540,20 +536,15 @@ impl App {
                         match status {
                             // Failing means a live process failing health checks —
                             // toggle stops it (start would no-op with AlreadyExists).
-                            Status::Running | Status::Healthy | Status::Failing => {
-                                orch.stop(&service_name).await
-                            }
+                            Status::Running | Status::Healthy | Status::Failing => orch
+                                .stop(&service_name)
+                                .await
+                                .map(|()| StartOutcome::default()),
                             Status::Stopped => orch.start(&service_name).await,
-                            _ => Ok(()),
+                            _ => Ok(StartOutcome::default()),
                         }
                     };
-                    if let Err(e) = result {
-                        self.set_status(
-                            &format!("Failed to toggle '{}': {}", service_name, e),
-                            StatusLevel::Error,
-                            5,
-                        );
-                    }
+                    self.report_start_result("toggle", "started", &service_name, result);
                 }
             }
             KeyCode::Char('r') => {
@@ -565,13 +556,7 @@ impl App {
                         let _ = orch.stop(&service_name).await;
                         orch.start(&service_name).await
                     };
-                    if let Err(e) = result {
-                        self.set_status(
-                            &format!("Failed to restart '{}': {}", service_name, e),
-                            StatusLevel::Error,
-                            5,
-                        );
-                    }
+                    self.report_start_result("restart", "restarted", &service_name, result);
                 }
             }
             KeyCode::Char('l') => {
@@ -895,18 +880,14 @@ impl App {
                 match status {
                     // Same Failing semantics as the details and graph views:
                     // a Failing service is running, so toggle stops it.
-                    Status::Running | Status::Healthy | Status::Failing => orch.stop(&name).await,
+                    Status::Running | Status::Healthy | Status::Failing => {
+                        orch.stop(&name).await.map(|()| StartOutcome::default())
+                    }
                     Status::Stopped => orch.start(&name).await,
-                    _ => Ok(()),
+                    _ => Ok(StartOutcome::default()),
                 }
             };
-            if let Err(e) = result {
-                self.set_status(
-                    &format!("Failed to toggle '{}': {}", name, e),
-                    StatusLevel::Error,
-                    5,
-                );
-            }
+            self.report_start_result("toggle", "started", &name, result);
         }
         Ok(())
     }
@@ -921,13 +902,7 @@ impl App {
                 let _ = orch.stop(&name).await;
                 orch.start(&name).await
             };
-            if let Err(e) = result {
-                self.set_status(
-                    &format!("Failed to restart '{}': {}", name, e),
-                    StatusLevel::Error,
-                    5,
-                );
-            }
+            self.report_start_result("restart", "restarted", &name, result);
         }
         Ok(())
     }
@@ -963,7 +938,15 @@ impl App {
         };
 
         match result {
-            Ok(()) => self.set_status("All services started", StatusLevel::Success, 5),
+            Ok(outcome) if outcome.has_warnings() => self.set_status(
+                &format!(
+                    "Services started with {} health warning(s)",
+                    outcome.warnings().count()
+                ),
+                StatusLevel::Warning,
+                10,
+            ),
+            Ok(_) => self.set_status("All services started", StatusLevel::Success, 5),
             Err(e) => self.set_status(&format!("Failed: {}", e), StatusLevel::Error, 10),
         }
 
@@ -1211,6 +1194,34 @@ impl App {
             } else {
                 self.log_level_filter.remove(&service);
             }
+        }
+    }
+
+    /// Surface a start/toggle/restart result in the status bar. A healthcheck
+    /// timeout is `Ok` at the orchestrator level, so a plain `Err` check
+    /// would silently drop the warning.
+    fn report_start_result(
+        &mut self,
+        failed_verb: &str,
+        done_verb: &str,
+        service_name: &str,
+        result: crate::error::Result<StartOutcome>,
+    ) {
+        match result {
+            Ok(outcome) if outcome.has_warnings() => self.set_status(
+                &format!(
+                    "⚠ '{}' {}, but a healthcheck did not pass in time",
+                    service_name, done_verb
+                ),
+                StatusLevel::Warning,
+                5,
+            ),
+            Ok(_) => {}
+            Err(e) => self.set_status(
+                &format!("Failed to {} '{}': {}", failed_verb, service_name, e),
+                StatusLevel::Error,
+                5,
+            ),
         }
     }
 

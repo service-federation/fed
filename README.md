@@ -76,6 +76,16 @@ All services started successfully!
 
 Day to day: `fed status`, `fed logs backend`, `fed stop`.
 
+### Startup health semantics
+
+`fed start` waits for each service's healthcheck before starting its dependents.
+
+- A healthcheck that passes before startup returns marks the service `healthy`. The `timeout` is evaluated between polling attempts, so a check already in flight at the deadline may still count.
+- A healthcheck that does not pass within its `timeout` (default 5s) is a warning, not an error: the process keeps running, dependents still start, and the run ends with `Services started with N health warning(s)` instead of the success line. The exit code stays 0.
+- A process that dies before its healthcheck passes fails the start with a non-zero exit code.
+
+In `fed status`, `running` means the process is up but no healthcheck has confirmed it; only `healthy` means verified. `fed status --json` reports the same distinction as `"status": "running"` with `"health": "unknown"`.
+
 ## Built for coding agents
 
 Claude Code, Cursor, and Codex parallelize with one worktree per task. Without isolation, those worktrees fight over ports and databases: one agent's test run wipes another's schema, and the fix is you, untangling it.

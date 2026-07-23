@@ -240,7 +240,7 @@ entrypoint: slow_service
         Err(fed::Error::Cancelled(_)) => {
             println!("Correctly received cancellation error");
         }
-        Ok(()) => {
+        Ok(_) => {
             // Service might have completed before cancellation - that's OK
             println!("Service completed before cancellation");
         }
@@ -346,7 +346,7 @@ entrypoint: hanging_service
             assert_eq!(name, "hanging_service");
             println!("Correctly received timeout error");
         }
-        Ok(()) => {
+        Ok(_) => {
             println!("Service started (spawn completed before timeout)");
         }
         Err(e) => {
@@ -404,7 +404,7 @@ entrypoint: slow_to_be_healthy
     match &result {
         Err(fed::Error::Timeout(name)) => assert_eq!(name, "slow_to_be_healthy"),
         Err(e) => panic!("expected Timeout, got {:?}", e),
-        Ok(()) => panic!("expected Timeout, got Ok"),
+        Ok(_) => panic!("expected Timeout, got Ok"),
     }
     assert!(
         elapsed < Duration::from_secs(5),
