@@ -1459,9 +1459,6 @@ impl App {
         }
     }
 
-    /// Surface a start/toggle/restart result in the status bar. A healthcheck
-    /// timeout is `Ok` at the orchestrator level, so a plain `Err` check
-    /// would silently drop the warning.
     /// Set a status message that will expire after the given duration
     pub fn set_status(&mut self, text: &str, level: StatusLevel, duration_secs: u64) {
         self.status_message = Some(StatusMessage {
