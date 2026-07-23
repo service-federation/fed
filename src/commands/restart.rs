@@ -18,11 +18,10 @@ fn report_restart_outcome(outcome: &StartOutcome, all: bool, out: &dyn UserOutpu
             "Services restarted with {} health warning(s):",
             warnings.len()
         ));
-        for (name, timeout) in warnings {
-            out.warning(&format!(
-                "  - {}: healthcheck did not pass within {:?} (process is running, health unverified)",
-                name, timeout
-            ));
+        for (name, health) in warnings {
+            if let Some(text) = health.warning_text() {
+                out.warning(&format!("  - {}: {}", name, text));
+            }
         }
     }
 }
@@ -63,6 +62,9 @@ pub async fn run_restart(
                     let suffix = match service_outcome.get(service) {
                         Some(fed::StartHealth::TimedOut { timeout }) => {
                             format!(" done (healthcheck timed out after {:?})", timeout)
+                        }
+                        Some(fed::StartHealth::CheckerInvalid { .. }) => {
+                            " done (healthcheck invalid, never run)".to_string()
                         }
                         _ => " done".to_string(),
                     };

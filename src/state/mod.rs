@@ -35,3 +35,15 @@ pub use types::{DesiredState, LockFile, RegistrationOutcome, ServiceState};
 ///
 /// This is an alias for [`SqliteStateTracker`] for backwards compatibility.
 pub type StateTracker = SqliteStateTracker;
+
+/// How long a `Starting` row with no PID/container yet is exempt from
+/// liveness sweeps (`mark_dead_services`).
+///
+/// That shape is exactly what a live concurrent start looks like while it
+/// runs install/migrate hooks — another `fed` process initializing must not
+/// mark it stale, or a start waiting on that attempt
+/// (`Orchestrator::await_concurrent_start`, which uses this same constant as
+/// its wait deadline) would misread the winner as failed. Only a row stuck
+/// in `Starting` past this window — a starter that died without cleanup —
+/// is treated as dead.
+pub const STARTING_STALE_GRACE: std::time::Duration = std::time::Duration::from_secs(180);

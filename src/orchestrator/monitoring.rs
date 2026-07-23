@@ -913,8 +913,18 @@ impl Orchestrator {
             }
         }
 
-        // Use health checker if available
-        if let Some(checker) = self.health_checkers.read().await.get(service_name) {
+        // Use health checker if available. An Invalid entry (checker
+        // configured but unconstructable, e.g. malformed URL) falls through
+        // to the manager's own probe: monitoring must not flip services to
+        // Failing over a config typo the start path already warned about.
+        let checker = {
+            let checkers = self.health_checkers.read().await;
+            match checkers.get(service_name) {
+                Some(super::health::HealthCheckerEntry::Ready(c)) => Some(Arc::clone(c)),
+                Some(super::health::HealthCheckerEntry::Invalid { .. }) | None => None,
+            }
+        };
+        if let Some(checker) = checker {
             return checker.check().await;
         }
 
