@@ -21,7 +21,7 @@ use super::core::Orchestrator;
 /// alive and dependents may proceed — but callers must still be able to tell
 /// "verified healthy" from "started, health never confirmed". This type
 /// carries that distinction as data instead of a log line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartHealth {
     /// The configured healthcheck passed before startup returned. The
     /// timeout is evaluated between polling attempts, so a check already in
@@ -33,9 +33,36 @@ pub enum StartHealth {
         /// The configured healthcheck timeout that elapsed.
         timeout: Duration,
     },
+    /// A healthcheck is configured but could not be constructed (e.g. a
+    /// malformed URL), so it never ran and never will until the config is
+    /// fixed. The service still starts, but unlike `Unchecked` this is a
+    /// warning: the user asked for verification they cannot get.
+    CheckerInvalid {
+        /// Why the checker could not be constructed.
+        reason: String,
+    },
     /// Nothing was verified this call: no healthcheck is configured, the
     /// service was already running, or the node is a hook-only oneshot.
     Unchecked,
+}
+
+impl StartHealth {
+    /// The warning line for this outcome, or `None` if it isn't warn-worthy.
+    /// Shared by `fed start`/`fed restart` summaries so the two commands
+    /// can't drift apart.
+    pub fn warning_text(&self) -> Option<String> {
+        match self {
+            StartHealth::TimedOut { timeout } => Some(format!(
+                "healthcheck did not pass within {:?} (process is running, health unverified)",
+                timeout
+            )),
+            StartHealth::CheckerInvalid { reason } => Some(format!(
+                "healthcheck is invalid and was never run: {}",
+                reason
+            )),
+            StartHealth::Healthy | StartHealth::Unchecked => None,
+        }
+    }
 }
 
 /// Per-service [`StartHealth`] outcomes collected by a start call, in start
@@ -47,10 +74,10 @@ pub struct StartOutcome {
 
 impl StartOutcome {
     /// Record `health` for `service`. The latest real observation
-    /// (`Healthy`/`TimedOut`) wins — a service restarted twice in one
-    /// command must report its final wait, not a stale earlier one. Only a
-    /// later `Unchecked` (a deduplicated no-op start) never downgrades a
-    /// real observation.
+    /// (`Healthy`/`TimedOut`/`CheckerInvalid`) wins — a service restarted
+    /// twice in one command must report its final wait, not a stale earlier
+    /// one. Only a later `Unchecked` (a deduplicated no-op start) never
+    /// downgrades a real observation.
     pub fn record(&mut self, service: &str, health: StartHealth) {
         match self.health.iter_mut().find(|(name, _)| name == service) {
             Some((_, existing)) => {
@@ -74,29 +101,46 @@ impl StartOutcome {
         self.health
             .iter()
             .find(|(name, _)| name == service)
-            .map(|(_, health)| *health)
+            .map(|(_, health)| health.clone())
     }
 
-    /// Services whose configured healthcheck did not pass during startup,
-    /// with the timeout that elapsed, in start order.
-    pub fn warnings(&self) -> impl Iterator<Item = (&str, Duration)> {
-        self.health
-            .iter()
-            .filter_map(|(name, health)| match health {
-                StartHealth::TimedOut { timeout } => Some((name.as_str(), *timeout)),
-                _ => None,
-            })
+    /// Services whose configured healthcheck was not verified during startup
+    /// (timed out, or invalid and never run), in start order.
+    pub fn warnings(&self) -> impl Iterator<Item = (&str, &StartHealth)> {
+        self.health.iter().filter_map(|(name, health)| {
+            health
+                .warning_text()
+                .is_some()
+                .then_some((name.as_str(), health))
+        })
     }
 
-    /// True if any service's healthcheck timed out during startup.
+    /// True if any service's configured healthcheck went unverified during
+    /// startup.
     pub fn has_warnings(&self) -> bool {
         self.warnings().next().is_some()
     }
 }
 
+/// A registry slot for one service's configured healthcheck.
+///
+/// `Invalid` exists so a checker that failed to construct (e.g. malformed
+/// URL) stays distinguishable from "no healthcheck configured". Every
+/// registry consumer must handle it explicitly — silently treating it as
+/// absent is exactly the gap this type closes.
+pub(super) enum HealthCheckerEntry {
+    /// A constructed checker, ready to poll. `Arc` so it can be cloned out
+    /// without holding the registry read lock.
+    Ready(Arc<dyn HealthChecker>),
+    /// The healthcheck is configured but could not be constructed.
+    Invalid {
+        /// Why construction failed, surfaced to the user at start time.
+        reason: String,
+    },
+}
+
 /// Type alias for the health checker registry.
-/// Uses `Arc` so checkers can be cloned out without holding the read lock.
-pub(super) type HealthCheckerRegistry = HashMap<String, Arc<dyn HealthChecker>>;
+pub(super) type HealthCheckerRegistry = HashMap<String, HealthCheckerEntry>;
 /// Type alias for the shared health checker registry
 pub(super) type SharedHealthCheckerRegistry = Arc<tokio::sync::RwLock<HealthCheckerRegistry>>;
 
@@ -120,20 +164,25 @@ impl<'a> HealthCheckRunner<'a> {
                 // Use configured timeout or default (5 seconds)
                 let timeout = healthcheck.get_timeout();
 
-                let checker: Arc<dyn HealthChecker> = match healthcheck.health_check_type() {
+                let entry: HealthCheckerEntry = match healthcheck.health_check_type() {
                     HealthCheckType::Http => {
                         if let Some(url) = healthcheck.get_http_url() {
                             // Use shared HTTP client to prevent file descriptor exhaustion
                             // when running many services with HTTP health checks
                             match HttpChecker::with_shared_client(url.to_string(), timeout) {
-                                Ok(checker) => Arc::new(checker),
+                                Ok(checker) => HealthCheckerEntry::Ready(Arc::new(checker)),
                                 Err(e) => {
                                     tracing::warn!(
-                                        "Skipping invalid healthcheck URL for service '{}': {}",
+                                        "Invalid healthcheck URL for service '{}': {}",
                                         name,
                                         e
                                     );
-                                    continue;
+                                    // Registered as Invalid, not skipped: the
+                                    // start path turns this into a visible
+                                    // warning instead of silent "unchecked".
+                                    HealthCheckerEntry::Invalid {
+                                        reason: e.to_string(),
+                                    }
                                 }
                             }
                         } else {
@@ -152,18 +201,18 @@ impl<'a> HealthCheckRunner<'a> {
                                     session_id.as_deref(),
                                     &self.orchestrator.work_dir,
                                 );
-                                Arc::new(DockerCommandChecker::new(
+                                HealthCheckerEntry::Ready(Arc::new(DockerCommandChecker::new(
                                     container_name,
                                     cmd.to_string(),
                                     timeout,
-                                ))
+                                )))
                             } else {
                                 // Process/Gradle service - run on host
-                                Arc::new(CommandChecker::new(
+                                HealthCheckerEntry::Ready(Arc::new(CommandChecker::new(
                                     "bash".to_string(),
                                     vec!["-c".to_string(), cmd.to_string()],
                                     timeout,
-                                ))
+                                )))
                             }
                         } else {
                             continue;
@@ -176,7 +225,7 @@ impl<'a> HealthCheckRunner<'a> {
                     .health_checkers
                     .write()
                     .await
-                    .insert(name.clone(), checker);
+                    .insert(name.clone(), entry);
             }
         }
     }
@@ -194,8 +243,10 @@ impl<'a> HealthCheckRunner<'a> {
         let checker = {
             let health_checkers = self.orchestrator.health_checkers.read().await;
             match health_checkers.get(name) {
-                Some(c) => Arc::clone(c),
-                None => return Ok(()),
+                Some(HealthCheckerEntry::Ready(c)) => Arc::clone(c),
+                // An invalid checker can't probe anything; the start path
+                // surfaces it as a warning, so don't block the start here.
+                Some(HealthCheckerEntry::Invalid { .. }) | None => return Ok(()),
             }
         };
 
@@ -221,7 +272,16 @@ impl<'a> HealthCheckRunner<'a> {
         let checker = {
             let health_checkers = self.orchestrator.health_checkers.read().await;
             match health_checkers.get(service_name) {
-                Some(c) => Arc::clone(c),
+                Some(HealthCheckerEntry::Ready(c)) => Arc::clone(c),
+                // A script explicitly waiting on this service's health can
+                // never succeed with an unconstructable checker — fail with
+                // the reason rather than pretending the wait passed.
+                Some(HealthCheckerEntry::Invalid { reason }) => {
+                    return Err(Error::HealthCheckFailed(
+                        service_name.to_string(),
+                        format!("healthcheck is configured but invalid: {}", reason),
+                    ));
+                }
                 None => {
                     // No healthcheck configured - consider it healthy after a brief moment
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -300,7 +360,15 @@ impl<'a> HealthCheckRunner<'a> {
         let checker = {
             let health_checkers = self.orchestrator.health_checkers.read().await;
             match health_checkers.get(name) {
-                Some(c) => Arc::clone(c),
+                Some(HealthCheckerEntry::Ready(c)) => Arc::clone(c),
+                // Configured but unconstructable: non-fatal (matches the
+                // long-standing behavior of starting anyway), but reported
+                // as a warning, not as a silent Unchecked.
+                Some(HealthCheckerEntry::Invalid { reason }) => {
+                    return Ok(StartHealth::CheckerInvalid {
+                        reason: reason.clone(),
+                    });
+                }
                 // No healthcheck configured -- nothing to wait for
                 None => return Ok(StartHealth::Unchecked),
             }
@@ -536,9 +604,9 @@ mod tests {
                 .unwrap();
         orchestrator.health_checkers.write().await.insert(
             "service".to_string(),
-            Arc::new(AlwaysUnhealthy {
+            HealthCheckerEntry::Ready(Arc::new(AlwaysUnhealthy {
                 timeout: Duration::from_millis(1),
-            }),
+            })),
         );
 
         let error = HealthCheckRunner::new(&orchestrator)
@@ -558,9 +626,9 @@ mod tests {
                 .unwrap();
         orchestrator.health_checkers.write().await.insert(
             "service".to_string(),
-            Arc::new(AlwaysUnhealthy {
+            HealthCheckerEntry::Ready(Arc::new(AlwaysUnhealthy {
                 timeout: Duration::ZERO,
-            }),
+            })),
         );
         let manager: Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>> =
             Arc::new(tokio::sync::Mutex::new(Box::new(LiveManager)));
@@ -648,9 +716,9 @@ mod tests {
         }
         orchestrator.health_checkers.write().await.insert(
             "service".to_string(),
-            Arc::new(AlwaysUnhealthy {
+            HealthCheckerEntry::Ready(Arc::new(AlwaysUnhealthy {
                 timeout: Duration::ZERO,
-            }),
+            })),
         );
         let manager: Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>> =
             Arc::new(tokio::sync::Mutex::new(Box::new(DeadPidManager { pid })));
@@ -688,7 +756,15 @@ mod tests {
         );
         assert!(outcome.has_warnings());
         let warnings: Vec<_> = outcome.warnings().collect();
-        assert_eq!(warnings, vec![("api", Duration::from_secs(5))]);
+        assert_eq!(
+            warnings,
+            vec![(
+                "api",
+                &StartHealth::TimedOut {
+                    timeout: Duration::from_secs(5)
+                }
+            )]
+        );
     }
 
     /// The latest real observation wins: a service restarted twice in one
@@ -701,10 +777,10 @@ mod tests {
 
         let mut outcome = StartOutcome::default();
         outcome.record("api", StartHealth::Healthy);
-        outcome.record("api", timed_out);
+        outcome.record("api", timed_out.clone());
         assert_eq!(
             outcome.get("api"),
-            Some(timed_out),
+            Some(timed_out.clone()),
             "a later timeout must not be masked by an earlier Healthy"
         );
 
@@ -717,5 +793,105 @@ mod tests {
             "a later healthy wait must clear an earlier stale warning"
         );
         assert!(!outcome.has_warnings());
+    }
+
+    /// An unconstructable checker surfaces as a `CheckerInvalid` warning at
+    /// startup, not as a silent `Unchecked`.
+    #[tokio::test]
+    async fn invalid_checker_surfaces_as_startup_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let orchestrator =
+            Orchestrator::new_ephemeral(Config::default(), temp.path().to_path_buf())
+                .await
+                .unwrap();
+        orchestrator.health_checkers.write().await.insert(
+            "service".to_string(),
+            HealthCheckerEntry::Invalid {
+                reason: "invalid URL scheme".to_string(),
+            },
+        );
+        let manager: Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>> =
+            Arc::new(tokio::sync::Mutex::new(Box::new(LiveManager)));
+
+        let health = HealthCheckRunner::new(&orchestrator)
+            .await_healthcheck("service", &manager)
+            .await
+            .expect("an invalid checker is non-fatal at startup");
+        assert_eq!(
+            health,
+            StartHealth::CheckerInvalid {
+                reason: "invalid URL scheme".to_string()
+            }
+        );
+
+        let mut outcome = StartOutcome::default();
+        outcome.record("service", health);
+        assert!(
+            outcome.has_warnings(),
+            "an invalid checker must count as a startup warning"
+        );
+        // A later deduplicated no-op start must not erase the warning.
+        outcome.record("service", StartHealth::Unchecked);
+        assert!(outcome.has_warnings());
+    }
+
+    /// A script explicitly waiting on a service whose checker is invalid must
+    /// fail with the reason, not silently proceed after a grace sleep.
+    #[tokio::test]
+    async fn script_wait_on_invalid_checker_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let orchestrator =
+            Orchestrator::new_ephemeral(Config::default(), temp.path().to_path_buf())
+                .await
+                .unwrap();
+        orchestrator.health_checkers.write().await.insert(
+            "service".to_string(),
+            HealthCheckerEntry::Invalid {
+                reason: "invalid URL scheme".to_string(),
+            },
+        );
+
+        let error = HealthCheckRunner::new(&orchestrator)
+            .wait_for_healthy("service", Duration::from_secs(1))
+            .await
+            .expect_err("waiting on an invalid checker can never succeed");
+        assert!(
+            matches!(error, Error::HealthCheckFailed(ref name, ref reason)
+                if name == "service" && reason.contains("invalid URL scheme")),
+            "expected HealthCheckFailed with the construction reason, got {:?}",
+            error
+        );
+    }
+
+    /// A malformed healthcheck URL in the config must land in the registry as
+    /// an `Invalid` entry — not be dropped, which would be indistinguishable
+    /// from "no healthcheck configured".
+    #[tokio::test]
+    async fn create_health_checkers_registers_invalid_url_as_invalid_entry() {
+        let yaml = r#"
+services:
+  api:
+    process: "sleep 1"
+    healthcheck:
+      httpGet: "not a valid url"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let orchestrator = Orchestrator::new_ephemeral(config, temp.path().to_path_buf())
+            .await
+            .unwrap();
+
+        HealthCheckRunner::new(&orchestrator)
+            .create_health_checkers()
+            .await;
+
+        let checkers = orchestrator.health_checkers.read().await;
+        assert!(
+            matches!(
+                checkers.get("api"),
+                Some(HealthCheckerEntry::Invalid { .. })
+            ),
+            "a malformed URL must produce an Invalid registry entry"
+        );
     }
 }

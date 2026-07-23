@@ -361,3 +361,49 @@ services:
         json
     );
 }
+
+/// An invalid healthcheck URL must not be silently skipped: the service
+/// still starts (non-fatal, exit 0), but the start reports a health warning
+/// naming the service, and the post-start status shows
+/// "Running (healthcheck invalid)" instead of bare Running.
+#[test]
+fn invalid_healthcheck_url_warns_instead_of_silently_skipping() {
+    let run = run_start(
+        r#"
+services:
+  bad-url:
+    process: "sleep 300"
+    healthcheck:
+      httpGet: "not a valid url"
+      timeout: "1s"
+"#,
+        &["bad-url"],
+    );
+
+    assert!(
+        run.exit_success,
+        "an invalid healthcheck is non-fatal — the process still starts, exit 0. stderr:\n{}",
+        run.stderr
+    );
+    assert!(
+        !run.stdout.contains("All services started successfully!"),
+        "the success line is reserved for fully healthy starts. stdout:\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stderr
+            .contains("Services started with 1 health warning"),
+        "an invalid checker must count as a health warning. stderr:\n{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("bad-url") && run.stderr.contains("healthcheck is invalid"),
+        "the warning must name the service and say the healthcheck is invalid. stderr:\n{}",
+        run.stderr
+    );
+    assert!(
+        run.stdout.contains("Running (healthcheck invalid)"),
+        "post-start status must show the invalid-healthcheck state. stdout:\n{}",
+        run.stdout
+    );
+}

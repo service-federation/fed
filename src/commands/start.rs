@@ -243,7 +243,7 @@ pub async fn run_start(
     // Track which services we've already started (to avoid duplicate messages)
     let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
     // (service, warning text) for services whose healthcheck never passed
-    let mut warnings: Vec<(String, String)> = Vec::new();
+    let mut warnings: Vec<(String, StartHealth)> = Vec::new();
     let startup_timer = std::time::Instant::now();
 
     // Group the plan into dependency levels. Services within a level start
@@ -342,9 +342,10 @@ pub async fn run_start(
     }
 
     // The unconditional success line is reserved for fully healthy starts.
-    // Healthcheck timeouts are non-fatal (processes are up, dependents
-    // proceeded), so `fed start` still exits 0 — but the summary must say
-    // which services were never verified healthy.
+    // Unverified healthchecks (timed out, or invalid and never run) are
+    // non-fatal (processes are up, dependents proceeded), so `fed start`
+    // still exits 0 — but the summary must say which services were never
+    // verified healthy.
     let elapsed = fmt_duration(startup_timer.elapsed());
     if warnings.is_empty() {
         out.success(&format!(
@@ -359,8 +360,8 @@ pub async fn run_start(
             started.len(),
             elapsed
         ));
-        for (_, warning) in &warnings {
-            out.warning(&format!("  - {}", warning));
+        for (name, health) in &warnings {
+            out.warning(&format!("  - {}", start_warning_line(name, health)));
         }
     }
 
@@ -388,8 +389,15 @@ pub async fn run_start(
             // explicitly whenever a healthcheck exists, instead of letting
             // Running read as success.
             Status::Running => {
-                if warnings.iter().any(|(warned, _)| warned == name) {
-                    "Running (healthcheck timed out)"
+                let warned = warnings
+                    .iter()
+                    .find(|(warned, _)| warned == name)
+                    .map(|(_, health)| health);
+                if let Some(health) = warned {
+                    match health {
+                        StartHealth::CheckerInvalid { .. } => "Running (healthcheck invalid)",
+                        _ => "Running (healthcheck timed out)",
+                    }
                 } else if config
                     .services
                     .get(name)
@@ -655,7 +663,7 @@ async fn start_one_service(
     name_width: usize,
     inline_progress: bool,
     out: &dyn UserOutput,
-) -> Result<Option<(String, String)>, FedError> {
+) -> Result<Option<(String, StartHealth)>, FedError> {
     let timer = std::time::Instant::now();
     if inline_progress {
         out.progress(&format!(
@@ -686,16 +694,15 @@ async fn start_one_service(
                         fmt_duration(timeout),
                         w = name_width
                     ),
-                    Some((
-                        name.to_string(),
-                        format!(
-                            "{}: healthcheck did not pass within {} (process is running, \
-                             health unverified) — see 'fed logs {}'",
-                            name,
-                            fmt_duration(timeout),
-                            name
-                        ),
-                    )),
+                    Some((name.to_string(), StartHealth::TimedOut { timeout })),
+                ),
+                Some(StartHealth::CheckerInvalid { reason }) => (
+                    format!(
+                        "  ⚠ {:<w$}  started, healthcheck invalid ({})",
+                        name, elapsed,
+                        w = name_width
+                    ),
+                    Some((name.to_string(), StartHealth::CheckerInvalid { reason })),
                 ),
                 // Unchecked or absent: no healthcheck configured, an
                 // already-running dedup, or a hook-only oneshot.
@@ -725,6 +732,30 @@ async fn start_one_service(
             }
             Err(e)
         }
+    }
+}
+
+/// Warning-summary line for one service whose startup health went
+/// unverified. Structured on [`StartHealth`] so the summary and the
+/// post-start status list can never disagree about which kind of warning a
+/// service carries.
+fn start_warning_line(name: &str, health: &StartHealth) -> String {
+    match health {
+        StartHealth::TimedOut { timeout } => format!(
+            "{}: healthcheck did not pass within {} (process is running, \
+             health unverified) — see 'fed logs {}'",
+            name,
+            fmt_duration(*timeout),
+            name
+        ),
+        StartHealth::CheckerInvalid { reason } => format!(
+            "{}: healthcheck is invalid and was never run: {} — fix the \
+             healthcheck in your config",
+            name, reason
+        ),
+        // warnings only ever holds warn-worthy variants; keep a sane
+        // fallback for completeness.
+        _ => format!("{}: health unverified", name),
     }
 }
 

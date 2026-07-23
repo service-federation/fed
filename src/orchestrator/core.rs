@@ -23,6 +23,12 @@ pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// Default timeout for service stop operations (30 seconds)
 pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a start that lost the registration race waits for the winning
+/// attempt to resolve. Generous, because the winner may be running install/
+/// migrate hooks; bounded, because a hard-killed winner leaves a `Starting`
+/// row behind that would otherwise hang us forever.
+const CONCURRENT_START_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// Type alias for the shared service registry
 pub(super) type SharedServiceManager = Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>>;
 pub(super) type ServiceRegistry = HashMap<String, SharedServiceManager>;
@@ -1396,8 +1402,17 @@ impl Orchestrator {
             super::registration::ServiceRegistration::register(&self.state_tracker, service_state)
                 .await?
         else {
-            // already registered by another thread
-            return Ok(StartHealth::Unchecked);
+            // Another start (a concurrent task in this process, or another
+            // `fed` process sharing the state DB) won the registration race.
+            // Returning `Unchecked` immediately would let our caller — and
+            // its dependents — proceed while the winner is still mid-start,
+            // and would report success even if that start ultimately fails.
+            // Wait for the winning attempt to resolve and report what
+            // actually happened.
+            return self
+                .await_concurrent_start(name, &manager_arc, CONCURRENT_START_WAIT_TIMEOUT)
+                .instrument(tracing::info_span!("await_concurrent_start"))
+                .await;
         };
 
         // All ? from here to commit() are safe — the guard cleans up on drop.
@@ -1489,6 +1504,85 @@ impl Orchestrator {
         self.await_healthcheck(name, &manager_arc)
             .instrument(tracing::info_span!("await_healthcheck"))
             .await
+    }
+
+    /// Wait for a concurrent start of `name` (which won the registration
+    /// race) to resolve, then report its real outcome.
+    ///
+    /// Polls the state DB — the only channel shared with a winner in another
+    /// process — until the service leaves `Starting`:
+    ///
+    /// - `Running`/`Failing`: the winner's process is up; await the
+    ///   healthcheck ourselves so we return a real observation. In-process
+    ///   the manager is shared, so liveness monitoring works too; cross-
+    ///   process we have no PID and only poll the checker, which is still an
+    ///   honest observation.
+    /// - `Healthy`/`Completed`: the winner already verified it.
+    /// - Row gone, `Stopped`, or `Stopping`: the winning attempt failed (its
+    ///   registration guard unregisters on failure) — surface an error
+    ///   instead of the old silent success.
+    ///
+    /// `deadline` bounds the wait (parameterized for tests): a winner that
+    /// was SIGKILLed leaves a `Starting` row behind forever, and hanging on
+    /// it would be worse than the honest error.
+    async fn await_concurrent_start(
+        &self,
+        name: &str,
+        manager_arc: &Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>>,
+        deadline: Duration,
+    ) -> Result<StartHealth> {
+        tracing::info!(
+            "Start of '{}' lost the registration race; waiting for the winning attempt to finish",
+            name
+        );
+        let started = std::time::Instant::now();
+        let poll_interval = Duration::from_millis(250);
+
+        loop {
+            if self.cancellation_token.is_cancelled() {
+                return Err(Error::Cancelled(name.to_string()));
+            }
+
+            let status = {
+                let tracker = self.state_tracker.read().await;
+                tracker.get_service(name).await.map(|s| s.status)
+            };
+
+            match status {
+                None | Some(Status::Stopped) | Some(Status::Stopping) => {
+                    return Err(Error::ServiceStartFailed(
+                        name.to_string(),
+                        format!(
+                            "a concurrent start of '{}' failed or did not leave it \
+                             running; see that command's output for the reason, then retry",
+                            name
+                        ),
+                    ));
+                }
+                Some(Status::Healthy) => return Ok(StartHealth::Healthy),
+                // Completed is the oneshot terminal state; nothing to verify.
+                Some(Status::Completed) => return Ok(StartHealth::Unchecked),
+                Some(Status::Running) | Some(Status::Failing) => {
+                    return self.await_healthcheck(name, manager_arc).await;
+                }
+                Some(Status::Starting) => {}
+            }
+
+            if started.elapsed() >= deadline {
+                return Err(Error::ServiceStartFailed(
+                    name.to_string(),
+                    format!(
+                        "waited {:?} for a concurrent start of '{}' to finish, but it is \
+                         still marked Starting. If no other `fed` command is running, the \
+                         previous attempt likely died without cleanup — run `fed stop {}` \
+                         to clear it, then retry",
+                        deadline, name, name
+                    ),
+                ));
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
     /// Run a hook-only node (the oneshot node) to completion.
@@ -3107,5 +3201,155 @@ mod tests {
                 .args(["-9", &pid.to_string()])
                 .status();
         }
+    }
+
+    /// Minimal manager stub for `await_concurrent_start` tests: the loser
+    /// path only touches the manager through `await_healthcheck`, which with
+    /// no registered checker never calls it at all.
+    struct StubManager;
+
+    #[async_trait::async_trait]
+    impl ServiceManager for StubManager {
+        async fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn kill(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<bool> {
+            Ok(true)
+        }
+        fn status(&self) -> Status {
+            Status::Running
+        }
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Orchestrator + registered `Starting` row for `svc`, as a lost
+    /// registration race would observe it.
+    async fn orchestrator_with_starting_row(
+        temp_dir: &tempfile::TempDir,
+    ) -> (
+        Orchestrator,
+        Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>>,
+    ) {
+        let orchestrator = Orchestrator::new(Config::default(), temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        {
+            let mut tracker = orchestrator.state_tracker.write().await;
+            tracker.initialize().await.unwrap();
+            tracker
+                .register_service(ServiceState::new(
+                    "svc".to_string(),
+                    ServiceType::Process,
+                    "root".to_string(),
+                ))
+                .await
+                .unwrap();
+        }
+        let manager: Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>> =
+            Arc::new(tokio::sync::Mutex::new(Box::new(StubManager)));
+        (orchestrator, manager)
+    }
+
+    /// The loser must block until the winner resolves, then report the
+    /// winner's real observation — here, `Healthy`.
+    #[tokio::test]
+    async fn concurrent_start_loser_waits_for_winner_and_reports_healthy() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (orchestrator, manager) = orchestrator_with_starting_row(&temp_dir).await;
+
+        let tracker = Arc::clone(&orchestrator.state_tracker);
+        let winner = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let mut t = tracker.write().await;
+            t.update_service_status("svc", Status::Healthy)
+                .await
+                .unwrap();
+            t.save().await.unwrap();
+        });
+
+        let health = orchestrator
+            .await_concurrent_start("svc", &manager, Duration::from_secs(10))
+            .await
+            .expect("loser must succeed once the winner reports Healthy");
+        assert_eq!(health, StartHealth::Healthy);
+        winner.await.unwrap();
+    }
+
+    /// A winner that reaches `Running` with no healthcheck configured
+    /// resolves the loser as `Unchecked` — same observation the winner made.
+    #[tokio::test]
+    async fn concurrent_start_loser_reports_unchecked_when_winner_runs_without_checker() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (orchestrator, manager) = orchestrator_with_starting_row(&temp_dir).await;
+
+        {
+            let mut t = orchestrator.state_tracker.write().await;
+            t.update_service_status("svc", Status::Running)
+                .await
+                .unwrap();
+            t.save().await.unwrap();
+        }
+
+        let health = orchestrator
+            .await_concurrent_start("svc", &manager, Duration::from_secs(10))
+            .await
+            .expect("Running with no checker resolves immediately");
+        assert_eq!(health, StartHealth::Unchecked);
+    }
+
+    /// A winner whose start fails unregisters the row; the loser must
+    /// surface an error, never a silent success.
+    #[tokio::test]
+    async fn concurrent_start_loser_errors_when_winner_fails() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (orchestrator, manager) = orchestrator_with_starting_row(&temp_dir).await;
+
+        let tracker = Arc::clone(&orchestrator.state_tracker);
+        let winner = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let mut t = tracker.write().await;
+            t.unregister_service("svc").await.unwrap();
+        });
+
+        let error = orchestrator
+            .await_concurrent_start("svc", &manager, Duration::from_secs(10))
+            .await
+            .expect_err("a failed winning attempt must fail the loser too");
+        assert!(
+            matches!(error, Error::ServiceStartFailed(ref name, _) if name == "svc"),
+            "expected ServiceStartFailed, got {:?}",
+            error
+        );
+        winner.await.unwrap();
+    }
+
+    /// A row stuck in `Starting` (winner hard-killed without cleanup) must
+    /// hit the deadline with an actionable error instead of hanging.
+    #[tokio::test]
+    async fn concurrent_start_loser_times_out_on_stuck_starting_row() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (orchestrator, manager) = orchestrator_with_starting_row(&temp_dir).await;
+
+        let error = orchestrator
+            .await_concurrent_start("svc", &manager, Duration::from_millis(600))
+            .await
+            .expect_err("a permanently-Starting row must not hang the loser");
+        assert!(
+            matches!(error, Error::ServiceStartFailed(ref name, ref reason)
+                if name == "svc" && reason.contains("still marked Starting")),
+            "expected the stuck-Starting error, got {:?}",
+            error
+        );
     }
 }
