@@ -24,7 +24,8 @@ pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Type alias for the shared service registry
-pub(super) type ServiceRegistry = HashMap<String, Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>>>;
+pub(super) type SharedServiceManager = Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>>;
+pub(super) type ServiceRegistry = HashMap<String, SharedServiceManager>;
 /// Type alias for the shared, async-safe service registry
 pub(super) type SharedServiceRegistry = Arc<tokio::sync::RwLock<ServiceRegistry>>;
 
@@ -1963,9 +1964,18 @@ impl Orchestrator {
     /// Get status of all services
     /// Also triggers health checks for running services to detect exits promptly
     pub async fn get_status(&self) -> HashMap<String, Status> {
-        let services = self.services.read().await;
-        let mut result = HashMap::new();
-        for (name, arc) in services.iter() {
+        // Clone the Arcs and drop the map lock so health checks don't hold it
+        let managers: Vec<(String, SharedServiceManager)> = {
+            let services = self.services.read().await;
+            services
+                .iter()
+                .map(|(name, arc)| (name.clone(), Arc::clone(arc)))
+                .collect()
+        };
+
+        // Check all services concurrently: one slow docker healthcheck must not
+        // serialize behind the others (the TUI polls this every tick)
+        let checks = managers.into_iter().map(|(name, arc)| async move {
             let manager = arc.lock().await;
             let status = manager.status();
 
@@ -1977,9 +1987,13 @@ impl Orchestrator {
             }
 
             // Get status again after potential health check update
-            result.insert(name.clone(), manager.status());
-        }
-        result
+            (name, manager.status())
+        });
+
+        futures::future::join_all(checks)
+            .await
+            .into_iter()
+            .collect()
     }
 
     /// Get a service manager

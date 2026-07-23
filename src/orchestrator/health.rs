@@ -233,6 +233,24 @@ impl<'a> HealthCheckRunner<'a> {
         let start = std::time::Instant::now();
         let check_interval = Duration::from_millis(500);
 
+        // Same visibility rule as await_healthcheck: without a pending
+        // progress line (script deps run without one), this wait would
+        // otherwise be a silent pause up to the full timeout.
+        let has_progress_line = crate::progress::has_pending();
+        if has_progress_line {
+            tracing::debug!(
+                "Waiting for healthcheck on '{}' (timeout: {:?})",
+                service_name,
+                timeout
+            );
+        } else {
+            tracing::info!(
+                "Waiting for healthcheck on '{}' (timeout: {:?})",
+                service_name,
+                timeout
+            );
+        }
+
         loop {
             if start.elapsed() > timeout {
                 return Err(Error::HealthCheckFailed(
@@ -243,7 +261,11 @@ impl<'a> HealthCheckRunner<'a> {
 
             match checker.check().await {
                 Ok(true) => {
-                    tracing::debug!("Service '{}' is healthy", service_name);
+                    if has_progress_line {
+                        tracing::debug!("Service '{}' is healthy", service_name);
+                    } else {
+                        tracing::info!("Service '{}' is healthy", service_name);
+                    }
                     return Ok(());
                 }
                 Ok(false) => {
@@ -288,13 +310,34 @@ impl<'a> HealthCheckRunner<'a> {
         let start = std::time::Instant::now();
         let check_interval = Duration::from_millis(500);
 
-        tracing::info!(
-            "Waiting for healthcheck on '{}' (timeout: {:?})",
-            name,
-            timeout
-        );
+        // Callers with an in-place progress line (fed start) get live detail
+        // attached to it; everyone else (restart, script deps, non-TTY) keeps
+        // the plain log lines so long waits aren't silent.
+        let has_progress_line = crate::progress::has_pending();
+        if has_progress_line {
+            tracing::debug!(
+                "Waiting for healthcheck on '{}' (timeout: {:?})",
+                name,
+                timeout
+            );
+        } else {
+            tracing::info!(
+                "Waiting for healthcheck on '{}' (timeout: {:?})",
+                name,
+                timeout
+            );
+        }
 
         loop {
+            // Live detail on the in-place progress line (no-op if none is up).
+            // Named, because concurrent starts share one pending line.
+            crate::progress::set_detail(&format!(
+                "{}: healthcheck {}s/{}s",
+                name,
+                start.elapsed().as_secs(),
+                timeout.as_secs()
+            ));
+
             // Respond to Ctrl-C promptly instead of waiting for timeout
             if self.orchestrator.cancellation_token.is_cancelled() {
                 tracing::debug!("Healthcheck wait for '{}' cancelled", name);
@@ -357,11 +400,20 @@ impl<'a> HealthCheckRunner<'a> {
             // died during the final poll sleep must surface as a fatal start
             // error, never be misreported as a non-fatal timeout warning.
             if start.elapsed() >= timeout {
-                tracing::warn!(
-                    "Service '{}' did not become healthy within {:?}",
-                    name,
-                    timeout
-                );
+                if has_progress_line {
+                    // fed start owns the reporting (⚠ outcome line + summary)
+                    tracing::debug!(
+                        "Service '{}' did not become healthy within {:?}",
+                        name,
+                        timeout
+                    );
+                } else {
+                    tracing::warn!(
+                        "Service '{}' did not become healthy within {:?}",
+                        name,
+                        timeout
+                    );
+                }
                 // Don't fail the start -- the service process is running, just
                 // not healthy yet. Return the timeout as data so the command
                 // layer can surface it instead of claiming full success.
@@ -396,7 +448,11 @@ impl<'a> HealthCheckRunner<'a> {
                             ));
                         }
                     }
-                    tracing::info!("Service '{}' is healthy", name);
+                    if has_progress_line {
+                        tracing::debug!("Service '{}' is healthy", name);
+                    } else {
+                        tracing::info!("Service '{}' is healthy", name);
+                    }
                     let mut tracker = self.orchestrator.state_tracker.write().await;
                     tracker.update_service_status(name, Status::Healthy).await?;
                     tracker.save().await?;

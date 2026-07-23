@@ -200,6 +200,8 @@ pub async fn run_status(
                 _ => out.status("  No services configured"),
             }
         } else {
+            let mut status: Vec<_> = status.into_iter().collect();
+            status.sort_by(|a, b| a.0.cmp(&b.0));
             for (name, stat) in status {
                 let status_icon = match stat {
                     fed::Status::Healthy => "✓",

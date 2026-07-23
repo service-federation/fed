@@ -37,6 +37,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Start services
+    #[command(alias = "s")]
     Start {
         /// Services to start (defaults to entrypoint)
         services: Vec<String>,
@@ -62,6 +63,13 @@ pub enum Commands {
         /// Enable isolation mode before starting (persisted)
         #[arg(long)]
         isolate: bool,
+
+        /// Maximum services starting concurrently within a dependency level.
+        /// Dependency levels still run in order; services with no dependency
+        /// edge between them must tolerate starting in any order. Use -j 1
+        /// for fully sequential startup.
+        #[arg(short = 'j', long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
+        jobs: u16,
     },
     /// Stop services
     Stop {

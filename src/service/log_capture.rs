@@ -65,7 +65,15 @@ pub struct LogCapture {
     log_shutdown: Arc<Notify>,
     /// Output capture mode.
     output_mode: OutputMode,
+    /// File-mode read cache keyed on (file size, tail count): pollers (the TUI
+    /// asks every tick) skip re-reading the file when it hasn't grown.
+    file_read_cache: Arc<Mutex<Option<FileReadCache>>>,
 }
+
+/// Cached result of a file-mode log read:
+/// ((file size, mtime), tail count, lines). Size alone would serve stale
+/// content after a truncate-and-rewrite to the same length.
+type FileReadCache = ((u64, Option<std::time::SystemTime>), usize, Vec<String>);
 
 impl LogCapture {
     /// Create a new LogCapture instance with default maximum lines.
@@ -112,6 +120,7 @@ impl LogCapture {
             log_tasks: Arc::new(StdMutex::new(Vec::new())),
             log_shutdown: Arc::new(Notify::new()),
             output_mode,
+            file_read_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -291,6 +300,22 @@ impl LogCapture {
         let log_path = log_path.clone();
         let tail_count = tail.unwrap_or(self.max_lines);
 
+        // Serve from cache while the file hasn't changed — pollers hit this
+        // every 250ms and the file usually hasn't changed between ticks
+        let current_key = match tokio::fs::metadata(&log_path).await {
+            Ok(m) => (m.len(), m.modified().ok()),
+            Err(_) => (0, None),
+        };
+        {
+            let cache = self.file_read_cache.lock().await;
+            if let Some((key, cached_tail, ref lines)) = *cache
+                && key == current_key
+                && cached_tail == tail_count
+            {
+                return Ok(lines.clone());
+            }
+        }
+
         let result = tokio::task::spawn_blocking(move || {
             use std::fs::File;
             use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -343,7 +368,11 @@ impl LogCapture {
         .await
         .map_err(|e| Error::Filesystem(format!("Log read task failed: {}", e)))?;
 
-        result.map_err(|e| Error::Filesystem(format!("Failed to read log file: {}", e)))
+        let lines =
+            result.map_err(|e| Error::Filesystem(format!("Failed to read log file: {}", e)))?;
+
+        *self.file_read_cache.lock().await = Some((current_key, tail_count, lines.clone()));
+        Ok(lines)
     }
 
     /// Shutdown log capture tasks gracefully.

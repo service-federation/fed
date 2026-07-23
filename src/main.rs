@@ -568,6 +568,7 @@ async fn run() -> anyhow::Result<()> {
             output: _,
             dry_run,
             isolate: _,
+            jobs,
         } => {
             commands::run_start(
                 &mut orchestrator,
@@ -577,6 +578,7 @@ async fn run() -> anyhow::Result<()> {
                     watch,
                     replace,
                     dry_run,
+                    jobs: jobs as usize,
                     config_path: &config_path,
                     offline: cli.offline,
                     profiles: cli.profile.clone(),

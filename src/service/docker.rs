@@ -126,6 +126,7 @@ const DOCKER_HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(30); // Healthc
 const DOCKER_INSPECT_TIMEOUT: Duration = Duration::from_secs(10); // Inspect container
 const DOCKER_LOGS_TIMEOUT: Duration = Duration::from_secs(10); // Fetch container logs
 const LOG_CACHE_TTL: Duration = Duration::from_secs(1); // Cache logs for 1 second
+const HEALTH_CACHE_TTL: Duration = Duration::from_millis(500); // Cache health results (docker exec is expensive)
 
 /// Docker-based service manager
 pub struct DockerService {
@@ -137,6 +138,9 @@ pub struct DockerService {
     client: DockerClient,
     /// Cached logs to avoid spawning docker subprocess on every call
     log_cache: Arc<tokio::sync::RwLock<(Vec<String>, Instant)>>,
+    /// Cached health result to avoid spawning `docker exec` on every call.
+    /// Locked for the whole check so concurrent callers don't duplicate work.
+    health_cache: Arc<tokio::sync::Mutex<(Option<bool>, Instant)>>,
 }
 
 impl DockerService {
@@ -159,6 +163,92 @@ impl DockerService {
                 Vec::new(),
                 Instant::now() - LOG_CACHE_TTL - Duration::from_secs(1),
             ))),
+            health_cache: Arc::new(tokio::sync::Mutex::new((None, Instant::now()))),
+        }
+    }
+
+    /// Invalidate the cached health result (e.g. after start/stop transitions).
+    async fn clear_health_cache(&self) {
+        *self.health_cache.lock().await = (None, Instant::now());
+    }
+
+    /// The actual health check: `docker exec` of the configured healthcheck
+    /// command, or `docker inspect` when none is configured.
+    async fn check_health_uncached(&self) -> Result<bool> {
+        let container_id = self.container_id.read().clone();
+        if let Some(ref id) = container_id {
+            // Check if Docker daemon is healthy first.
+            // If the daemon is down/restarting, all container checks will fail.
+            // In this case, we assume the container is healthy to avoid spurious restarts.
+            if !crate::docker::is_daemon_healthy().await {
+                tracing::warn!(
+                    "Docker daemon unhealthy - assuming container '{}' is healthy to avoid spurious restarts",
+                    self.name
+                );
+                return Ok(true);
+            }
+
+            // If a healthcheck command is configured, run it inside the container
+            if let Some(ref healthcheck) = self.config.healthcheck
+                && let Some(cmd) = healthcheck.get_command()
+            {
+                tracing::debug!(
+                    "Running healthcheck for {}: docker exec {} /bin/sh -c '{}'",
+                    self.name,
+                    id,
+                    cmd
+                );
+
+                let output = match self
+                    .client
+                    .exec_sh(id, cmd, DOCKER_HEALTHCHECK_TIMEOUT)
+                    .await
+                {
+                    Ok(out) => out,
+                    Err(e) => {
+                        tracing::debug!("Healthcheck command failed for {}: {:?}", self.name, e);
+                        return Ok(false); // Container doesn't exist or docker error
+                    }
+                };
+
+                // Healthcheck passes if command exits with status 0
+                let success = output.status.success();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                if success {
+                    tracing::debug!("Healthcheck passed for {}", self.name);
+                } else {
+                    // Log at warn level with actual error output for better debugging
+                    let stderr_trimmed = stderr.trim();
+                    let stdout_trimmed = stdout.trim();
+                    if !stderr_trimmed.is_empty() {
+                        tracing::warn!(
+                            "Healthcheck failed for '{}': {}",
+                            self.name,
+                            stderr_trimmed
+                        );
+                    } else if !stdout_trimmed.is_empty() {
+                        tracing::warn!(
+                            "Healthcheck failed for '{}': {}",
+                            self.name,
+                            stdout_trimmed
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Healthcheck failed for '{}' (exit code {})",
+                            self.name,
+                            output.status.code().unwrap_or(-1)
+                        );
+                    }
+                }
+                return Ok(success);
+            }
+
+            // No healthcheck configured - fall back to checking if container is running
+            Ok(self.client.is_running(id, DOCKER_INSPECT_TIMEOUT).await)
+        } else {
+            Ok(false)
         }
     }
 
@@ -419,6 +509,7 @@ impl ServiceManager for DockerService {
             }
             base.set_status(Status::Starting);
         }
+        self.clear_health_cache().await;
 
         let image = self
             .config
@@ -773,6 +864,7 @@ impl ServiceManager for DockerService {
             let mut base = self.base.write();
             base.set_status(Status::Stopped);
         }
+        self.clear_health_cache().await;
 
         Ok(())
     }
@@ -796,86 +888,26 @@ impl ServiceManager for DockerService {
             let mut base = self.base.write();
             base.set_status(Status::Stopped);
         }
+        self.clear_health_cache().await;
 
         Ok(())
     }
 
     async fn health(&self) -> Result<bool> {
-        let container_id = self.container_id.read().clone();
-        if let Some(ref id) = container_id {
-            // Check if Docker daemon is healthy first.
-            // If the daemon is down/restarting, all container checks will fail.
-            // In this case, we assume the container is healthy to avoid spurious restarts.
-            if !crate::docker::is_daemon_healthy().await {
-                tracing::warn!(
-                    "Docker daemon unhealthy - assuming container '{}' is healthy to avoid spurious restarts",
-                    self.name
-                );
-                return Ok(true);
-            }
-
-            // If a healthcheck command is configured, run it inside the container
-            if let Some(ref healthcheck) = self.config.healthcheck
-                && let Some(cmd) = healthcheck.get_command()
-            {
-                tracing::debug!(
-                    "Running healthcheck for {}: docker exec {} /bin/sh -c '{}'",
-                    self.name,
-                    id,
-                    cmd
-                );
-
-                let output = match self
-                    .client
-                    .exec_sh(id, cmd, DOCKER_HEALTHCHECK_TIMEOUT)
-                    .await
-                {
-                    Ok(out) => out,
-                    Err(e) => {
-                        tracing::debug!("Healthcheck command failed for {}: {:?}", self.name, e);
-                        return Ok(false); // Container doesn't exist or docker error
-                    }
-                };
-
-                // Healthcheck passes if command exits with status 0
-                let success = output.status.success();
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-
-                if success {
-                    tracing::debug!("Healthcheck passed for {}", self.name);
-                } else {
-                    // Log at warn level with actual error output for better debugging
-                    let stderr_trimmed = stderr.trim();
-                    let stdout_trimmed = stdout.trim();
-                    if !stderr_trimmed.is_empty() {
-                        tracing::warn!(
-                            "Healthcheck failed for '{}': {}",
-                            self.name,
-                            stderr_trimmed
-                        );
-                    } else if !stdout_trimmed.is_empty() {
-                        tracing::warn!(
-                            "Healthcheck failed for '{}': {}",
-                            self.name,
-                            stdout_trimmed
-                        );
-                    } else {
-                        tracing::warn!(
-                            "Healthcheck failed for '{}' (exit code {})",
-                            self.name,
-                            output.status.code().unwrap_or(-1)
-                        );
-                    }
-                }
-                return Ok(success);
-            }
-
-            // No healthcheck configured - fall back to checking if container is running
-            Ok(self.client.is_running(id, DOCKER_INSPECT_TIMEOUT).await)
-        } else {
-            Ok(false)
+        // Serialize checks through the cache lock so concurrent callers
+        // (TUI ticks, health monitor) don't each spawn a `docker exec`.
+        let mut cache = self.health_cache.lock().await;
+        if let (Some(result), timestamp) = *cache
+            && timestamp.elapsed() < HEALTH_CACHE_TTL
+        {
+            return Ok(result);
         }
+
+        let result = self.check_health_uncached().await;
+        if let Ok(healthy) = result {
+            *cache = (Some(healthy), Instant::now());
+        }
+        result
     }
 
     fn status(&self) -> Status {

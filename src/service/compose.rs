@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 
 const LOG_CACHE_TTL: Duration = Duration::from_secs(1);
+const HEALTH_CACHE_TTL: Duration = Duration::from_millis(500); // Cache health results (compose ps is expensive)
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(30); // Bound `compose ps` subprocess
 
 /// Docker Compose command type (v1 or v2)
 #[derive(Debug, Clone, Copy)]
@@ -84,6 +86,9 @@ pub struct DockerComposeService {
     container_id: Option<String>,
     /// Cached logs to avoid spawning compose subprocess on every call
     log_cache: Arc<tokio::sync::RwLock<(Vec<String>, Instant)>>,
+    /// Cached health result to avoid spawning `compose ps` on every call.
+    /// Locked for the whole check so concurrent callers don't duplicate work.
+    health_cache: Arc<tokio::sync::Mutex<(Option<bool>, Instant)>>,
 }
 
 impl DockerComposeService {
@@ -151,7 +156,13 @@ impl DockerComposeService {
                 Vec::new(),
                 Instant::now() - LOG_CACHE_TTL - Duration::from_secs(1),
             ))),
+            health_cache: Arc::new(tokio::sync::Mutex::new((None, Instant::now()))),
         })
+    }
+
+    /// Invalidate the cached health result (e.g. after start/stop transitions).
+    async fn clear_health_cache(&self) {
+        *self.health_cache.lock().await = (None, Instant::now());
     }
 
     /// Generate a short hash of the compose file path for project naming.
@@ -208,6 +219,69 @@ impl DockerComposeService {
         let base = self.base.read();
         base.environment.clone()
     }
+
+    /// The actual health check: `compose ps` and parse container state.
+    async fn check_health_uncached(&self) -> Result<bool> {
+        let mut command = self.build_base_command().await?;
+        command.args(["ps", "--format", "json", &self.compose_service]);
+
+        // Bound the subprocess: a hung docker daemon must not wedge callers
+        // (the TUI refresh loop polls this) indefinitely. kill_on_drop so the
+        // timed-out `compose ps` dies instead of leaking.
+        command.kill_on_drop(true);
+        let output = match tokio::time::timeout(HEALTH_CHECK_TIMEOUT, command.output()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                tracing::warn!(
+                    "compose ps for '{}' timed out after {:?}",
+                    self.name,
+                    HEALTH_CHECK_TIMEOUT
+                );
+                return Ok(false);
+            }
+        };
+
+        if !output.status.success() {
+            return Ok(false);
+        }
+
+        // Parse JSON output to check if service is running
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Docker compose v2 returns JSON array, v1 may return newline-delimited JSON
+        // Try parsing as JSON array first
+        if let Ok(containers) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
+            for container in containers {
+                if let Some(state) = container.get("State").and_then(|s| s.as_str()) {
+                    // Check if state is "running" or starts with "Up" (case-insensitive)
+                    let state_lower = state.to_lowercase();
+                    if state_lower == "running" || state_lower.starts_with("up") {
+                        return Ok(true);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+
+        // Fallback: try parsing each line as separate JSON object (newline-delimited JSON)
+        for line in stdout.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(container) = serde_json::from_str::<serde_json::Value>(line)
+                && let Some(state) = container.get("State").and_then(|s| s.as_str())
+            {
+                let state_lower = state.to_lowercase();
+                if state_lower == "running" || state_lower.starts_with("up") {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Last fallback: if JSON parsing completely failed, use string matching
+        // This handles edge cases where compose output format is unexpected
+        Ok(stdout.contains("running") || stdout.contains("Up"))
+    }
 }
 
 #[async_trait]
@@ -220,6 +294,7 @@ impl ServiceManager for DockerComposeService {
             }
             base.set_status(Status::Starting);
         }
+        self.clear_health_cache().await;
 
         // Clean up any orphaned containers/networks from previous runs
         // This handles cases where tests failed or were interrupted
@@ -351,6 +426,7 @@ impl ServiceManager for DockerComposeService {
             let mut base = self.base.write();
             base.set_status(Status::Stopped);
         }
+        self.clear_health_cache().await;
 
         Ok(())
     }
@@ -365,51 +441,20 @@ impl ServiceManager for DockerComposeService {
     }
 
     async fn health(&self) -> Result<bool> {
-        let mut command = self.build_base_command().await?;
-        command.args(["ps", "--format", "json", &self.compose_service]);
-
-        let output = command.output().await?;
-
-        if !output.status.success() {
-            return Ok(false);
+        // Serialize checks through the cache lock so concurrent callers
+        // (TUI ticks, health monitor) don't each spawn a `compose ps`.
+        let mut cache = self.health_cache.lock().await;
+        if let (Some(result), timestamp) = *cache
+            && timestamp.elapsed() < HEALTH_CACHE_TTL
+        {
+            return Ok(result);
         }
 
-        // Parse JSON output to check if service is running
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        // Docker compose v2 returns JSON array, v1 may return newline-delimited JSON
-        // Try parsing as JSON array first
-        if let Ok(containers) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
-            for container in containers {
-                if let Some(state) = container.get("State").and_then(|s| s.as_str()) {
-                    // Check if state is "running" or starts with "Up" (case-insensitive)
-                    let state_lower = state.to_lowercase();
-                    if state_lower == "running" || state_lower.starts_with("up") {
-                        return Ok(true);
-                    }
-                }
-            }
-            return Ok(false);
+        let result = self.check_health_uncached().await;
+        if let Ok(healthy) = result {
+            *cache = (Some(healthy), Instant::now());
         }
-
-        // Fallback: try parsing each line as separate JSON object (newline-delimited JSON)
-        for line in stdout.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(container) = serde_json::from_str::<serde_json::Value>(line)
-                && let Some(state) = container.get("State").and_then(|s| s.as_str())
-            {
-                let state_lower = state.to_lowercase();
-                if state_lower == "running" || state_lower.starts_with("up") {
-                    return Ok(true);
-                }
-            }
-        }
-
-        // Last fallback: if JSON parsing completely failed, use string matching
-        // This handles edge cases where compose output format is unexpected
-        Ok(stdout.contains("running") || stdout.contains("Up"))
+        result
     }
 
     fn status(&self) -> Status {

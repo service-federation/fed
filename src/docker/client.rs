@@ -34,9 +34,15 @@ impl DockerClient {
 
     /// Run a docker command with a timeout, returning raw Output.
     async fn run(&self, args: &[&str], timeout: Duration) -> Result<Output, DockerError> {
+        // kill_on_drop: when the timeout wins the race and drops the output
+        // future, the docker process must die with it — otherwise every
+        // timeout against a hung daemon leaks a subprocess.
         let result = tokio::time::timeout(
             timeout,
-            tokio::process::Command::new("docker").args(args).output(),
+            tokio::process::Command::new("docker")
+                .args(args)
+                .kill_on_drop(true)
+                .output(),
         )
         .await;
 
