@@ -210,7 +210,23 @@ pub async fn run_status(
                     fed::Status::Stopping => "-",
                     fed::Status::Failing => "x",
                 };
-                out.status(&format!("  {} {:<30} {}", status_icon, name, stat));
+                // Running means the process is up but its healthcheck has not
+                // passed — when one is configured, say so instead of letting
+                // "running" read as verified-healthy.
+                let annotation = if stat == fed::Status::Running
+                    && config
+                        .services
+                        .get(&name)
+                        .is_some_and(|s| s.healthcheck.is_some())
+                {
+                    " (health unverified)"
+                } else {
+                    ""
+                };
+                out.status(&format!(
+                    "  {} {:<30} {}{}",
+                    status_icon, name, stat, annotation
+                ));
             }
         }
     }

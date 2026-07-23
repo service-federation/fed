@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::health::SharedHealthCheckerRegistry;
+use super::health::{SharedHealthCheckerRegistry, StartHealth, StartOutcome};
 
 /// Default timeout for service startup operations (2 minutes)
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1090,7 +1090,7 @@ impl Orchestrator {
         &self,
         name: &str,
         manager_arc: &Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>>,
-    ) -> Result<()> {
+    ) -> Result<StartHealth> {
         let runner = super::health::HealthCheckRunner::new(self);
         runner.await_healthcheck(name, manager_arc).await
     }
@@ -1179,7 +1179,13 @@ impl Orchestrator {
     ///
     /// Each service has `startup_timeout` to complete startup. If exceeded,
     /// returns `Error::Timeout`.
-    pub async fn start(&self, service_name: &str) -> Result<()> {
+    ///
+    /// The returned [`StartOutcome`] carries the per-service startup health
+    /// result (healthy / healthcheck timed out / unchecked) for the named
+    /// service and every dependency this call started — a healthcheck
+    /// timeout is deliberately not an `Err` (the process is alive and
+    /// dependents proceed), so it must be read from the outcome.
+    pub async fn start(&self, service_name: &str) -> Result<StartOutcome> {
         // Check for early cancellation
         if self.cancellation_token.is_cancelled() {
             return Err(Error::Cancelled(service_name.to_string()));
@@ -1192,24 +1198,29 @@ impl Orchestrator {
         // Get services to start in order
         let deps = self.dep_graph.get_dependencies(service_name);
 
+        let mut outcome = StartOutcome::default();
+
         // Start dependencies first
         for dep in deps {
             // Check for cancellation before each dependency
             if self.cancellation_token.is_cancelled() {
                 return Err(Error::Cancelled(dep.clone()));
             }
-            self.start_service_with_timeout(&dep).await?;
+            let health = self.start_service_with_timeout(&dep).await?;
+            outcome.record(&dep, health);
         }
 
         // Start the requested service
-        self.start_service_with_timeout(service_name).await
+        let health = self.start_service_with_timeout(service_name).await?;
+        outcome.record(service_name, health);
+        Ok(outcome)
     }
 
     /// Start a service with timeout and cancellation support.
     ///
     /// A per-service `startup_timeout` (set in the service config) takes
     /// precedence over the orchestrator-wide default.
-    async fn start_service_with_timeout(&self, name: &str) -> Result<()> {
+    async fn start_service_with_timeout(&self, name: &str) -> Result<StartHealth> {
         let cancel_token = self.cancellation_token.clone();
         let timeout = self
             .config
@@ -1283,14 +1294,14 @@ impl Orchestrator {
     }
 
     /// Start a single service
-    async fn start_service(&self, name: &str) -> Result<()> {
+    async fn start_service(&self, name: &str) -> Result<StartHealth> {
         self.start_service_impl(name)
             .instrument(tracing::info_span!("start_service", service.name = %name))
             .await
     }
 
     /// Implementation of start_service (separate to allow instrumentation)
-    async fn start_service_impl(&self, name: &str) -> Result<()> {
+    async fn start_service_impl(&self, name: &str) -> Result<StartHealth> {
         // Get Arc clone of manager
         let manager_arc = {
             let services = self.services.read().await;
@@ -1320,7 +1331,10 @@ impl Orchestrator {
             .map(|s| s.service_type() == ServiceType::Oneshot)
             .unwrap_or(false)
         {
-            return self.run_oneshot(name, &manager_arc).await;
+            return self
+                .run_oneshot(name, &manager_arc)
+                .await
+                .map(|()| StartHealth::Unchecked);
         }
 
         // Check if already running (deduplication) and check for cancellation
@@ -1343,7 +1357,7 @@ impl Orchestrator {
                 // Verify the service is actually alive — its process/container may
                 // have died since we last checked (e.g. OOM kill, Docker restart).
                 if self.verify_service_alive(&**manager) {
-                    return Ok(());
+                    return Ok(StartHealth::Unchecked);
                 }
                 tracing::warn!(
                     "Service '{}' reports {} but is no longer alive, restarting",
@@ -1381,7 +1395,8 @@ impl Orchestrator {
             super::registration::ServiceRegistration::register(&self.state_tracker, service_state)
                 .await?
         else {
-            return Ok(()); // already registered by another thread
+            // already registered by another thread
+            return Ok(StartHealth::Unchecked);
         };
 
         // All ? from here to commit() are safe — the guard cleans up on drop.
@@ -1468,11 +1483,11 @@ impl Orchestrator {
         // If a healthcheck is registered, poll it before declaring the service ready.
         // This ensures services that crash immediately or need warmup time are detected
         // during startup rather than appearing as "Running" when they're actually dead.
+        // A timeout with the process still alive is non-fatal and surfaces as
+        // `StartHealth::TimedOut` in the returned outcome.
         self.await_healthcheck(name, &manager_arc)
             .instrument(tracing::info_span!("await_healthcheck"))
-            .await?;
-
-        Ok(())
+            .await
     }
 
     /// Run a hook-only node (the oneshot node) to completion.
@@ -1575,7 +1590,7 @@ impl Orchestrator {
     ///
     /// This method is cancellable via `cancel_operations()`. If cancelled,
     /// the current group will complete but subsequent groups will not start.
-    pub async fn start_all(&self) -> Result<()> {
+    pub async fn start_all(&self) -> Result<StartOutcome> {
         // Check for early cancellation
         if self.cancellation_token.is_cancelled() {
             return Err(Error::Cancelled("start_all".to_string()));
@@ -1587,6 +1602,8 @@ impl Orchestrator {
 
         // Get parallel groups
         let groups = self.dep_graph.get_parallel_groups()?;
+
+        let mut outcome = StartOutcome::default();
 
         // Start each group sequentially, but services within each group start concurrently
         for group in groups {
@@ -1604,8 +1621,14 @@ impl Orchestrator {
             // Wait for all services in the group to start
             let results = futures::future::join_all(futures).await;
 
-            // Collect any errors
-            let errors: Vec<Error> = results.into_iter().filter_map(|r| r.err()).collect();
+            // Collect errors; record health outcomes for services that started
+            let mut errors: Vec<Error> = Vec::new();
+            for (service_name, result) in group.iter().zip(results) {
+                match result {
+                    Ok(health) => outcome.record(service_name, health),
+                    Err(e) => errors.push(e),
+                }
+            }
 
             // If any service failed, return aggregated errors
             if !errors.is_empty() {
@@ -1617,7 +1640,7 @@ impl Orchestrator {
             }
         }
 
-        Ok(())
+        Ok(outcome)
     }
 
     /// Stop a service and its dependents.
@@ -1858,7 +1881,7 @@ impl Orchestrator {
     ///
     /// The stop phase will complete even if cancelled, but the start phase
     /// can be cancelled.
-    pub async fn restart_all(&self) -> Result<()> {
+    pub async fn restart_all(&self) -> Result<StartOutcome> {
         // First, stop all services in reverse dependency order
         self.stop_all().await?;
 
@@ -1868,9 +1891,7 @@ impl Orchestrator {
         }
 
         // Then, start all services in dependency order
-        self.start_all().await?;
-
-        Ok(())
+        self.start_all().await
     }
 
     /// Restart a single service, preserving the running state of its
@@ -1892,7 +1913,7 @@ impl Orchestrator {
     ///
     /// Each phase respects `startup_timeout` / `stop_timeout` and the
     /// orchestrator's cancellation token, matching `start` and `stop`.
-    pub async fn restart(&self, service_name: &str) -> Result<()> {
+    pub async fn restart(&self, service_name: &str) -> Result<StartOutcome> {
         let dependents = self.get_all_dependents(service_name);
         let statuses = self.get_status_passive().await;
         let was_running: Vec<String> = dependents
@@ -1912,7 +1933,7 @@ impl Orchestrator {
             return Err(Error::Cancelled(service_name.to_string()));
         }
 
-        self.start(service_name).await?;
+        let mut outcome = self.start(service_name).await?;
 
         // Dependents come back in shallowest-first order (reverse of the
         // stop iteration) so each one's own dependencies are already up.
@@ -1920,10 +1941,11 @@ impl Orchestrator {
             if self.cancellation_token.is_cancelled() {
                 return Err(Error::Cancelled(dependent.clone()));
             }
-            self.start_service_with_timeout(dependent).await?;
+            let health = self.start_service_with_timeout(dependent).await?;
+            outcome.record(dependent, health);
         }
 
-        Ok(())
+        Ok(outcome)
     }
 
     /// Returns current service statuses without triggering active health checks.
