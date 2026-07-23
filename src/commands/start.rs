@@ -207,7 +207,7 @@ pub async fn run_start(
             }
 
             if had_errors {
-                orchestrator.cleanup().await;
+                orchestrator.cleanup_failed_start().await;
                 return Err(anyhow::anyhow!("Failed to pull docker image(s)"));
             }
             out.blank();
@@ -270,7 +270,7 @@ pub async fn run_start(
         // Check if user aborted during startup
         if startup_abort.load(Ordering::SeqCst) {
             out.status("\n\nStartup aborted. Cleaning up...");
-            orchestrator.cleanup().await;
+            orchestrator.cleanup_failed_start().await;
             out.status("Cleanup complete");
             return Ok(());
         }
@@ -329,7 +329,7 @@ pub async fn run_start(
         };
 
         if let Err(e) = result {
-            orchestrator.cleanup().await;
+            orchestrator.cleanup_failed_start().await;
 
             // Unknown service: build one rich error (did-you-mean + service
             // list) and let main print it once.

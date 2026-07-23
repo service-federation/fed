@@ -522,6 +522,40 @@ impl SqliteStateTracker {
     }
 
     /// Unregister a service (when stopped)
+    /// Unregister a service row only if it still carries the given identity
+    /// (PID or container id). Used by the failed-start rollback: after this
+    /// run's registration was dropped, another process may have re-registered
+    /// the same name — an unconditional delete-by-name would destroy that
+    /// process's row. A row whose pid/container doesn't match (or an absent
+    /// row) is left untouched; both identities `None` is a no-op.
+    pub async fn unregister_service_matching(
+        &mut self,
+        service_id: &str,
+        pid: Option<u32>,
+        container_id: Option<&str>,
+    ) -> Result<()> {
+        if pid.is_none() && container_id.is_none() {
+            return Ok(());
+        }
+        let service_id = service_id.to_string();
+        let container_id = container_id.map(str::to_string);
+
+        self.with_transaction(move |tx| {
+            tx.execute(
+                "DELETE FROM services WHERE id = ?1 AND \
+                 ((?2 IS NOT NULL AND pid = ?2) OR (?3 IS NOT NULL AND container_id = ?3))",
+                rusqlite::params![&service_id, pid, container_id],
+            )?;
+            // Clean up global ports no longer in use
+            tx.execute(
+                "DELETE FROM allocated_ports WHERE port NOT IN (SELECT DISTINCT port FROM port_allocations)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn unregister_service(&mut self, service_id: &str) -> Result<()> {
         let service_id = service_id.to_string();
         let service_id_for_tx = service_id.clone();
@@ -945,6 +979,65 @@ impl SqliteStateTracker {
 mod tests {
     use super::*;
     use crate::state::sqlite::tests::test_support::*;
+
+    // ========================================================================
+    // unregister_service_matching tests (failed-start rollback identity gate)
+    // ========================================================================
+
+    async fn register_running_with_pid(tracker: &mut SqliteStateTracker, name: &str, pid: u32) {
+        register_stopped_service(tracker, name).await;
+        tracker
+            .apply_state_transition(name, crate::service::StateTransition::starting())
+            .await
+            .unwrap();
+        tracker
+            .apply_state_transition(name, crate::service::StateTransition::running_with_pid(pid))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_unregister_matching_removes_row_with_matching_pid() {
+        let (mut tracker, _temp_dir) = create_test_tracker().await;
+        register_running_with_pid(&mut tracker, "svc", 4242).await;
+
+        tracker
+            .unregister_service_matching("svc", Some(4242), None)
+            .await
+            .unwrap();
+        assert!(tracker.get_service("svc").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unregister_matching_spares_row_with_different_pid() {
+        let (mut tracker, _temp_dir) = create_test_tracker().await;
+        // Another process's re-registration of the same name.
+        register_running_with_pid(&mut tracker, "svc", 5555).await;
+
+        tracker
+            .unregister_service_matching("svc", Some(4242), None)
+            .await
+            .unwrap();
+        assert!(
+            tracker.get_service("svc").await.is_some(),
+            "a row carrying someone else's identity must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unregister_matching_without_identity_is_noop() {
+        let (mut tracker, _temp_dir) = create_test_tracker().await;
+        register_stopped_service(&mut tracker, "svc").await;
+
+        tracker
+            .unregister_service_matching("svc", None, None)
+            .await
+            .unwrap();
+        assert!(
+            tracker.get_service("svc").await.is_some(),
+            "no identity means no provable ownership — the row must stay"
+        );
+    }
 
     // ========================================================================
     // apply_state_transition tests

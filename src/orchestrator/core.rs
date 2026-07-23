@@ -126,6 +126,13 @@ pub struct Orchestrator {
     /// Used by isolated script execution to give child orchestrators their own
     /// container namespace, preventing collisions with parent containers.
     pub(super) isolation_id: Option<String>,
+    /// Names of services whose start THIS orchestrator instance owns: it won
+    /// the cross-process registration race (or ran a oneshot's hooks). The
+    /// failure-path [`Orchestrator::cleanup`] scopes its teardown to this set
+    /// — services registered by a concurrent winning `fed` process, or left
+    /// running from a previous start, must survive this run's failed start.
+    /// Leaf lock: never held across an await or another lock acquisition.
+    owned_services: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Orchestrator {
@@ -184,6 +191,7 @@ impl Orchestrator {
             monitoring_stop_started: AtomicBool::new(false),
             randomize_ports: false,
             isolation_id: None,
+            owned_services: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -218,6 +226,7 @@ impl Orchestrator {
             monitoring_stop_started: AtomicBool::new(false),
             randomize_ports: false,
             isolation_id: None,
+            owned_services: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -254,6 +263,7 @@ impl Orchestrator {
             monitoring_stop_started: AtomicBool::new(false),
             randomize_ports: false,
             isolation_id: None,
+            owned_services: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -1363,6 +1373,7 @@ impl Orchestrator {
             // The oneshot path runs hooks this attempt owns — an
             // interruption may leave their processes behind for cleanup.
             attempt_owns_service.store(true, Ordering::SeqCst);
+            self.record_owned(name);
             return self
                 .run_oneshot(name, &manager_arc)
                 .await
@@ -1460,6 +1471,7 @@ impl Orchestrator {
         // Registration won: from here on this attempt may spawn a process/
         // container, so an interrupted start must clean up after itself.
         attempt_owns_service.store(true, Ordering::SeqCst);
+        self.record_owned(name);
 
         // All ? from here to commit() are safe — the guard cleans up on drop.
 
@@ -2412,6 +2424,138 @@ impl Orchestrator {
             return;
         }
 
+        self.shutdown_monitoring_for_cleanup().await;
+
+        tracing::debug!("Cleanup: stopping all services");
+        let _ = self.stop_all().await;
+        self.release_ports_and_maybe_clear().await;
+        tracing::debug!("Cleanup: complete");
+    }
+
+    /// Failure-path rollback for an aborted or failed `start`: tear down only
+    /// what THIS run's start attempts actually created, leaving everything
+    /// else — a concurrent winning `fed` process's registrations, services
+    /// left healthy by a previous start — untouched. This is the
+    /// orchestrator-wide counterpart of the per-service `attempt_owns_service`
+    /// gate: an unscoped [`Orchestrator::cleanup`] here used to let a LOSING
+    /// invocation's failed start stop and unregister the winner's live
+    /// services. Full-session shutdown (watch-mode Ctrl-C) must keep calling
+    /// [`Orchestrator::cleanup`] instead — its contract is "stop the stack".
+    ///
+    /// Two safeguards scope the teardown:
+    /// - Only services in `owned_services` (recorded at the two sites that
+    ///   set `attempt_owns_service`) are touched, via THIS process's manager
+    ///   handles — never by state-DB row.
+    /// - A state row is unregistered only when it still carries this run's
+    ///   identity (our manager's PID / container id). Rows without identity
+    ///   are left alone: a registered-but-never-spawned row was already
+    ///   removed by the registration guard's drop, and after that another
+    ///   process may have re-registered the name — deleting by name would
+    ///   destroy THEIR registration. Identity-less completed-oneshot rows
+    ///   are kept for the same reason (harmless, re-run on next start).
+    ///
+    /// Shares `cleanup_started` with [`Orchestrator::cleanup`]: the two are
+    /// alternative terminal teardowns of one orchestrator lifecycle and must
+    /// not both run.
+    pub async fn cleanup_failed_start(&self) {
+        if self
+            .cleanup_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            tracing::debug!("Cleanup already in progress or completed, skipping");
+            return;
+        }
+
+        self.shutdown_monitoring_for_cleanup().await;
+
+        tracing::debug!("Failed-start rollback: stopping services owned by this run");
+        let owned = self
+            .owned_services
+            .lock()
+            .expect("owned_services lock poisoned")
+            .clone();
+        if !owned.is_empty() {
+            // Reverse topological order, as in stop_all: dependents first.
+            // Owned services absent from the graph (never built, or a cycle
+            // error) are appended so they still get torn down.
+            let order = self.dep_graph.topological_sort().unwrap_or_default();
+            let mut remaining: std::collections::HashSet<&String> = owned.iter().collect();
+            let mut plan: Vec<&String> = order
+                .iter()
+                .rev()
+                .filter(|n| remaining.remove(*n))
+                .collect();
+            plan.extend(remaining);
+
+            for name in plan {
+                let manager_arc = {
+                    let services = self.services.read().await;
+                    services.get(name.as_str()).map(Arc::clone)
+                };
+                let Some(manager_arc) = manager_arc else {
+                    continue;
+                };
+                // Capture identity BEFORE stopping — stop may clear it.
+                let (pid, container_id) = {
+                    let manager = manager_arc.lock().await;
+                    (manager.get_pid(), manager.get_container_id())
+                };
+                if pid.is_none() && container_id.is_none() {
+                    // Nothing was spawned by this run (hook-only node, or a
+                    // start that failed before spawn). The registration
+                    // guard already handled the row; leave state alone.
+                    continue;
+                }
+                let stop_result = tokio::time::timeout(self.stop_timeout, async {
+                    let mut manager = manager_arc.lock().await;
+                    manager.stop().await
+                })
+                .await;
+                match stop_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        // Keep the row: the process/container may still be
+                        // alive and must stay tracked.
+                        tracing::warn!(
+                            "Failed-start rollback: stop of '{}' failed; its state row is kept: {}",
+                            name,
+                            e
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "Failed-start rollback: stop of '{}' timed out; its state row is kept",
+                            name
+                        );
+                        continue;
+                    }
+                }
+                // Conditional on identity so a name re-registered by another
+                // process between our failure and this rollback survives.
+                let mut tracker = self.state_tracker.write().await;
+                if let Err(e) = tracker
+                    .unregister_service_matching(name, pid, container_id.as_deref())
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed-start rollback: unregister of '{}' failed: {}",
+                        name,
+                        e
+                    );
+                }
+                let _ = tracker.save().await;
+            }
+        }
+
+        self.release_ports_and_maybe_clear().await;
+        tracing::debug!("Failed-start rollback: complete");
+    }
+
+    /// Shared preamble of both teardown paths: cancel in-progress operations
+    /// and wait (bounded) for the monitoring task to wind down.
+    async fn shutdown_monitoring_for_cleanup(&self) {
         // Cancel all in-progress operations first
         // This ensures any running start/stop operations bail out quickly
         tracing::debug!("Cleanup: canceling in-progress operations");
@@ -2436,9 +2580,11 @@ impl Orchestrator {
                 }
             }
         }
+    }
 
-        tracing::debug!("Cleanup: stopping all services");
-        let _ = self.stop_all().await;
+    /// Shared tail of both teardown paths: release port listeners, then clear
+    /// residual state bookkeeping only when no service rows remain.
+    async fn release_ports_and_maybe_clear(&self) {
         tracing::debug!("Cleanup: releasing port listeners");
         // Use shared cleanup since we only have &self
         self.resolver.cleanup_shared();
@@ -2455,7 +2601,17 @@ impl Orchestrator {
         {
             let _ = self.state_tracker.write().await.clear().await;
         }
-        tracing::debug!("Cleanup: complete");
+    }
+
+    /// Record that this orchestrator instance's start attempt owns `name` —
+    /// it won the cross-process registration race or ran a oneshot's hooks.
+    /// Consulted by [`Orchestrator::cleanup_failed_start`] to scope
+    /// failure-path teardown.
+    fn record_owned(&self, name: &str) {
+        self.owned_services
+            .lock()
+            .expect("owned_services lock poisoned")
+            .insert(name.to_string());
     }
 
     /// Stop monitoring without stopping any service.
@@ -3486,6 +3642,114 @@ mod tests {
         assert!(
             matches!(row.map(|s| s.status), Some(Status::Starting)),
             "the winner's Starting registration must survive the loser's cancellation"
+        );
+    }
+
+    /// The failed-start rollback must not touch registrations this
+    /// orchestrator's start attempts don't own: a losing invocation whose own
+    /// start failed (e.g. a hook error) used to stop_all + clear, destroying
+    /// the concurrent winner's live state rows.
+    #[tokio::test]
+    async fn cleanup_leaves_unowned_registrations_alone() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.services.insert(
+            "svc".to_string(),
+            crate::config::Service {
+                process: Some("sleep 300".to_string()),
+                ..Default::default()
+            },
+        );
+        let orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        {
+            let mut tracker = orchestrator.state_tracker.write().await;
+            tracker.initialize().await.unwrap();
+            // A concurrent winner's registration, mid-start. This
+            // orchestrator never records ownership of it.
+            tracker
+                .register_service(ServiceState::new(
+                    "svc".to_string(),
+                    ServiceType::Process,
+                    "root".to_string(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        orchestrator.cleanup_failed_start().await;
+
+        let row = {
+            let tracker = orchestrator.state_tracker.read().await;
+            tracker.get_service("svc").await
+        };
+        assert!(
+            matches!(row.map(|s| s.status), Some(Status::Starting)),
+            "an unowned registration must survive this run's failure cleanup"
+        );
+    }
+
+    /// An owned service whose manager holds no identity (nothing spawned)
+    /// must leave its state row for the registration guard / other owners.
+    #[tokio::test]
+    async fn cleanup_failed_start_spares_identityless_rows() {
+        use crate::service::ProcessService;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.services.insert(
+            "svc".to_string(),
+            crate::config::Service {
+                process: Some("sleep 300".to_string()),
+                ..Default::default()
+            },
+        );
+        let orchestrator = Orchestrator::new(config.clone(), temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        {
+            let mut tracker = orchestrator.state_tracker.write().await;
+            tracker.initialize().await.unwrap();
+            tracker
+                .register_service(ServiceState::new(
+                    "svc".to_string(),
+                    ServiceType::Process,
+                    "root".to_string(),
+                ))
+                .await
+                .unwrap();
+        }
+        {
+            let manager = ProcessService::new(
+                "svc".into(),
+                config.services.get("svc").unwrap().clone(),
+                HashMap::new(),
+                temp_dir.path().to_string_lossy().into_owned(),
+                OutputMode::Captured,
+                None,
+            );
+            orchestrator.services.write().await.insert(
+                "svc".to_string(),
+                Arc::new(tokio::sync::Mutex::new(Box::new(manager))),
+            );
+        }
+        orchestrator.record_owned("svc");
+
+        orchestrator.cleanup_failed_start().await;
+
+        // The manager never spawned anything (no PID/container), so the row
+        // is deliberately NOT deleted by name: in the real flow the
+        // registration guard's drop already removed it, and after that the
+        // name may belong to another process. Identity-matched removal is
+        // covered by the state-layer unregister_service_matching tests.
+        let row = {
+            let tracker = orchestrator.state_tracker.read().await;
+            tracker.get_service("svc").await
+        };
+        assert!(
+            matches!(row.map(|s| s.status), Some(Status::Starting)),
+            "an identity-less owned row must be left for the registration guard"
         );
     }
 
