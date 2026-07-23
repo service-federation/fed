@@ -15,7 +15,9 @@ pub struct StartOptions<'a> {
     pub watch: bool,
     pub replace: bool,
     pub dry_run: bool,
-    pub parallel: bool,
+    /// Max services starting concurrently within a dependency level
+    /// (1 = fully sequential).
+    pub jobs: usize,
     pub config_path: &'a std::path::Path,
     /// Threaded to `spawn_if_needed` so a spawned `fed supervise` sees the
     /// same `--offline`/`--profile` session settings as this invocation
@@ -35,11 +37,12 @@ pub async fn run_start(
         watch,
         replace,
         dry_run,
-        parallel,
+        jobs,
         config_path,
         offline,
         profiles,
     } = opts;
+    let jobs = jobs.max(1);
     let services_to_start = if services.is_empty() {
         // Use entrypoint
         if let Some(ref ep) = config.entrypoint {
@@ -242,9 +245,10 @@ pub async fn run_start(
     let mut warnings: Vec<String> = Vec::new();
     let startup_timer = std::time::Instant::now();
 
-    // Group the plan into dependency levels. With --parallel, services in
-    // the same level start concurrently; otherwise one at a time.
-    let groups: Vec<Vec<String>> = if parallel {
+    // Group the plan into dependency levels. Services within a level start
+    // concurrently, bounded by `jobs`; -j 1 keeps the exact sequential plan
+    // order (dependencies-first DFS order, matching pre-parallel behavior).
+    let groups: Vec<Vec<String>> = if jobs > 1 {
         match parallel_groups_for_plan(orchestrator.get_dependency_graph(), &plan) {
             Ok(groups) => groups,
             Err(FedError::ServiceNotFound(missing)) => {
@@ -282,14 +286,33 @@ pub async fn run_start(
                 }
             })
         } else {
-            let starts = group.iter().map(|service| {
-                start_one_service(orchestrator, config, service, name_width, false, out)
-            });
+            // Concurrent level: at most `jobs` services start at once. The
+            // pending line tracks what's still starting; each completion
+            // prints its outcome line above it.
+            use futures::StreamExt;
+
+            let orch: &Orchestrator = orchestrator;
+            let mut remaining: Vec<&str> = group.iter().map(|s| s.as_str()).collect();
+            out.progress(&format!("  ⋯ starting {}", remaining.join(", ")));
+
+            let mut stream = futures::stream::iter(group.iter().map(|service| async move {
+                let outcome =
+                    start_one_service(orch, config, service, name_width, false, out).await;
+                (*service, outcome)
+            }))
+            .buffer_unordered(jobs);
+
             let mut first_err = None;
-            for (service, outcome) in group.iter().zip(futures::future::join_all(starts).await) {
+            while let Some((service, outcome)) = stream.next().await {
+                remaining.retain(|s| *s != service.as_str());
+                if remaining.is_empty() {
+                    out.clear_progress();
+                } else {
+                    out.progress(&format!("  ⋯ starting {}", remaining.join(", ")));
+                }
                 match outcome {
                     Ok(w) => {
-                        started.insert((*service).clone());
+                        started.insert(service.clone());
                         if let Some(w) = w {
                             warnings.push(w);
                         }
@@ -297,6 +320,7 @@ pub async fn run_start(
                     Err(e) => first_err = first_err.or(Some(e)),
                 }
             }
+            drop(stream);
             match first_err {
                 None => Ok(()),
                 Some(e) => Err(e),

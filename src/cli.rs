@@ -64,11 +64,12 @@ pub enum Commands {
         #[arg(long)]
         isolate: bool,
 
-        /// Start independent services concurrently (dependency levels still
-        /// run in order). Services with no dependency edge between them must
-        /// tolerate starting in any order.
-        #[arg(long)]
-        parallel: bool,
+        /// Maximum services starting concurrently within a dependency level.
+        /// Dependency levels still run in order; services with no dependency
+        /// edge between them must tolerate starting in any order. Use -j 1
+        /// for fully sequential startup.
+        #[arg(short = 'j', long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
+        jobs: u16,
     },
     /// Stop services
     Stop {

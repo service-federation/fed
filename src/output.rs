@@ -34,6 +34,9 @@ pub trait UserOutput: Send + Sync {
         self.finish_progress(line);
     }
 
+    /// Clear an inline progress line without printing anything in its place.
+    fn clear_progress(&self) {}
+
     /// A blank line separator.
     fn blank(&self);
 }
@@ -101,6 +104,11 @@ impl UserOutput for CliOutput {
     fn finish_progress_with(&self, line: &str) {
         self.pending_progress.lock().unwrap().clear();
         fed::progress::finish_line(line);
+    }
+
+    fn clear_progress(&self) {
+        self.pending_progress.lock().unwrap().clear();
+        fed::progress::clear_line();
     }
 
     fn blank(&self) {

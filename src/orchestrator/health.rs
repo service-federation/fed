@@ -249,9 +249,11 @@ impl<'a> HealthCheckRunner<'a> {
         }
 
         loop {
-            // Live detail on the in-place progress line (no-op if none is up)
+            // Live detail on the in-place progress line (no-op if none is up).
+            // Named, because concurrent starts share one pending line.
             crate::progress::set_detail(&format!(
-                "healthcheck {}s/{}s",
+                "{}: healthcheck {}s/{}s",
+                name,
                 start.elapsed().as_secs(),
                 timeout.as_secs()
             ));
