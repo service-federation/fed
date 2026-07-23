@@ -958,9 +958,11 @@ mod tests {
         for i in 0..5 {
             // The previous iteration's lock releases on drop, but under a
             // loaded parallel test run that release can land a beat late.
-            // Retry briefly instead of asserting on drop timing.
+            // Retry instead of asserting on drop timing. The window is
+            // deliberately generous (10s): 2s was observed to flake on
+            // loaded GitHub Actions macOS runners.
             let mut acquired = false;
-            for _ in 0..40 {
+            for _ in 0..100 {
                 let normal = SqliteStateTracker::new(temp_dir.path().to_path_buf())
                     .await
                     .unwrap();
@@ -969,7 +971,7 @@ mod tests {
                     break;
                 }
                 drop(normal);
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             assert!(
                 acquired,
