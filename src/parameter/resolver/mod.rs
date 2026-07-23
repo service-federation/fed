@@ -1225,6 +1225,44 @@ mod tests {
     }
 
     #[test]
+    fn either_error_redacts_tainted_generate_value() {
+        use crate::config::{Config, Parameter};
+
+        // The validation-passing shape of the terminal-leak scenario: the
+        // secret itself has no `either`, but a non-secret generate parameter
+        // derived from it does, and fails it. The error must not echo the
+        // derived value (which embeds the secret).
+        const SENTINEL: &str = "secret-gen-value-88";
+
+        let mut resolver = Resolver::new();
+        let mut config = Config::default();
+
+        let mut secret = Parameter {
+            param_type: Some("secret".to_string()),
+            ..Default::default()
+        };
+        secret.value = Some(SENTINEL.to_string());
+        config.parameters.insert("LICENSE".to_string(), secret);
+
+        config.parameters.insert(
+            "MODE".to_string(),
+            Parameter {
+                generate: Some("printf 'x-{{LICENSE}}'".to_string()),
+                either: vec!["a".to_string(), "b".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not in the allowed values"), "got: {msg}");
+        assert!(
+            !msg.contains(SENTINEL),
+            "either-constraint error leaked a secret through a derived value: {msg}"
+        );
+    }
+
+    #[test]
     fn test_either_constraint_with_template() {
         use crate::config::{Config, Parameter};
 
