@@ -2855,9 +2855,13 @@ mod tests {
         use crate::state::{DesiredState, ServiceState};
 
         // A real, long-lived child process so mark_dead_services sees it as
-        // genuinely alive (not stale).
+        // genuinely alive (not stale). Long enough to survive a slow CI
+        // runner: with only 2 seconds, the child could exit before
+        // initialize_supervisor's liveness check under load, making the
+        // attach assertion flake (observed on GitHub Actions). The test
+        // kills the child on exit.
         let mut child = std::process::Command::new("sleep")
-            .arg("2")
+            .arg("300")
             .spawn()
             .expect("failed to spawn helper process");
         let live_pid = child.id();
