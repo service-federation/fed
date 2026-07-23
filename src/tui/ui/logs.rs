@@ -102,17 +102,17 @@ fn draw_logs(f: &mut Frame, app: &App, service_name: &str, area: Rect) {
     let is_following = app.is_following(service_name);
     let scroll_pos = app.get_scroll(service_name);
     let level_filter = app.get_log_filter(service_name);
-    let search_query = app.get_search(service_name).map(|s| s.to_lowercase());
+    let search_query = app.get_search(service_name).map(|s| s.as_bytes().to_vec());
 
     if let Some(buffer) = app.log_buffers.get(service_name) {
-        // Filter logs by level and search query
+        // Filter logs by level and search query (allocation-free per line)
         let filtered_logs: Vec<_> = buffer
             .iter()
             .filter(|log| log.level.passes_filter(level_filter))
             .filter(|log| {
                 search_query
                     .as_ref()
-                    .map(|q| log.message.to_lowercase().contains(q))
+                    .map(|q| crate::tui::app::contains_ci(&log.message, q))
                     .unwrap_or(true)
             })
             .collect();

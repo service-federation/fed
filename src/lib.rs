@@ -61,6 +61,7 @@ pub mod orchestrator;
 pub mod package;
 pub mod parameter;
 pub mod port;
+pub mod progress;
 pub mod service;
 pub mod state;
 pub mod tui;

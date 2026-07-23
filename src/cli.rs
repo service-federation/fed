@@ -37,6 +37,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Start services
+    #[command(alias = "s")]
     Start {
         /// Services to start (defaults to entrypoint)
         services: Vec<String>,
@@ -62,6 +63,12 @@ pub enum Commands {
         /// Enable isolation mode before starting (persisted)
         #[arg(long)]
         isolate: bool,
+
+        /// Start independent services concurrently (dependency levels still
+        /// run in order). Services with no dependency edge between them must
+        /// tolerate starting in any order.
+        #[arg(long)]
+        parallel: bool,
     },
     /// Stop services
     Stop {

@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 const LOG_BUFFER_SIZE: usize = 1000;
 
 /// Case-insensitive ASCII substring search without allocation.
-fn contains_ci(haystack: &str, needle: &[u8]) -> bool {
+pub(crate) fn contains_ci(haystack: &str, needle: &[u8]) -> bool {
     haystack
         .as_bytes()
         .windows(needle.len())
@@ -21,6 +21,79 @@ pub struct StatusMessage {
     pub text: String,
     pub level: StatusLevel,
     pub expires_at: Instant,
+}
+
+/// Result of a background service action (start/stop/restart), sent back to
+/// the UI loop so actions never block input handling.
+#[derive(Debug)]
+pub struct ActionOutcome {
+    pub text: String,
+    pub level: StatusLevel,
+    pub duration_secs: u64,
+    /// The pending-action key this outcome releases (service name, or "*"
+    /// for all-services operations).
+    pub key: String,
+}
+
+/// Pending-action key for all-services operations (stop all / start all).
+const ALL_SERVICES_KEY: &str = "*";
+
+/// A service lifecycle action to run off the UI loop.
+#[derive(Debug, Clone, Copy)]
+enum ServiceAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+/// Snapshot of orchestrator state gathered off the UI loop.
+pub struct RefreshData {
+    status_map: HashMap<String, Status>,
+    service_states: HashMap<String, (String, String, Option<u16>, chrono::DateTime<chrono::Utc>)>,
+    logs: Option<(String, Vec<String>)>,
+}
+
+/// Gather service status, state metadata, and logs for one service.
+///
+/// Runs in a spawned task: docker healthchecks and log fetches can take
+/// hundreds of milliseconds and must never stall the render/input loop.
+pub async fn gather_refresh_data(
+    orchestrator: Arc<RwLock<Orchestrator>>,
+    log_target: Option<String>,
+) -> RefreshData {
+    let orch = orchestrator.read().await;
+    let status_map = orch.get_status().await;
+
+    let mut service_states = HashMap::new();
+    {
+        let state_tracker = orch.state_tracker.read().await;
+        for name in status_map.keys() {
+            if let Some(state) = state_tracker.get_service(name).await {
+                service_states.insert(
+                    name.clone(),
+                    (
+                        state.namespace.clone(),
+                        state.service_type.to_string(),
+                        state.port_allocations.values().next().copied(),
+                        state.started_at,
+                    ),
+                );
+            }
+        }
+    }
+
+    let logs = if let Some(name) = log_target {
+        let lines = orch.get_logs(&name, Some(50)).await.unwrap_or_default();
+        Some((name, lines))
+    } else {
+        None
+    };
+
+    RefreshData {
+        status_map,
+        service_states,
+        logs,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,6 +180,27 @@ pub struct App {
 
     /// Whether we're in filter input mode for params view
     pub params_filter_mode: bool,
+
+    /// Sender for background action outcomes (start/stop/restart tasks)
+    action_tx: tokio::sync::mpsc::UnboundedSender<ActionOutcome>,
+
+    /// Receiver end, taken by the event loop with [`App::take_action_rx`]
+    action_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ActionOutcome>>,
+
+    /// Serializes background actions among themselves. Actions take the
+    /// orchestrator *read* lock (lifecycle methods are `&self`), so they
+    /// never queue behind an in-flight refresh — but two user actions
+    /// should still run one at a time.
+    action_gate: Arc<tokio::sync::Mutex<()>>,
+
+    /// Join handles of in-flight background actions, so quitting the TUI
+    /// can wait for them instead of abandoning a half-done stop/start.
+    action_tasks: tokio::task::JoinSet<()>,
+
+    /// Keys (service name, or "*" for all-services ops) with an action in
+    /// flight. Repeat keypresses are rejected instead of queueing stale
+    /// operations behind the gate.
+    pending_action_keys: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,6 +266,7 @@ impl App {
         let parameters = orchestrator.get_resolved_parameters_owned();
 
         let orchestrator = Arc::new(RwLock::new(orchestrator));
+        let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel();
 
         Self {
             orchestrator,
@@ -200,7 +295,143 @@ impl App {
             params_selected: 0,
             params_filter: String::new(),
             params_filter_mode: false,
+            action_tx,
+            action_rx: Some(action_rx),
+            action_gate: Arc::new(tokio::sync::Mutex::new(())),
+            action_tasks: tokio::task::JoinSet::new(),
+            pending_action_keys: std::collections::HashSet::new(),
         }
+    }
+
+    /// Try to claim an action slot for `key`. Returns false (and shows a
+    /// status message) when an action for this key — or a conflicting one —
+    /// is already in flight.
+    fn try_claim_action(&mut self, key: &str) -> bool {
+        let conflict = if key == ALL_SERVICES_KEY {
+            // A global op conflicts with anything in flight
+            !self.pending_action_keys.is_empty()
+        } else {
+            self.pending_action_keys.contains(key)
+                || self.pending_action_keys.contains(ALL_SERVICES_KEY)
+        };
+        if conflict {
+            self.set_status(
+                &format!("An operation is already running for '{}'", key),
+                StatusLevel::Warning,
+                3,
+            );
+            return false;
+        }
+        self.pending_action_keys.insert(key.to_string());
+        true
+    }
+
+    /// Wait for any in-flight background actions to finish (used on quit so
+    /// a half-done stop/start isn't abandoned when the runtime shuts down).
+    /// Bounded by `limit`; returns the number of actions still pending.
+    pub async fn drain_actions(&mut self, limit: Duration) -> usize {
+        let deadline = Instant::now() + limit;
+        while !self.action_tasks.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.action_tasks.join_next()).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => break, // deadline hit
+            }
+        }
+        self.action_tasks.len()
+    }
+
+    /// Whether any background action is still running
+    pub fn has_pending_actions(&self) -> bool {
+        !self.action_tasks.is_empty()
+    }
+
+    /// Take the action-outcome receiver (called once by the event loop)
+    pub fn take_action_rx(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<ActionOutcome>> {
+        self.action_rx.take()
+    }
+
+    /// Apply the outcome of a completed background action
+    pub fn apply_action_outcome(&mut self, outcome: ActionOutcome) {
+        self.pending_action_keys.remove(&outcome.key);
+        self.status_message = Some(StatusMessage {
+            text: outcome.text,
+            level: outcome.level,
+            expires_at: Instant::now() + Duration::from_secs(outcome.duration_secs),
+        });
+    }
+
+    /// Run a service lifecycle action in a background task.
+    ///
+    /// Shows an immediate "…" status; the final outcome arrives through the
+    /// action channel. This keeps docker stop/start (which can take many
+    /// seconds) off the render/input loop.
+    fn spawn_action(&mut self, name: String, action: ServiceAction) {
+        if !self.try_claim_action(&name) {
+            return;
+        }
+        let verb = match action {
+            ServiceAction::Start => "Starting",
+            ServiceAction::Stop => "Stopping",
+            ServiceAction::Restart => "Restarting",
+        };
+        self.set_status(&format!("{} '{}'…", verb, name), StatusLevel::Info, 60);
+
+        let orchestrator = self.orchestrator.clone();
+        let gate = self.action_gate.clone();
+        let tx = self.action_tx.clone();
+        self.action_tasks.spawn(async move {
+            // Serialize actions among themselves, but take only the read
+            // lock on the orchestrator (lifecycle methods are `&self`) so
+            // an in-flight status refresh can't delay the action.
+            let _gate = gate.lock().await;
+            let result = {
+                let orch = orchestrator.read().await;
+                match action {
+                    ServiceAction::Start => orch.start(&name).await,
+                    ServiceAction::Stop => orch.stop(&name).await,
+                    ServiceAction::Restart => {
+                        let _ = orch.stop(&name).await;
+                        orch.start(&name).await
+                    }
+                }
+            };
+            let outcome = match result {
+                Ok(_) => {
+                    let done = match action {
+                        ServiceAction::Start => "started",
+                        ServiceAction::Stop => "stopped",
+                        ServiceAction::Restart => "restarted",
+                    };
+                    ActionOutcome {
+                        text: format!("✓ '{}' {}", name, done),
+                        level: StatusLevel::Success,
+                        duration_secs: 3,
+                        key: name,
+                    }
+                }
+                Err(e) => {
+                    let infinitive = match action {
+                        ServiceAction::Start => "start",
+                        ServiceAction::Stop => "stop",
+                        ServiceAction::Restart => "restart",
+                    };
+                    ActionOutcome {
+                        text: format!("✗ Failed to {} '{}': {}", infinitive, name, e),
+                        level: StatusLevel::Error,
+                        duration_secs: 5,
+                        key: name,
+                    }
+                }
+            };
+            let _ = tx.send(outcome);
+        });
     }
 
     /// Get reference to the orchestrator's work directory
@@ -238,31 +469,13 @@ impl App {
         self.last_restart
             .insert(service_name.clone(), Instant::now());
 
-        // Show status message
+        // Show status message, then restart off the UI loop
         let msg = format!(
             "🔄 {} file(s) changed in '{}', restarting...",
             file_count, service_name
         );
-        self.set_status(&msg, StatusLevel::Info, 3);
-
-        // Restart the service
-        let result = {
-            let orchestrator = self.orchestrator.write().await;
-            // Try to stop, but continue even if it fails
-            let _ = orchestrator.stop(&service_name).await;
-            orchestrator.start(&service_name).await
-        };
-
-        match result {
-            Ok(_) => {
-                let msg = format!("✓ '{}' restarted successfully", service_name);
-                self.set_status(&msg, StatusLevel::Success, 3);
-            }
-            Err(e) => {
-                let msg = format!("✗ Failed to restart '{}': {}", service_name, e);
-                self.set_status(&msg, StatusLevel::Error, 5);
-            }
-        }
+        self.set_status(&msg, StatusLevel::Info, 30);
+        self.spawn_action(service_name, ServiceAction::Restart);
 
         Ok(())
     }
@@ -436,40 +649,18 @@ impl App {
             KeyCode::Char('s') => {
                 // Toggle start/stop
                 if let Some(service) = self.services.iter().find(|s| s.name == service_name) {
-                    let status = service.status;
-                    let result = {
-                        let orch = self.orchestrator.write().await;
-                        match status {
-                            Status::Running | Status::Healthy | Status::Failing => {
-                                orch.stop(&service_name).await
-                            }
-                            Status::Stopped => orch.start(&service_name).await,
-                            _ => Ok(()),
+                    match service.status {
+                        Status::Running | Status::Healthy | Status::Failing => {
+                            self.spawn_action(service_name, ServiceAction::Stop)
                         }
-                    };
-                    if let Err(e) = result {
-                        self.set_status(
-                            &format!("Failed to toggle '{}': {}", service_name, e),
-                            StatusLevel::Error,
-                            5,
-                        );
+                        Status::Stopped => self.spawn_action(service_name, ServiceAction::Start),
+                        _ => {}
                     }
                 }
             }
             KeyCode::Char('r') => {
                 // Restart service
-                let result = {
-                    let orch = self.orchestrator.write().await;
-                    let _ = orch.stop(&service_name).await;
-                    orch.start(&service_name).await
-                };
-                if let Err(e) = result {
-                    self.set_status(
-                        &format!("Failed to restart '{}': {}", service_name, e),
-                        StatusLevel::Error,
-                        5,
-                    );
-                }
+                self.spawn_action(service_name, ServiceAction::Restart);
             }
             KeyCode::Char('l') => {
                 // View logs
@@ -534,25 +725,14 @@ impl App {
                 // Toggle start/stop for selected service
                 if let Some(service) = self.services.get(self.graph_selected) {
                     let service_name = service.name.clone();
-                    let status = service.status;
-                    let result = {
-                        let orch = self.orchestrator.write().await;
-                        match status {
-                            // Failing means a live process failing health checks —
-                            // toggle stops it (start would no-op with AlreadyExists).
-                            Status::Running | Status::Healthy | Status::Failing => {
-                                orch.stop(&service_name).await
-                            }
-                            Status::Stopped => orch.start(&service_name).await,
-                            _ => Ok(()),
+                    match service.status {
+                        // Failing means a live process failing health checks —
+                        // toggle stops it (start would no-op with AlreadyExists).
+                        Status::Running | Status::Healthy | Status::Failing => {
+                            self.spawn_action(service_name, ServiceAction::Stop)
                         }
-                    };
-                    if let Err(e) = result {
-                        self.set_status(
-                            &format!("Failed to toggle '{}': {}", service_name, e),
-                            StatusLevel::Error,
-                            5,
-                        );
+                        Status::Stopped => self.spawn_action(service_name, ServiceAction::Start),
+                        _ => {}
                     }
                 }
             }
@@ -560,18 +740,7 @@ impl App {
                 // Restart selected service
                 if let Some(service) = self.services.get(self.graph_selected) {
                     let service_name = service.name.clone();
-                    let result = {
-                        let orch = self.orchestrator.write().await;
-                        let _ = orch.stop(&service_name).await;
-                        orch.start(&service_name).await
-                    };
-                    if let Err(e) = result {
-                        self.set_status(
-                            &format!("Failed to restart '{}': {}", service_name, e),
-                            StatusLevel::Error,
-                            5,
-                        );
-                    }
+                    self.spawn_action(service_name, ServiceAction::Restart);
                 }
             }
             KeyCode::Char('l') => {
@@ -692,8 +861,9 @@ impl App {
         params
     }
 
-    /// Called on each tick (e.g., every 250ms)
-    pub async fn on_tick(&mut self) -> anyhow::Result<()> {
+    /// Called on each tick (e.g., every 250ms). Cheap and synchronous — the
+    /// actual data refresh runs in a background task (see `gather_refresh_data`).
+    pub fn on_tick(&mut self) {
         // Clear expired status messages
         if let Some(ref msg) = self.status_message
             && Instant::now() > msg.expires_at
@@ -701,13 +871,14 @@ impl App {
             self.status_message = None;
         }
 
-        // Refresh service status
-        self.refresh_services().await?;
+        // Reap finished background actions so has_pending_actions stays honest
+        while self.action_tasks.try_join_next().is_some() {}
 
-        // Fetch new logs
-        self.fetch_logs().await?;
-
-        Ok(())
+        // Safety net: a panicked action never sends its outcome, which would
+        // leave its key claimed forever. No tasks left means no keys either.
+        if self.action_tasks.is_empty() && !self.pending_action_keys.is_empty() {
+            self.pending_action_keys.clear();
+        }
     }
 
     pub fn on_resize(&mut self, width: u16, height: u16) {
@@ -715,34 +886,28 @@ impl App {
         self.terminal_height = height;
     }
 
-    async fn refresh_services(&mut self) -> anyhow::Result<()> {
-        // Acquire all needed data in a single scope, then drop locks before processing
-        let (status_map, service_states) = {
-            let orch = self.orchestrator.read().await;
-            let status_map = orch.get_status().await;
-            let state_tracker = orch.state_tracker.read().await;
-
-            // Extract all service states we need while holding the lock
-            let mut service_states: HashMap<String, _> = HashMap::new();
-            for name in status_map.keys() {
-                if let Some(state) = state_tracker.get_service(name).await {
-                    service_states.insert(
-                        name.clone(),
-                        (
-                            state.namespace.clone(),
-                            state.service_type.to_string(),
-                            state.port_allocations.values().next().copied(),
-                            state.started_at,
-                        ),
-                    );
-                }
+    /// Which service the next refresh should fetch logs for
+    pub fn refresh_target(&self) -> Option<String> {
+        match &self.view {
+            View::Logs(name) | View::ServiceDetails(name) => Some(name.clone()),
+            View::Dashboard => {
+                // In dashboard, fetch logs for selected service only
+                self.selected_service
+                    .and_then(|idx| self.services.get(idx))
+                    .map(|s| s.name.clone())
             }
+            _ => None,
+        }
+    }
 
-            // Drop locks by moving out of the scope
-            (status_map, service_states)
-        };
+    /// Merge a background refresh snapshot into the UI state
+    pub fn apply_refresh(&mut self, data: RefreshData) {
+        let RefreshData {
+            status_map,
+            service_states,
+            logs,
+        } = data;
 
-        // Process data without holding any locks
         self.services = status_map
             .into_iter()
             .map(|(name, status)| {
@@ -781,31 +946,8 @@ impl App {
         // Sort by name for consistent display
         self.services.sort_by(|a, b| a.name.cmp(&b.name));
 
-        Ok(())
-    }
-
-    async fn fetch_logs(&mut self) -> anyhow::Result<()> {
-        // Only fetch logs for the service currently being viewed to avoid
-        // spawning docker/compose subprocesses for ALL services every tick
-        let service_to_fetch = match &self.view {
-            View::Logs(name) | View::ServiceDetails(name) => Some(name.clone()),
-            View::Dashboard => {
-                // In dashboard, fetch logs for selected service only
-                self.selected_service
-                    .and_then(|idx| self.services.get(idx))
-                    .map(|s| s.name.clone())
-            }
-            _ => None,
-        };
-
-        if let Some(service_name) = service_to_fetch {
-            let logs = {
-                let orch = self.orchestrator.read().await;
-                orch.get_logs(&service_name, Some(50))
-                    .await
-                    .unwrap_or_default()
-            };
-
+        // Merge fetched logs (only one service per refresh — the viewed one)
+        if let Some((service_name, logs)) = logs {
             let buffer = self
                 .log_buffers
                 .entry(service_name.clone())
@@ -832,8 +974,6 @@ impl App {
                 self.log_seen_count.insert(service_name.clone(), logs.len());
             }
         }
-
-        Ok(())
     }
 
     fn parse_log_level(line: &str) -> LogLevel {
@@ -890,22 +1030,14 @@ impl App {
         {
             let name = service.name.clone();
             let status = service.status;
-            let result = {
-                let orch = self.orchestrator.write().await;
-                match status {
-                    // Same Failing semantics as the details and graph views:
-                    // a Failing service is running, so toggle stops it.
-                    Status::Running | Status::Healthy | Status::Failing => orch.stop(&name).await,
-                    Status::Stopped => orch.start(&name).await,
-                    _ => Ok(()),
+            match status {
+                // Same Failing semantics as the details and graph views:
+                // a Failing service is running, so toggle stops it.
+                Status::Running | Status::Healthy | Status::Failing => {
+                    self.spawn_action(name, ServiceAction::Stop)
                 }
-            };
-            if let Err(e) = result {
-                self.set_status(
-                    &format!("Failed to toggle '{}': {}", name, e),
-                    StatusLevel::Error,
-                    5,
-                );
+                Status::Stopped => self.spawn_action(name, ServiceAction::Start),
+                _ => {}
             }
         }
         Ok(())
@@ -916,57 +1048,92 @@ impl App {
             && let Some(service) = self.services.get(idx)
         {
             let name = service.name.clone();
-            let result = {
-                let orch = self.orchestrator.write().await;
-                let _ = orch.stop(&name).await;
-                orch.start(&name).await
-            };
-            if let Err(e) = result {
-                self.set_status(
-                    &format!("Failed to restart '{}': {}", name, e),
-                    StatusLevel::Error,
-                    5,
-                );
-            }
+            self.spawn_action(name, ServiceAction::Restart);
         }
         Ok(())
     }
 
     async fn stop_all_services(&mut self) -> anyhow::Result<()> {
-        let orch = self.orchestrator.write().await;
-        orch.stop_all().await?;
+        if !self.try_claim_action(ALL_SERVICES_KEY) {
+            return Ok(());
+        }
+        self.set_status("Stopping all services…", StatusLevel::Info, 60);
+        let orchestrator = self.orchestrator.clone();
+        let gate = self.action_gate.clone();
+        let tx = self.action_tx.clone();
+        self.action_tasks.spawn(async move {
+            let _gate = gate.lock().await;
+            let result = {
+                let orch = orchestrator.read().await;
+                orch.stop_all().await
+            };
+            let outcome = match result {
+                Ok(()) => ActionOutcome {
+                    text: "✓ All services stopped".to_string(),
+                    level: StatusLevel::Success,
+                    duration_secs: 5,
+                    key: ALL_SERVICES_KEY.to_string(),
+                },
+                Err(e) => ActionOutcome {
+                    text: format!("✗ Failed to stop all: {}", e),
+                    level: StatusLevel::Error,
+                    duration_secs: 10,
+                    key: ALL_SERVICES_KEY.to_string(),
+                },
+            };
+            let _ = tx.send(outcome);
+        });
         Ok(())
     }
 
     async fn start_all_services(&mut self) -> anyhow::Result<()> {
         // Count stopped services
-        let stopped: Vec<_> = self
+        let stopped = self
             .services
             .iter()
             .filter(|s| matches!(s.status, Status::Stopped | Status::Failing))
-            .collect();
+            .count();
 
-        if stopped.is_empty() {
+        if stopped == 0 {
             self.set_status("All services already running", StatusLevel::Info, 3);
             return Ok(());
         }
 
-        self.set_status(
-            &format!("Starting {} services...", stopped.len()),
-            StatusLevel::Info,
-            30,
-        );
-
-        let result = {
-            let orch = self.orchestrator.write().await;
-            orch.start_all().await
-        };
-
-        match result {
-            Ok(()) => self.set_status("All services started", StatusLevel::Success, 5),
-            Err(e) => self.set_status(&format!("Failed: {}", e), StatusLevel::Error, 10),
+        if !self.try_claim_action(ALL_SERVICES_KEY) {
+            return Ok(());
         }
 
+        self.set_status(
+            &format!("Starting {} services…", stopped),
+            StatusLevel::Info,
+            60,
+        );
+
+        let orchestrator = self.orchestrator.clone();
+        let gate = self.action_gate.clone();
+        let tx = self.action_tx.clone();
+        self.action_tasks.spawn(async move {
+            let _gate = gate.lock().await;
+            let result = {
+                let orch = orchestrator.read().await;
+                orch.start_all().await
+            };
+            let outcome = match result {
+                Ok(()) => ActionOutcome {
+                    text: "✓ All services started".to_string(),
+                    level: StatusLevel::Success,
+                    duration_secs: 5,
+                    key: ALL_SERVICES_KEY.to_string(),
+                },
+                Err(e) => ActionOutcome {
+                    text: format!("✗ Failed: {}", e),
+                    level: StatusLevel::Error,
+                    duration_secs: 10,
+                    key: ALL_SERVICES_KEY.to_string(),
+                },
+            };
+            let _ = tx.send(outcome);
+        });
         Ok(())
     }
 
@@ -1104,7 +1271,7 @@ impl App {
             if let Some(buffer) = self.log_buffers.get(&service) {
                 let current_scroll = self.get_scroll(&service);
                 let level_filter = self.get_log_filter(&service);
-                let search_query = self.get_search(&service).map(|s| s.to_lowercase());
+                let search_query = self.get_search(&service).map(|s| s.as_bytes().to_vec());
 
                 // Find filtered logs and their indices
                 let filtered_with_idx: Vec<_> = buffer
@@ -1114,7 +1281,7 @@ impl App {
                     .filter(|(_, log)| {
                         search_query
                             .as_ref()
-                            .map(|q| log.message.to_lowercase().contains(q))
+                            .map(|q| contains_ci(&log.message, q))
                             .unwrap_or(true)
                     })
                     .collect();
@@ -1147,7 +1314,7 @@ impl App {
             if let Some(buffer) = self.log_buffers.get(&service) {
                 let current_scroll = self.get_scroll(&service);
                 let level_filter = self.get_log_filter(&service);
-                let search_query = self.get_search(&service).map(|s| s.to_lowercase());
+                let search_query = self.get_search(&service).map(|s| s.as_bytes().to_vec());
 
                 // Find filtered logs and their indices
                 let filtered_with_idx: Vec<_> = buffer
@@ -1157,7 +1324,7 @@ impl App {
                     .filter(|(_, log)| {
                         search_query
                             .as_ref()
-                            .map(|q| log.message.to_lowercase().contains(q))
+                            .map(|q| contains_ci(&log.message, q))
                             .unwrap_or(true)
                     })
                     .collect();

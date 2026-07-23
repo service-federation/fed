@@ -52,6 +52,10 @@ async fn run_internal(
     // Mark startup complete so health monitoring works in TUI mode
     orchestrator.mark_startup_complete();
 
+    // The TUI owns the screen: silence coordinated progress/hook output
+    // (it would corrupt the alternate screen)
+    crate::progress::set_silent(true);
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -93,6 +97,7 @@ async fn run_internal(
 
     // Restore terminal - always cleanup even on error
     let cleanup_result = restore_terminal(&mut terminal);
+    crate::progress::set_silent(false);
 
     // Return the app result, but if cleanup failed and app succeeded, return cleanup error
     match (result, cleanup_result) {
@@ -122,6 +127,18 @@ async fn run_app<B: ratatui::backend::Backend>(
     mut events: EventHandler,
     mut watch_mode: Option<crate::watch::WatchMode>,
 ) -> anyhow::Result<()> {
+    // Data refreshes run in spawned tasks so a slow docker daemon can never
+    // stall rendering or input. At most one refresh is in flight, tracked by
+    // its JoinHandle: a panic surfaces as an immediate JoinError (and the
+    // next tick starts a fresh refresh), while a legitimately slow refresh
+    // simply remains the sole one.
+    let mut refresh_task: Option<tokio::task::JoinHandle<app::RefreshData>> = None;
+
+    // Background start/stop/restart outcomes (see App::spawn_action)
+    let mut action_rx = app
+        .take_action_rx()
+        .expect("action receiver taken exactly once");
+
     loop {
         // Draw UI
         terminal.draw(|f| ui::draw(f, app))?;
@@ -131,7 +148,16 @@ async fn run_app<B: ratatui::backend::Backend>(
             event = events.next() => {
                 if let Some(event) = event {
                     match event {
-                        events::Event::Tick => app.on_tick().await?,
+                        events::Event::Tick => {
+                            app.on_tick();
+                            if refresh_task.is_none() {
+                                let orchestrator = app.orchestrator();
+                                let target = app.refresh_target();
+                                refresh_task = Some(tokio::spawn(async move {
+                                    app::gather_refresh_data(orchestrator, target).await
+                                }));
+                            }
+                        }
                         events::Event::Key(key) => {
                             if !app.handle_key(key).await? {
                                 break; // User quit
@@ -148,6 +174,18 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
                     }
                 }
+            }
+            result = async { refresh_task.as_mut().expect("guarded by is_some").await },
+                if refresh_task.is_some() =>
+            {
+                refresh_task = None;
+                match result {
+                    Ok(data) => app.apply_refresh(data),
+                    Err(e) => tracing::error!("TUI refresh task failed: {}", e),
+                }
+            }
+            Some(outcome) = action_rx.recv() => {
+                app.apply_action_outcome(outcome);
             }
             file_event = async {
                 if let Some(ref mut wm) = watch_mode {
@@ -169,6 +207,24 @@ async fn run_app<B: ratatui::backend::Backend>(
 
     // Clean up event handler task
     events.shutdown();
+
+    // Don't abandon a half-done stop/start: give in-flight background
+    // actions a bounded window to finish before the runtime shuts down.
+    if app.has_pending_actions() {
+        app.set_status(
+            "Waiting for pending service operations to finish…",
+            app::StatusLevel::Info,
+            60,
+        );
+        terminal.draw(|f| ui::draw(f, app))?;
+        let leftover = app.drain_actions(std::time::Duration::from_secs(30)).await;
+        if leftover > 0 {
+            tracing::warn!(
+                "Quit with {} service operation(s) still running after 30s",
+                leftover
+            );
+        }
+    }
 
     Ok(())
 }

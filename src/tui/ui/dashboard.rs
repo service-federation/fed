@@ -121,11 +121,12 @@ fn draw_services_list(f: &mut Frame, app: &App, area: Rect) {
 fn draw_log_panel(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
 
-    // Collect last 6 log lines across all services
+    // Only the newest lines per service can make the cut, so cap the
+    // candidate set instead of sorting every buffered line each frame
     let mut all_logs: Vec<_> = app
         .log_buffers
         .values()
-        .flat_map(|buffer| buffer.iter())
+        .flat_map(|buffer| buffer.iter().rev().take(6))
         .collect();
 
     // Sort by timestamp

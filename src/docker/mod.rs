@@ -50,22 +50,33 @@ fn elapsed_nanos() -> u64 {
 /// If the daemon is down, individual container checks will fail even for
 /// healthy containers - we should not trigger restarts in this case.
 pub async fn is_daemon_healthy() -> bool {
-    // Check cache first
-    let last_checked = DAEMON_HEALTH_CHECKED_AT.load(Ordering::Relaxed);
-    let now = elapsed_nanos();
-    let cache_valid = last_checked > 0
-        && now.saturating_sub(last_checked) < DAEMON_HEALTH_CACHE_DURATION.as_nanos() as u64;
-
-    if cache_valid {
-        return DAEMON_HEALTHY.load(Ordering::Relaxed);
+    fn cache_lookup() -> Option<bool> {
+        let last_checked = DAEMON_HEALTH_CHECKED_AT.load(Ordering::Relaxed);
+        let now = elapsed_nanos();
+        let cache_valid = last_checked > 0
+            && now.saturating_sub(last_checked) < DAEMON_HEALTH_CACHE_DURATION.as_nanos() as u64;
+        cache_valid.then(|| DAEMON_HEALTHY.load(Ordering::Relaxed))
     }
 
-    // Cache expired or never set - perform actual check
+    if let Some(cached) = cache_lookup() {
+        return cached;
+    }
+
+    // Single-flight the probe: concurrent health checks (all services at
+    // once) must not each spawn `docker info` when the cache expires.
+    static PROBE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _gate = PROBE_GATE.lock().await;
+
+    // Someone else may have refreshed the cache while we waited
+    if let Some(cached) = cache_lookup() {
+        return cached;
+    }
+
     let healthy = check_daemon_health_uncached().await;
 
     // Update cache
     DAEMON_HEALTHY.store(healthy, Ordering::Relaxed);
-    DAEMON_HEALTH_CHECKED_AT.store(now, Ordering::Relaxed);
+    DAEMON_HEALTH_CHECKED_AT.store(elapsed_nanos(), Ordering::Relaxed);
 
     healthy
 }

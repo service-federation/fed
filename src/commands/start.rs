@@ -15,6 +15,7 @@ pub struct StartOptions<'a> {
     pub watch: bool,
     pub replace: bool,
     pub dry_run: bool,
+    pub parallel: bool,
     pub config_path: &'a std::path::Path,
     /// Threaded to `spawn_if_needed` so a spawned `fed supervise` sees the
     /// same `--offline`/`--profile` session settings as this invocation
@@ -34,6 +35,7 @@ pub async fn run_start(
         watch,
         replace,
         dry_run,
+        parallel,
         config_path,
         offline,
         profiles,
@@ -217,10 +219,49 @@ pub async fn run_start(
         startup_abort_clone.store(true, Ordering::SeqCst);
     });
 
+    // Full startup plan: dependencies first, then targets, deduplicated,
+    // in dependency order.
+    let mut plan: Vec<String> = Vec::new();
+    {
+        let dep_graph = orchestrator.get_dependency_graph();
+        for service in &services_to_start {
+            for dep in dep_graph.get_dependencies(service) {
+                if !plan.contains(&dep) {
+                    plan.push(dep);
+                }
+            }
+            if !plan.contains(service) {
+                plan.push(service.clone());
+            }
+        }
+    }
+    let name_width = plan.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+
     // Track which services we've already started (to avoid duplicate messages)
     let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let startup_timer = std::time::Instant::now();
 
-    for service in &services_to_start {
+    // Group the plan into dependency levels. With --parallel, services in
+    // the same level start concurrently; otherwise one at a time.
+    let groups: Vec<Vec<String>> = if parallel {
+        match parallel_groups_for_plan(orchestrator.get_dependency_graph(), &plan) {
+            Ok(groups) => groups,
+            Err(FedError::ServiceNotFound(missing)) => {
+                return Err(unknown_service_error(config, &missing));
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Cannot compute parallel start order: {}",
+                    e
+                ));
+            }
+        }
+    } else {
+        plan.iter().map(|name| vec![name.clone()]).collect()
+    };
+
+    for group in &groups {
         // Check if user aborted during startup
         if startup_abort.load(Ordering::SeqCst) {
             out.status("\n\nStartup aborted. Cleaning up...");
@@ -229,69 +270,76 @@ pub async fn run_start(
             return Ok(());
         }
 
-        // Get dependencies for this service
-        let deps = orchestrator
-            .get_dependency_graph()
-            .get_dependencies(service);
-
-        // Start dependencies first (show progress)
-        for dep in &deps {
-            if !started.contains(dep) {
-                out.progress(&format!("  {} (dependency)...", dep));
-                match orchestrator.start(dep).await {
-                    Ok(_) => {
-                        out.finish_progress(" ready");
-                        started.insert(dep.clone());
-                    }
-                    Err(e) => {
-                        // The progress line above names the failing dependency;
-                        // main prints the error itself (once, with hints).
-                        out.error(" failed");
-                        orchestrator.cleanup().await;
-                        return Err(e.into());
-                    }
+        let group: Vec<&String> = group.iter().filter(|s| !started.contains(*s)).collect();
+        let result = if group.len() == 1 {
+            let service = group[0];
+            let outcome =
+                start_one_service(orchestrator, config, service, name_width, true, out).await;
+            outcome.map(|w| {
+                started.insert(service.clone());
+                if let Some(w) = w {
+                    warnings.push(w);
                 }
-            }
-        }
-
-        // Start the main service
-        if !started.contains(service) {
-            out.progress(&format!("  {}...", service));
-            match orchestrator.start(service).await {
-                Ok(_) => {
-                    out.finish_progress(" ready");
-                    started.insert(service.clone());
-                }
-                Err(e) => {
-                    out.error(" failed");
-                    orchestrator.cleanup().await;
-
-                    // Unknown service: build one rich error (did-you-mean + service
-                    // list) and let main print it once.
-                    if matches!(e, FedError::ServiceNotFound(_)) {
-                        let mut msg = super::suggest::with_did_you_mean(
-                            &format!("Service '{}' not found.", service),
-                            service,
-                            config.services.keys().map(String::as_str),
-                        );
-                        if !config.services.is_empty() {
-                            msg.push_str("\n\nAvailable services:");
-                            let mut names: Vec<_> = config.services.keys().collect();
-                            names.sort();
-                            for name in names {
-                                msg.push_str(&format!("\n  - {}", name));
-                            }
+            })
+        } else {
+            let starts = group.iter().map(|service| {
+                start_one_service(orchestrator, config, service, name_width, false, out)
+            });
+            let mut first_err = None;
+            for (service, outcome) in group.iter().zip(futures::future::join_all(starts).await) {
+                match outcome {
+                    Ok(w) => {
+                        started.insert((*service).clone());
+                        if let Some(w) = w {
+                            warnings.push(w);
                         }
-                        return Err(anyhow::anyhow!(msg));
                     }
-
-                    return Err(e.into());
+                    Err(e) => first_err = first_err.or(Some(e)),
                 }
             }
+            match first_err {
+                None => Ok(()),
+                Some(e) => Err(e),
+            }
+        };
+
+        if let Err(e) = result {
+            orchestrator.cleanup().await;
+
+            // Unknown service: build one rich error (did-you-mean + service
+            // list) and let main print it once.
+            if let FedError::ServiceNotFound(ref missing) = e {
+                return Err(unknown_service_error(config, missing));
+            }
+
+            return Err(e.into());
         }
     }
 
-    out.success("\nAll services started successfully!");
+    let elapsed = fmt_duration(startup_timer.elapsed());
+    if warnings.is_empty() {
+        out.success(&format!(
+            "\nAll {} services started in {}",
+            started.len(),
+            elapsed
+        ));
+    } else {
+        let warning_word = if warnings.len() == 1 {
+            "warning"
+        } else {
+            "warnings"
+        };
+        out.status(&format!(
+            "\nStarted {} services in {} — {} {}:",
+            started.len(),
+            elapsed,
+            warnings.len(),
+            warning_word
+        ));
+        for warning in &warnings {
+            out.warning(&format!("  ⚠ {}", warning));
+        }
+    }
 
     // Print startup messages from the resolved config (templates substituted)
     print_startup_messages(orchestrator.get_config(), &started, out);
@@ -309,7 +357,9 @@ pub async fn run_start(
     let mut port_conflicts: Vec<(String, u16, String, Option<u32>)> = Vec::new();
     let has_failing = status.values().any(|s| *s == Status::Failing);
 
-    for (name, stat) in &status {
+    let mut status_entries: Vec<(&String, &Status)> = status.iter().collect();
+    status_entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, stat) in status_entries {
         let status_str = match stat {
             Status::Running => "Running",
             Status::Healthy => "Healthy",
@@ -493,6 +543,168 @@ pub async fn run_start(
     }
 
     Ok(())
+}
+
+/// Group `plan` into dependency levels using the graph's parallel groups.
+///
+/// Every plan entry must land in a group: a requested service the graph
+/// doesn't know would otherwise be silently dropped by the filtering and
+/// never started (while the command still reports success). Such names
+/// return `ServiceNotFound` instead.
+fn parallel_groups_for_plan(
+    graph: &fed::dependency::Graph,
+    plan: &[String],
+) -> Result<Vec<Vec<String>>, FedError> {
+    let mut groups = graph.get_parallel_groups()?;
+    for group in &mut groups {
+        group.retain(|name| plan.iter().any(|p| p == name));
+        group.sort();
+    }
+    groups.retain(|g| !g.is_empty());
+
+    let grouped: std::collections::HashSet<&String> = groups.iter().flatten().collect();
+    for name in plan {
+        if !grouped.contains(name) {
+            return Err(FedError::ServiceNotFound(name.clone()));
+        }
+    }
+    Ok(groups)
+}
+
+/// Rich unknown-service error: did-you-mean plus the configured service list.
+fn unknown_service_error(config: &Config, missing: &str) -> anyhow::Error {
+    let mut msg = super::suggest::with_did_you_mean(
+        &format!("Service '{}' not found.", missing),
+        missing,
+        config.services.keys().map(String::as_str),
+    );
+    if !config.services.is_empty() {
+        msg.push_str("\n\nAvailable services:");
+        let mut names: Vec<_> = config.services.keys().collect();
+        names.sort();
+        for name in names {
+            msg.push_str(&format!("\n  - {}", name));
+        }
+    }
+    anyhow::anyhow!(msg)
+}
+
+/// Human-friendly duration: "0.4s", "12.3s", "2m05s".
+fn fmt_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 60.0 {
+        format!("{:.1}s", secs)
+    } else {
+        format!("{}m{:02}s", d.as_secs() / 60, d.as_secs() % 60)
+    }
+}
+
+/// Start one service and print a single outcome line for it.
+///
+/// With `inline_progress`, an in-place "starting" line is drawn first and
+/// replaced by the outcome (sequential mode); without it, only the outcome
+/// line is printed when done (parallel groups, where several services share
+/// the terminal).
+///
+/// Returns `Ok(Some(warning))` when the service started but deserves a
+/// warning in the summary (e.g. healthcheck timed out).
+async fn start_one_service(
+    orchestrator: &Orchestrator,
+    config: &Config,
+    name: &str,
+    name_width: usize,
+    inline_progress: bool,
+    out: &dyn UserOutput,
+) -> Result<Option<String>, FedError> {
+    let timer = std::time::Instant::now();
+    if inline_progress {
+        out.progress(&format!(
+            "  ⋯ {:<width$}  starting",
+            name,
+            width = name_width
+        ));
+    }
+
+    match orchestrator.start(name).await {
+        Ok(_) => {
+            let elapsed = fmt_duration(timer.elapsed());
+            // Healthcheck results are recorded in the state tracker (the
+            // manager's in-memory status stays Running), so read the tracker
+            // first and fall back to the live manager status.
+            let status = {
+                let tracked = {
+                    let tracker = orchestrator.state_tracker.read().await;
+                    tracker.get_service(name).await.map(|s| s.status)
+                };
+                match tracked {
+                    Some(status) => Some(status),
+                    None => orchestrator.get_service(name).await,
+                }
+            };
+            let has_healthcheck = config
+                .services
+                .get(name)
+                .map(|s| s.healthcheck.is_some())
+                .unwrap_or(false);
+
+            let (line, warning) = match status {
+                Some(Status::Healthy) => (
+                    format!("  ✓ {:<w$}  healthy in {}", name, elapsed, w = name_width),
+                    None,
+                ),
+                Some(Status::Completed) => (
+                    format!("  ✓ {:<w$}  completed in {}", name, elapsed, w = name_width),
+                    None,
+                ),
+                Some(Status::Running) if has_healthcheck => (
+                    format!(
+                        "  ⚠ {:<w$}  started, but not healthy after {}",
+                        name,
+                        elapsed,
+                        w = name_width
+                    ),
+                    Some(format!(
+                        "'{}' has not passed its healthcheck — see 'fed logs {}'",
+                        name, name
+                    )),
+                ),
+                Some(Status::Running) => (
+                    format!("  ✓ {:<w$}  running ({})", name, elapsed, w = name_width),
+                    None,
+                ),
+                Some(other) => (
+                    format!(
+                        "  ⚠ {:<w$}  {} after {}",
+                        name,
+                        other,
+                        elapsed,
+                        w = name_width
+                    ),
+                    Some(format!("'{}' is {} after startup", name, other)),
+                ),
+                None => (
+                    format!("  ✓ {:<w$}  started ({})", name, elapsed, w = name_width),
+                    None,
+                ),
+            };
+
+            if inline_progress {
+                out.finish_progress_with(&line);
+            } else {
+                out.status(&line);
+            }
+            Ok(warning)
+        }
+        Err(e) => {
+            let line = format!("  ✗ {:<w$}  failed", name, w = name_width);
+            if inline_progress {
+                out.finish_progress_with(&line);
+            } else {
+                out.error(&line);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Print startup messages from services in a Unicode box.
@@ -1209,5 +1421,47 @@ mod tests {
         assert_eq!(mask_sensitive_value("PASSWORD", "pass"), "***");
         assert_eq!(mask_sensitive_value("Password", "pass"), "***");
         assert_eq!(mask_sensitive_value("PaSsWoRd", "pass"), "***");
+    }
+
+    fn test_graph() -> fed::dependency::Graph {
+        // a ── b ── d,  c independent
+        let mut graph = fed::dependency::Graph::new();
+        graph.add_node("a".to_string());
+        graph.add_node("b".to_string());
+        graph.add_node("c".to_string());
+        graph.add_node("d".to_string());
+        graph.add_edge("b".to_string(), "a".to_string());
+        graph.add_edge("d".to_string(), "b".to_string());
+        graph
+    }
+
+    #[test]
+    fn parallel_groups_cover_the_plan_in_dependency_order() {
+        let graph = test_graph();
+        let plan = vec!["a".to_string(), "b".to_string(), "d".to_string()];
+        let groups = parallel_groups_for_plan(&graph, &plan).unwrap();
+
+        // c is outside the plan and must be filtered out; levels stay ordered
+        assert_eq!(groups, vec![vec!["a"], vec!["b"], vec!["d"]]);
+    }
+
+    #[test]
+    fn parallel_groups_keep_independent_services_in_one_level() {
+        let graph = test_graph();
+        let plan = vec!["a".to_string(), "c".to_string()];
+        let groups = parallel_groups_for_plan(&graph, &plan).unwrap();
+        assert_eq!(groups, vec![vec!["a", "c"]]);
+    }
+
+    #[test]
+    fn parallel_groups_reject_unknown_services() {
+        // A service missing from the graph must fail loudly, not be
+        // silently dropped from the filtered groups.
+        let graph = test_graph();
+        let plan = vec!["a".to_string(), "typo".to_string()];
+        match parallel_groups_for_plan(&graph, &plan) {
+            Err(FedError::ServiceNotFound(name)) => assert_eq!(name, "typo"),
+            other => panic!("expected ServiceNotFound, got {:?}", other.map(|_| ())),
+        }
     }
 }

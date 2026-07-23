@@ -562,6 +562,7 @@ async fn run() -> anyhow::Result<()> {
             output: _,
             dry_run,
             isolate: _,
+            parallel,
         } => {
             commands::run_start(
                 &mut orchestrator,
@@ -571,6 +572,7 @@ async fn run() -> anyhow::Result<()> {
                     watch,
                     replace,
                     dry_run,
+                    parallel,
                     config_path: &config_path,
                     offline: cli.offline,
                     profiles: cli.profile.clone(),

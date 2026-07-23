@@ -69,6 +69,118 @@ impl<'a> ServiceLifecycleCommands<'a> {
         )
     }
 
+    /// Run a hook shell command (`install:`/`migrate:`/`build:`/`clean:`),
+    /// streaming its output through the progress coordinator: dimmed and
+    /// prefixed with the service name, so pnpm/prisma noise reads as
+    /// subordinate to fed's own startup lines instead of drowning them.
+    ///
+    /// Hooks are non-interactive by contract: stdout/stderr are pipes (not
+    /// TTYs) and partial lines are only flushed on newline, so a program
+    /// that prompts (`Continue? [y/n]`) will appear to hang. Tools that
+    /// gate prompts on a TTY (pnpm, npm, prisma) degrade gracefully;
+    /// anything genuinely interactive should run outside fed hooks.
+    ///
+    /// Returns the exit status plus the last lines of combined output so
+    /// callers can attach real context to a failure (the live stream may be
+    /// silenced, e.g. under the TUI).
+    async fn run_streamed_hook(
+        &self,
+        service_name: &str,
+        kind: &str,
+        cmd: &str,
+        cwd: std::path::PathBuf,
+        env_vars: &std::collections::HashMap<String, String>,
+    ) -> Result<(std::process::ExitStatus, Vec<String>)> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        const TAIL_LINES: usize = 15;
+
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-ec")
+            .arg(cmd)
+            .current_dir(cwd)
+            .envs(env_vars)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                Error::Process(format!(
+                    "Failed to execute {} command for '{}': {}",
+                    kind, service_name, e
+                ))
+            })?;
+
+        let tail = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::<String>::with_capacity(TAIL_LINES),
+        ));
+        let mut readers = Vec::new();
+
+        if let Some(stdout) = child.stdout.take() {
+            let service = service_name.to_string();
+            let tail = tail.clone();
+            readers.push(tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    crate::progress::hook_output_line(&service, &line);
+                    let mut t = tail.lock().unwrap();
+                    if t.len() == TAIL_LINES {
+                        t.pop_front();
+                    }
+                    t.push_back(line);
+                }
+            }));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            let service = service_name.to_string();
+            let tail = tail.clone();
+            readers.push(tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    crate::progress::hook_output_line(&service, &line);
+                    let mut t = tail.lock().unwrap();
+                    if t.len() == TAIL_LINES {
+                        t.pop_front();
+                    }
+                    t.push_back(line);
+                }
+            }));
+        }
+
+        let status = child.wait().await.map_err(|e| {
+            Error::Process(format!(
+                "Failed to wait for {} command for '{}': {}",
+                kind, service_name, e
+            ))
+        })?;
+
+        // Drain remaining output before reporting
+        for reader in readers {
+            let _ = reader.await;
+        }
+
+        let tail_lines: Vec<String> = tail.lock().unwrap().iter().cloned().collect();
+        Ok((status, tail_lines))
+    }
+
+    /// Build a hook failure error that carries the tail of the command output.
+    fn hook_failure(service_name: &str, kind: &str, tail: &[String]) -> Error {
+        if tail.is_empty() {
+            Error::Process(format!(
+                "{} command failed for '{}'",
+                capitalize(kind),
+                service_name
+            ))
+        } else {
+            Error::Process(format!(
+                "{} command failed for '{}'. Last output:\n  {}",
+                capitalize(kind),
+                service_name,
+                tail.join("\n  ")
+            ))
+        }
+    }
+
     /// Force run install command for a service (clears install state first).
     ///
     /// This method will:
@@ -164,29 +276,13 @@ impl<'a> ServiceLifecycleCommands<'a> {
             env_vars.insert(key.clone(), value.clone());
         }
 
-        // Run the install command with streaming output
-        let status = tokio::process::Command::new("sh")
-            .arg("-ec")
-            .arg(install_cmd)
-            .current_dir(cwd)
-            .envs(&env_vars)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .await
-            .map_err(|e| {
-                Error::Process(format!(
-                    "Failed to execute install command for '{}': {}",
-                    service_name, e
-                ))
-            })?;
+        // Run the install command with streaming (prefixed, dimmed) output
+        let (status, tail) = self
+            .run_streamed_hook(service_name, "install", install_cmd, cwd, &env_vars)
+            .await?;
 
         if !status.success() {
-            return Err(Error::Process(format!(
-                "Install command failed for '{}'",
-                service_name
-            )));
+            return Err(Self::hook_failure(service_name, "install", &tail));
         }
 
         // Mark as installed
@@ -250,28 +346,12 @@ impl<'a> ServiceLifecycleCommands<'a> {
             env_vars.insert(key.clone(), value.clone());
         }
 
-        let status = tokio::process::Command::new("sh")
-            .arg("-ec")
-            .arg(migrate_cmd)
-            .current_dir(cwd)
-            .envs(&env_vars)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .await
-            .map_err(|e| {
-                Error::Process(format!(
-                    "Failed to execute migrate command for '{}': {}",
-                    service_name, e
-                ))
-            })?;
+        let (status, tail) = self
+            .run_streamed_hook(service_name, "migrate", migrate_cmd, cwd, &env_vars)
+            .await?;
 
         if !status.success() {
-            return Err(Error::Process(format!(
-                "Migrate command failed for '{}'",
-                service_name
-            )));
+            return Err(Self::hook_failure(service_name, "migrate", &tail));
         }
 
         tracing::info!(
@@ -353,28 +433,12 @@ impl<'a> ServiceLifecycleCommands<'a> {
                     cmd
                 );
 
-                let status = tokio::process::Command::new("sh")
-                    .arg("-ec")
-                    .arg(cmd)
-                    .current_dir(&cwd)
-                    .envs(&env_vars)
-                    .stdin(Stdio::inherit())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .status()
-                    .await
-                    .map_err(|e| {
-                        Error::Process(format!(
-                            "Failed to execute build command for '{}': {}",
-                            service_name, e
-                        ))
-                    })?;
+                let (status, tail) = self
+                    .run_streamed_hook(service_name, "build", cmd, cwd.clone(), &env_vars)
+                    .await?;
 
                 if !status.success() {
-                    return Err(Error::Process(format!(
-                        "Build command failed for '{}'",
-                        service_name
-                    )));
+                    return Err(Self::hook_failure(service_name, "build", &tail));
                 }
             }
             BuildConfig::DockerBuild(docker_config) => {
@@ -529,29 +593,13 @@ impl<'a> ServiceLifecycleCommands<'a> {
                 env_vars.insert(key.clone(), value.clone());
             }
 
-            // Run the clean command with streaming output
-            let status = tokio::process::Command::new("sh")
-                .arg("-ec")
-                .arg(clean_cmd)
-                .current_dir(cwd)
-                .envs(&env_vars)
-                .stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()
-                .await
-                .map_err(|e| {
-                    Error::Process(format!(
-                        "Failed to execute clean command for '{}': {}",
-                        service_name, e
-                    ))
-                })?;
+            // Run the clean command with streaming (prefixed, dimmed) output
+            let (status, tail) = self
+                .run_streamed_hook(service_name, "clean", clean_cmd, cwd, &env_vars)
+                .await?;
 
             if !status.success() {
-                return Err(Error::Process(format!(
-                    "Clean command failed for '{}'",
-                    service_name
-                )));
+                return Err(Self::hook_failure(service_name, "clean", &tail));
             }
         }
 
@@ -780,6 +828,15 @@ impl<'a> ServiceLifecycleCommands<'a> {
 
         // It's a named volume
         Some(source.to_string())
+    }
+}
+
+/// Uppercase the first ASCII character ("install" → "Install").
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
     }
 }
 
