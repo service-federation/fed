@@ -341,6 +341,10 @@ fn api_error(status: reqwest::StatusCode, context: &str) -> Error {
         401 => " — your token is invalid or revoked; run `fed login`",
         403 => " — you no longer have access; ask an org admin",
         404 => " — org or project not found; check `fed link`",
+        // The server's signal that this CLI speaks a protocol it no longer
+        // accepts (HTTP 426 Upgrade Required). Reserved for future breaking
+        // changes to the login/API contract.
+        426 => " — this version of fed is too old for the server; upgrade fed and try again",
         429 => " — rate limited; try again in a minute",
         _ => "",
     };
@@ -547,6 +551,11 @@ pub async fn activate_token(creds: &Credentials) -> Activation {
             },
             // Dead token: no retry will resurrect it.
             Ok(res) if res.status().as_u16() == 401 => return Activation::Dead,
+            // Upgrade Required is just as terminal — retrying the same
+            // protocol version cannot succeed.
+            Ok(res) if res.status().as_u16() == 426 => {
+                return Activation::Failed(api_error(res.status(), "activating login").to_string());
+            }
             Ok(res) => last = api_error(res.status(), "activating login").to_string(),
             Err(e) => last = format!("cloud: cannot reach {}: {}", creds.url, e),
         }
@@ -1256,6 +1265,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id, "fedar_stub-request-id");
+    }
+
+    /// A 426 (Upgrade Required — the server refusing this CLI's protocol
+    /// version; reserved for future breaking changes) maps to a clear
+    /// upgrade hint rather than a generic failure.
+    #[tokio::test]
+    async fn status_426_maps_to_upgrade_hint_on_login_start() {
+        let url = spawn_one_shot("426 Upgrade Required", "{\"error\":\"upgrade_fed\"}");
+        let err = create_auth_request(&url, &AuthRequestBody::manual("dev-box".to_string()))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too old") && msg.contains("upgrade fed"),
+            "426 must map to the upgrade hint: {}",
+            msg
+        );
+    }
+
+    /// The same 426 mapping applies at code exchange.
+    #[tokio::test]
+    async fn status_426_maps_to_upgrade_hint_on_exchange() {
+        let url = spawn_one_shot("426 Upgrade Required", "{\"error\":\"upgrade_fed\"}");
+        let err = exchange_code(&url, "fedac_stub-code").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too old") && msg.contains("upgrade fed"),
+            "426 must map to the upgrade hint: {}",
+            msg
+        );
+    }
+
+    /// Activation treats 426 as terminal — retrying the same protocol
+    /// version cannot succeed, so the bounded retry loop must not spin.
+    #[tokio::test]
+    async fn activate_426_is_terminal_failure_with_upgrade_hint() {
+        let url = spawn_one_shot("426 Upgrade Required", "{\"error\":\"upgrade_fed\"}");
+        match activate_token(&creds_at(url)).await {
+            Activation::Failed(reason) => assert!(
+                reason.contains("too old") && !reason.contains("super-secret-token"),
+                "426 activation failure must carry the upgrade hint and no token: {}",
+                reason
+            ),
+            _ => panic!("426 must be a terminal activation failure"),
+        }
     }
 
     /// A 201 from the token endpoint yields the bearer token.
