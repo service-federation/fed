@@ -191,9 +191,17 @@ pub enum Commands {
 
     /// Sign in to Service Federation Cloud
     Login {
-        /// Print the URL and paste the token manually (for SSH sessions)
+        /// Print the sign-in URL and paste the one-time code manually (for SSH sessions)
         #[arg(long)]
         no_browser: bool,
+        /// Always print the sign-in URL (hidden by default when the browser opens)
+        #[arg(long)]
+        print_url: bool,
+        /// Label identifying this device on the authorization page and in the
+        /// token list (defaults to this machine's hostname). Sent in the
+        /// request body, never in a URL.
+        #[arg(long)]
+        label: Option<String>,
         /// Cloud URL override (defaults to https://app.service-federation.com)
         #[arg(long, hide = true)]
         url: Option<String>,

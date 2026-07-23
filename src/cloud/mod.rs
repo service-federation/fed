@@ -102,6 +102,128 @@ pub fn delete_credentials() -> Result<bool> {
     }
 }
 
+// ── Staged credential promotion (login) ───────────────────────────────
+
+/// The on-disk credential pair: the ACTIVE file (`~/.fed/credentials`) and
+/// its staging sibling (`credentials.pending`).
+///
+/// `fed login` writes the freshly-exchanged token — still provisional — to
+/// the pending file first, and renames it over the active file only after
+/// the server confirms activation (durability). The previous working
+/// credential is therefore never destroyed by a login that ultimately
+/// fails, and a crash between activation and promotion is recoverable from
+/// the pending file on the next `fed login`.
+pub struct CredentialFiles {
+    active: PathBuf,
+    pending: PathBuf,
+    lock: PathBuf,
+}
+
+/// Cross-process guard for the login sequence, backed by an advisory
+/// `flock`/`LockFileEx` on `login.lock` beside the credentials (via `fs2`,
+/// the same mechanism as the supervisor lock). Released on drop — and by the
+/// OS if the process dies, so a crashed login never wedges future ones.
+#[derive(Debug)]
+pub struct LoginLock {
+    file: std::fs::File,
+}
+
+impl Drop for LoginLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+impl CredentialFiles {
+    /// The real `~/.fed` locations; `None` when no home dir is available.
+    pub fn default_paths() -> Option<Self> {
+        Some(Self::for_active(credentials_path()?))
+    }
+
+    /// Rooted at `dir` (`dir/credentials` + `dir/credentials.pending` +
+    /// `dir/login.lock`) — lets tests exercise the real file behavior
+    /// against a temp dir.
+    pub fn in_dir(dir: &Path) -> Self {
+        Self::for_active(dir.join("credentials"))
+    }
+
+    fn for_active(active: PathBuf) -> Self {
+        let pending = active.with_extension("pending");
+        let lock = active
+            .parent()
+            .map(|p| p.join("login.lock"))
+            .unwrap_or_else(|| active.with_extension("lock"));
+        Self {
+            active,
+            pending,
+            lock,
+        }
+    }
+
+    /// Try to take the cross-process login lock. `Ok(None)` means another
+    /// process holds it right now — concurrent logins would race on the
+    /// single pending file (one login promoting the other's token and
+    /// stranding its own), so the caller should fail fast, not queue.
+    /// Never blocks.
+    pub fn try_lock_login(&self) -> Result<Option<LoginLock>> {
+        if let Some(parent) = self.lock.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Filesystem(format!("creating {}: {}", parent.display(), e)))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.lock)
+            .map_err(|e| Error::Filesystem(format!("opening {}: {}", self.lock.display(), e)))?;
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(Some(LoginLock { file })),
+            // Any lock failure means a live holder (the supervisor-lock
+            // pattern): report contended rather than hard-failing.
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Stage a (provisional) credential. Same atomic 0600 writer as the
+    /// active file; the active file is untouched.
+    pub fn save_pending_credentials(&self, creds: &Credentials) -> Result<()> {
+        save_credentials_to(&self.pending, creds)
+    }
+
+    pub fn load_pending_credentials(&self) -> Option<Credentials> {
+        load_credentials_from(&self.pending)
+    }
+
+    /// Promote the pending credential over the active one — a single atomic
+    /// rename, so there is never a moment without a valid credentials file
+    /// and the 0600 mode carries over.
+    pub fn promote_pending_credentials(&self) -> Result<()> {
+        std::fs::rename(&self.pending, &self.active).map_err(|e| {
+            Error::Filesystem(format!(
+                "promoting {} to {}: {}",
+                self.pending.display(),
+                self.active.display(),
+                e
+            ))
+        })
+    }
+
+    /// Remove the staging file (e.g. after a failed activation). Returns
+    /// whether a file was actually removed.
+    pub fn delete_pending_credentials(&self) -> Result<bool> {
+        match std::fs::remove_file(&self.pending) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(Error::Filesystem(format!(
+                "removing {}: {}",
+                self.pending.display(),
+                e
+            ))),
+        }
+    }
+}
+
 // ── Project link (.fed/cloud.yaml, committed) ────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +341,10 @@ fn api_error(status: reqwest::StatusCode, context: &str) -> Error {
         401 => " — your token is invalid or revoked; run `fed login`",
         403 => " — you no longer have access; ask an org admin",
         404 => " — org or project not found; check `fed link`",
+        // The server's signal that this CLI speaks a protocol it no longer
+        // accepts (HTTP 426 Upgrade Required). Reserved for future breaking
+        // changes to the login/API contract.
+        426 => " — this version of fed is too old for the server; upgrade fed and try again",
         429 => " — rate limited; try again in a minute",
         _ => "",
     };
@@ -257,6 +383,184 @@ pub async fn whoami(creds: &Credentials) -> Result<Me> {
     res.json()
         .await
         .map_err(|e| Error::Validation(format!("cloud: bad whoami response: {}", e)))
+}
+
+// ── Login: authorization request + code exchange ──────────────────────
+//
+// `fed login` never receives the bearer token through the browser. The CLI
+// first registers an AUTHORIZATION REQUEST server-side; the browser URL
+// carries only that request's opaque id — an unguessable handle, not a
+// credential: approval still requires an authenticated browser session plus
+// an explicit click. Approval yields a short-lived, single-use EXCHANGE CODE
+// (hashed at rest server-side), which the CLI redeems for the bearer token
+// over HTTPS via `POST /api/v1/cli/token`. The token therefore never appears
+// in a URL, browser page, redirect, log line, or terminal output.
+
+/// Body for `POST /api/v1/cli/authorize-request`. Built via [`Self::browser`]
+/// or [`Self::manual`] so the two shapes the server accepts (`{port, state,
+/// label}` and `{manual: true, label}`) cannot be mixed. The device label
+/// travels only in this POST body over HTTPS — never in a URL.
+#[derive(Serialize)]
+pub struct AuthRequestBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manual: Option<bool>,
+    label: String,
+}
+
+impl AuthRequestBody {
+    /// Browser mode: the server will redirect the approving browser to the
+    /// CLI's loopback listener on `port`, echoing `state` (CSRF/correlation
+    /// defense in depth between the CLI and its own callback — not a bearer
+    /// credential).
+    pub fn browser(port: u16, state: String, label: String) -> Self {
+        Self {
+            port: Some(port),
+            state: Some(state),
+            manual: None,
+            label,
+        }
+    }
+
+    /// Manual (`--no-browser`) mode: the approval page displays the exchange
+    /// code for copy-paste instead of redirecting to a loopback port.
+    pub fn manual(label: String) -> Self {
+        Self {
+            port: None,
+            state: None,
+            manual: Some(true),
+            label,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AuthRequestResponse {
+    request: String,
+}
+
+/// Create a server-side authorization request and return its opaque id — the
+/// only thing that may ever appear in the authorize URL.
+pub async fn create_auth_request(base_url: &str, body: &AuthRequestBody) -> Result<String> {
+    let res = client()
+        .post(format!("{}/api/v1/cli/authorize-request", base_url))
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", base_url, e)))?;
+    if !res.status().is_success() {
+        return Err(api_error(res.status(), "starting login"));
+    }
+    let body: AuthRequestResponse = res
+        .json()
+        .await
+        .map_err(|e| Error::Validation(format!("cloud: bad authorize-request response: {}", e)))?;
+    Ok(body.request)
+}
+
+#[derive(Serialize)]
+struct ExchangeCodeBody<'a> {
+    code: &'a str,
+}
+
+#[derive(Deserialize)]
+struct ExchangeCodeResponse {
+    token: String,
+}
+
+/// Redeem a single-use exchange code for the bearer token via
+/// `POST /api/v1/cli/token`.
+///
+/// Security invariant: the code never appears in any error message. The
+/// server's 400 covers invalid, expired, and already-used codes alike, and
+/// maps to one fixed, friendly message here.
+pub async fn exchange_code(base_url: &str, code: &str) -> Result<String> {
+    let res = client()
+        .post(format!("{}/api/v1/cli/token", base_url))
+        .json(&ExchangeCodeBody { code })
+        .send()
+        .await
+        .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", base_url, e)))?;
+    if res.status().as_u16() == 400 {
+        return Err(Error::Validation(
+            "the sign-in link expired or was already used — run `fed login` again".to_string(),
+        ));
+    }
+    if !res.status().is_success() {
+        return Err(api_error(res.status(), "completing login"));
+    }
+    let body: ExchangeCodeResponse = res
+        .json()
+        .await
+        .map_err(|e| Error::Validation(format!("cloud: bad token response: {}", e)))?;
+    Ok(body.token)
+}
+
+/// Outcome of asking the server to activate a freshly-exchanged token.
+pub enum Activation {
+    /// A 200 with a parsed `{"activated": bool}` body — the token is durable
+    /// (`true`: activated just now; `false`: already activated — idempotent
+    /// retry). Only a parsed 200 proves the activation endpoint ran.
+    Activated,
+    /// 401 — the token is dead; no retry can resurrect it.
+    Dead,
+    /// Activation could not be confirmed (network, 5xx, 429, or an
+    /// unparseable 200 body) after the bounded retries. Carries a short
+    /// reason — never the token.
+    Failed(String),
+}
+
+#[derive(Deserialize)]
+struct ActivateResponse {
+    activated: bool,
+}
+
+/// Activate a freshly-exchanged token via `POST /api/v1/cli/activate`.
+///
+/// The server mints exchange tokens PROVISIONAL (10-minute expiry); this
+/// authenticated call extends the presented token to its full lifetime
+/// exactly once. Because this call is what makes a login durable, transient
+/// failures get a small bounded retry, and success FAILS CLOSED: a 200 whose
+/// body is not `{"activated": bool}` (endpoint misrouting, interposed proxy)
+/// is a failure, not a success. A stranded provisional token simply
+/// self-expires — no orphaned one-year credential is ever left behind.
+pub async fn activate_token(creds: &Credentials) -> Activation {
+    let mut last = String::new();
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(250 * u64::from(attempt))).await;
+        }
+        let res = client()
+            .post(format!("{}/api/v1/cli/activate", creds.url))
+            .bearer_auth(&creds.token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await;
+        match res {
+            Ok(res) if res.status().is_success() => match res.json::<ActivateResponse>().await {
+                Ok(body) => {
+                    // true = first activation, false = already durable —
+                    // either way the token is now long-lived.
+                    let _ = body.activated;
+                    return Activation::Activated;
+                }
+                Err(e) => last = format!("cloud: bad activate response: {}", e),
+            },
+            // Dead token: no retry will resurrect it.
+            Ok(res) if res.status().as_u16() == 401 => return Activation::Dead,
+            // Upgrade Required is just as terminal — retrying the same
+            // protocol version cannot succeed.
+            Ok(res) if res.status().as_u16() == 426 => {
+                return Activation::Failed(api_error(res.status(), "activating login").to_string());
+            }
+            Ok(res) => last = api_error(res.status(), "activating login").to_string(),
+            Err(e) => last = format!("cloud: cannot reach {}: {}", creds.url, e),
+        }
+    }
+    Activation::Failed(last)
 }
 
 #[derive(Deserialize)]
@@ -792,6 +1096,253 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "connect-refused must fail fast, took {:?}",
             start.elapsed()
+        );
+    }
+
+    /// Sequential HTTP stub: serves the given (status, body) responses one
+    /// connection at a time, in order. For exercising bounded retries.
+    fn spawn_shots(responses: &'static [(&'static str, &'static str)]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for (status_line, body) in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    /// First activation: 200 `activated:true` is durable.
+    #[tokio::test]
+    async fn activate_200_true_is_activated() {
+        let url = spawn_one_shot("200 OK", "{\"activated\":true}");
+        assert!(matches!(
+            activate_token(&creds_at(url)).await,
+            Activation::Activated
+        ));
+    }
+
+    /// Idempotent retry: 200 `activated:false` (already activated) is still
+    /// durable.
+    #[tokio::test]
+    async fn activate_200_false_is_activated() {
+        let url = spawn_one_shot("200 OK", "{\"activated\":false}");
+        assert!(matches!(
+            activate_token(&creds_at(url)).await,
+            Activation::Activated
+        ));
+    }
+
+    /// FAIL CLOSED: a 200 whose body is not `{"activated": bool}` (endpoint
+    /// misrouting) must not read as success — and the reason must not leak
+    /// the token.
+    #[tokio::test]
+    async fn activate_200_garbage_body_fails_closed() {
+        let url = spawn_shots(&[
+            ("200 OK", "<html>welcome to the marketing site</html>"),
+            ("200 OK", "<html>welcome to the marketing site</html>"),
+            ("200 OK", "<html>welcome to the marketing site</html>"),
+        ]);
+        match activate_token(&creds_at(url)).await {
+            Activation::Failed(reason) => assert!(
+                !reason.contains("super-secret-token"),
+                "reason leaked the token: {}",
+                reason
+            ),
+            _ => panic!("an unparseable 200 body must fail closed"),
+        }
+    }
+
+    /// 401 (dead token) classifies immediately — no pointless retries.
+    #[tokio::test]
+    async fn activate_401_is_dead_fast() {
+        let url = spawn_one_shot("401 Unauthorized", "{}");
+        let start = std::time::Instant::now();
+        assert!(matches!(
+            activate_token(&creds_at(url)).await,
+            Activation::Dead
+        ));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "401 must not be retried, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A transient failure (5xx) is retried and the login still becomes
+    /// durable when a later attempt succeeds.
+    #[tokio::test]
+    async fn activate_retries_transient_failure_then_succeeds() {
+        let url = spawn_shots(&[
+            ("500 Internal Server Error", "{}"),
+            ("200 OK", "{\"activated\":true}"),
+        ]);
+        assert!(matches!(
+            activate_token(&creds_at(url)).await,
+            Activation::Activated
+        ));
+    }
+
+    /// All attempts failing yields Failed (no token leak) after the bounded
+    /// number of tries.
+    #[tokio::test]
+    async fn activate_gives_up_after_bounded_retries() {
+        let url = spawn_shots(&[
+            ("500 Internal Server Error", "{}"),
+            ("500 Internal Server Error", "{}"),
+            ("500 Internal Server Error", "{}"),
+        ]);
+        match activate_token(&creds_at(url)).await {
+            Activation::Failed(reason) => assert!(
+                !reason.contains("super-secret-token"),
+                "reason leaked the token: {}",
+                reason
+            ),
+            _ => panic!("exhausted retries must classify as Failed"),
+        }
+    }
+
+    /// Staged promotion: saving a pending credential leaves the active file
+    /// untouched (and the staging file is 0600); promotion atomically
+    /// replaces the active file and removes the pending one.
+    #[test]
+    fn staged_promotion_replaces_active_and_removes_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = CredentialFiles::in_dir(dir.path());
+        let active_path = dir.path().join("credentials");
+        let pending_path = dir.path().join("credentials.pending");
+
+        save_credentials_to(&active_path, &sample_creds()).unwrap();
+        let mut rotated = sample_creds();
+        rotated.token = "rotated-token".to_string();
+        files.save_pending_credentials(&rotated).unwrap();
+
+        #[cfg(unix)]
+        assert_eq!(mode_of(&pending_path), 0o600, "pending must be 0600");
+        assert_eq!(
+            load_credentials_from(&active_path).unwrap().token,
+            "super-secret-token",
+            "staging must not touch the active credential"
+        );
+
+        files.promote_pending_credentials().unwrap();
+        assert_eq!(
+            load_credentials_from(&active_path).unwrap().token,
+            "rotated-token",
+            "promotion must install the pending credential"
+        );
+        assert!(
+            !pending_path.exists(),
+            "promotion must consume the pending file"
+        );
+        #[cfg(unix)]
+        assert_eq!(mode_of(&active_path), 0o600, "promoted file keeps 0600");
+
+        // delete_pending on nothing reports false, not an error.
+        assert!(!files.delete_pending_credentials().unwrap());
+    }
+
+    /// A 201 from the authorize-request endpoint yields the opaque request id.
+    #[tokio::test]
+    async fn create_auth_request_returns_request_id() {
+        let url = spawn_one_shot(
+            "201 Created",
+            "{\"request\":\"fedar_stub-request-id\",\"expires_in\":300}",
+        );
+        let id = create_auth_request(&url, &AuthRequestBody::manual("dev-box".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(id, "fedar_stub-request-id");
+    }
+
+    /// A 426 (Upgrade Required — the server refusing this CLI's protocol
+    /// version; reserved for future breaking changes) maps to a clear
+    /// upgrade hint rather than a generic failure.
+    #[tokio::test]
+    async fn status_426_maps_to_upgrade_hint_on_login_start() {
+        let url = spawn_one_shot("426 Upgrade Required", "{\"error\":\"upgrade_fed\"}");
+        let err = create_auth_request(&url, &AuthRequestBody::manual("dev-box".to_string()))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too old") && msg.contains("upgrade fed"),
+            "426 must map to the upgrade hint: {}",
+            msg
+        );
+    }
+
+    /// The same 426 mapping applies at code exchange.
+    #[tokio::test]
+    async fn status_426_maps_to_upgrade_hint_on_exchange() {
+        let url = spawn_one_shot("426 Upgrade Required", "{\"error\":\"upgrade_fed\"}");
+        let err = exchange_code(&url, "fedac_stub-code").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too old") && msg.contains("upgrade fed"),
+            "426 must map to the upgrade hint: {}",
+            msg
+        );
+    }
+
+    /// Activation treats 426 as terminal — retrying the same protocol
+    /// version cannot succeed, so the bounded retry loop must not spin.
+    #[tokio::test]
+    async fn activate_426_is_terminal_failure_with_upgrade_hint() {
+        let url = spawn_one_shot("426 Upgrade Required", "{\"error\":\"upgrade_fed\"}");
+        match activate_token(&creds_at(url)).await {
+            Activation::Failed(reason) => assert!(
+                reason.contains("too old") && !reason.contains("super-secret-token"),
+                "426 activation failure must carry the upgrade hint and no token: {}",
+                reason
+            ),
+            _ => panic!("426 must be a terminal activation failure"),
+        }
+    }
+
+    /// A 201 from the token endpoint yields the bearer token.
+    #[tokio::test]
+    async fn exchange_code_returns_token() {
+        let url = spawn_one_shot("201 Created", "{\"token\":\"fed_stub-bearer\"}");
+        let token = exchange_code(&url, "fedac_stub-code").await.unwrap();
+        assert_eq!(token, "fed_stub-bearer");
+    }
+
+    /// A 400 (invalid/expired/used code — the server does not distinguish)
+    /// maps to the fixed friendly message, which must NOT contain the code.
+    #[tokio::test]
+    async fn exchange_code_400_is_friendly_and_never_leaks_the_code() {
+        let url = spawn_one_shot("400 Bad Request", "{\"error\":\"code\"}");
+        let err = exchange_code(&url, "fedac_super-secret-code")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expired or was already used"),
+            "message should explain what happened: {}",
+            msg
+        );
+        assert!(
+            msg.contains("fed login"),
+            "message should say what to do: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("fedac_super-secret-code") && !msg.contains("super-secret"),
+            "error must never contain the exchange code: {}",
+            msg
         );
     }
 
