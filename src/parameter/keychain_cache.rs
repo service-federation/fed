@@ -1,10 +1,12 @@
 //! Operating-system credential-store backend for the team-vault cache.
 //!
-//! Each value is a separate credential so a project with many or unusually
-//! large secrets does not depend on one monolithic platform entry. Accounts
+//! macOS Keychain and Linux Secret Service use one item per project. In
+//! particular, macOS access control is item-scoped: one item avoids a password
+//! prompt for every individual secret after installing a new fed binary.
+//! Windows Credential Manager has a much smaller per-credential payload limit,
+//! so Windows keeps one item per secret plus a manifest for cleanup. Accounts
 //! are opaque hashes: secret names and project identifiers are not exposed in
-//! credential-store listings. A manifest records the names fed owns so a cache
-//! rewrite can remove entries deleted from the project configuration.
+//! credential-store listings.
 
 use crate::error::{Error, Result};
 use crate::parameter::secret::CacheEntry;
@@ -21,6 +23,13 @@ struct StoredEntry {
     fetched_at: Option<u64>,
 }
 
+#[cfg(not(target_os = "windows"))]
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct StoredProject {
+    entries: HashMap<String, StoredEntry>,
+}
+
+#[cfg(target_os = "windows")]
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Manifest {
     names: Vec<String>,
@@ -50,6 +59,44 @@ impl KeychainCache {
         &self,
         declared_names: &HashSet<String>,
     ) -> Result<(HashMap<String, String>, HashMap<String, u64>)> {
+        #[cfg(not(target_os = "windows"))]
+        return self.load_project(declared_names);
+
+        #[cfg(target_os = "windows")]
+        {
+            self.load_entries(declared_names)
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn load_project(
+        &self,
+        declared_names: &HashSet<String>,
+    ) -> Result<(HashMap<String, String>, HashMap<String, u64>)> {
+        let Some(payload) = read_if_present(&credential(&self.project_account())?)? else {
+            return Ok((HashMap::new(), HashMap::new()));
+        };
+        let stored: StoredProject = serde_json::from_slice(&payload)
+            .map_err(|e| Error::Validation(format!("team-vault keychain cache is corrupt: {e}")))?;
+        let mut values = HashMap::new();
+        let mut stamps = HashMap::new();
+        for (name, entry) in stored.entries {
+            if !declared_names.contains(&name) {
+                continue;
+            }
+            if let Some(stamp) = entry.fetched_at {
+                stamps.insert(name.clone(), stamp);
+            }
+            values.insert(name, entry.value);
+        }
+        Ok((values, stamps))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn load_entries(
+        &self,
+        declared_names: &HashSet<String>,
+    ) -> Result<(HashMap<String, String>, HashMap<String, u64>)> {
         let mut values = HashMap::new();
         let mut stamps = HashMap::new();
         for name in declared_names {
@@ -65,6 +112,44 @@ impl KeychainCache {
     }
 
     pub(crate) fn replace(&self, entries: &HashMap<String, CacheEntry>) -> Result<()> {
+        #[cfg(not(target_os = "windows"))]
+        return self.replace_project(entries);
+
+        #[cfg(target_os = "windows")]
+        {
+            self.replace_entries(entries)
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn replace_project(&self, entries: &HashMap<String, CacheEntry>) -> Result<()> {
+        let credential = credential(&self.project_account())?;
+        if entries.is_empty() {
+            return delete_if_present(&credential);
+        }
+        let stored = StoredProject {
+            entries: entries
+                .iter()
+                .map(|(name, entry)| {
+                    (
+                        name.clone(),
+                        StoredEntry {
+                            value: entry.value.clone(),
+                            fetched_at: entry.fetched_at,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let payload = serde_json::to_vec(&stored)
+            .map_err(|e| Error::Validation(format!("serializing keychain vault cache: {e}")))?;
+        credential
+            .set_secret(&payload)
+            .map_err(|e| keychain_error("write to", e))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn replace_entries(&self, entries: &HashMap<String, CacheEntry>) -> Result<()> {
         let old_manifest = self.read_manifest()?;
         let new_names: HashSet<&str> = entries.keys().map(String::as_str).collect();
 
@@ -101,6 +186,7 @@ impl KeychainCache {
             .map_err(|e| keychain_error("write manifest to", e))
     }
 
+    #[cfg(target_os = "windows")]
     fn read_secret(&self, name: &str) -> Result<Option<StoredEntry>> {
         let Some(payload) = read_if_present(&credential(&self.secret_account(name))?)? else {
             return Ok(None);
@@ -112,6 +198,7 @@ impl KeychainCache {
         })
     }
 
+    #[cfg(target_os = "windows")]
     fn read_manifest(&self) -> Result<Manifest> {
         let Some(payload) = read_if_present(&credential(&self.manifest_account())?)? else {
             return Ok(Manifest::default());
@@ -120,12 +207,18 @@ impl KeychainCache {
             .map_err(|e| Error::Validation(format!("team-vault keychain manifest is corrupt: {e}")))
     }
 
+    #[cfg(target_os = "windows")]
     fn manifest_account(&self) -> String {
         format!("{}:manifest", self.project_id)
     }
 
+    #[cfg(target_os = "windows")]
     fn secret_account(&self, name: &str) -> String {
         format!("{}:{}", self.project_id, digest(name))
+    }
+
+    fn project_account(&self) -> String {
+        format!("{}:cache", self.project_id)
     }
 }
 
@@ -178,11 +271,11 @@ mod tests {
         let cache = KeychainCache {
             project_id: digest("https://example.test\0acme\0web"),
         };
-        let account = cache.secret_account("DATABASE_PASSWORD");
-        assert_eq!(account.len(), 129);
+        let account = cache.project_account();
+        assert_eq!(account.len(), 70);
         assert!(!account.contains("DATABASE_PASSWORD"));
-        assert_eq!(account, cache.secret_account("DATABASE_PASSWORD"));
-        assert_ne!(account, cache.secret_account("STRIPE_SECRET"));
+        assert_eq!(account, cache.project_account());
+        assert_ne!(digest("DATABASE_PASSWORD"), digest("STRIPE_SECRET"));
     }
 
     #[test]
