@@ -9,6 +9,7 @@ mod ports;
 mod registration;
 mod run_context;
 mod scripts;
+mod start_lock;
 pub mod supervisor;
 
 pub use builder::OrchestratorBuilder;
@@ -20,3 +21,4 @@ pub use lifecycle::ServiceLifecycleCommands;
 /// itself (in the private `monitoring` module) for the union-scope formula.
 pub use monitoring::supervised_service_names;
 pub use run_context::{RunContext, SecretCacheMode};
+pub use start_lock::StartLock;

@@ -2,6 +2,7 @@ use crate::output::UserOutput;
 use fed::{
     Error as FedError, Orchestrator, StartHealth, WatchMode,
     config::{Config, ServiceType},
+    orchestrator::StartLock,
     parameter::PortResolutionReason,
     port::PortConflict,
     service::Status,
@@ -24,6 +25,10 @@ pub struct StartOptions<'a> {
     /// (`07-supervisor.md` Design §1's note on settings-threading).
     pub offline: bool,
     pub profiles: Vec<String>,
+    /// Scope-wide guard acquired before orchestrator initialization. Kept
+    /// alive through startup, then released before a watch loop can run
+    /// indefinitely.
+    pub start_lock: Option<StartLock>,
 }
 
 pub async fn run_start(
@@ -41,6 +46,7 @@ pub async fn run_start(
         config_path,
         offline,
         profiles,
+        start_lock,
     } = opts;
     let jobs = jobs.max(1);
     let services_to_start = if services.is_empty() {
@@ -562,6 +568,12 @@ pub async fn run_start(
             out.status("Use 'fed logs <service>' for full logs");
         }
     }
+
+    // Parameter resolution, hooks, process spawn, health checks, and the
+    // post-start liveness snapshot have converged. A waiting invocation can
+    // now initialize afresh from this run's committed state. In watch mode
+    // this explicit drop is essential: the event loop below is long-lived.
+    drop(start_lock);
 
     if !watch {
         out.status("\nServices running in background");

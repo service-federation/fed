@@ -7,7 +7,10 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser};
 use cli::{Cli, Commands};
-use fed::{Error as FedError, Orchestrator, OutputMode, Parser as ConfigParser, RunContext};
+use fed::{
+    Error as FedError, Orchestrator, OutputMode, Parser as ConfigParser, RunContext,
+    orchestrator::StartLock,
+};
 
 /// Best-effort discovery of the workspace directory for the current
 /// invocation. Used by the recursion check to compare the child's
@@ -397,6 +400,15 @@ async fn run() -> anyhow::Result<()> {
         .or_else(|| fed::cloud::load_link(&work_dir).map(|link| link.secret_cache))
         .unwrap_or_default();
 
+    // Parameter resolution and service registration are two separate phases.
+    // Serialize real `fed start` invocations before either phase so concurrent
+    // commands cannot resolve different port sets and then split registration
+    // wins between them. Dry-run is read-only and must remain non-blocking.
+    let start_lock = match &cli.command {
+        Commands::Start { dry_run: false, .. } => Some(StartLock::acquire(&work_dir).await?),
+        _ => None,
+    };
+
     // `fed supervise` builds its orchestrator through a completely
     // different path (`.supervisor_attach(true)` -> `initialize_supervisor`,
     // never `.readonly()`/`.dry_run()`/plain `initialize()`) and then runs
@@ -587,6 +599,7 @@ async fn run() -> anyhow::Result<()> {
                     config_path: &config_path,
                     offline: cli.offline,
                     profiles: cli.profile.clone(),
+                    start_lock,
                 },
                 &out,
             )
