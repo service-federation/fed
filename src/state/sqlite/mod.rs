@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 const DB_FILE_NAME: &str = "lock.db";
 const LOCK_FILE_NAME: &str = ".lock";
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 
 mod isolation;
 mod migrations;

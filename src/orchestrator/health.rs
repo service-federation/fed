@@ -252,15 +252,40 @@ impl<'a> HealthCheckRunner<'a> {
         };
 
         if let Ok(true) = checker.check().await {
+            let listener_hint = self
+                .orchestrator
+                .config
+                .services
+                .get(name)
+                .and_then(|service| service.healthcheck.as_ref())
+                .and_then(|healthcheck| healthcheck.get_http_url())
+                .and_then(|url| url::Url::parse(url).ok())
+                .and_then(|url| url.port_or_known_default())
+                .and_then(crate::port::PortConflict::check)
+                .map(|conflict| {
+                    if conflict.processes.is_empty() {
+                        format!(" Port {} is occupied.", conflict.port)
+                    } else {
+                        let processes = conflict
+                            .processes
+                            .iter()
+                            .map(|process| format!("'{}' (PID {})", process.name, process.pid))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!(" Port {} is served by {}.", conflict.port, processes)
+                    }
+                })
+                .unwrap_or_default();
             return Err(Error::ServiceStartFailed(
                 name.to_string(),
                 format!(
                     "The healthcheck for '{}' already passes before the service was \
                      started — another process is already serving it. Starting anyway \
                      would make the healthcheck meaningless (it can't tell the two \
-                     apart). Stop the other process first. A common cause is a dev \
-                     server that daemonized and outlived a previous run.",
-                    name
+                     apart).{} Stop the other process first, or rerun with \
+                     `fed start --replace` to free resolved ports. A common cause is a \
+                     dev server that daemonized and outlived a previous run.",
+                    name, listener_hint
                 ),
             ));
         }

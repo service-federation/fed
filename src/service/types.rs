@@ -405,6 +405,14 @@ pub trait ServiceManager: Send + Sync {
         None
     }
 
+    /// Get the process group ID created for this service, if applicable.
+    ///
+    /// This can outlive the tracked launcher PID when a package-manager shim
+    /// is killed but its server child remains alive.
+    fn get_process_group_id(&self) -> Option<u32> {
+        None
+    }
+
     /// Get container ID (if applicable)
     fn get_container_id(&self) -> Option<String> {
         // Default implementation returns None
