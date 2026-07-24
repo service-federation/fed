@@ -190,7 +190,17 @@ For credentials a team must share, the optional Service Federation Cloud vault c
 
 Removing a member blocks new server fetches. It cannot erase values already cached on that person's machine, so rotate credentials after removing someone who had access. Read [Generated secrets](https://www.service-federation.com/docs/generated-secrets/) and [Team secrets](https://www.service-federation.com/docs/secrets/) before choosing either path.
 
-By default, fetched vault values are cached in the owner-only, Git-ignored `.fed/secrets.cache.env` file so the stack can start while the vault is unavailable. To make memory-only handling the shared policy for a linked project, commit it in `.fed/cloud.yaml`:
+By default, fetched vault values are cached in the owner-only, Git-ignored `.fed/secrets.cache.env` file so the stack can start while the vault is unavailable. To keep the offline fallback in each developer's operating-system credential store instead, commit the shared policy in `.fed/cloud.yaml`:
+
+```yaml
+org: acme
+project: web
+secret_cache: keychain
+```
+
+Keychain mode removes an existing plaintext vault cache and stores each fetched value in macOS Keychain, Linux Secret Service, or Windows Credential Manager. If the selected credential store is locked or unavailable, Fed fails clearly rather than falling back to plaintext.
+
+To disable persistence entirely, use memory mode:
 
 ```yaml
 org: acme
@@ -198,7 +208,7 @@ project: web
 secret_cache: memory
 ```
 
-Memory mode removes any existing vault cache and disables the vault's offline fallback. It does not change locally generated secrets or explicit `env_file` values, and it cannot prevent a child process from logging or otherwise persisting a value it receives. `--secret-cache file|memory` remains available as an explicit override for one invocation.
+Memory mode removes any existing vault cache and disables the vault's offline fallback. It does not change locally generated secrets or explicit `env_file` values, and it cannot prevent a child process from logging or otherwise persisting a value it receives. `--secret-cache file|memory|keychain` remains available as an explicit override for one invocation.
 
 ## Documentation and examples
 

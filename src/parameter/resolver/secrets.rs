@@ -249,31 +249,36 @@ impl Resolver {
         let generated_env_key = crate::fed_dir::GENERATED_SECRETS_REL.to_string();
         let cache_path = crate::fed_dir::secrets_cache_path(&work_dir);
         let memory_only = self.secret_cache == crate::orchestrator::SecretCacheMode::Memory;
+        let keychain_only = self.secret_cache == crate::orchestrator::SecretCacheMode::Keychain;
 
-        // Cache safety gate: the cache holds real secret values, so it must
+        // File-cache safety gate: the cache holds real secret values, so it must
         // never sit in a commit-eligible location. With the self-managed
         // .fed/.gitignore this always passes; a user-edited permissive
         // .fed/.gitignore disables caching entirely — an existing cache file
         // is DELETED (leaving secrets on disk where git can pick them up is
         // the unsafe option) and its values are neither read nor rewritten.
-        let cache_usable = if memory_only {
-            // Memory cache policy is an affirmative no-persistence request:
-            // remove an earlier file-backed cache before resolving anything,
-            // then neither read nor rewrite it. Failing to remove it must be
-            // loud; silently leaving plaintext behind would violate the mode's
-            // central promise.
+        let file_cache_usable = if memory_only || keychain_only {
+            // Memory and keychain policies both exclude plaintext persistence:
+            // remove an earlier file-backed cache before resolving anything.
+            // Failing to remove it must be loud; silently leaving plaintext
+            // behind would violate either mode's central promise.
             if cache_path.exists() {
                 std::fs::remove_file(&cache_path).map_err(|e| {
                     Error::Filesystem(format!(
-                        "Cannot remove vault secrets cache '{}' for memory-only mode: {}",
+                        "Cannot remove plaintext vault secrets cache '{}' for {} mode: {}",
                         cache_path.display(),
+                        if memory_only { "memory" } else { "keychain" },
                         e
                     ))
                 })?;
             }
-            tracing::info!(
-                "Team-vault cache is memory-only; fetched values will not be written to disk"
-            );
+            if memory_only {
+                tracing::info!(
+                    "Team-vault cache is memory-only; fetched values will not be persisted"
+                );
+            } else {
+                tracing::info!("Team-vault cache uses the operating-system keychain");
+            }
             false
         } else {
             let (in_repo, ignored) = crate::parameter::secret::path_git_status(&cache_path);
@@ -312,7 +317,22 @@ impl Resolver {
             Some(a) => a,
             None => return Ok(()), // No secret parameters at all
         };
-        if !cache_usable {
+        let keychain_cache = if keychain_only {
+            let backend = crate::parameter::keychain_cache::KeychainCache::for_work_dir(&work_dir)?;
+            let declared_names: HashSet<String> = config
+                .get_effective_parameters()
+                .iter()
+                .filter(|(_, parameter)| parameter.is_secret_type())
+                .map(|(name, _)| name.clone())
+                .collect();
+            let (values, stamps) = backend.load(&declared_names)?;
+            analysis.cache_values = values;
+            analysis.cache_stamps = stamps;
+            Some(backend)
+        } else {
+            None
+        };
+        if memory_only || (!keychain_only && !file_cache_usable) {
             analysis.cache_values.clear();
             analysis.cache_stamps.clear();
         }
@@ -458,9 +478,12 @@ impl Resolver {
                     },
                 );
             }
-            // cache_usable was decided (and warned about) up front; an unsafe
-            // path means no cache writes at all.
-            if cache_usable
+            if let Some(backend) = &keychain_cache {
+                // An explicitly selected secure-store backend is a contract.
+                // Surface write failures instead of pretending offline
+                // fallback was established.
+                backend.replace(&new_cache)?;
+            } else if file_cache_usable
                 && let Err(e) = crate::parameter::secret::write_cache_file(&cache_path, &new_cache)
             {
                 tracing::warn!(

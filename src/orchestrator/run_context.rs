@@ -22,6 +22,9 @@ pub enum SecretCacheMode {
     /// Resolve vault values for this invocation and its child processes only.
     /// Any existing vault cache is removed and no cache is read or written.
     Memory,
+    /// Persist vault values in the operating system credential store. Any
+    /// existing plaintext vault cache is removed.
+    Keychain,
 }
 
 /// Session-scoped run settings: the answers to "what did the user ask for

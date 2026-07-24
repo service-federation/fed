@@ -282,6 +282,18 @@ mod cloud_link_tests {
         let yaml = serde_yaml::to_string(&link).unwrap();
         assert!(yaml.contains("secret_cache: memory"));
     }
+
+    #[test]
+    fn keychain_cache_round_trips_in_cloud_config() {
+        let link: CloudLink =
+            serde_yaml::from_str("org: acme\nproject: web\nsecret_cache: keychain\n").unwrap();
+        assert_eq!(
+            link.secret_cache,
+            crate::orchestrator::SecretCacheMode::Keychain
+        );
+        let yaml = serde_yaml::to_string(&link).unwrap();
+        assert!(yaml.contains("secret_cache: keychain"));
+    }
 }
 
 // ── Vault timing knobs ──────────────────────────────────────────────────
