@@ -4,6 +4,8 @@ use super::*;
 /// Reason a port was resolved to its final value
 #[derive(Debug, Clone, PartialEq)]
 pub enum PortResolutionReason {
+    /// User supplied an exact value
+    Explicit,
     /// Default port was available and used directly
     DefaultAvailable,
     /// Default port had a conflict, auto-resolved to a different port
@@ -21,6 +23,7 @@ pub enum PortResolutionReason {
 impl std::fmt::Display for PortResolutionReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Explicit => write!(f, "explicit value"),
             Self::DefaultAvailable => write!(f, "default port available"),
             Self::ConflictAutoResolved {
                 default_port,
@@ -49,6 +52,29 @@ pub struct PortResolution {
 }
 
 impl Resolver {
+    /// Reserve a user-supplied port exactly, unless it is already owned by a
+    /// running service managed by this orchestrator.
+    pub(super) fn reserve_exact_port(&mut self, port: u16, param_name: &str) -> Result<()> {
+        if self.managed_ports.contains(&port) {
+            self.port_allocator.mark_allocated(port);
+            return Ok(());
+        }
+
+        self.port_allocator
+            .try_allocate_port(port)
+            .map(|_| ())
+            .map_err(|error| {
+                let detail = match error {
+                    Error::PortAllocation(detail) => detail,
+                    other => other.to_string(),
+                };
+                Error::PortAllocation(format!(
+                    "Parameter '{}' requires port {}, but it cannot be reserved: {}",
+                    param_name, port, detail
+                ))
+            })
+    }
+
     /// Get all allocated ports
     pub fn get_allocated_ports(&self) -> Vec<u16> {
         self.port_allocator.allocated_ports()
@@ -218,10 +244,19 @@ impl Resolver {
         port: u16,
         param_name: &str,
     ) -> Result<(u16, Option<PortConflict>)> {
-        // Check for conflict
-        let Some(conflict) = PortConflict::check(port) else {
-            // Port is actually available, just allocate it
-            return Ok((port, None));
+        // A failed allocation can be caused by a transient holder. If it has
+        // disappeared by the time we inspect the conflict, reserve the port
+        // before returning it. Returning the bare number here used to violate
+        // the allocator's TOCTOU guarantee.
+        let conflict = match PortConflict::check(port) {
+            Some(conflict) => conflict,
+            None => match self.port_allocator.try_allocate_port(port) {
+                Ok(_) => return Ok((port, None)),
+                Err(_) => PortConflict {
+                    port,
+                    processes: Vec::new(),
+                },
+            },
         };
 
         // Allocate alternative port (we may need it as fallback)
@@ -307,6 +342,11 @@ impl Resolver {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    fn free_port_candidate() -> u16 {
+        let probe = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        probe.local_addr().unwrap().port()
+    }
 
     #[test]
     fn test_port_allocation_with_default_available() {
@@ -682,27 +722,121 @@ mod tests {
     fn test_port_validation_with_user_value() {
         use crate::config::{Config, Parameter};
 
+        // A discovered port can legitimately be claimed after the probe is
+        // dropped. Treat that as a lost candidate, not a test failure.
+        for _ in 0..32 {
+            let exact_port = free_port_candidate();
+            let mut resolver = Resolver::new();
+            let mut config = Config::default();
+            config.parameters.insert(
+                "API_PORT".to_string(),
+                Parameter {
+                    param_type: Some("port".to_string()),
+                    value: Some(exact_port.to_string()),
+                    ..Default::default()
+                },
+            );
+
+            if resolver.resolve_parameters(&mut config).is_err() {
+                continue;
+            }
+
+            assert_eq!(
+                resolver.get_resolved_parameters().get("API_PORT"),
+                Some(&exact_port.to_string())
+            );
+            assert_eq!(
+                resolver.get_port_resolutions()[0].reason,
+                PortResolutionReason::Explicit
+            );
+            assert!(resolver.get_allocated_ports().contains(&exact_port));
+            assert!(
+                std::net::TcpListener::bind(("127.0.0.1", exact_port)).is_err(),
+                "an explicit port must remain reserved after resolution"
+            );
+            return;
+        }
+
+        panic!("could not reserve an exact candidate after 32 attempts");
+    }
+
+    #[test]
+    fn test_explicit_port_rejects_an_external_holder() {
+        use crate::config::{Config, Parameter};
+
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let exact_port = holder.local_addr().unwrap().port();
         let mut resolver = Resolver::new();
         let mut config = Config::default();
+        config.parameters.insert(
+            "API_PORT".to_string(),
+            Parameter {
+                param_type: Some("port".to_string()),
+                value: Some(exact_port.to_string()),
+                ..Default::default()
+            },
+        );
 
-        // Create a port parameter with a valid user-provided value
-        let mut param = Parameter {
-            param_type: Some("port".to_string()),
-            default: None,
-            either: vec![],
-            source: None,
-            description: None,
-            optional: None,
-            ..Default::default()
-        };
-        param.value = Some("8080".to_string());
+        let error = resolver.resolve_parameters(&mut config).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("API_PORT"), "{message}");
+        assert!(message.contains(&exact_port.to_string()), "{message}");
+        assert!(message.contains("cannot be reserved"), "{message}");
+    }
 
-        config.parameters.insert("API_PORT".to_string(), param);
+    #[test]
+    fn test_explicit_managed_port_is_tracked_without_rebinding() {
+        use crate::config::{Config, Parameter};
+
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let managed_port = holder.local_addr().unwrap().port();
+        let mut resolver = Resolver::new();
+        resolver.set_managed_ports(HashSet::from([managed_port]));
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_PORT".to_string(),
+            Parameter {
+                param_type: Some("port".to_string()),
+                value: Some(managed_port.to_string()),
+                ..Default::default()
+            },
+        );
 
         resolver.resolve_parameters(&mut config).unwrap();
 
-        let resolved = resolver.get_resolved_parameters();
-        assert_eq!(resolved.get("API_PORT").unwrap(), "8080");
+        assert_eq!(
+            resolver.get_resolved_parameters().get("API_PORT"),
+            Some(&managed_port.to_string())
+        );
+        assert!(resolver.get_allocated_ports().contains(&managed_port));
+    }
+
+    #[test]
+    fn test_disappeared_conflict_is_rechecked_and_reserved() {
+        let mut resolver = Resolver::new();
+        resolver.set_auto_resolve_conflicts(true);
+
+        for _ in 0..32 {
+            let port = free_port_candidate();
+            let Ok((resolved, conflict)) =
+                resolver.handle_port_conflict_interactive(port, "API_PORT")
+            else {
+                continue;
+            };
+            if conflict.is_some() {
+                continue;
+            }
+
+            assert_eq!(resolved, port);
+            assert!(resolver.get_allocated_ports().contains(&port));
+            assert!(
+                std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+                "the no-conflict recheck path must retain a reservation"
+            );
+            return;
+        }
+
+        panic!("could not reserve a disappeared-conflict candidate after 32 attempts");
     }
 
     #[test]

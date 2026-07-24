@@ -88,8 +88,10 @@ pub(super) async fn collect_managed_ports(
 /// Release port listeners exactly once (idempotent via atomic CAS).
 ///
 /// After port resolution, the resolver holds `TcpListener`s on allocated ports
-/// to prevent TOCTOU races. This function releases them just before services
-/// bind, minimising the race window.
+/// to prevent races during resolution. Arbitrary child processes cannot inherit
+/// these sockets as listening endpoints, so startup must release them before
+/// those processes bind. This narrows, but cannot eliminate, the final handoff
+/// window without a socket-activation protocol.
 pub(super) fn release_port_listeners_once(
     port_listeners_released: &AtomicBool,
     resolver: &Resolver,

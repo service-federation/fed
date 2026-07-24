@@ -1,12 +1,14 @@
 use crate::error::{Error, Result};
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::TcpListener;
 
 /// Port allocator for dynamically assigning available ports
 ///
-/// Uses interior mutability via Mutex for both `allocated_ports` and `listeners`
-/// to enable concurrent access patterns. This makes the allocator fully thread-safe.
+/// Every allocated port has a corresponding entry in `allocations`, whose
+/// state records whether fed still owns a reservation, trusts an already
+/// running managed service, or deliberately released the reservation for
+/// process startup.
 ///
 /// # Thread Safety
 ///
@@ -14,19 +16,19 @@ use std::net::TcpListener;
 /// allowing the allocator to be used from multiple threads safely. Methods that
 /// only need `&self` can still modify internal state through the Mutex.
 pub struct PortAllocator {
-    /// Set of allocated ports, protected by Mutex for thread-safe access
-    allocated_ports: Mutex<HashSet<u16>>,
-    /// Listeners are wrapped in Mutex to allow release_listeners() to work with &self.
-    /// This is important because releasing listeners needs to happen during start operations
-    /// which may be called concurrently.
-    listeners: Mutex<Vec<TcpListener>>,
+    allocations: Mutex<HashMap<u16, PortAllocation>>,
+}
+
+enum PortAllocation {
+    Reserved(Vec<TcpListener>),
+    Managed,
+    Released,
 }
 
 impl PortAllocator {
     pub fn new() -> Self {
         Self {
-            allocated_ports: Mutex::new(HashSet::new()),
-            listeners: Mutex::new(Vec::new()),
+            allocations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -34,22 +36,14 @@ impl PortAllocator {
     ///
     /// Thread-safe: Uses interior mutability to allow concurrent allocation.
     pub fn allocate_random_port(&mut self) -> Result<u16> {
-        // Let the OS pick a port that's free on the v4 wildcard. Picking via
-        // the wildcard (not loopback) matters: the kernel then avoids ports
-        // held by dual-stack [::] listeners. The candidate still goes
-        // through try_allocate_port so it also passes the loopback probe —
-        // re-roll on the rare case where a loopback-only server holds it
-        // (or another process grabbed it in the gap).
+        // Let the OS pick and reserve a port on the v4 wildcard. Keep that
+        // listener alive while checking loopback so there is no probe/drop/
+        // rebind gap in which another process can take the candidate.
         for _ in 0..16 {
-            let probe = TcpListener::bind("0.0.0.0:0").map_err(|e| {
+            let listener_any = TcpListener::bind("0.0.0.0:0").map_err(|e| {
                 Error::PortAllocation(format!("Failed to bind to random port: {}", e))
             })?;
-            let port = probe
-                .local_addr()
-                .map_err(|e| Error::PortAllocation(format!("Failed to get local address: {}", e)))?
-                .port();
-            drop(probe);
-            if let Ok(port) = self.try_allocate_port(port) {
+            if let Ok(port) = self.reserve_bound_wildcard(listener_any) {
                 return Ok(port);
             }
         }
@@ -91,6 +85,12 @@ impl PortAllocator {
                 "Port 0 cannot be allocated: valid ports are 1-65535".to_string(),
             ));
         }
+        if self.allocations.lock().contains_key(&port) {
+            return Err(Error::PortAllocation(format!(
+                "Port {} is already allocated",
+                port
+            )));
+        }
         // The wildcard bind is the load-bearing conflict check and is bound
         // FIRST. It is MANDATORY: with SO_REUSEADDR (which std sets), a
         // loopback bind succeeds alongside a dual-stack [::]:PORT listener —
@@ -100,6 +100,25 @@ impl PortAllocator {
         let listener_any = TcpListener::bind(("0.0.0.0", port)).map_err(|e| {
             Error::PortAllocation(format!("Port {} not available (0.0.0.0): {}", port, e))
         })?;
+        self.reserve_bound_wildcard(listener_any)
+    }
+
+    /// Finish reserving a port whose wildcard listener is already held.
+    ///
+    /// Keeping `listener_any` alive while attempting the loopback bind is what
+    /// makes random allocation atomic from the allocator's point of view.
+    fn reserve_bound_wildcard(&mut self, listener_any: TcpListener) -> Result<u16> {
+        let port = listener_any
+            .local_addr()
+            .map_err(|e| Error::PortAllocation(format!("Failed to get local address: {}", e)))?
+            .port();
+        if self.allocations.lock().contains_key(&port) {
+            return Err(Error::PortAllocation(format!(
+                "Port {} is already allocated",
+                port
+            )));
+        }
+
         // Also hold loopback (TOCTOU guard: on BSD kernels a 127.0.0.1 bind
         // coexists with our wildcard, so without this a squatter could still
         // steal the port before the service starts).
@@ -127,12 +146,13 @@ impl PortAllocator {
             }
         };
 
-        let mut listeners = self.listeners.lock();
-        listeners.push(listener_any);
+        let mut listeners = vec![listener_any];
         if let Some(l) = listener_lo {
             listeners.push(l);
         }
-        self.allocated_ports.lock().insert(port);
+        self.allocations
+            .lock()
+            .insert(port, PortAllocation::Reserved(listeners));
         Ok(port)
     }
 
@@ -141,7 +161,10 @@ impl PortAllocator {
     /// Used for ports already held by managed services — we trust the port is
     /// occupied by us and don't need to bind-check it.
     pub fn mark_allocated(&mut self, port: u16) {
-        self.allocated_ports.lock().insert(port);
+        self.allocations
+            .lock()
+            .entry(port)
+            .or_insert(PortAllocation::Managed);
     }
 
     /// Release all listeners but keep ports marked as allocated.
@@ -150,15 +173,19 @@ impl PortAllocator {
     /// which is essential for concurrent start operations where we need to release
     /// port listeners without holding exclusive access to the entire orchestrator.
     pub fn release_listeners(&self) {
-        self.listeners.lock().clear();
+        for allocation in self.allocations.lock().values_mut() {
+            if let PortAllocation::Reserved(listeners) = allocation {
+                listeners.clear();
+                *allocation = PortAllocation::Released;
+            }
+        }
     }
 
     /// Release all allocated resources
     ///
     /// Thread-safe: Uses interior mutability to allow concurrent cleanup.
     pub fn release_all(&mut self) {
-        self.listeners.lock().clear();
-        self.allocated_ports.lock().clear();
+        self.allocations.lock().clear();
     }
 
     /// Release listeners only (for cleanup with &self)
@@ -166,7 +193,7 @@ impl PortAllocator {
     /// Note: This only releases the listeners, not the allocated_ports set.
     /// Use this when you only have &self access.
     pub fn release_listeners_for_cleanup(&self) {
-        self.listeners.lock().clear();
+        self.release_listeners();
     }
 
     /// Get all allocated ports
@@ -174,7 +201,7 @@ impl PortAllocator {
     /// Returns a copy of the allocated ports to avoid holding the lock.
     /// Thread-safe: Uses interior mutability for concurrent access.
     pub fn allocated_ports(&self) -> Vec<u16> {
-        self.allocated_ports.lock().iter().copied().collect()
+        self.allocations.lock().keys().copied().collect()
     }
 }
 
@@ -271,8 +298,11 @@ mod tests {
 
         // Port should still be in allocated set
         assert!(allocator.allocated_ports().contains(&port));
-        // But listeners should be cleared
-        assert!(allocator.listeners.lock().is_empty());
+        // But its reservation should be cleared
+        assert!(matches!(
+            allocator.allocations.lock().get(&port),
+            Some(PortAllocation::Released)
+        ));
     }
 
     #[test]
@@ -293,7 +323,10 @@ mod tests {
         assert!(port > 0);
         assert!(allocator.allocated_ports().contains(&port));
         // Listener is held to prevent TOCTOU until release_listeners() is called
-        assert!(!allocator.listeners.lock().is_empty());
+        assert!(matches!(
+            allocator.allocations.lock().get(&port),
+            Some(PortAllocation::Reserved(listeners)) if !listeners.is_empty()
+        ));
     }
 
     #[test]
