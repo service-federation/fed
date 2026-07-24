@@ -1537,6 +1537,11 @@ impl Orchestrator {
                 if let Some(pid) = manager.get_pid() {
                     tracker.update_service_pid(name, pid).await?;
                 }
+                if let Some(process_group_id) = manager.get_process_group_id() {
+                    tracker
+                        .update_service_process_group_id(name, process_group_id)
+                        .await?;
+                }
                 if let Some(container_id) = manager.get_container_id() {
                     tracker
                         .update_service_container_id(name, container_id)

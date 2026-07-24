@@ -66,6 +66,12 @@ impl SqliteStateTracker {
             self.migrate_v7_to_v8().await?;
         }
 
+        // Migration from v8 to v9: Persist process-group ownership separately
+        // from the launcher PID.
+        if current_version < 9 {
+            self.migrate_v8_to_v9().await?;
+        }
+
         Ok(())
     }
 
@@ -502,6 +508,59 @@ impl SqliteStateTracker {
         Ok(())
     }
 
+    /// Migration v8 -> v9: Add the process group created for process services.
+    ///
+    /// Package-manager launchers can die while their real server child remains
+    /// in the group. The launcher PID can no longer be queried for its PGID at
+    /// that point, so the group must be captured while the launcher is alive.
+    async fn migrate_v8_to_v9(&self) -> Result<()> {
+        debug!("Running migration v8 -> v9: Adding process_group_id column");
+
+        self.conn
+            .call(|conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+                let tx = conn.transaction()?;
+
+                let already_applied: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM schema_version WHERE version = 9",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+
+                if already_applied {
+                    return Ok(());
+                }
+
+                let has_column: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM pragma_table_info('services') WHERE name = 'process_group_id'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+
+                if !has_column {
+                    tx.execute(
+                        "ALTER TABLE services ADD COLUMN process_group_id INTEGER",
+                        [],
+                    )?;
+                }
+
+                tx.execute(
+                    "INSERT INTO schema_version (version, applied_at) VALUES (9, datetime('now'))",
+                    [],
+                )?;
+
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+
+        info!("Migration v8 -> v9 completed successfully");
+        Ok(())
+    }
+
     /// Create database schema
     pub(super) async fn create_schema(&self) -> Result<()> {
         self.conn.call(|conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
@@ -539,7 +598,8 @@ impl SqliteStateTracker {
                     startup_message TEXT,
                     desired_state TEXT NOT NULL DEFAULT 'running',
                     native_restart_enabled INTEGER NOT NULL DEFAULT 0,
-                    stale_grace_count INTEGER NOT NULL DEFAULT 0
+                    stale_grace_count INTEGER NOT NULL DEFAULT 0,
+                    process_group_id INTEGER
                 );
 
                 -- Indexes for services
@@ -741,8 +801,8 @@ mod desired_state_migration_tests {
 
         // Schema version must have advanced all the way to current — a
         // legacy v6 db run through `initialize()` now migrates straight
-        // through v7 (desired_state) to v8 (native_restart_enabled /
-        // stale_grace_count), not just to v7.
+        // through v7 (desired_state), v8 (native restart metadata), and v9
+        // (process group ownership), not just to v7.
         let conn = rusqlite::Connection::open(fed_dir.join("lock.db")).unwrap();
         let version: i32 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
@@ -750,7 +810,7 @@ mod desired_state_migration_tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[tokio::test]
@@ -806,6 +866,14 @@ mod desired_state_migration_tests {
         assert_eq!(retrieved.desired_state, DesiredState::Running);
 
         let conn = rusqlite::Connection::open(temp_dir.path().join(".fed/lock.db")).unwrap();
+        let has_process_group_column: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('services') WHERE name = 'process_group_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_process_group_column);
         let version: i32 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
                 row.get(0)
@@ -961,7 +1029,19 @@ mod native_restart_migration_tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
+
+        let process_group_id: Option<u32> = conn
+            .query_row(
+                "SELECT process_group_id FROM services WHERE id = 'legacy-docker-svc'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            process_group_id, None,
+            "legacy rows must migrate safely without inventing process-group ownership"
+        );
     }
 
     #[tokio::test]

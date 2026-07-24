@@ -372,6 +372,126 @@ impl SqliteStateTracker {
         Ok(())
     }
 
+    /// Persist the process group created for a process service.
+    ///
+    /// Kept separate from the launcher PID because package-manager shims can
+    /// exit or be killed while descendants remain alive in the group.
+    pub async fn update_service_process_group_id(
+        &mut self,
+        service_id: &str,
+        process_group_id: u32,
+    ) -> Result<()> {
+        if process_group_id <= 1 || process_group_id > i32::MAX as u32 {
+            return Err(Error::Validation(format!(
+                "Service '{}': process group ID {} is unsafe for signal operations",
+                service_id, process_group_id
+            )));
+        }
+
+        let service_id = service_id.to_string();
+        let service_id_for_tx = service_id.clone();
+        let rows = self
+            .with_transaction(move |tx| {
+                tx.execute(
+                    "UPDATE services SET process_group_id = ?1 WHERE id = ?2",
+                    rusqlite::params![process_group_id, &service_id_for_tx],
+                )
+            })
+            .await?;
+
+        if rows == 0 {
+            return Err(Error::ServiceNotFound(service_id));
+        }
+
+        Ok(())
+    }
+
+    async fn get_service_process_group_id(&self, service_id: &str) -> Result<Option<u32>> {
+        let service_id = service_id.to_string();
+        self.conn
+            .call(move |conn: &mut rusqlite::Connection| {
+                Ok(conn
+                    .query_row(
+                        "SELECT process_group_id FROM services WHERE id = ?1",
+                        rusqlite::params![&service_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten())
+            })
+            .await
+            .map_err(Error::from)
+    }
+
+    /// Terminate a fed-owned process group whose tracked launcher is gone.
+    ///
+    /// Failure is fatal to reconciliation: retaining the row is safer than
+    /// purging the only ownership evidence while descendants remain alive.
+    async fn cleanup_orphaned_process_group(service_id: &str, process_group_id: u32) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{self, Signal};
+            use nix::unistd::{Pid, getpgrp};
+
+            if process_group_id <= 1 || process_group_id > i32::MAX as u32 {
+                return Err(Error::Process(format!(
+                    "Refusing to clean unsafe process group {} for service '{}'",
+                    process_group_id, service_id
+                )));
+            }
+
+            let process_group = Pid::from_raw(process_group_id as i32);
+            if process_group == getpgrp() {
+                return Err(Error::Process(format!(
+                    "Refusing to signal fed's own process group {} while cleaning service '{}'",
+                    process_group_id, service_id
+                )));
+            }
+
+            if signal::killpg(process_group, None).is_err() {
+                return Ok(());
+            }
+
+            tracing::warn!(
+                "Service '{}' lost launcher PID but process group {} still has live descendants; cleaning it up",
+                service_id,
+                process_group_id
+            );
+            signal::killpg(process_group, Signal::SIGTERM).map_err(|e| {
+                Error::Process(format!(
+                    "Failed to terminate orphaned process group {} for service '{}': {}",
+                    process_group_id, service_id, e
+                ))
+            })?;
+
+            for _ in 0..20 {
+                if signal::killpg(process_group, None).is_err() {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
+            let _ = signal::killpg(process_group, Signal::SIGKILL);
+            for _ in 0..20 {
+                if signal::killpg(process_group, None).is_err() {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
+            Err(Error::Process(format!(
+                "Process group {} for service '{}' survived SIGKILL; state was retained for recovery",
+                process_group_id, service_id
+            )))
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (service_id, process_group_id);
+            Ok(())
+        }
+    }
+
     /// Update service container ID
     #[must_use = "ignoring this result may cause state loss - the container ID will not be persisted"]
     pub async fn update_service_container_id(
@@ -811,7 +931,15 @@ impl SqliteStateTracker {
             // Stale services are already filtered out at the DB read boundary
 
             let is_stale = if let Some(pid) = service_state.pid {
-                !Self::is_process_running(pid).await
+                let launcher_is_dead = !Self::is_process_running(pid).await;
+                if launcher_is_dead
+                    && service_state.service_type == ServiceType::Process
+                    && let Some(process_group_id) =
+                        self.get_service_process_group_id(service_id).await?
+                {
+                    Self::cleanup_orphaned_process_group(service_id, process_group_id).await?;
+                }
+                launcher_is_dead
             } else if let Some(ref container_id) = service_state.container_id {
                 // Only check container status if daemon is healthy
                 if daemon_healthy {

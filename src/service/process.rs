@@ -49,6 +49,9 @@ pub struct ProcessService {
     /// Process ID for signal operations.
     /// Uses SyncMutex (parking_lot::Mutex) - quick synchronous access, never held across await.
     pid: Arc<SyncMutex<Option<u32>>>,
+    /// Process group created for the service. Unlike `pid`, this remains a
+    /// usable ownership handle when a launcher exits but descendants survive.
+    process_group_id: Arc<SyncMutex<Option<u32>>>,
     /// Log capture and management (encapsulates log buffer, file path, tasks, and shutdown).
     log_capture: LogCapture,
     /// Cached health check result with timestamp.
@@ -81,6 +84,7 @@ impl ProcessService {
             process: Arc::new(tokio::sync::Mutex::new(None)),
             output_mode,
             pid: Arc::new(SyncMutex::new(None)),
+            process_group_id: Arc::new(SyncMutex::new(None)),
             log_capture: LogCapture::new(name, log_file_path, output_mode),
             health_cache: Arc::new(tokio::sync::Mutex::new((None, Instant::now()))),
             grace_period,
@@ -122,6 +126,8 @@ impl ProcessService {
             )));
         }
         *self.pid.lock() = Some(pid);
+        *self.process_group_id.lock() =
+            Self::get_process_group(pid).map(|process_group| process_group.as_raw() as u32);
         Ok(())
     }
 
@@ -605,6 +611,7 @@ impl ServiceManager for ProcessService {
                         self.name
                     );
                     *self.pid.lock() = None;
+                    *self.process_group_id.lock() = None;
 
                     // Shutdown log capture tasks
                     self.log_capture.shutdown().await;
@@ -619,7 +626,12 @@ impl ServiceManager for ProcessService {
                 // This is important because the PGID may differ from the PID if the process
                 // was reparented or created without setsid. Using the correct PGID ensures
                 // we kill all child processes, not just the leader.
-                let pgid = Self::get_process_group(pid_val).unwrap_or(pid);
+                let pgid = self
+                    .process_group_id
+                    .lock()
+                    .and_then(|stored| validate_pid(stored, &self.name).ok())
+                    .or_else(|| Self::get_process_group(pid_val))
+                    .unwrap_or(pid);
 
                 // Send SIGTERM to process group first
                 let signal_result = killpg(pgid, Signal::SIGTERM);
@@ -667,6 +679,7 @@ impl ServiceManager for ProcessService {
                 }
 
                 *self.pid.lock() = None;
+                *self.process_group_id.lock() = None;
             }
         }
 
@@ -700,9 +713,15 @@ impl ServiceManager for ProcessService {
             // Validate PID: rejects 0, 1, and values > i32::MAX
             let pid = validate_pid(pid_val, &self.name)?;
 
-            // Send SIGKILL immediately (no SIGTERM first)
-            // Use killpg() for process group signaling
-            let _ = killpg(pid, Signal::SIGKILL).or_else(|_| signal::kill(pid, Signal::SIGKILL));
+            // Send SIGKILL immediately (no SIGTERM first). File-mode launchers
+            // are not necessarily their process-group leader, so prefer the
+            // group captured while the launcher was alive.
+            let pgid = self
+                .process_group_id
+                .lock()
+                .and_then(|stored| validate_pid(stored, &self.name).ok())
+                .unwrap_or(pid);
+            let _ = killpg(pgid, Signal::SIGKILL).or_else(|_| signal::kill(pid, Signal::SIGKILL));
 
             // Brief wait for process to be reaped
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -718,6 +737,7 @@ impl ServiceManager for ProcessService {
 
         // Now that the process is confirmed dead, clear PID
         *self.pid.lock() = None;
+        *self.process_group_id.lock() = None;
 
         // Shutdown log capture tasks
         self.log_capture.shutdown().await;
@@ -784,6 +804,10 @@ impl ServiceManager for ProcessService {
     fn get_pid(&self) -> Option<u32> {
         // Return stored PID (works for both detached and interactive mode)
         *self.pid.lock()
+    }
+
+    fn get_process_group_id(&self) -> Option<u32> {
+        *self.process_group_id.lock()
     }
 
     fn get_last_error(&self) -> Option<String> {

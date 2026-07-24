@@ -388,3 +388,108 @@ fn test_orchestrator_stop_kills_child_processes() {
         child_pid,
     );
 }
+
+/// Killing a package-manager-style launcher must not make its surviving
+/// descendants invisible. A fresh start should use the persisted process
+/// group to clean the old tree before registering a replacement.
+#[test]
+fn test_start_recovers_when_tracked_launcher_is_killed_but_child_survives() {
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let workdir = temp_dir.path();
+    let child_pid_file = workdir.join("child.pid");
+    let config_content = child_spawner_config(&child_pid_file);
+    let config_path = create_test_config(&temp_dir, "config.yaml", &config_content);
+
+    let first_start = run_fed(&[
+        "-c",
+        config_path.to_str().unwrap(),
+        "-w",
+        workdir.to_str().unwrap(),
+        "start",
+        "spawner",
+    ]);
+    assert!(
+        first_start.status.success(),
+        "initial fed start failed: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first_start.stdout),
+        String::from_utf8_lossy(&first_start.stderr),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !child_pid_file.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(child_pid_file.exists(), "Child PID file was never written");
+
+    let tracked_pid = get_service_pid(workdir, "spawner").expect("tracked launcher PID");
+    let orphaned_child_pid: u32 = fs::read_to_string(&child_pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let process_group_id: u32 = rusqlite::Connection::open(workdir.join(".fed/lock.db"))
+        .unwrap()
+        .query_row(
+            "SELECT process_group_id FROM services WHERE id = 'spawner'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("persisted process group ID");
+    assert!(process_group_id > 1);
+
+    let killed = Command::new("kill")
+        .args(["-9", &tracked_pid.to_string()])
+        .status()
+        .expect("kill tracked launcher");
+    assert!(killed.success());
+    assert!(
+        wait_for_pid_exit(tracked_pid, Duration::from_secs(5)),
+        "tracked launcher {} did not exit",
+        tracked_pid
+    );
+    assert!(
+        is_pid_alive(orphaned_child_pid),
+        "the repro requires child {} to survive its launcher",
+        orphaned_child_pid
+    );
+
+    let second_start = run_fed(&[
+        "-c",
+        config_path.to_str().unwrap(),
+        "-w",
+        workdir.to_str().unwrap(),
+        "start",
+        "spawner",
+    ]);
+    assert!(
+        second_start.status.success(),
+        "recovery start failed: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&second_start.stdout),
+        String::from_utf8_lossy(&second_start.stderr),
+    );
+    assert!(
+        wait_for_pid_exit(orphaned_child_pid, Duration::from_secs(5)),
+        "orphaned child {} from process group {} survived recovery",
+        orphaned_child_pid,
+        process_group_id
+    );
+
+    let replacement_pid =
+        get_service_pid(workdir, "spawner").expect("replacement launcher should be tracked");
+    assert_ne!(replacement_pid, tracked_pid);
+    assert!(is_pid_alive(replacement_pid));
+
+    let stop = run_fed(&[
+        "-c",
+        config_path.to_str().unwrap(),
+        "-w",
+        workdir.to_str().unwrap(),
+        "stop",
+    ]);
+    assert!(
+        stop.status.success(),
+        "cleanup stop failed: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr),
+    );
+}
