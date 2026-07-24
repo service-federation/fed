@@ -1,6 +1,6 @@
 [package]
 name = "fed"
-version = "7.6.0"
+version = "7.6.1"
 edition = "2024"
 authors = ["Adrian Helvik"]
 description = "Run native apps and Docker dependencies as an isolated dev stack per Git worktree"
@@ -107,7 +107,7 @@ unicode-width = "0.1"
 keyring = { version = "3.6.3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust"] }
+keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust", "vendored"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6.3", features = ["windows-native"] }
