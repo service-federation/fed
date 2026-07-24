@@ -53,11 +53,62 @@ fn test_link_writes_cloud_yaml() {
     let written = std::fs::read_to_string(tmp.path().join(".fed/cloud.yaml")).unwrap();
     assert!(written.contains("org: acme"));
     assert!(written.contains("project: web"));
+    assert!(written.contains("secret_cache: file"));
 
     // fed self-manages .fed/.gitignore: everything ignored except cloud.yaml
     // (and the .gitignore itself).
     let gitignore = std::fs::read_to_string(tmp.path().join(".fed/.gitignore")).unwrap();
     assert_eq!(gitignore, "*\n!cloud.yaml\n!.gitignore\n");
+}
+
+#[test]
+fn cloud_config_memory_policy_removes_and_refuses_the_file_cache() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".fed")).unwrap();
+    std::fs::write(
+        tmp.path().join(".fed/cloud.yaml"),
+        "org: acme\nproject: web\nsecret_cache: memory\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(".fed/secrets.cache.env"),
+        "API_KEY=must_not_be_used\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("fed.yaml"),
+        "parameters:\n  API_KEY:\n    type: secret\n    source: manual\nservices:\n  app:\n    process: echo ok\n    environment:\n      API_KEY: '{{API_KEY}}'\nentrypoint: app\n",
+    )
+    .unwrap();
+
+    let config_path = tmp.path().join("fed.yaml");
+    let output = Command::new(fed_binary())
+        .args([
+            "--workdir",
+            tmp.path().to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
+            "--offline",
+            "start",
+            "--dry-run",
+        ])
+        .env("HOME", tmp.path())
+        .env_remove("FED_TOKEN")
+        .output()
+        .unwrap();
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{combined}");
+    assert!(
+        !tmp.path().join(".fed/secrets.cache.env").exists(),
+        "cloud-config memory policy must remove and bypass an existing file cache: {combined}"
+    );
+    assert!(combined.contains("API_KEY"), "{combined}");
+    assert!(!combined.contains("must_not_be_used"), "{combined}");
 }
 
 /// link rejects malformed targets.

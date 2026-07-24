@@ -257,7 +257,7 @@ impl Resolver {
         // is DELETED (leaving secrets on disk where git can pick them up is
         // the unsafe option) and its values are neither read nor rewritten.
         let cache_usable = if memory_only {
-            // `--secret-cache memory` is an affirmative no-persistence request:
+            // Memory cache policy is an affirmative no-persistence request:
             // remove an earlier file-backed cache before resolving anything,
             // then neither read nor rewrite it. Failing to remove it must be
             // loud; silently leaving plaintext behind would violate the mode's

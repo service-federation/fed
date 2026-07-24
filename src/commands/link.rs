@@ -24,7 +24,14 @@ pub async fn run_link(
         None => pick_interactively(out).await?,
     };
 
-    let link = cloud::CloudLink { org, project };
+    let secret_cache = cloud::load_link(&work_dir)
+        .map(|link| link.secret_cache)
+        .unwrap_or_default();
+    let link = cloud::CloudLink {
+        org,
+        project,
+        secret_cache,
+    };
     let path = cloud::save_link(&work_dir, &link)?;
     out.success(&format!(
         "Linked to {}/{} ({})",

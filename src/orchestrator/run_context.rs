@@ -3,6 +3,7 @@
 
 use crate::service::OutputMode;
 use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// Where fetched team-vault values may persist after the current `fed`
@@ -11,7 +12,8 @@ use std::collections::HashSet;
 /// This policy applies only to values fetched from Service Federation Cloud.
 /// Locally generated secrets keep using `.fed/secrets.generated.env`, and values
 /// supplied by an explicit `env_file` remain owned by that file.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SecretCacheMode {
     /// Read and atomically update the owner-only `.fed/secrets.cache.env`
     /// fallback used for offline starts.

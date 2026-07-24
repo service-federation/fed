@@ -215,7 +215,7 @@ async fn run() -> anyhow::Result<()> {
     // context is correct for them as-is.
     let mut run_context = RunContext {
         offline: cli.offline,
-        secret_cache: cli.secret_cache,
+        secret_cache: cli.secret_cache.unwrap_or_default(),
         is_interactive,
         output_mode: OutputMode::default(),
         profiles: cli.profile.clone(),
@@ -392,6 +392,10 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let work_dir = resolve_work_dir(cli.workdir.clone(), &config_path)?;
+    run_context.secret_cache = cli
+        .secret_cache
+        .or_else(|| fed::cloud::load_link(&work_dir).map(|link| link.secret_cache))
+        .unwrap_or_default();
 
     // `fed supervise` builds its orchestrator through a completely
     // different path (`.supervisor_attach(true)` -> `initialize_supervisor`,

@@ -27,10 +27,9 @@ pub struct Cli {
     #[arg(long)]
     pub offline: bool,
 
-    /// Team-vault cache policy: file keeps today's owner-only offline cache;
-    /// memory removes and bypasses it for this invocation
-    #[arg(long, global = true, value_enum, default_value_t = SecretCacheMode::File)]
-    pub secret_cache: SecretCacheMode,
+    /// Override `.fed/cloud.yaml`'s team-vault cache policy for this invocation
+    #[arg(long, global = true, value_enum)]
+    pub secret_cache: Option<SecretCacheMode>,
 
     /// Show verbose debug output
     #[arg(short, long, global = true)]
@@ -428,9 +427,9 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn secret_cache_defaults_to_file() {
+    fn secret_cache_has_no_cli_override_by_default() {
         let cli = Cli::try_parse_from(["fed", "status"]).expect("parse");
-        assert_eq!(cli.secret_cache, SecretCacheMode::File);
+        assert_eq!(cli.secret_cache, None);
     }
 
     #[test]
@@ -439,8 +438,8 @@ mod tests {
             Cli::try_parse_from(["fed", "--secret-cache", "memory", "status"]).expect("parse");
         let after =
             Cli::try_parse_from(["fed", "status", "--secret-cache", "memory"]).expect("parse");
-        assert_eq!(before.secret_cache, SecretCacheMode::Memory);
-        assert_eq!(after.secret_cache, SecretCacheMode::Memory);
+        assert_eq!(before.secret_cache, Some(SecretCacheMode::Memory));
+        assert_eq!(after.secret_cache, Some(SecretCacheMode::Memory));
     }
 
     #[test]

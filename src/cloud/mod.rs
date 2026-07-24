@@ -230,6 +230,9 @@ impl CredentialFiles {
 pub struct CloudLink {
     pub org: String,
     pub project: String,
+    /// Persistence policy for values fetched from this project's team vault.
+    #[serde(default)]
+    pub secret_cache: crate::orchestrator::SecretCacheMode,
 }
 
 pub fn link_path(work_dir: &Path) -> PathBuf {
@@ -253,6 +256,32 @@ pub fn save_link(work_dir: &Path, link: &CloudLink) -> Result<PathBuf> {
     std::fs::write(&path, yaml)
         .map_err(|e| Error::Filesystem(format!("writing {}: {}", path.display(), e)))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod cloud_link_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_link_defaults_to_file_cache() {
+        let link: CloudLink = serde_yaml::from_str("org: acme\nproject: web\n").unwrap();
+        assert_eq!(
+            link.secret_cache,
+            crate::orchestrator::SecretCacheMode::File
+        );
+    }
+
+    #[test]
+    fn memory_cache_round_trips_in_cloud_config() {
+        let link: CloudLink =
+            serde_yaml::from_str("org: acme\nproject: web\nsecret_cache: memory\n").unwrap();
+        assert_eq!(
+            link.secret_cache,
+            crate::orchestrator::SecretCacheMode::Memory
+        );
+        let yaml = serde_yaml::to_string(&link).unwrap();
+        assert!(yaml.contains("secret_cache: memory"));
+    }
 }
 
 // ── Vault timing knobs ──────────────────────────────────────────────────
