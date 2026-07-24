@@ -1,6 +1,6 @@
 [package]
 name = "fed"
-version = "7.6.1"
+version = "7.6.2"
 edition = "2024"
 authors = ["Adrian Helvik"]
 description = "Run native apps and Docker dependencies as an isolated dev stack per Git worktree"

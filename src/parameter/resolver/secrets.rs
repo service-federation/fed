@@ -317,7 +317,13 @@ impl Resolver {
             Some(a) => a,
             None => return Ok(()), // No secret parameters at all
         };
-        let keychain_cache = if keychain_only {
+        // A committed keychain policy must not make headless CI depend on a
+        // desktop credential store when every manual secret was already
+        // supplied by env_file/explicit values. Open the backend only when
+        // there is actually a vault/cache value left to resolve.
+        let needs_vault_cache =
+            !analysis.missing_manual.is_empty() || !analysis.missing_optional_manual.is_empty();
+        let keychain_cache = if keychain_only && needs_vault_cache {
             let backend = crate::parameter::keychain_cache::KeychainCache::for_work_dir(&work_dir)?;
             let declared_names: HashSet<String> = config
                 .get_effective_parameters()
@@ -2276,6 +2282,37 @@ mod tests {
         assert!(
             !cache_path.exists(),
             "memory mode must remove the previous cache and never rewrite it"
+        );
+    }
+
+    #[test]
+    fn keychain_policy_does_not_open_store_when_manual_secret_is_already_supplied() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        // Deliberately no .fed/cloud.yaml: opening the keychain backend would
+        // fail with "requires a linked project". An explicit value makes the
+        // vault/cache irrelevant, as in headless CI.
+        let temp_dir = TempDir::new().unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::Keychain);
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                value: Some("supplied-by-ci".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(
+            resolver.get_resolved_parameters().get("API_KEY").unwrap(),
+            "supplied-by-ci"
         );
     }
 
