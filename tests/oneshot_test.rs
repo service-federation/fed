@@ -12,10 +12,9 @@
 //! gates its dependents on that completion, and a hook failure aborts `fed start`
 //! naming the node. Concurrent dependents get one execution per startup.
 //!
-//! The driving real-world bug (Plenora): install/migrate were attached to the
-//! LAST service in the graph and ran just-in-time before that service spawned,
-//! so earlier services booted against an un-migrated database. A hook-only node
-//! that completes before its dependents fixes this.
+//! The motivating ordering bug attached install/migrate hooks to the last
+//! service in the graph, so earlier services could boot against an unmigrated
+//! database. A hook-only node that completes before its dependents fixes this.
 
 use std::fs;
 use std::process::Command;

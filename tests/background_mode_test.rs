@@ -292,10 +292,8 @@ services:
 
 #[test]
 fn test_double_ampersand_without_quotes_still_works() {
-    // Locks in the shape that "worked" before the fix purely by luck
-    // (plenora's actual config shape has no quote characters, so it never
-    // triggered the wrapper-splicing bug). A correct fix must not regress
-    // this case while fixing the quoted one.
+    // Keep the simple, unquoted shell-operator case working alongside the
+    // embedded-quote regression cases.
     let config = r#"
 services:
   and-service:

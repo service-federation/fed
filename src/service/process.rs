@@ -1607,8 +1607,8 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn test_spawn_process_with_double_ampersand() {
-        // Locks in the shape that worked before the fix only by luck
-        // (plenora's config shape has no quote characters).
+        // Keep the simple, unquoted shell-operator case working alongside
+        // the quote-sensitive wrapper cases above.
         let temp_dir = tempfile::tempdir().unwrap();
         let mut service = file_mode_service(
             "echo one && echo two; sleep 2",
