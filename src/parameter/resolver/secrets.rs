@@ -321,8 +321,14 @@ impl Resolver {
         // desktop credential store when every manual secret was already
         // supplied by env_file/explicit values. Open the backend only when
         // there is actually a vault/cache value left to resolve.
-        let needs_vault_cache =
-            !analysis.missing_manual.is_empty() || !analysis.missing_optional_manual.is_empty();
+        let needs_vault_cache = analysis
+            .missing_manual
+            .iter()
+            .any(|(name, _)| self.name_in_scope(name))
+            || analysis
+                .missing_optional_manual
+                .iter()
+                .any(|name| self.name_in_scope(name));
         let keychain_cache = if keychain_only && needs_vault_cache {
             let backend = crate::parameter::keychain_cache::KeychainCache::for_work_dir(&work_dir)?;
             let declared_names: HashSet<String> = config
@@ -2313,6 +2319,38 @@ mod tests {
         assert_eq!(
             resolver.get_resolved_parameters().get("API_KEY").unwrap(),
             "supplied-by-ci"
+        );
+    }
+
+    #[test]
+    fn keychain_policy_does_not_open_store_for_out_of_scope_manual_secret() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        // A scoped script that references no secrets must not require a
+        // desktop keychain merely because unrelated services declare them.
+        // No cloud link is present, so opening the backend would fail.
+        let temp_dir = TempDir::new().unwrap();
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_required_names(Some(HashSet::new()));
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::Keychain);
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "UNRELATED_API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert!(
+            !resolver
+                .get_resolved_parameters()
+                .contains_key("UNRELATED_API_KEY")
         );
     }
 
