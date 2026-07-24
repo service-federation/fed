@@ -2,10 +2,22 @@ use crate::cli::WorkspaceCommands;
 use crate::output::UserOutput;
 use anyhow::{Context, bail};
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::time::Duration;
 use tokio::process::Command;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> std::result::Result<std::io::Result<Output>, tokio::time::error::Elapsed> {
+    // Tokio's default is to leave a child running when its future is dropped.
+    // Every caller reports a timeout as terminal, so the corresponding Git
+    // process must stop rather than mutate worktrees after that report.
+    command.kill_on_drop(true);
+    tokio::time::timeout(timeout, command.output()).await
+}
 
 pub async fn run_workspace(cmd: &WorkspaceCommands, out: &dyn UserOutput) -> anyhow::Result<()> {
     match cmd {
@@ -29,15 +41,12 @@ struct WorktreeInfo {
 }
 
 async fn list_worktrees_parsed() -> anyhow::Result<Vec<WorktreeInfo>> {
-    let output = tokio::time::timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
-            .args(["worktree", "list", "--porcelain"])
-            .output(),
-    )
-    .await
-    .context("git worktree list timed out")?
-    .context("Failed to run git worktree list")?;
+    let mut command = Command::new("git");
+    command.args(["worktree", "list", "--porcelain"]);
+    let output = output_with_timeout(command, GIT_TIMEOUT)
+        .await
+        .context("git worktree list timed out")?
+        .context("Failed to run git worktree list")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -182,16 +191,12 @@ async fn ws_new(branch: &str, create_branch: bool, out: &dyn UserOutput) -> anyh
         args.push(branch);
     }
 
-    let output = tokio::time::timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
-            .args(&args)
-            .current_dir(&main_wt)
-            .output(),
-    )
-    .await
-    .context("git worktree add timed out")?
-    .context("Failed to run git worktree add")?;
+    let mut command = Command::new("git");
+    command.args(&args).current_dir(&main_wt);
+    let output = output_with_timeout(command, GIT_TIMEOUT)
+        .await
+        .context("git worktree add timed out")?
+        .context("Failed to run git worktree add")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -331,16 +336,12 @@ async fn ws_rm(name: &str, force: bool, out: &dyn UserOutput) -> anyhow::Result<
     }
     args.push(wt_path_str);
 
-    let output = tokio::time::timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
-            .args(&args)
-            .current_dir(&main_wt)
-            .output(),
-    )
-    .await
-    .context("git worktree remove timed out")?
-    .context("Failed to run git worktree remove")?;
+    let mut command = Command::new("git");
+    command.args(&args).current_dir(&main_wt);
+    let output = output_with_timeout(command, GIT_TIMEOUT)
+        .await
+        .context("git worktree remove timed out")?
+        .context("Failed to run git worktree remove")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -362,16 +363,12 @@ async fn ws_prune(out: &dyn UserOutput) -> anyhow::Result<()> {
     let main_wt = get_main_worktree().await?;
 
     // Run git worktree prune (removes entries whose directories are gone)
-    let output = tokio::time::timeout(
-        GIT_TIMEOUT,
-        Command::new("git")
-            .args(["worktree", "prune"])
-            .current_dir(&main_wt)
-            .output(),
-    )
-    .await
-    .context("git worktree prune timed out")?
-    .context("Failed to run git worktree prune")?;
+    let mut command = Command::new("git");
+    command.args(["worktree", "prune"]).current_dir(&main_wt);
+    let output = output_with_timeout(command, GIT_TIMEOUT)
+        .await
+        .context("git worktree prune timed out")?
+        .context("Failed to run git worktree prune")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -571,5 +568,47 @@ mod tests {
             !last_fn_line.contains("FED_WS_CD_FILE"),
             "passthrough path should not set FED_WS_CD_FILE"
         );
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_exit(pid: nix::unistd::Pid) -> bool {
+        for _ in 0..40 {
+            if nix::sys::signal::kill(pid, None).is_err() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_workspace_command_kills_child() {
+        use nix::sys::signal::Signal;
+
+        let temp = tempfile::tempdir().unwrap();
+        let pid_path = temp.path().join("workspace-command.pid");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            r#"echo $$ > "$1"; exec sleep 30"#,
+            "fed-workspace",
+            &pid_path.to_string_lossy(),
+        ]);
+
+        let result = output_with_timeout(command, Duration::from_millis(500)).await;
+        assert!(result.is_err(), "command should hit the test timeout");
+
+        let pid: i32 = std::fs::read_to_string(&pid_path)
+            .expect("workspace command should record its pid before timing out")
+            .trim()
+            .parse()
+            .unwrap();
+        let pid = nix::unistd::Pid::from_raw(pid);
+        let exited = wait_for_exit(pid).await;
+        if !exited {
+            let _ = nix::sys::signal::kill(pid, Signal::SIGKILL);
+        }
+        assert!(exited, "timed-out workspace child was left running");
     }
 }

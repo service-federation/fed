@@ -556,6 +556,31 @@ impl SqliteStateTracker {
         .await
     }
 
+    /// Unregister a just-created service row only if its original registration
+    /// timestamp still matches. This is the cancellation identity gate for the
+    /// window before a process/container identity exists.
+    pub(crate) async fn unregister_service_started_at(
+        &mut self,
+        service_id: &str,
+        started_at: &str,
+    ) -> Result<()> {
+        let service_id = service_id.to_string();
+        let started_at = started_at.to_string();
+
+        self.with_transaction(move |tx| {
+            tx.execute(
+                "DELETE FROM services WHERE id = ?1 AND started_at = ?2",
+                rusqlite::params![&service_id, &started_at],
+            )?;
+            tx.execute(
+                "DELETE FROM allocated_ports WHERE port NOT IN (SELECT DISTINCT port FROM port_allocations)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn unregister_service(&mut self, service_id: &str) -> Result<()> {
         let service_id = service_id.to_string();
         let service_id_for_tx = service_id.clone();
@@ -1036,6 +1061,37 @@ mod tests {
         assert!(
             tracker.get_service("svc").await.is_some(),
             "no identity means no provable ownership — the row must stay"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unregister_started_at_removes_matching_registration() {
+        let (mut tracker, _temp_dir) = create_test_tracker().await;
+        let state = ServiceState::new("svc".to_string(), ServiceType::Process, "test".to_string());
+        let started_at = state.started_at.to_rfc3339();
+        tracker.register_service(state).await.unwrap();
+
+        tracker
+            .unregister_service_started_at("svc", &started_at)
+            .await
+            .unwrap();
+        assert!(tracker.get_service("svc").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unregister_started_at_spares_replacement_registration() {
+        let (mut tracker, _temp_dir) = create_test_tracker().await;
+        let state = ServiceState::new("svc".to_string(), ServiceType::Process, "test".to_string());
+        tracker.register_service(state).await.unwrap();
+        let another_attempt = (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+
+        tracker
+            .unregister_service_started_at("svc", &another_attempt)
+            .await
+            .unwrap();
+        assert!(
+            tracker.get_service("svc").await.is_some(),
+            "a replacement row with a different registration timestamp must survive"
         );
     }
 
