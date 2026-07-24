@@ -37,6 +37,7 @@ services:
 
     let ctx = RunContext {
         offline: true,
+        secret_cache: fed::SecretCacheMode::Memory,
         is_interactive: false,
         output_mode: fed::OutputMode::Captured,
         profiles: vec![],
@@ -55,4 +56,8 @@ services:
     // Offline must have propagated — the pre-fix bypass never called
     // set_offline on its hand-built orchestrator.
     assert!(orchestrator.get_offline());
+    assert_eq!(
+        orchestrator.get_secret_cache(),
+        fed::SecretCacheMode::Memory
+    );
 }

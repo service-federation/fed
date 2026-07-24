@@ -135,6 +135,8 @@ pub struct Resolver {
     /// Whether stdin is a TTY (for interactive secret generation prompts).
     is_interactive: bool,
     offline: bool,
+    /// Whether fetched team-vault values may use the on-disk offline cache.
+    secret_cache: crate::orchestrator::SecretCacheMode,
     /// Test seam: when set, used instead of the real cloud vault lookup.
     test_vault_values: Option<HashMap<String, String>>,
     /// Test seam: when set, the vault lookup is simulated as failing with this
@@ -180,6 +182,7 @@ impl Resolver {
             prefer_config_defaults: true,
             is_interactive: false,
             offline: false,
+            secret_cache: crate::orchestrator::SecretCacheMode::File,
             test_vault_values: None,
             test_vault_failure: None,
             required_names: None,
@@ -246,6 +249,16 @@ impl Resolver {
     /// Whether this resolver is in offline mode.
     pub fn get_offline(&self) -> bool {
         self.offline
+    }
+
+    /// Select whether team-vault values persist in the owner-only file cache
+    /// or remain memory-only for this invocation.
+    pub fn set_secret_cache(&mut self, mode: crate::orchestrator::SecretCacheMode) {
+        self.secret_cache = mode;
+    }
+
+    pub fn get_secret_cache(&self) -> crate::orchestrator::SecretCacheMode {
+        self.secret_cache
     }
 
     /// Register ports owned by already-running managed services.

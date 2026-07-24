@@ -37,6 +37,7 @@ parameters:
 
     let ctx = RunContext {
         offline: true,
+        secret_cache: fed::SecretCacheMode::File,
         is_interactive: false,
         output_mode: OutputMode::Captured,
         profiles: vec![],

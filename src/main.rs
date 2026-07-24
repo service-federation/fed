@@ -215,6 +215,7 @@ async fn run() -> anyhow::Result<()> {
     // context is correct for them as-is.
     let mut run_context = RunContext {
         offline: cli.offline,
+        secret_cache: cli.secret_cache,
         is_interactive,
         output_mode: OutputMode::default(),
         profiles: cli.profile.clone(),

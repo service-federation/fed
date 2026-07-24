@@ -349,6 +349,14 @@ impl Orchestrator {
         self.resolver.set_offline(offline);
     }
 
+    pub fn set_secret_cache(&mut self, mode: super::SecretCacheMode) {
+        self.resolver.set_secret_cache(mode);
+    }
+
+    pub fn get_secret_cache(&self) -> super::SecretCacheMode {
+        self.resolver.get_secret_cache()
+    }
+
     /// Whether this orchestrator resolves secrets offline. Used to propagate
     /// `--offline` into isolated-child orchestrators.
     pub fn get_offline(&self) -> bool {
@@ -411,6 +419,7 @@ impl Orchestrator {
     pub fn apply_run_context(&mut self, ctx: &super::RunContext) {
         self.set_required_secret_names(ctx.required_secret_names.clone());
         self.set_offline(ctx.offline);
+        self.set_secret_cache(ctx.secret_cache);
         self.set_is_interactive(ctx.is_interactive);
         self.set_output_mode(ctx.output_mode);
         self.active_profiles = ctx.profiles.clone();
@@ -426,6 +435,7 @@ impl Orchestrator {
     pub fn current_run_context(&self) -> super::RunContext {
         super::RunContext {
             offline: self.get_offline(),
+            secret_cache: self.get_secret_cache(),
             is_interactive: self.resolver.get_is_interactive(),
             output_mode: self.output_mode,
             profiles: self.active_profiles.clone(),
@@ -3158,6 +3168,7 @@ mod tests {
 
         let ctx = super::super::RunContext {
             offline: true,
+            secret_cache: super::super::SecretCacheMode::Memory,
             is_interactive: true,
             output_mode: OutputMode::Passthrough,
             profiles: vec!["a".to_string(), "b".to_string()],
@@ -3168,6 +3179,7 @@ mod tests {
         let round_tripped = orchestrator.current_run_context();
 
         assert_eq!(round_tripped.offline, ctx.offline);
+        assert_eq!(round_tripped.secret_cache, ctx.secret_cache);
         assert_eq!(round_tripped.is_interactive, ctx.is_interactive);
         assert_eq!(round_tripped.output_mode, ctx.output_mode);
         assert_eq!(round_tripped.profiles, ctx.profiles);

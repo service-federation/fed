@@ -2,7 +2,25 @@
 //! command and into `OrchestratorBuilder`/`Orchestrator`.
 
 use crate::service::OutputMode;
+use clap::ValueEnum;
 use std::collections::HashSet;
+
+/// Where fetched team-vault values may persist after the current `fed`
+/// invocation exits.
+///
+/// This policy applies only to values fetched from Service Federation Cloud.
+/// Locally generated secrets keep using `.fed/secrets.generated.env`, and values
+/// supplied by an explicit `env_file` remain owned by that file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum SecretCacheMode {
+    /// Read and atomically update the owner-only `.fed/secrets.cache.env`
+    /// fallback used for offline starts.
+    #[default]
+    File,
+    /// Resolve vault values for this invocation and its child processes only.
+    /// Any existing vault cache is removed and no cache is read or written.
+    Memory,
+}
 
 /// Session-scoped run settings: the answers to "what did the user ask for
 /// on the command line" that stay constant for the life of one `fed`
@@ -35,6 +53,8 @@ use std::collections::HashSet;
 pub struct RunContext {
     /// Skip cloud vault lookups for manual secrets. From `--offline`.
     pub offline: bool,
+    /// Persistence policy for values fetched from the team vault.
+    pub secret_cache: SecretCacheMode,
     /// Whether stdin is a TTY, for interactive prompts like secret
     /// generation. From `std::io::stdin().is_terminal()`.
     pub is_interactive: bool,

@@ -248,6 +248,7 @@ impl Resolver {
         // The env_file key under which the generated secrets file is loaded.
         let generated_env_key = crate::fed_dir::GENERATED_SECRETS_REL.to_string();
         let cache_path = crate::fed_dir::secrets_cache_path(&work_dir);
+        let memory_only = self.secret_cache == crate::orchestrator::SecretCacheMode::Memory;
 
         // Cache safety gate: the cache holds real secret values, so it must
         // never sit in a commit-eligible location. With the self-managed
@@ -255,7 +256,26 @@ impl Resolver {
         // .fed/.gitignore disables caching entirely — an existing cache file
         // is DELETED (leaving secrets on disk where git can pick them up is
         // the unsafe option) and its values are neither read nor rewritten.
-        let cache_usable = {
+        let cache_usable = if memory_only {
+            // `--secret-cache memory` is an affirmative no-persistence request:
+            // remove an earlier file-backed cache before resolving anything,
+            // then neither read nor rewrite it. Failing to remove it must be
+            // loud; silently leaving plaintext behind would violate the mode's
+            // central promise.
+            if cache_path.exists() {
+                std::fs::remove_file(&cache_path).map_err(|e| {
+                    Error::Filesystem(format!(
+                        "Cannot remove vault secrets cache '{}' for memory-only mode: {}",
+                        cache_path.display(),
+                        e
+                    ))
+                })?;
+            }
+            tracing::info!(
+                "Team-vault cache is memory-only; fetched values will not be written to disk"
+            );
+            false
+        } else {
             let (in_repo, ignored) = crate::parameter::secret::path_git_status(&cache_path);
             if in_repo && !ignored {
                 let existed = cache_path.exists();
@@ -294,6 +314,7 @@ impl Resolver {
         };
         if !cache_usable {
             analysis.cache_values.clear();
+            analysis.cache_stamps.clear();
         }
 
         // Team vault: when online and linked, the vault is authoritative for
@@ -2193,6 +2214,85 @@ mod tests {
         assert!(
             !temp_dir.path().join(".fed/secrets.cache.env").exists(),
             "unsafe cache file must be deleted"
+        );
+    }
+
+    #[test]
+    fn memory_cache_resolves_from_vault_without_writing_or_retaining_a_file() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+        let cache_path = temp_dir.path().join(".fed/secrets.cache.env");
+        std::fs::write(&cache_path, "API_KEY=stale_file_value\n").unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::Memory);
+        resolver.set_test_vault_values(HashMap::from([(
+            "API_KEY".to_string(),
+            "fresh_memory_value".to_string(),
+        )]));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(
+            resolver.get_resolved_parameters().get("API_KEY").unwrap(),
+            "fresh_memory_value"
+        );
+        assert!(
+            !cache_path.exists(),
+            "memory mode must remove the previous cache and never rewrite it"
+        );
+    }
+
+    #[test]
+    fn memory_cache_never_uses_an_existing_file_offline() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+        let cache_path = temp_dir.path().join(".fed/secrets.cache.env");
+        std::fs::write(&cache_path, "API_KEY=must_not_be_used\n").unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_offline(true);
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::Memory);
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        assert!(
+            err.to_string().contains("API_KEY"),
+            "required manual secret must remain missing: {err}"
+        );
+        assert!(
+            !cache_path.exists(),
+            "memory mode must remove the previous cache even offline"
+        );
+        assert!(
+            !err.to_string().contains("must_not_be_used"),
+            "cached value must not leak through the error"
         );
     }
 

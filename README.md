@@ -190,6 +190,14 @@ For credentials a team must share, the optional Service Federation Cloud vault c
 
 Removing a member blocks new server fetches. It cannot erase values already cached on that person's machine, so rotate credentials after removing someone who had access. Read [Generated secrets](https://www.service-federation.com/docs/generated-secrets/) and [Team secrets](https://www.service-federation.com/docs/secrets/) before choosing either path.
 
+By default, fetched vault values are cached in the owner-only, Git-ignored `.fed/secrets.cache.env` file so the stack can start while the vault is unavailable. To remove any existing vault cache and keep fetched values in memory for only the current invocation and its child processes, use:
+
+```bash
+fed start --secret-cache memory
+```
+
+Memory mode disables the vault's offline fallback. It does not change locally generated secrets or explicit `env_file` values, and it cannot prevent a child process from logging or otherwise persisting a value it receives.
+
 ## Documentation and examples
 
 - [Quickstart](https://www.service-federation.com/docs/)

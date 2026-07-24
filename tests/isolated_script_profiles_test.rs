@@ -30,6 +30,7 @@ scripts:
 
     let ctx = RunContext {
         offline: true,
+        secret_cache: fed::SecretCacheMode::File,
         is_interactive: false,
         output_mode: fed::OutputMode::Captured,
         profiles: vec!["with-db".to_string()],

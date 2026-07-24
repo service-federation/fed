@@ -19,4 +19,4 @@ pub use lifecycle::ServiceLifecycleCommands;
 /// (`07-supervisor.md` Design §4) — see the doc comment on the function
 /// itself (in the private `monitoring` module) for the union-scope formula.
 pub use monitoring::supervised_service_names;
-pub use run_context::RunContext;
+pub use run_context::{RunContext, SecretCacheMode};

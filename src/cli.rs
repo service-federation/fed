@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use fed::SecretCacheMode;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -25,6 +26,11 @@ pub struct Cli {
     /// Offline mode: skip network package and vault lookups; use cached values only
     #[arg(long)]
     pub offline: bool,
+
+    /// Team-vault cache policy: file keeps today's owner-only offline cache;
+    /// memory removes and bypasses it for this invocation
+    #[arg(long, global = true, value_enum, default_value_t = SecretCacheMode::File)]
+    pub secret_cache: SecretCacheMode,
 
     /// Show verbose debug output
     #[arg(short, long, global = true)]
@@ -420,6 +426,22 @@ pub enum IsolateCommands {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn secret_cache_defaults_to_file() {
+        let cli = Cli::try_parse_from(["fed", "status"]).expect("parse");
+        assert_eq!(cli.secret_cache, SecretCacheMode::File);
+    }
+
+    #[test]
+    fn secret_cache_memory_is_a_global_option() {
+        let before =
+            Cli::try_parse_from(["fed", "--secret-cache", "memory", "status"]).expect("parse");
+        let after =
+            Cli::try_parse_from(["fed", "status", "--secret-cache", "memory"]).expect("parse");
+        assert_eq!(before.secret_cache, SecretCacheMode::Memory);
+        assert_eq!(after.secret_cache, SecretCacheMode::Memory);
+    }
 
     #[test]
     fn secrets_ls_still_parses() {
