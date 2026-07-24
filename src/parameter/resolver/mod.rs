@@ -79,7 +79,7 @@ pub fn compute_project_id(work_dir: &Path, isolation_id: Option<&str>) -> String
 /// # Port Allocation
 ///
 /// Port parameters are allocated with the following priority:
-/// 1. Explicit `value:` field (validated but not allocated)
+/// 1. Explicit `value:` field (validated and reserved exactly)
 /// 2. Preferred port from `default:` (if available and defaults are
 ///    preferred — normal, non-isolated `fed start`)
 /// 3. Persisted port from previous run (if available)
@@ -93,7 +93,10 @@ pub fn compute_project_id(work_dir: &Path, isolation_id: Option<&str>) -> String
 /// In force-random mode (`fed start --randomize`, `fed ports randomize`),
 /// steps 2 and 3 are skipped and all port parameters allocate random ports.
 ///
-/// Port listeners are held until services start to prevent TOCTOU races.
+/// Port listeners are held from resolution until the startup handoff begins.
+/// This prevents races while resolving a configuration and narrows the final
+/// bind race. It cannot eliminate that last window for arbitrary child
+/// processes, which must bind their own sockets after fed releases them.
 ///
 /// # .env File Handling
 ///
@@ -331,6 +334,7 @@ impl Resolver {
         self.port_resolutions.clear();
         self.resolved_parameters.clear();
         self.port_parameter_names.clear();
+        self.port_allocator.release_all();
 
         // Determine which parameters are deferred this run BEFORE anything is
         // resolved — secret resolution's `generate` DAG (below), default
@@ -398,6 +402,13 @@ impl Resolver {
                             name
                         )));
                     }
+
+                    self.reserve_exact_port(port_num, name)?;
+                    self.port_resolutions.push(PortResolution {
+                        param_name: name.clone(),
+                        resolved_port: port_num,
+                        reason: PortResolutionReason::Explicit,
+                    });
                 }
 
                 parameters.insert(name.clone(), value.clone());
@@ -602,12 +613,27 @@ impl Resolver {
             let effective_params = config.get_effective_parameters();
             for (name, param) in effective_params {
                 if let Some(ref value) = param.value {
+                    if param.is_port_type() {
+                        let port = value.parse::<u16>().map_err(|_| {
+                            Error::TemplateResolution(format!(
+                                "Parameter '{}' has invalid port value '{}': must be a number between 1 and 65535",
+                                name, value
+                            ))
+                        })?;
+                        if port == 0 {
+                            return Err(Error::TemplateResolution(format!(
+                                "Parameter '{}' has invalid port value '0': must be between 1 and 65535",
+                                name
+                            )));
+                        }
+                        self.reserve_exact_port(port, name)?;
+                    }
                     params.insert(name.clone(), value.clone());
+                } else if param.is_port_type() {
+                    let (port, _) = self.allocate_fresh_port(param, name)?;
+                    params.insert(name.clone(), port.to_string());
                 } else if let Some(default_value) = param.default.as_ref() {
                     params.insert(name.clone(), Self::value_to_string(default_value));
-                } else if param.is_port_type() {
-                    let port = self.port_allocator.allocate_random_port()?;
-                    params.insert(name.clone(), port.to_string());
                 }
             }
             params

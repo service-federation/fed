@@ -1,8 +1,8 @@
 //! Tests for port allocation TOCTOU (Time-of-Check-Time-of-Use) race condition prevention
 //!
 //! These tests verify that the PortAllocator correctly prevents race conditions by
-//! keeping TcpListeners alive until services are started, preventing other processes
-//! from stealing allocated ports.
+//! keeping TcpListeners alive until the startup handoff begins, preventing other
+//! processes from stealing ports during allocation and configuration resolution.
 
 use fed::parameter::PortAllocator;
 use std::net::TcpListener;
@@ -225,22 +225,15 @@ fn test_concurrent_allocation_attempts() {
 // =============================================================================
 
 #[test]
-fn test_multiple_try_allocate_ports() {
+fn test_multiple_random_allocations_retain_ownership() {
     let mut allocator = PortAllocator::new();
 
-    // Find several free ports
-    let mut ports = Vec::new();
-    for _ in 0..5 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind");
-        ports.push(listener.local_addr().unwrap().port());
-        drop(listener);
-    }
-
-    // Allocate all of them
-    for port in &ports {
-        let result = allocator.try_allocate_port(*port);
-        assert!(result.is_ok(), "Should allocate port {}", port);
-    }
+    // Ask the allocator to discover and retain ownership in one operation.
+    // Probing loopback, dropping the probe, and later requiring a wildcard
+    // bind made this test race macOS's ephemeral-port users.
+    let ports: Vec<u16> = (0..5)
+        .map(|_| allocator.allocate_random_port().expect("Allocate"))
+        .collect();
 
     // All should be in allocated set
     for port in &ports {
