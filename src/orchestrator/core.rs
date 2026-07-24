@@ -687,7 +687,7 @@ impl Orchestrator {
             StateTracker::new_for_supervisor(self.work_dir.clone()).await?,
         ));
 
-        let newly_stale = self
+        let mut newly_stale = self
             .state_tracker
             .write()
             .await
@@ -697,7 +697,13 @@ impl Orchestrator {
         self.build_dependency_graph()?;
 
         // Restore managers, honoring desired_state (never resurrect stopped).
-        self.create_services_for_supervisor().await?;
+        // A service can die after initialize_for_supervisor's liveness sweep
+        // but before its manager is restored. Treat that second-check miss as
+        // newly stale too; unregistering it here would leave a Stopped manager
+        // that the monitoring loop permanently skips.
+        newly_stale.extend(self.create_services_for_supervisor().await?);
+        newly_stale.sort();
+        newly_stale.dedup();
 
         // Re-derive whether each newly-stale row should come back. A row
         // marked stale by mark_dead_services this pass is, by definition,

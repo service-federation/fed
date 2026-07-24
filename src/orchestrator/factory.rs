@@ -21,6 +21,12 @@ use super::Orchestrator;
 /// Type alias for the service registry entry
 type ServiceEntry = Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>>;
 
+#[derive(Clone, Copy)]
+enum MissingServiceHandling {
+    Unregister,
+    Report,
+}
+
 impl Orchestrator {
     /// Check if a Docker container is running
     pub(super) fn is_container_running(container_id: &str) -> bool {
@@ -85,8 +91,12 @@ impl Orchestrator {
 
         // Restore PIDs and container IDs from state tracker for existing services
         let state_services = { self.state_tracker.read().await.get_services().await };
-        self.restore_service_state(&mut services, state_services)
-            .await;
+        self.restore_service_state(
+            &mut services,
+            state_services,
+            MissingServiceHandling::Unregister,
+        )
+        .await;
 
         *self.services.write().await = services;
         Ok(())
@@ -105,16 +115,21 @@ impl Orchestrator {
     /// supervisor can drive a newly-stale, restart-worthy service through
     /// `manager.start()` afterward) — only the *restoration* step is
     /// filtered.
-    pub(super) async fn create_services_for_supervisor(&mut self) -> Result<()> {
+    pub(super) async fn create_services_for_supervisor(&mut self) -> Result<Vec<String>> {
         let mut services = self.build_service_managers()?;
 
         let mut state_services = { self.state_tracker.read().await.get_services().await };
         state_services.retain(|_, s| s.desired_state == crate::state::DesiredState::Running);
-        self.restore_service_state(&mut services, state_services)
+        let missing_services = self
+            .restore_service_state(
+                &mut services,
+                state_services,
+                MissingServiceHandling::Report,
+            )
             .await;
 
         *self.services.write().await = services;
-        Ok(())
+        Ok(missing_services)
     }
 
     /// Build a fresh service manager for every configured service (Gradle
@@ -334,31 +349,40 @@ impl Orchestrator {
         &self,
         services: &mut HashMap<String, ServiceEntry>,
         state_services: HashMap<String, crate::state::ServiceState>,
-    ) {
+        missing_handling: MissingServiceHandling,
+    ) -> Vec<String> {
+        let mut missing_services = Vec::new();
+
         for (service_id, service_state) in state_services {
             // Extract service name from ID (format: "namespace/name")
             let service_name = service_id.split('/').next_back().unwrap_or(&service_id);
+            let mut missing = false;
 
             if let Some(manager_arc) = services.get_mut(service_name) {
                 let mut manager = manager_arc.lock().await;
 
                 // Restore PID for process and gradle services
                 if let Some(pid) = service_state.pid {
-                    self.restore_process_pid(
+                    if let Some(restored) = self.restore_process_pid(
                         &mut manager,
                         service_name,
                         pid,
                         service_state.started_at,
-                    )
-                    .await;
-                    self.restore_gradle_pid(&mut manager, service_name, pid)
-                        .await;
+                    ) {
+                        missing |= !restored;
+                    }
+                    if let Some(restored) = self.restore_gradle_pid(&mut manager, service_name, pid)
+                    {
+                        missing |= !restored;
+                    }
                 }
 
                 // Restore container ID for docker services
-                if let Some(container_id) = &service_state.container_id {
-                    self.restore_container_id(&mut manager, service_name, container_id)
-                        .await;
+                if let Some(container_id) = &service_state.container_id
+                    && let Some(restored) =
+                        self.restore_container_id(&mut manager, service_name, container_id)
+                {
+                    missing |= !restored;
                 }
 
                 // Oneshots have no PID/container to restore — carry over their
@@ -395,46 +419,68 @@ impl Orchestrator {
                     compose.restore_status(crate::service::Status::Running);
                 }
             }
+
+            if missing {
+                match missing_handling {
+                    MissingServiceHandling::Unregister => {
+                        self.unregister_stale_service(service_name).await;
+                    }
+                    MissingServiceHandling::Report => {
+                        missing_services.push(service_id);
+                    }
+                }
+            }
         }
+
+        missing_services
     }
 
     /// Restore a process PID if the process is still running
-    async fn restore_process_pid(
+    fn restore_process_pid(
         &self,
         manager: &mut Box<dyn ServiceManager>,
         service_name: &str,
         pid: u32,
         started_at: chrono::DateTime<chrono::Utc>,
-    ) {
-        if let Some(process_service) = manager.as_any_mut().downcast_mut::<ProcessService>() {
-            self.restore_pid_for_service(service_name, pid, || {
-                process_service.set_pid_with_start_time(pid, Some(started_at));
+    ) -> Option<bool> {
+        manager
+            .as_any_mut()
+            .downcast_mut::<ProcessService>()
+            .map(|process_service| {
+                self.restore_pid_for_service(service_name, pid, || {
+                    process_service.set_pid_with_start_time(pid, Some(started_at));
+                })
             })
-            .await;
-        }
     }
 
     /// Restore a Gradle service PID if the process is still running
-    async fn restore_gradle_pid(
+    fn restore_gradle_pid(
         &self,
         manager: &mut Box<dyn ServiceManager>,
         service_name: &str,
         pid: u32,
-    ) {
-        if let Some(gradle_service) = manager.as_any_mut().downcast_mut::<GradleService>() {
-            self.restore_pid_for_service(service_name, pid, || {
-                gradle_service.set_pid(pid);
+    ) -> Option<bool> {
+        manager
+            .as_any_mut()
+            .downcast_mut::<GradleService>()
+            .map(|gradle_service| {
+                self.restore_pid_for_service(service_name, pid, || {
+                    gradle_service.set_pid(pid);
+                })
             })
-            .await;
-        }
     }
 
-    /// Validate a PID and either restore it via the callback or unregister the stale service.
+    /// Validate a PID and restore it via the callback when it is still alive.
     ///
-    /// Shared logic for restoring process and gradle PIDs. On Unix,
-    /// sends signal 0 to check whether the process is alive. On other platforms,
-    /// unconditionally calls `set_pid` as a fallback.
-    async fn restore_pid_for_service(&self, service_name: &str, pid: u32, set_pid: impl FnOnce()) {
+    /// Returns whether the PID was restored. The caller decides whether a
+    /// missing process should be unregistered (ordinary initialization) or
+    /// reported for restart (supervisor attachment).
+    fn restore_pid_for_service(
+        &self,
+        service_name: &str,
+        pid: u32,
+        set_pid: impl FnOnce(),
+    ) -> bool {
         #[cfg(unix)]
         {
             use nix::sys::signal::kill;
@@ -443,13 +489,14 @@ impl Orchestrator {
                 if kill(nix_pid, None).is_ok() {
                     tracing::debug!("Restoring PID {} for service '{}'", pid, service_name);
                     set_pid();
+                    true
                 } else {
                     tracing::warn!(
                         "Skipping PID {} for service '{}' - process no longer exists",
                         pid,
                         service_name
                     );
-                    self.unregister_stale_service(service_name).await;
+                    false
                 }
             } else {
                 tracing::error!(
@@ -457,7 +504,7 @@ impl Orchestrator {
                     pid,
                     service_name
                 );
-                self.unregister_stale_service(service_name).await;
+                false
             }
         }
 
@@ -468,6 +515,7 @@ impl Orchestrator {
                 pid
             );
             set_pid();
+            true
         }
     }
 
@@ -489,12 +537,12 @@ impl Orchestrator {
     }
 
     /// Restore a container ID if the container is still running
-    async fn restore_container_id(
+    fn restore_container_id(
         &self,
         manager: &mut Box<dyn ServiceManager>,
         service_name: &str,
         container_id: &str,
-    ) {
+    ) -> Option<bool> {
         if let Some(docker_service) = manager.as_any_mut().downcast_mut::<DockerService>() {
             // Verify the container still exists before restoring
             if Self::is_container_running(container_id) {
@@ -504,14 +552,17 @@ impl Orchestrator {
                     service_name
                 );
                 docker_service.set_container_id(container_id.to_string());
+                Some(true)
             } else {
                 tracing::warn!(
                     "Skipping container ID {} for service '{}' - container no longer exists",
                     container_id,
                     service_name
                 );
-                self.unregister_stale_service(service_name).await;
+                Some(false)
             }
+        } else {
+            None
         }
     }
 }
@@ -534,6 +585,105 @@ mod tests {
         Orchestrator::new(config, temp.path().to_path_buf())
             .await
             .unwrap()
+    }
+
+    /// Regression for the supervisor-attach race where the initial stale
+    /// sweep sees a live process, but it exits before manager restoration
+    /// validates the persisted PID. Ordinary initialization unregisters
+    /// such rows; supervisor initialization must report and retain them so
+    /// `initialize_supervisor` can drive the existing restart path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_restore_reports_process_that_dies_after_stale_sweep() {
+        use crate::config::{RestartPolicy, Service};
+        use crate::service::Status;
+        use crate::state::{DesiredState, ServiceState};
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("failed to spawn helper process");
+        let live_pid = child.id();
+
+        let mut config = crate::config::Config::default();
+        config.services.insert(
+            "steady".to_string(),
+            Service {
+                process: Some("sleep 300".to_string()),
+                restart: Some(RestartPolicy::Always),
+                ..Default::default()
+            },
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let first_sweep = {
+            let mut tracker = orchestrator.state_tracker.write().await;
+            tracker.initialize().await.unwrap();
+            tracker
+                .register_service(ServiceState {
+                    id: "steady".to_string(),
+                    status: Status::Running,
+                    service_type: ServiceType::Process,
+                    pid: Some(live_pid),
+                    container_id: None,
+                    started_at: chrono::Utc::now(),
+                    external_repo: None,
+                    namespace: "root".to_string(),
+                    restart_count: 0,
+                    last_restart_at: None,
+                    consecutive_failures: 0,
+                    port_allocations: Default::default(),
+                    startup_message: None,
+                    desired_state: DesiredState::Running,
+                    native_restart_enabled: false,
+                })
+                .await
+                .unwrap();
+
+            tracker.mark_dead_services().await.unwrap()
+        };
+
+        child.kill().expect("failed to kill helper process");
+        child.wait().expect("failed to reap helper process");
+
+        assert!(
+            first_sweep.is_empty(),
+            "the first supervisor sweep must see the helper process alive"
+        );
+
+        let raced_stale = orchestrator
+            .create_services_for_supervisor()
+            .await
+            .expect("supervisor manager restoration should succeed");
+
+        assert_eq!(raced_stale, vec!["steady".to_string()]);
+        assert!(
+            orchestrator
+                .state_tracker
+                .read()
+                .await
+                .get_service("steady")
+                .await
+                .is_some(),
+            "the raced row must remain available to the supervisor restart path"
+        );
+        assert_eq!(
+            orchestrator
+                .services
+                .read()
+                .await
+                .get("steady")
+                .expect("steady manager should exist")
+                .lock()
+                .await
+                .get_pid(),
+            None,
+            "a dead PID must not be attached to the fresh manager"
+        );
     }
 
     #[tokio::test]
