@@ -1,5 +1,4 @@
 pub mod generate;
-pub(crate) mod keychain_cache;
 mod port;
 mod resolver;
 pub mod scanner;

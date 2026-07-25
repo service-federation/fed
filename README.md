@@ -190,17 +190,7 @@ For credentials a team must share, the optional Service Federation Cloud vault c
 
 Removing a member blocks new server fetches. It cannot erase values already cached on that person's machine, so rotate credentials after removing someone who had access. Read [Generated secrets](https://www.service-federation.com/docs/generated-secrets/) and [Team secrets](https://www.service-federation.com/docs/secrets/) before choosing either path.
 
-By default, fetched vault values are cached in the owner-only, Git-ignored `.fed/secrets.cache.env` file so the stack can start while the vault is unavailable. To keep the offline fallback in each developer's operating-system credential store instead, commit the shared policy in `.fed/cloud.yaml`:
-
-```yaml
-org: acme
-project: web
-secret_cache: keychain
-```
-
-Keychain mode removes an existing plaintext vault cache and stores each fetched value in macOS Keychain, Linux Secret Service, or Windows Credential Manager. If the selected credential store is locked or unavailable, Fed fails clearly rather than falling back to plaintext.
-
-To disable persistence entirely, use memory mode:
+By default, fetched vault values are cached in the owner-only, Git-ignored `.fed/secrets.cache.env` file so the stack can start while the vault is unavailable. To disable persistence entirely, commit the shared policy in `.fed/cloud.yaml`:
 
 ```yaml
 org: acme
@@ -208,7 +198,23 @@ project: web
 secret_cache: memory
 ```
 
-Memory mode removes any existing vault cache and disables the vault's offline fallback. It does not change locally generated secrets or explicit `env_file` values, and it cannot prevent a child process from logging or otherwise persisting a value it receives. `--secret-cache file|memory|keychain` remains available as an explicit override for one invocation.
+Memory mode removes any existing vault cache and disables the vault's offline fallback — every start fetches from the vault. It does not change locally generated secrets or explicit `env_file` values, and it cannot prevent a child process from logging or otherwise persisting a value it receives. `--secret-cache file|memory` remains available as an explicit override for one invocation.
+
+### Removed: `secret_cache: keychain`
+
+`secret_cache: keychain` was removed in fed 7.7. Reading the OS credential store blocks indefinitely in a non-interactive shell, which is how fed runs under a coding agent or in CI. A keychain policy left in `.fed/cloud.yaml` still parses — fed warns once and uses memory mode, so vault values are no longer persisted and offline starts will not have them. Set `secret_cache: file`, or drop the key, to restore an offline fallback.
+
+Re-running `fed link` rewrites the stale policy out of `.fed/cloud.yaml` for you.
+
+fed does not reclaim the credential-store items it previously wrote — deleting them can raise the same blocking prompt. Clear them by hand:
+
+```bash
+# macOS — repeat until it reports "could not be found"
+security delete-generic-password -s com.service-federation.fed.vault-cache
+
+# Linux (Secret Service) — inspect and remove via your keyring UI, e.g. seahorse,
+# under the service name com.service-federation.fed.vault-cache
+```
 
 ## Documentation and examples
 

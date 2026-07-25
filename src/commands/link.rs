@@ -24,9 +24,13 @@ pub async fn run_link(
         None => pick_interactively(out).await?,
     };
 
+    // Preserve the existing policy across a re-link — but normalize the removed
+    // keychain mode, so re-linking is also how a checkout sheds the dead value
+    // from its committed cloud.yaml.
     let secret_cache = cloud::load_link(&work_dir)
         .map(|link| link.secret_cache)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .effective();
     let link = cloud::CloudLink {
         org,
         project,
