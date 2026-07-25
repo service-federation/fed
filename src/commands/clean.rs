@@ -59,24 +59,38 @@ pub async fn run_clean(
         ));
     }
 
+    // One service's clean command failing must not abandon the rest of the
+    // cleanup. `fed clean` is what AGENTS.md tells you to run before removing a
+    // worktree, and a fresh worktree is exactly where a command like
+    // `rm -r node_modules` hits an already-absent path — aborting there would
+    // leave every later service's containers and volumes behind. Failures are
+    // collected, reported together at the end, and still exit non-zero.
+    let mut failures: Vec<String> = Vec::new();
+
     for service in &services_to_clean {
         out.status(&format!("\n[clean] {}", service));
         if let Err(e) = orchestrator.run_clean(service).await {
-            // Name the failing service here; main prints the error once.
-            out.error(&format!("[clean] {} failed", service));
-            return Err(e.into());
+            out.error(&format!("[clean] {} failed: {}", service, e));
+            failures.push(service.clone());
         }
     }
 
     // When cleaning all services, also clear persisted port allocations
     // (from `fed ports randomize`). Partial cleans leave port state intact.
     if cleaning_all {
-        orchestrator
+        if let Err(e) = orchestrator
             .state_tracker
             .write()
             .await
             .clear_port_resolutions()
-            .await?;
+            .await
+        {
+            out.error(&format!(
+                "Failed to clear persisted port allocations: {}",
+                e
+            ));
+            failures.push("port allocations".to_string());
+        }
 
         // Per-service clean already cleared install markers for each service
         // in `services_to_clean` (those with `clean:` or `volumes:`). But a
@@ -92,6 +106,14 @@ pub async fn run_clean(
                 e
             ));
         }
+    }
+
+    if !failures.is_empty() {
+        // main prints the returned error once; keep it to the summary line.
+        anyhow::bail!(
+            "clean failed for: {} — everything else was still cleaned",
+            failures.join(", ")
+        );
     }
 
     out.success("\nAll clean commands completed successfully.");
