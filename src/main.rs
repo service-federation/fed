@@ -218,7 +218,7 @@ async fn run() -> anyhow::Result<()> {
     // context is correct for them as-is.
     let mut run_context = RunContext {
         offline: cli.offline,
-        secret_cache: cli.secret_cache.unwrap_or_default(),
+        secret_cache: cli.secret_cache.unwrap_or_default().effective(),
         is_interactive,
         output_mode: OutputMode::default(),
         profiles: cli.profile.clone(),
@@ -398,7 +398,8 @@ async fn run() -> anyhow::Result<()> {
     run_context.secret_cache = cli
         .secret_cache
         .or_else(|| fed::cloud::load_link(&work_dir).map(|link| link.secret_cache))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .effective();
 
     // Parameter resolution and service registration are two separate phases.
     // Serialize real `fed start` invocations before either phase so concurrent

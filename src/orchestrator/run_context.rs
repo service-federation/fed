@@ -22,9 +22,43 @@ pub enum SecretCacheMode {
     /// Resolve vault values for this invocation and its child processes only.
     /// Any existing vault cache is removed and no cache is read or written.
     Memory,
-    /// Persist vault values in the operating system credential store. Any
-    /// existing plaintext vault cache is removed.
+    /// Removed in fed 7.7. Retained only so a `secret_cache: keychain` written
+    /// by fed 7.6.x still parses instead of failing the whole `.fed/cloud.yaml`
+    /// load. Every ingress point normalizes it through [`Self::effective`]
+    /// before it reaches a [`RunContext`], so no consumer ever sees this
+    /// variant. Hidden from `--secret-cache`'s value list for the same reason.
+    #[clap(hide = true)]
     Keychain,
+}
+
+impl SecretCacheMode {
+    /// Map a deprecated mode onto the one that actually runs, warning once.
+    ///
+    /// `Keychain` becomes `Memory`, not `File`: whoever selected it opted out
+    /// of plaintext-on-disk, and silently demoting them to the plaintext file
+    /// cache would break the exact promise they chose the mode for. Losing the
+    /// offline fallback is the honest cost of the removal.
+    pub fn effective(self) -> Self {
+        match self {
+            Self::Keychain => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        "secret_cache: keychain was removed — falling back to memory mode, so \
+                         vault values are not persisted and offline starts won't have them. \
+                         Set `secret_cache: file` in .fed/cloud.yaml (or drop the key) to \
+                         restore an offline fallback; `fed link` rewrites the file for you. \
+                         Any credential-store items fed already wrote are left in place; \
+                         remove them with `security delete-generic-password -s \
+                         com.service-federation.fed.vault-cache` on macOS, or via your \
+                         keyring UI on Linux."
+                    );
+                });
+                Self::Memory
+            }
+            mode => mode,
+        }
+    }
 }
 
 /// Session-scoped run settings: the answers to "what did the user ask for

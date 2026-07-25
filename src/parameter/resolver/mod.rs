@@ -256,8 +256,13 @@ impl Resolver {
 
     /// Select whether team-vault values persist in the owner-only file cache
     /// or remain memory-only for this invocation.
+    ///
+    /// Normalizes the removed `Keychain` mode here as well as at the CLI/config
+    /// ingress points. Both guards are deliberate: this is public API, and a
+    /// library caller passing `Keychain` must not silently land in *file* mode
+    /// and start writing the plaintext cache they asked not to have.
     pub fn set_secret_cache(&mut self, mode: crate::orchestrator::SecretCacheMode) {
-        self.secret_cache = mode;
+        self.secret_cache = mode.effective();
     }
 
     pub fn get_secret_cache(&self) -> crate::orchestrator::SecretCacheMode {

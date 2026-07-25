@@ -294,6 +294,13 @@ impl ServiceManager for GradleService {
         self.base.read().status
     }
 
+    fn mark_healthy(&self) {
+        let mut base = self.base.write();
+        if base.status == Status::Running {
+            base.set_status(Status::Healthy);
+        }
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

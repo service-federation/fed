@@ -676,3 +676,148 @@ services:
         .args(["volume", "rm", "-f", &unrelated_volume])
         .output();
 }
+
+/// Regression: one service's failing clean command must not abandon the rest.
+///
+/// `fed clean` is what AGENTS.md tells you to run before removing a worktree,
+/// and a fresh worktree is exactly where a command like `rm -r node_modules`
+/// hits an already-absent path. Aborting on the first non-zero exit left every
+/// later service's resources behind — and which service is "later" is not even
+/// stable, since `config.services` is a `HashMap`. So this asserts that *every*
+/// other service cleaned, whatever the iteration order, while the command still
+/// exits non-zero.
+#[test]
+fn test_clean_continues_past_a_failing_service() {
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let alpha_marker = temp_dir.path().join("alpha-cleaned");
+    let beta_marker = temp_dir.path().join("beta-cleaned");
+    let config_content = format!(
+        r#"
+services:
+  failing:
+    process: "echo running"
+    clean: "rm -r definitely-not-here"
+  alpha:
+    process: "echo running"
+    clean: "touch {alpha}"
+  beta:
+    process: "echo running"
+    clean: "touch {beta}"
+"#,
+        alpha = alpha_marker.display(),
+        beta = beta_marker.display()
+    );
+
+    let config_path = temp_dir.path().join("service-federation.yaml");
+    fs::write(&config_path, &config_content).expect("Failed to write test config");
+    let workdir = temp_dir.path().to_str().unwrap();
+
+    let clean_output = Command::new(fed_binary())
+        .args(["-c", config_path.to_str().unwrap(), "-w", workdir, "clean"])
+        .output()
+        .expect("Failed to run clean");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&clean_output.stdout),
+        String::from_utf8_lossy(&clean_output.stderr)
+    );
+
+    assert!(
+        !clean_output.status.success(),
+        "clean must still exit non-zero when a clean command failed:\n{}",
+        combined
+    );
+    assert!(
+        alpha_marker.exists(),
+        "'alpha' must still be cleaned despite 'failing' failing:\n{}",
+        combined
+    );
+    assert!(
+        beta_marker.exists(),
+        "'beta' must still be cleaned despite 'failing' failing:\n{}",
+        combined
+    );
+    assert!(
+        combined.contains("failing"),
+        "the summary must name the service that failed:\n{}",
+        combined
+    );
+}
+
+/// A failing clean command must not strand that same service's Docker volume.
+/// The volume is the part a user cannot easily remove by hand, and the shell
+/// command failing says nothing about whether the volume should survive.
+#[test]
+fn test_clean_removes_volumes_when_the_clean_command_fails() {
+    if !is_docker_available() {
+        eprintln!("Skipping Docker volume test - Docker not available");
+        return;
+    }
+
+    let raw_volume = format!("failcleanvolume{}", std::process::id());
+    let config_content = format!(
+        r#"
+services:
+  docker-service:
+    image: alpine:latest
+    clean: "rm -r definitely-not-here"
+    volumes:
+      - "{}:/data"
+"#,
+        raw_volume
+    );
+
+    let (temp_dir, config_path) = create_clean_test_config(&config_content);
+    let workdir = temp_dir.path().to_str().unwrap();
+
+    let hash = hash_work_dir(temp_dir.path());
+    let scoped_volume = format!("fed-{}-{}", hash, raw_volume);
+
+    let _ = Command::new("docker")
+        .args([
+            "volume",
+            "create",
+            "--label",
+            "com.service-federation.managed=true",
+            &scoped_volume,
+        ])
+        .output();
+
+    let volume_check = Command::new("docker")
+        .args(["volume", "inspect", &scoped_volume])
+        .output()
+        .expect("Failed to inspect volume");
+    if !volume_check.status.success() {
+        eprintln!("Could not create test volume, skipping test");
+        return;
+    }
+
+    let clean_output = Command::new(fed_binary())
+        .args(["-c", config_path.to_str().unwrap(), "-w", workdir, "clean"])
+        .output()
+        .expect("Failed to run clean");
+
+    assert!(
+        !clean_output.status.success(),
+        "clean must report the failed clean command with a non-zero exit"
+    );
+
+    std::thread::sleep(Duration::from_millis(500));
+    let volume_check_after = Command::new("docker")
+        .args(["volume", "inspect", &scoped_volume])
+        .output()
+        .expect("Failed to inspect volume");
+
+    let removed = !volume_check_after.status.success();
+    let _ = Command::new("docker")
+        .args(["volume", "rm", "-f", &scoped_volume])
+        .output();
+
+    assert!(
+        removed,
+        "the Docker volume must still be removed when the clean command failed:\n{}{}",
+        String::from_utf8_lossy(&clean_output.stdout),
+        String::from_utf8_lossy(&clean_output.stderr)
+    );
+}

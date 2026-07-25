@@ -284,15 +284,17 @@ mod cloud_link_tests {
     }
 
     #[test]
-    fn keychain_cache_round_trips_in_cloud_config() {
+    fn removed_keychain_policy_still_parses_and_resolves_to_memory() {
+        // A cloud.yaml committed by fed 7.6.x must keep loading — rejecting the
+        // value would take the org/project link down with it and break `fed
+        // start` entirely for everyone on the team who hasn't re-linked yet.
         let link: CloudLink =
             serde_yaml::from_str("org: acme\nproject: web\nsecret_cache: keychain\n").unwrap();
+        assert_eq!(link.org, "acme");
         assert_eq!(
-            link.secret_cache,
-            crate::orchestrator::SecretCacheMode::Keychain
+            link.secret_cache.effective(),
+            crate::orchestrator::SecretCacheMode::Memory
         );
-        let yaml = serde_yaml::to_string(&link).unwrap();
-        assert!(yaml.contains("secret_cache: keychain"));
     }
 }
 

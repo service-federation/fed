@@ -545,12 +545,21 @@ impl<'a> ServiceLifecycleCommands<'a> {
     ///
     /// * `service_name` - Name of the service to clean
     ///
+    /// Every step is attempted even if an earlier one fails: a `clean:` command
+    /// that exits non-zero must not strand this service's Docker volumes or its
+    /// install marker. The most common failure is a command like
+    /// `rm -r node_modules` in a fresh worktree, where the path is simply
+    /// already absent — the least useful moment to abandon the rest of the
+    /// cleanup. The first error is still returned, so the caller reports a
+    /// failure and exits non-zero.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - Service not found in configuration
     /// - Clean command execution fails
     /// - Clean command returns non-zero exit code
+    /// - Volume removal or install-marker clearing fails
     pub async fn run_clean(&self, service_name: &str) -> Result<()> {
         // Get service config
         let service_config = self
@@ -566,6 +575,9 @@ impl<'a> ServiceLifecycleCommands<'a> {
         if !has_clean_cmd && !has_volumes {
             return Ok(());
         }
+
+        // Collected rather than returned early — see the doc comment.
+        let mut failures: Vec<Error> = Vec::new();
 
         // Run user-defined clean command if present
         if let Some(ref clean_cmd) = service_config.clean {
@@ -594,25 +606,49 @@ impl<'a> ServiceLifecycleCommands<'a> {
             }
 
             // Run the clean command with streaming (prefixed, dimmed) output
-            let (status, tail) = self
+            match self
                 .run_streamed_hook(service_name, "clean", clean_cmd, cwd, &env_vars)
-                .await?;
-
-            if !status.success() {
-                return Err(Self::hook_failure(service_name, "clean", &tail));
+                .await
+            {
+                Ok((status, tail)) if !status.success() => {
+                    failures.push(Self::hook_failure(service_name, "clean", &tail));
+                }
+                Ok(_) => {}
+                Err(e) => failures.push(e),
             }
         }
 
-        // Clean up Docker volumes if present
-        if has_volumes {
-            self.clean_docker_volumes(service_name, &service_config.volumes)
-                .await?;
+        // Clean up Docker volumes if present. Deliberately still attempted
+        // after a failed clean command — the volumes are the part the user
+        // cannot easily remove by hand.
+        if has_volumes
+            && let Err(e) = self
+                .clean_docker_volumes(service_name, &service_config.volumes)
+                .await
+        {
+            failures.push(e);
         }
 
         // Clear install state since we cleaned up. (migrate has no marker in
         // fed 6.0 — it re-runs on every start — so there is nothing to clear.)
+        // Cleared even after a failure: forcing a re-install on the next start
+        // is the safe direction when cleanup was only partial.
         let ctx = self.markers();
-        ctx.clear_installed(service_name)?;
+        if let Err(e) = ctx.clear_installed(service_name) {
+            failures.push(e);
+        }
+
+        let mut failures = failures.into_iter();
+        if let Some(first) = failures.next() {
+            for extra in failures {
+                tracing::warn!(
+                    "Additional failure while cleaning '{}': {}",
+                    service_name,
+                    extra
+                );
+            }
+            return Err(first);
+        }
 
         tracing::info!(
             "Successfully completed clean for service '{}'",

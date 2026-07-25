@@ -1,0 +1,20 @@
+# A compose file you already had. fed does not rewrite this file — it passes each
+# service's resolved `environment:` to the `docker compose up` subprocess, so
+# compose's own ${VAR} substitution is what picks up fed's allocated port.
+#
+# The `:-6399` fallback keeps `docker compose up` working on its own, without fed.
+services:
+  cache:
+    image: redis:7-alpine
+    ports:
+      - "${CACHE_PORT:-6399}:6379"
+    volumes:
+      - cache_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+volumes:
+  cache_data:

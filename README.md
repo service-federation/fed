@@ -25,7 +25,7 @@ fed handles the parts of local development that shell scripts and Compose overri
 - Runs project commands with the ports and credentials allocated to that checkout.
 - Starts and cleans up throwaway native and image-backed stacks for integration tests.
 
-The CLI is open source, works without an account, and does not replace Docker or Compose. It coordinates them with the processes that should stay on your host.
+Rather than replacing Docker or Compose, fed drives them alongside the processes you keep on the host.
 
 ![fed demo: starting a mixed native and Docker stack, then running an isolated copy from a Git worktree](docs/fed-demo.gif)
 
@@ -43,6 +43,14 @@ cargo install --git https://github.com/service-federation/fed --locked
 
 Run `fed doctor` after installation to check Docker, Compose, and Git.
 
+### What it touches
+
+fed shells out to the `docker` and `docker compose` CLIs, so it has the same Docker access your own shell has. It runs for the duration of a command and exits.
+
+Everything it tracks for a project lives in `.fed/` inside that checkout: state, logs, port allocations, and generated secrets. It manages `.fed/.gitignore` for you. `fed stop` stops and removes the containers it started, and `fed clean` additionally runs the clean commands you declare.
+
+It opens network connections to two places: the healthcheck URLs you configure, and the hosted vault once you have run `fed login` and `fed link`.
+
 ## Try a real stack
 
 The repository includes a small Python and PostgreSQL project. It has a native API, a Docker database, a schema migration, and health checks.
@@ -56,7 +64,7 @@ fed stop
 fed clean
 ```
 
-This proves the whole path before you write a config for your own project.
+If that works, your machine is set up. Then write a config for your own project.
 
 ## Add fed to a project
 
@@ -115,9 +123,9 @@ In `fed status`, `running` means the process is up but no healthcheck has confir
 
 ## One stack per worktree
 
-Your coding agents stop killing each other's databases. One worktree per agent, one full stack per worktree, zero shared ports.
-
 Git isolates files. fed isolates the runtime state that usually still collides.
+
+One worktree per branch or agent, one full stack per worktree, zero shared ports.
 
 ```console
 ~/app         $ fed start
@@ -131,7 +139,7 @@ Git isolates files. fed isolates the runtime state that usually still collides.
 
 Each isolated checkout gets its own values for declared `type: port` parameters, direct Docker container names, named volumes, generated secrets, and fed state.
 
-Caveat: fed cannot remap a port hardcoded inside a command, URL, or Compose file. Declare every host port as a `type: port` parameter. See [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/) for Compose behavior, bind mounts, cookies, cleanup, and the full isolation model.
+Caveat: fed cannot remap a port hardcoded inside a command, URL, or Compose file. Declare it as a `type: port` parameter and it can, one port at a time, as you hit the ones that actually collide. See [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/) for Compose behavior, bind mounts, cookies, cleanup, and the full isolation model.
 
 For coding agents, put this in `AGENTS.md` or `CLAUDE.md`:
 
@@ -180,35 +188,30 @@ services:
     depends_on: [database]
 ```
 
-Read [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/) before enabling worktree isolation. Compose ports must use environment substitution so fed can allocate them.
-
-## Local and team secrets
-
-`type: secret` creates a stable local development value in a mode-0600, Git-ignored file. This needs no account or network access.
-
-For credentials a team must share, the optional Service Federation Cloud vault can fill `source: manual` values during `fed start`. The first three people in an organization are free, then each additional seat costs €8 per month. It is for development credentials, not production secrets or compliance workloads.
-
-Removing a member blocks new server fetches. It cannot erase values already cached on that person's machine, so rotate credentials after removing someone who had access. Read [Generated secrets](https://www.service-federation.com/docs/generated-secrets/) and [Team secrets](https://www.service-federation.com/docs/secrets/) before choosing either path.
-
-By default, fetched vault values are cached in the owner-only, Git-ignored `.fed/secrets.cache.env` file so the stack can start while the vault is unavailable. To keep the offline fallback in each developer's operating-system credential store instead, commit the shared policy in `.fed/cloud.yaml`:
+One `fed.yaml` can point at as many Compose files as you like, so a monorepo keeps each service's file where it already lives:
 
 ```yaml
-org: acme
-project: web
-secret_cache: keychain
+services:
+  auth-cache:
+    compose_file: ./services/auth/compose.yaml
+    compose_service: cache
+
+  billing-cache:
+    compose_file: ./services/billing/compose.yaml
+    compose_service: cache
 ```
 
-Keychain mode removes an existing plaintext vault cache and stores each fetched value in macOS Keychain, Linux Secret Service, or Windows Credential Manager. If the selected credential store is locked or unavailable, Fed fails clearly rather than falling back to plaintext.
+fed starts those as separate Compose projects, each with its own containers, volumes, and ports.
 
-To disable persistence entirely, use memory mode:
+Compose files with hardcoded host ports work as they are. One checkout starts exactly as it does today. You only need `${VAR}` substitution on a port when you want *two* checkouts of that service running at the same time, because fed exports the allocated value and Compose's own substitution picks it up. Leave a port hardcoded and the second checkout stops on the bind rather than quietly sharing the first one's container. So you can retrofit ports when you actually hit a collision.
 
-```yaml
-org: acme
-project: web
-secret_cache: memory
-```
+[`examples/compose-worktrees/`](examples/compose-worktrees/) is a runnable version of all of this, with a `verify.sh` that checks each claim against a real Docker daemon.
 
-Memory mode removes any existing vault cache and disables the vault's offline fallback. It does not change locally generated secrets or explicit `env_file` values, and it cannot prevent a child process from logging or otherwise persisting a value it receives. `--secret-cache file|memory|keychain` remains available as an explicit override for one invocation.
+## Secrets
+
+`type: secret` generates a stable local development value and keeps it in a mode-0600, Git-ignored file, with no account or network access involved.
+
+If your team needs to share development credentials, an optional hosted vault can fill `source: manual` values during `fed start`. Everything above this line works without it. It handles development credentials, not production secrets, and removing someone's access does not erase values already cached on their machine, so rotate after offboarding. [Team secrets](https://www.service-federation.com/docs/secrets/) covers how it works, what it costs, and how to turn the local cache off. For the local-only path, see [Generated secrets](https://www.service-federation.com/docs/generated-secrets/).
 
 ## Documentation and examples
 

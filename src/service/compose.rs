@@ -461,6 +461,13 @@ impl ServiceManager for DockerComposeService {
         self.base.read().status
     }
 
+    fn mark_healthy(&self) {
+        let mut base = self.base.write();
+        if base.status == Status::Running {
+            base.set_status(Status::Healthy);
+        }
+    }
+
     fn get_container_id(&self) -> Option<String> {
         self.container_id.clone()
     }

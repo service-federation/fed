@@ -584,6 +584,13 @@ impl<'a> HealthCheckRunner<'a> {
                         ));
                     }
                     tracker.save().await?;
+                    // Release the tracker before touching the manager: the
+                    // in-memory promotion is display state, and taking it
+                    // under the tracker write lock would nest two locks for
+                    // no reason. `mark_healthy` only promotes from Running,
+                    // so a concurrent stop landing in this gap wins.
+                    drop(tracker);
+                    manager_arc.lock().await.mark_healthy();
                     return Ok(StartHealth::Healthy);
                 }
                 Ok(false) => {

@@ -249,7 +249,6 @@ impl Resolver {
         let generated_env_key = crate::fed_dir::GENERATED_SECRETS_REL.to_string();
         let cache_path = crate::fed_dir::secrets_cache_path(&work_dir);
         let memory_only = self.secret_cache == crate::orchestrator::SecretCacheMode::Memory;
-        let keychain_only = self.secret_cache == crate::orchestrator::SecretCacheMode::Keychain;
 
         // File-cache safety gate: the cache holds real secret values, so it must
         // never sit in a commit-eligible location. With the self-managed
@@ -257,28 +256,21 @@ impl Resolver {
         // .fed/.gitignore disables caching entirely — an existing cache file
         // is DELETED (leaving secrets on disk where git can pick them up is
         // the unsafe option) and its values are neither read nor rewritten.
-        let file_cache_usable = if memory_only || keychain_only {
-            // Memory and keychain policies both exclude plaintext persistence:
-            // remove an earlier file-backed cache before resolving anything.
-            // Failing to remove it must be loud; silently leaving plaintext
-            // behind would violate either mode's central promise.
+        let file_cache_usable = if memory_only {
+            // Memory policy excludes plaintext persistence: remove an earlier
+            // file-backed cache before resolving anything. Failing to remove it
+            // must be loud; silently leaving plaintext behind would violate the
+            // mode's central promise.
             if cache_path.exists() {
                 std::fs::remove_file(&cache_path).map_err(|e| {
                     Error::Filesystem(format!(
-                        "Cannot remove plaintext vault secrets cache '{}' for {} mode: {}",
+                        "Cannot remove plaintext vault secrets cache '{}' for memory mode: {}",
                         cache_path.display(),
-                        if memory_only { "memory" } else { "keychain" },
                         e
                     ))
                 })?;
             }
-            if memory_only {
-                tracing::info!(
-                    "Team-vault cache is memory-only; fetched values will not be persisted"
-                );
-            } else {
-                tracing::info!("Team-vault cache uses the operating-system keychain");
-            }
+            tracing::info!("Team-vault cache is memory-only; fetched values will not be persisted");
             false
         } else {
             let (in_repo, ignored) = crate::parameter::secret::path_git_status(&cache_path);
@@ -317,34 +309,10 @@ impl Resolver {
             Some(a) => a,
             None => return Ok(()), // No secret parameters at all
         };
-        // A committed keychain policy must not make headless CI depend on a
-        // desktop credential store when every manual secret was already
-        // supplied by env_file/explicit values. Open the backend only when
-        // there is actually a vault/cache value left to resolve.
-        let needs_vault_cache = analysis
-            .missing_manual
-            .iter()
-            .any(|(name, _)| self.name_in_scope(name))
-            || analysis
-                .missing_optional_manual
-                .iter()
-                .any(|name| self.name_in_scope(name));
-        let keychain_cache = if keychain_only && needs_vault_cache {
-            let backend = crate::parameter::keychain_cache::KeychainCache::for_work_dir(&work_dir)?;
-            let declared_names: HashSet<String> = config
-                .get_effective_parameters()
-                .iter()
-                .filter(|(_, parameter)| parameter.is_secret_type())
-                .map(|(name, _)| name.clone())
-                .collect();
-            let (values, stamps) = backend.load(&declared_names)?;
-            analysis.cache_values = values;
-            analysis.cache_stamps = stamps;
-            Some(backend)
-        } else {
-            None
-        };
-        if memory_only || (!keychain_only && !file_cache_usable) {
+        // Memory mode and a disabled (commit-eligible) file cache both set
+        // `file_cache_usable = false`; in either case whatever `analyze_secrets`
+        // read off disk must not answer for a missing secret.
+        if !file_cache_usable {
             analysis.cache_values.clear();
             analysis.cache_stamps.clear();
         }
@@ -490,12 +458,7 @@ impl Resolver {
                     },
                 );
             }
-            if let Some(backend) = &keychain_cache {
-                // An explicitly selected secure-store backend is a contract.
-                // Surface write failures instead of pretending offline
-                // fallback was established.
-                backend.replace(&new_cache)?;
-            } else if file_cache_usable
+            if file_cache_usable
                 && let Err(e) = crate::parameter::secret::write_cache_file(&cache_path, &new_cache)
             {
                 tracing::warn!(
@@ -2292,17 +2255,28 @@ mod tests {
     }
 
     #[test]
-    fn keychain_policy_does_not_open_store_when_manual_secret_is_already_supplied() {
+    fn removed_keychain_policy_degrades_to_memory_not_to_plaintext() {
         use crate::config::{Config, Parameter};
         use tempfile::TempDir;
 
-        // Deliberately no .fed/cloud.yaml: opening the keychain backend would
-        // fail with "requires a linked project". An explicit value makes the
-        // vault/cache irrelevant, as in headless CI.
+        // fed 7.6.x could commit `secret_cache: keychain` to .fed/cloud.yaml.
+        // The mode is gone, but a checkout still carrying it must not be
+        // demoted to the *file* cache — that would start writing plaintext to
+        // disk for the one audience that explicitly opted out of it.
         let temp_dir = TempDir::new().unwrap();
+        let cache_path = crate::fed_dir::secrets_cache_path(temp_dir.path());
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&cache_path, "API_KEY=stale_from_before_the_upgrade\n").unwrap();
+
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_offline(true);
         resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::Keychain);
+        assert_eq!(
+            resolver.get_secret_cache(),
+            crate::orchestrator::SecretCacheMode::Memory,
+            "the removed mode must normalize on the way in, never reach resolution"
+        );
 
         let mut config = Config::default();
         config.parameters.insert(
@@ -2320,37 +2294,9 @@ mod tests {
             resolver.get_resolved_parameters().get("API_KEY").unwrap(),
             "supplied-by-ci"
         );
-    }
-
-    #[test]
-    fn keychain_policy_does_not_open_store_for_out_of_scope_manual_secret() {
-        use crate::config::{Config, Parameter};
-        use tempfile::TempDir;
-
-        // A scoped script that references no secrets must not require a
-        // desktop keychain merely because unrelated services declare them.
-        // No cloud link is present, so opening the backend would fail.
-        let temp_dir = TempDir::new().unwrap();
-        let mut resolver = Resolver::new();
-        resolver.set_work_dir(temp_dir.path());
-        resolver.set_required_names(Some(HashSet::new()));
-        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::Keychain);
-
-        let mut config = Config::default();
-        config.parameters.insert(
-            "UNRELATED_API_KEY".to_string(),
-            Parameter {
-                param_type: Some("secret".to_string()),
-                source: Some("manual".to_string()),
-                ..Default::default()
-            },
-        );
-
-        resolver.resolve_parameters(&mut config).unwrap();
         assert!(
-            !resolver
-                .get_resolved_parameters()
-                .contains_key("UNRELATED_API_KEY")
+            !cache_path.exists(),
+            "memory semantics must remove the plaintext cache, not adopt it"
         );
     }
 

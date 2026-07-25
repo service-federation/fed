@@ -418,6 +418,17 @@ impl Orchestrator {
                 {
                     compose.restore_status(crate::service::Status::Running);
                 }
+
+                // A healthcheck that passed in the starting process stays
+                // passed for a later `fed status`: carry the persisted
+                // Healthy forward rather than reporting the freshly-restored
+                // Running as "health unverified". Gated on `!missing` so a
+                // row whose process is gone is never restored as healthy —
+                // and `mark_healthy` itself only promotes from Running, so
+                // restores that failed to reach Running are unaffected.
+                if !missing && service_state.status == crate::service::Status::Healthy {
+                    manager.mark_healthy();
+                }
             }
 
             if missing {
