@@ -390,6 +390,23 @@ pub trait ServiceManager: Send + Sync {
     /// Get the current lifecycle status.
     fn status(&self) -> Status;
 
+    /// Promote a verified-alive service from `Running` to `Healthy`.
+    ///
+    /// Called from exactly two places: the startup health wait, the moment a
+    /// healthcheck first passes, and manager restoration in a fresh process
+    /// carrying a persisted `Healthy` row forward. Without it the passing
+    /// check is observed, printed, and then thrown away — the in-memory
+    /// manager stays `Running`, so the start summary and `fed status` both
+    /// report "health unverified" for a service whose check demonstrably
+    /// passed.
+    ///
+    /// Implementations MUST promote only from `Running`. Anything else
+    /// (`Starting`, `Failing`, `Stopping`, `Stopped`) means a concurrent stop
+    /// or a liveness failure has moved the service on since the check, and
+    /// resurrecting it as `Healthy` would be a lie. Managers with no mutable
+    /// status of their own (external, oneshot) keep the no-op default.
+    fn mark_healthy(&self) {}
+
     /// Get the service name/identifier.
     fn name(&self) -> &str;
 

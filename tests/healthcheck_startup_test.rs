@@ -245,3 +245,128 @@ services:
     // Cleanup
     fed_stop(&config_path, workdir);
 }
+
+/// Regression: a healthcheck that passes during `fed start` must still read as
+/// healthy from a *later, separate* `fed status` process.
+///
+/// The passing check used to be observed, printed ("✓ verified healthy in
+/// 1.5s"), and then discarded: only the SQLite row was moved to `Healthy`,
+/// while the in-memory manager stayed `Running`. So `fed start`'s own summary
+/// two lines later said "Running (health unverified)", and a fresh `fed
+/// status` — which restores managers from the row but only carried the
+/// persisted status forward for oneshot and compose services — agreed with it.
+///
+/// Asserted through `--json` on purpose: the human-readable status line says
+/// "healthy" for both `Healthy` and (via the `running` substring) `Running`,
+/// which is exactly the looseness that let this through. `health` is
+/// `"healthy"` only for `Status::Healthy`, and `"unknown"` for `Running`.
+#[test]
+fn test_passed_startup_healthcheck_is_reported_healthy_by_later_status() {
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("service-federation.yaml");
+    let workdir = temp_dir.path().to_str().unwrap();
+
+    // `verified` becomes healthy once it touches a marker; `no-check` has no
+    // healthcheck at all. Both must stay distinguishable afterwards — the fix
+    // must promote the first without collapsing the second into a false
+    // "healthy". The marker matters: fed rejects a healthcheck that already
+    // passes *before* its service starts (it can't tell that apart from a
+    // foreign process serving the same endpoint), so a `true` check is not a
+    // usable stand-in here.
+    let marker_path = temp_dir.path().join("verified-marker");
+    let config_content = format!(
+        r#"
+services:
+  verified:
+    process: |
+      touch {marker}
+      sleep 300
+    healthcheck:
+      command: "test -f {marker}"
+      timeout: "10s"
+  no-check:
+    process: "sleep 300"
+"#,
+        marker = marker_path.display()
+    );
+    fs::write(&config_path, &config_content).expect("Failed to write config");
+
+    let start_output = Command::new(fed_binary())
+        .args([
+            "-c",
+            config_path.to_str().unwrap(),
+            "-w",
+            workdir,
+            "start",
+            "verified",
+            "no-check",
+        ])
+        .env("FED_NON_INTERACTIVE", "1")
+        .output()
+        .expect("Failed to run fed start");
+
+    let start_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&start_output.stdout),
+        String::from_utf8_lossy(&start_output.stderr)
+    );
+    println!("Start output:\n{}", start_text);
+    assert!(
+        start_output.status.success(),
+        "fed start failed:\n{}",
+        start_text
+    );
+
+    // The start summary must not contradict the outcome line it just printed.
+    assert!(
+        !start_text.contains("verified: Running (health unverified)"),
+        "start summary reported 'health unverified' for a service whose \
+         healthcheck passed during this very start:\n{}",
+        start_text
+    );
+
+    let status_output = Command::new(fed_binary())
+        .args([
+            "-c",
+            config_path.to_str().unwrap(),
+            "-w",
+            workdir,
+            "status",
+            "--json",
+        ])
+        .env("FED_NON_INTERACTIVE", "1")
+        .output()
+        .expect("Failed to run fed status --json");
+
+    let status_stdout = String::from_utf8_lossy(&status_output.stdout).to_string();
+    println!("Status JSON:\n{}", status_stdout);
+    let json: serde_json::Value = serde_json::from_str(&status_stdout)
+        .unwrap_or_else(|e| panic!("status --json did not emit valid JSON: {e}\n{status_stdout}"));
+
+    assert_eq!(
+        json["verified"]["health"], "healthy",
+        "a healthcheck that passed during start must survive into a later \
+         `fed status`, not decay back to unverified:\n{}",
+        status_stdout
+    );
+    assert_eq!(
+        json["verified"]["status"], "healthy",
+        "status word must match the health bucket:\n{}",
+        status_stdout
+    );
+
+    // The distinction has to stay meaningful: no healthcheck configured is
+    // still "process is up, nothing verified it", never "healthy".
+    assert_eq!(
+        json["no-check"]["health"], "unknown",
+        "a service with no healthcheck must not be promoted to healthy:\n{}",
+        status_stdout
+    );
+    assert_eq!(
+        json["no-check"]["status"], "running",
+        "a service with no healthcheck must stay Running:\n{}",
+        status_stdout
+    );
+
+    fed_stop(&config_path, workdir);
+}
