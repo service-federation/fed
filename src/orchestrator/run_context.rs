@@ -44,11 +44,14 @@ impl SecretCacheMode {
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| {
                     tracing::warn!(
-                        "secret_cache: keychain was removed in fed 7.7 — falling back to memory \
-                         mode, so vault values are not persisted and offline starts won't have \
-                         them. Set `secret_cache: file` in .fed/cloud.yaml (or drop the key) to \
-                         restore an offline fallback; `fed link` rewrites the file for you. See \
-                         the README for clearing leftover credential-store items."
+                        "secret_cache: keychain was removed — falling back to memory mode, so \
+                         vault values are not persisted and offline starts won't have them. \
+                         Set `secret_cache: file` in .fed/cloud.yaml (or drop the key) to \
+                         restore an offline fallback; `fed link` rewrites the file for you. \
+                         Any credential-store items fed already wrote are left in place; \
+                         remove them with `security delete-generic-password -s \
+                         com.service-federation.fed.vault-cache` on macOS, or via your \
+                         keyring UI on Linux."
                     );
                 });
                 Self::Memory

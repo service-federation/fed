@@ -1,0 +1,33 @@
+# Pointing fed at a compose file you already have, and proving what that does
+# and does not isolate across git worktrees. Run ./verify.sh to check the claims
+# in README.md against a real Docker daemon.
+
+parameters:
+  # Declaring the host port here is what makes isolation work. fed allocates a
+  # fresh value per isolated checkout and exports it to the compose subprocess,
+  # where `${CACHE_PORT}` in compose.yaml picks it up.
+  CACHE_PORT:
+    type: port
+    default: 6399
+
+services:
+  # A service fed does not own: it delegates to `docker compose up cache`.
+  cache:
+    compose_file: ./compose.yaml
+    compose_service: cache
+    environment:
+      CACHE_PORT: '{{CACHE_PORT}}'
+
+  # A native process, to show the two kinds sitting in one dependency graph.
+  # It reads the same parameter, so it always points at its own checkout's cache.
+  probe:
+    process: |
+      echo "probe: cache is on port ${CACHE_PORT}"
+      while true; do sleep 5; done
+    environment:
+      CACHE_PORT: '{{CACHE_PORT}}'
+    depends_on: [cache]
+    healthcheck:
+      command: redis-cli -p {{CACHE_PORT}} ping
+
+entrypoint: probe
