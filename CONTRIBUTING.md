@@ -1,12 +1,10 @@
 # Contributing to Service Federation
 
-Thank you for your interest in contributing to Service Federation! This document provides guidelines and information for contributors.
-
 ## Getting Started
 
 ### Prerequisites
 
-- Rust 1.89 or later
+- Rust 1.95 or later
 - Docker (for running Docker-related tests)
 - Git
 
@@ -31,41 +29,10 @@ cargo test -- --include-ignored
 cargo test test_name
 ```
 
-## How to Contribute
+## Pull Requests
 
-### Reporting Bugs
-
-Before creating a bug report:
-1. Check the [existing issues](https://github.com/service-federation/fed/issues) to avoid duplicates
-2. Include steps to reproduce the issue
-3. Include your environment details (OS, Rust version, etc.)
-
-### Suggesting Features
-
-Feature requests are welcome! Please:
-1. Check existing issues to see if it's already been suggested
-2. Describe the use case and why existing features don't meet your needs
-3. Be open to discussion about alternative approaches
-
-### Pull Requests
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Make your changes
-4. Ensure tests pass (`cargo test`)
-5. Ensure code is formatted (`cargo fmt`)
-6. Ensure clippy is happy (`cargo clippy`)
-7. Commit your changes with a descriptive message
-8. Push to your fork
-9. Open a Pull Request
-
-## Code Style
-
-- Follow standard Rust conventions
-- Run `cargo fmt` before committing
-- Run `cargo clippy` and address any warnings
-- Write tests for new functionality
-- Add doc comments for complex logic
+Run `cargo fmt`, `cargo clippy`, and `cargo test` before opening one. Write
+tests for new functionality.
 
 ### Linting platform-specific code
 
@@ -86,21 +53,13 @@ update both `.github/workflows/ci.yml` and `scripts/lint-linux.sh`.
 
 ## Commit Messages
 
-Write clear, concise commit messages that describe what the change does:
-
-```
-Add health check retry with exponential backoff
-
-- Implement retry logic for failed health checks
-- Add configurable backoff parameters
-- Update documentation
-```
+Match `git log`: a plain-sentence summary line, then prose explaining the
+symptom, the root cause, and why the fix works — not a bullet list of what
+changed. The diff already says what changed; the message is for what the
+diff can't say.
 
 ## Testing Guidelines
 
-- Write unit tests for new functions
-- Write integration tests for new features
-- Ensure existing tests continue to pass
 - Docker-related tests should be marked with `#[ignore]` and include `// Requires Docker` comment
 - When a new integration test builds a fed-config YAML fixture inline, parse
   it through `support::parse_checked` (`tests/support/mod.rs`) instead of a
@@ -123,11 +82,3 @@ The codebase is organized as follows:
 - `src/state/` - State persistence (SQLite-based)
 - `src/tui/` - Terminal UI implementation
 - `src/commands/` - CLI command implementations
-
-## Questions?
-
-Feel free to open an issue for any questions about contributing.
-
-## License
-
-By contributing, you agree that your contributions will be licensed under the MIT License.
