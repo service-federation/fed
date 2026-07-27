@@ -317,15 +317,17 @@ impl ProcessService {
                 );
             }
 
-            // SAFETY: pre_exec is unsafe because the closure runs after fork() but before exec()
-            // in the child process. During this window, only async-signal-safe functions can be called.
-            //
-            // Safety invariants upheld:
-            // 1. parsed_limits contains only Copy types (Option<u64>) - no heap allocations
-            // 2. All string parsing happened BEFORE this point (in from_config)
-            // 3. The closure only calls setrlimit() which is async-signal-safe per POSIX
-            // 4. No heap allocation, no locks, no I/O in the closure itself
-            // 5. The closure is FnMut + Send which is required for pre_exec
+            // SAFETY: pre_exec is unsafe because the closure runs after fork() but before
+            // exec() in the child of what is, in fed, always a multithreaded process — a
+            // thread other than the one that forked may hold the allocator lock, and the
+            // child can never release it, so allocating here can deadlock the child.
+            // `parsed_limits` holds only pre-resolved Copy values (all string parsing
+            // happened earlier, in `from_config`), and `apply()` (see its doc comment)
+            // avoids `format!`/`eprintln!`/`std::io::stderr()` in favor of a raw
+            // `libc::write` of a `'static` byte string on its error paths. POSIX does not
+            // list `setrlimit` itself as async-signal-safe, so this relies on it behaving
+            // as a plain syscall on the platforms fed supports (Linux, macOS), not on a
+            // formal guarantee.
             //
             // See: https://man7.org/linux/man-pages/man7/signal-safety.7.html
             unsafe {
@@ -971,7 +973,10 @@ pub mod resource_limits {
     }
 
     /// Pre-parsed resource limits containing only Copy types.
-    /// This struct is safe to use inside pre_exec because it contains no heap allocations.
+    ///
+    /// Holding only `Copy` data is necessary but not sufficient for `pre_exec`
+    /// use — see `apply()`'s doc comment for what else that requires of its
+    /// own implementation.
     #[derive(Clone, Copy)]
     #[allow(dead_code)] // pids_limit is Linux-only, unused on macOS
     pub struct ParsedResourceLimits {
@@ -1077,51 +1082,106 @@ pub mod resource_limits {
 
         /// Apply pre-parsed resource limits using setrlimit.
         ///
-        /// If `strict_limits` is false (default), logs warnings and continues on error.
+        /// If `strict_limits` is false (default), warns and continues on error.
         /// If `strict_limits` is true, returns error immediately on any setrlimit failure.
         ///
-        /// SAFETY: This function is async-signal-safe because it only calls setrlimit()
-        /// with pre-computed numeric values. No string parsing, heap allocation, or I/O.
-        /// The eprintln! calls are technically not async-signal-safe, but are used only
-        /// in non-strict mode where startup failure is acceptable.
+        /// Called from `pre_exec`, so this runs after `fork()` but before `exec()` in
+        /// the child of what is, in `fed`, always a multithreaded process — a thread
+        /// other than the one that forked may hold the allocator lock, and the child
+        /// has no way to release it, so allocating here can deadlock the child.
+        /// `setrlimit()` itself takes only pre-computed numeric values; its error
+        /// paths used to call `format!` (allocates) and `eprintln!` (uses
+        /// formatting machinery and, more importantly, acquires
+        /// `std::io::stderr()`'s global reentrant lock, which another thread could
+        /// hold at the moment of `fork()` and which the child can never release).
+        /// They're replaced with a raw errno-to-`io::Error` conversion (no
+        /// formatting) and a direct `libc::write(2, ...)` of a `'static` byte string
+        /// (no allocation, no locking; a closed fd 2 just returns `EBADF`). This
+        /// removes the known allocation/locking/stdio hazards; it is not a formal
+        /// proof of async-signal-safety, since POSIX does not list `setrlimit`
+        /// itself among the guaranteed-safe functions — this relies on it behaving
+        /// as a plain syscall on the platforms fed supports (Linux, macOS).
         pub fn apply(self) -> std::io::Result<()> {
-            // Helper macro to handle setrlimit with strict_limits flag
-            macro_rules! apply_limit {
-                ($resource:expr, $limit:expr, $name:expr) => {
-                    if let Err(e) = setrlimit($resource, $limit, $limit) {
-                        if self.strict_limits {
-                            return Err(std::io::Error::other(format!(
-                                "Failed to set {} limit: {}",
-                                $name, e
-                            )));
-                        } else {
-                            // Note: eprintln! is not async-signal-safe but acceptable here
-                            // since we're in non-strict mode (startup failure acceptable)
-                            eprintln!("Warning: Failed to set {} limit: {}", $name, e);
-                        }
-                    }
-                };
-            }
-
             // Set memory limit (RLIMIT_AS - address space)
             if let Some(bytes) = self.memory_bytes {
-                apply_limit!(Resource::RLIMIT_AS, bytes, "memory");
+                apply_one(
+                    Resource::RLIMIT_AS,
+                    bytes,
+                    bytes,
+                    self.strict_limits,
+                    b"fed: warning: failed to set memory limit\n",
+                )?;
             }
 
             // Set max number of processes/threads (RLIMIT_NPROC)
             // Note: RLIMIT_NPROC is available on Linux but not all Unix systems
             #[cfg(target_os = "linux")]
             if let Some(limit) = self.pids_limit {
-                apply_limit!(Resource::RLIMIT_NPROC, limit, "pids");
+                apply_one(
+                    Resource::RLIMIT_NPROC,
+                    limit,
+                    limit,
+                    self.strict_limits,
+                    b"fed: warning: failed to set pids limit\n",
+                )?;
             }
 
             // Set max open file descriptors (RLIMIT_NOFILE)
             if let Some(limit) = self.nofile_limit {
-                apply_limit!(Resource::RLIMIT_NOFILE, limit, "nofile");
+                apply_one(
+                    Resource::RLIMIT_NOFILE,
+                    limit,
+                    limit,
+                    self.strict_limits,
+                    b"fed: warning: failed to set nofile limit\n",
+                )?;
             }
 
             Ok(())
         }
+    }
+
+    /// Set one resource limit, warning (non-strict) or failing (strict) on
+    /// error. Soft and hard are taken separately — production always calls
+    /// this with `soft == hard`, but tests use `soft > hard` to force a
+    /// deterministic `EINVAL` regardless of the ambient hard limit or
+    /// process privilege (unlike, say, requesting a value close to
+    /// `RLIM_INFINITY`, which a sufficiently privileged process could
+    /// legitimately satisfy).
+    ///
+    /// Called only from [`ParsedResourceLimits::apply`] — see that
+    /// function's doc comment for the `pre_exec`/async-signal-safety
+    /// constraints this must uphold.
+    #[cfg(unix)]
+    pub(super) fn apply_one(
+        resource: Resource,
+        soft: u64,
+        hard: u64,
+        strict: bool,
+        warning: &'static [u8],
+    ) -> std::io::Result<()> {
+        if let Err(errno) = setrlimit(resource, soft, hard) {
+            if strict {
+                return Err(std::io::Error::from(errno));
+            }
+            // No format!/eprintln! here: format! allocates, and eprintln!
+            // uses formatting machinery and, more importantly, acquires
+            // std::io::stderr()'s global reentrant lock — not a safety
+            // contract this close to fork(). `warning` is a
+            // 'static byte string, and this calls libc::write directly
+            // rather than nix::unistd::write (which needs fd 2 to still
+            // be open, via BorrowedFd). A closed or invalid fd 2 just
+            // makes the raw syscall return EBADF, which is ignored the
+            // same as any other failure to warn.
+            let _ = unsafe {
+                nix::libc::write(
+                    nix::libc::STDERR_FILENO,
+                    warning.as_ptr().cast(),
+                    warning.len(),
+                )
+            };
+        }
+        Ok(())
     }
 
     /// Parse memory string (e.g., "512m", "2g") to bytes
@@ -1464,6 +1524,111 @@ mod tests {
         assert!(validation.memory.is_none());
         assert!(validation.nofile.is_none());
         // pids is only validated on Linux, so we don't check it here
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_apply_via_pre_exec_succeeds_with_valid_limits() {
+        use resource_limits::ParsedResourceLimits;
+        use std::os::unix::process::CommandExt;
+
+        let mut limits = ParsedResourceLimits {
+            memory_bytes: None,
+            pids_limit: None,
+            nofile_limit: Some(1024),
+            strict_limits: true,
+        };
+        // Values applied inside pre_exec must already be resolved against the
+        // system's hard limit, exactly as the real spawn path does in
+        // start_native_process before registering the closure.
+        limits.validate_against_system();
+
+        let mut cmd = std::process::Command::new("true");
+        // SAFETY: apply() only calls setrlimit()/write(2) with pre-resolved,
+        // Copy-only data — see apply()'s doc comment for the invariant this
+        // relies on.
+        unsafe {
+            cmd.pre_exec(move || limits.apply());
+        }
+        let status = cmd.status().expect("spawn with pre_exec resource limits");
+        assert!(status.success(), "child should exit 0: {status:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_apply_via_pre_exec_nonstrict_warns_and_execs() {
+        use nix::sys::resource::Resource;
+        use resource_limits::apply_one;
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let mut cmd = std::process::Command::new("true");
+        cmd.stderr(Stdio::piped());
+        // SAFETY: see test_apply_via_pre_exec_succeeds_with_valid_limits.
+        // soft(17) > hard(16) makes setrlimit() fail with EINVAL
+        // unconditionally — no dependency on the ambient hard limit or on
+        // whether the test process is privileged enough to raise one.
+        unsafe {
+            cmd.pre_exec(move || {
+                apply_one(
+                    Resource::RLIMIT_NOFILE,
+                    17,
+                    16,
+                    false,
+                    b"fed: warning: failed to set nofile limit\n",
+                )
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn with a failing non-strict limit");
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let status = child.wait().unwrap();
+
+        assert!(
+            status.success(),
+            "non-strict setrlimit failure must warn, not abort exec: {status:?}"
+        );
+        assert_eq!(
+            stderr, "fed: warning: failed to set nofile limit\n",
+            "the write(2) warning should reach the child's stderr verbatim"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_apply_via_pre_exec_strict_mode_fails_spawn_on_setrlimit_error() {
+        use nix::sys::resource::Resource;
+        use resource_limits::apply_one;
+        use std::os::unix::process::CommandExt;
+
+        let mut cmd = std::process::Command::new("true");
+        // SAFETY: see test_apply_via_pre_exec_succeeds_with_valid_limits.
+        // Same soft(17) > hard(16) as the non-strict test above.
+        unsafe {
+            cmd.pre_exec(move || {
+                apply_one(
+                    Resource::RLIMIT_NOFILE,
+                    17,
+                    16,
+                    true,
+                    b"fed: warning: failed to set nofile limit\n",
+                )
+            });
+        }
+        let err = cmd
+            .status()
+            .expect_err("strict mode should surface the setrlimit failure as a spawn error");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(nix::libc::EINVAL),
+            "should fail specifically because soft > hard, not for an unrelated spawn reason: {err}"
+        );
     }
 
     // ========================================================================
