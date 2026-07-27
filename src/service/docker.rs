@@ -522,12 +522,12 @@ impl ServiceManager for DockerService {
         // We'll manually remove containers in stop() to ensure proper state tracking
         let mut args = vec!["run".to_string(), "-d".to_string()];
 
-        // Native restart mapping (07-supervisor.md Design §3): `restart:
-        // always` also gets Docker's own `--restart unless-stopped` as an
-        // *additional* reboot-survival safety net — fed's own
-        // healthcheck-command supervision and circuit-breaker accounting
-        // stay fully active regardless (Docker has no visibility into
-        // fed's `healthcheck:` feature, so it can't be handed the whole
+        // Native restart mapping: `restart: always` also gets Docker's own
+        // `--restart unless-stopped` as an *additional* reboot-survival
+        // safety net — fed's own healthcheck-command supervision and
+        // circuit-breaker accounting stay fully active regardless (Docker
+        // has no visibility into fed's `healthcheck:` feature, so it can't
+        // be handed the whole
         // job). `unless-stopped`, not Docker's literal `always`, so an
         // explicit `fed stop` (which runs a real `docker stop` in this
         // service's own `stop()`, below) is honored instead of the
@@ -1145,14 +1145,14 @@ mod tests {
 
     #[test]
     fn test_validate_volume_utf8_multibyte_safe() {
-        // SAFETY: Ensure multi-byte UTF-8 characters don't cause panics
-        // The emoji isn't a valid volume spec but shouldn't cause a crash
+        // Regression test: a multi-byte UTF-8 host path used to panic on the
+        // byte-indexed Windows-drive-letter check. It isn't a Windows path,
+        // so validation accepts it; the coverage that matters here is that
+        // the call above returns instead of panicking.
         let result = DockerService::validate_volume_spec("😀:/app");
-        // This is actually OK because it's not detected as Windows path
-        // The important thing is it doesn't panic (which it did before the fix)
         assert!(
-            result.is_ok() || result.is_err(),
-            "Should handle UTF-8 without panicking"
+            result.is_ok(),
+            "non-Windows-drive UTF-8 host path should be accepted"
         );
     }
 

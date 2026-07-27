@@ -33,9 +33,11 @@ fn test_parse_whitespace_only_config() {
 
     let yaml = "   \n\n   \t\t  \n  ";
     let result = parser.parse_config(yaml);
-    // Whitespace-only config will parse as null, which might fail or return default
-    // The actual behavior is that it fails due to invalid YAML
-    assert!(result.is_err() || result.is_ok());
+    // Whitespace-only YAML parses to null, which is not a valid Config document.
+    assert!(
+        result.is_err(),
+        "whitespace-only config should fail to parse, not silently default"
+    );
 }
 
 #[test]
@@ -192,12 +194,11 @@ fn test_template_with_empty_variable_name() {
     let resolver = Resolver::new();
     let params = std::collections::HashMap::new();
 
-    // Empty variable name {{}} is valid regex match but will fail parameter lookup
-    // However, the regex matches empty string which leads to looking up ""
+    // {{}} does not match the template regex (it requires at least one
+    // non-'}' character between the braces), so it passes through unchanged
+    // rather than triggering a parameter lookup on "".
     let result = resolver.resolve_template("{{}}", &params);
-    // Actually, empty template var is accepted (regex matches), but parameter "" doesn't exist
-    // Let's check the actual behavior
-    assert!(result.is_err() || result.is_ok());
+    assert_eq!(result.unwrap(), "{{}}");
 }
 
 #[test]
@@ -207,11 +208,10 @@ fn test_template_with_nested_braces() {
     params.insert("VAR".to_string(), "value".to_string());
 
     // Nested braces: {{{{VAR}}}}
-    // The regex \{\{([^}]+)\}\} will match {{VAR}} (the inner one)
-    // But then it tries to look up parameter "{{VAR" which doesn't exist
+    // The regex \{\{([^}]+)\}\} greedily matches the outer pair, capturing
+    // "{{VAR" as the parameter name, which has no matching entry.
     let result = resolver.resolve_template("{{{{VAR}}}}", &params);
-    // This will fail because it tries to find parameter "{{VAR"
-    assert!(result.is_err() || result.is_ok());
+    assert!(matches!(result, Err(Error::ParameterNotFound(ref name)) if name == "{{VAR"));
 }
 
 #[test]
@@ -770,8 +770,12 @@ async fn test_orchestrator_service_with_no_type() {
     orchestrator.set_auto_resolve_conflicts(true);
     let result = orchestrator.initialize().await;
 
-    // Should handle undefined service type
-    assert!(result.is_ok() || result.is_err());
+    let err =
+        result.expect_err("a service with no type fields should be rejected, not silently skipped");
+    assert!(
+        err.to_string().contains("Undefined service type"),
+        "unexpected error for a typeless service: {err}"
+    );
 }
 
 #[tokio::test]
