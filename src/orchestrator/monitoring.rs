@@ -104,10 +104,10 @@ pub(super) fn calculate_backoff_delay(consecutive_failures: u32) -> Duration {
 ///
 /// `scope`, if `Some`, restricts health-checking to services whose name is
 /// in the set — everything else is skipped entirely (not even a liveness
-/// check), matching the supervisor's filtered-monitoring policy
-/// (`07-supervisor.md` Design §2; see [`supervised_service_names`] for the
-/// scope formula). `None` preserves today's behavior exactly: every
-/// Running/Healthy/Failing service is checked, unfiltered — this is what
+/// check), matching the supervisor's filtered-monitoring policy (see
+/// [`supervised_service_names`] for the scope formula). `None` preserves
+/// today's behavior exactly: every Running/Healthy/Failing service is
+/// checked, unfiltered — this is what
 /// `--watch`/`fed tui` (via [`Orchestrator::start_monitoring`]) always pass,
 /// so their behavior is bit-identical to before this parameter existed.
 ///
@@ -214,9 +214,8 @@ async fn check_all_services(
 ///
 /// Re-exported as `crate::orchestrator::supervised_service_names` (see
 /// `orchestrator/mod.rs`) so `fed status --json`'s per-service
-/// `supervised_by` field (`07-supervisor.md` Design §4) can compute the same
-/// scope the supervisor itself uses, without status.rs reimplementing the
-/// union formula.
+/// `supervised_by` field can compute the same scope the supervisor itself
+/// uses, without status.rs reimplementing the union formula.
 pub fn supervised_service_names(config: &Config) -> HashSet<String> {
     let mut scope: HashSet<String> = HashSet::new();
 
@@ -471,9 +470,9 @@ async fn execute_health_check_cycle(
         // A service the user explicitly stopped (any of the three `fed
         // stop` paths — whole-project, per-service, or the config-can't-
         // load fallback) must never be treated as crash-looping. This is
-        // the persisted, cross-process signal (`07-supervisor.md` Design
-        // §1): a separate `fed stop` invocation never touches this
-        // process's manager objects, but it does write `desired_state`, so
+        // the persisted, cross-process signal: a separate `fed stop`
+        // invocation never touches this process's manager objects, but it
+        // does write `desired_state`, so
         // gating here — rather than only on `restart_single_service`'s own
         // same-process `manager.status()` check below — is what makes
         // `fed stop` reliably prevent resurrection across processes (the
@@ -949,13 +948,13 @@ impl Orchestrator {
     /// Start monitoring unconditionally, regardless of output mode, scoped to
     /// [`supervised_service_names`] rather than every service.
     ///
-    /// Used exclusively by [`Orchestrator::initialize_supervisor`]
-    /// (`07-supervisor.md` Design §1/§2/§6): a supervisor exists precisely to
-    /// watch backgrounded (`OutputMode::File`) services, so the
-    /// output-mode skip in [`Orchestrator::start_monitoring`] above must not
-    /// apply, and its health-check scope must be the restart-policy/
-    /// dependency union rather than "every service" (the cost argument for
-    /// scoping only matters once monitoring actually runs unconditionally).
+    /// Used exclusively by [`Orchestrator::initialize_supervisor`]: a
+    /// supervisor exists precisely to watch backgrounded (`OutputMode::File`)
+    /// services, so the output-mode skip in
+    /// [`Orchestrator::start_monitoring`] above must not apply, and its
+    /// health-check scope must be the restart-policy/dependency union
+    /// rather than "every service" (the cost argument for scoping only
+    /// matters once monitoring actually runs unconditionally).
     pub(super) async fn start_monitoring_for_supervisor(&self) {
         self.spawn_monitoring_loop(true).await;
     }
@@ -1052,7 +1051,7 @@ mod tests {
         }
     }
 
-    // --- supervised_service_names (07-supervisor.md Design §2 union formula) ---
+    // --- supervised_service_names (union formula) ---
 
     fn service_with_restart(restart: Option<RestartPolicy>) -> crate::config::Service {
         crate::config::Service {

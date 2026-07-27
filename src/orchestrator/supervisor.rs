@@ -1,6 +1,5 @@
 //! `.fed/supervisor.lock` — single-instance enforcement and liveness
-//! detection for the `fed supervise` daemon (`07-supervisor.md` Design
-//! §1/§7).
+//! detection for the `fed supervise` daemon.
 //!
 //! Modeled on the existing `.fed/.lock` advisory-lock pattern
 //! (`crate::state::sqlite::mod`'s `try_acquire_lock`), but held by a

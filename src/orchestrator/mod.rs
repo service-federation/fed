@@ -16,9 +16,9 @@ pub use builder::OrchestratorBuilder;
 pub use core::*;
 pub use health::{StartHealth, StartOutcome};
 pub use lifecycle::ServiceLifecycleCommands;
-/// Re-exported for `fed status --json`'s `supervised_by` field
-/// (`07-supervisor.md` Design §4) — see the doc comment on the function
-/// itself (in the private `monitoring` module) for the union-scope formula.
+/// Re-exported for `fed status --json`'s `supervised_by` field — see the
+/// doc comment on the function itself (in the private `monitoring` module)
+/// for the union-scope formula.
 pub use monitoring::supervised_service_names;
 pub use run_context::{RunContext, SecretCacheMode};
 pub use start_lock::StartLock;

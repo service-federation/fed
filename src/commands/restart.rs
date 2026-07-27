@@ -97,10 +97,9 @@ pub async fn run_restart(
     };
 
     // `fed restart` already mutates state and runs the full `initialize()`
-    // path, so — per the scaled-back self-heal promise
-    // (`07-supervisor.md`) — it also gets to respawn a dead/missing
-    // supervisor, same as `fed start`. `fed status` deliberately does
-    // neither.
+    // path, so it also gets to respawn a dead/missing supervisor, same as
+    // `fed start`. `fed status` deliberately does neither, since it never
+    // mutates state and stays strictly read-only.
     if super::supervise::any_has_restart_policy(config, restarted_names.iter()) {
         let work_dir = orchestrator.work_dir().to_path_buf();
         if let Err(e) =

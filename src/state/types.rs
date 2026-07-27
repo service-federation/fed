@@ -89,9 +89,8 @@ pub struct ServiceState {
     /// `Running`/`Failing`/`Stopping`): `desired_state` is the persisted
     /// *intent* signal. Every stop path writes `Stopped` here before sending
     /// any kill signal, so a separate `fed` process sharing only the SQLite
-    /// state file (see `07-supervisor.md` Design §1) can tell an intentional
-    /// stop apart from a crash without relying on an in-process manager
-    /// object it never touched.
+    /// state file can tell an intentional stop apart from a crash without
+    /// relying on an in-process manager object it never touched.
     #[serde(default)]
     pub desired_state: DesiredState,
 
@@ -101,9 +100,9 @@ pub struct ServiceState {
     /// at registration time (registration leaves an already-registered row
     /// untouched, same as `startup_message`).
     ///
-    /// Read by `mark_dead_services` (`07-supervisor.md` Design §3): a
-    /// concurrent `fed` command's container-liveness check would otherwise
-    /// mark a row `'stale'` (permanently filtering it out of
+    /// Read by `mark_dead_services`: a concurrent `fed` command's
+    /// container-liveness check would otherwise mark a row `'stale'`
+    /// (permanently filtering it out of
     /// `get_services()`) during Docker's own brief native-restart backoff
     /// window. Services with this flag set get a short grace period
     /// (consecutive-failure counter, not a single snapshot) before staling;

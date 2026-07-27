@@ -21,7 +21,7 @@ const SCHEMA_VERSION: u32 = 1;
 /// collide with a real service literally named that. This is additive to
 /// the schema (every existing key keeps its exact shape), so
 /// `SCHEMA_VERSION` stays at `1` per its own "bumped only on a
-/// breaking/renaming change" rule (`07-supervisor.md` Design §4).
+/// breaking/renaming change" rule.
 #[derive(serde::Serialize)]
 struct ServiceStatusJson {
     status: &'static str,
@@ -33,7 +33,7 @@ struct ServiceStatusJson {
     started_at: Option<String>,
     uptime_seconds: Option<i64>,
     // best-effort; empty for docker-compose services until compose port
-    // introspection is added, see 03-status-json.md
+    // introspection is added
     ports: std::collections::HashMap<String, u16>,
     startup_message: Option<String>,
     /// `"fed"` — in the supervisor's filtered health-check scope
@@ -121,9 +121,9 @@ pub async fn run_status(
     // Directory-wide supervisor facts, computed once regardless of the
     // json/human branch below — a plain file read plus a non-blocking
     // flock probe (`live_supervisor_pid`), not an Orchestrator/state-tracker
-    // call, so this never spawns or respawns anything (`fed status` stays
-    // strictly read-only, per `07-supervisor.md` Design §1's scaled-back
-    // self-heal promise).
+    // call, so this never spawns or respawns anything: `fed status` stays
+    // strictly read-only, unlike `fed start`/`fed restart` which spawn or
+    // respawn a missing supervisor.
     let supervisor_pid =
         fed::orchestrator::supervisor::live_supervisor_pid(orchestrator.work_dir());
     let supervised_scope = fed::orchestrator::supervised_service_names(config);
@@ -240,10 +240,9 @@ pub async fn run_status(
 mod tests {
     use super::*;
 
-    /// Every `Status` variant must map to exactly the bucket documented in
-    /// the schema design (03-status-json.md) — cheapest, fastest test to
-    /// catch a future accidental remap (e.g. someone "simplifying" `Running`
-    /// to `"healthy"`).
+    /// Every `Status` variant must map to exactly one health bucket —
+    /// cheapest, fastest test to catch a future accidental remap (e.g.
+    /// someone "simplifying" `Running` to `"healthy"`).
     #[test]
     fn health_bucket_covers_all_status_variants() {
         assert_eq!(health_bucket(fed::Status::Healthy), "healthy");
@@ -255,7 +254,7 @@ mod tests {
         assert_eq!(health_bucket(fed::Status::Running), "unknown");
     }
 
-    // --- supervised_by_bucket (07-supervisor.md Design §4) ---
+    // --- supervised_by_bucket ---
 
     /// `docker-native` takes precedence over `fed` when both technically
     /// apply — a Docker service with `restart: always` is always in the

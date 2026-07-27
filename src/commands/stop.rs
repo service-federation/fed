@@ -22,9 +22,11 @@ pub async fn run_stop(
         // write or kill signal. The daemon's restart-gate check and its
         // actual respawn are not atomic: a restart that passed the gate a
         // moment before we write Stopped would land after our kills and
-        // resurrect the service (`07-supervisor.md` Design §1 requires
-        // quiesce-before-kill for whole-project stop; the soak test
-        // reproduces the resurrection when this ordering is violated).
+        // resurrect the service. Quiesce-before-kill ordering for
+        // whole-project stop is required to avoid this; the soak test
+        // (`test_full_cycle_soak_start_crash_loop_stop_daemon_exits_no_resurrection`
+        // in `tests/supervisor_daemon_test.rs`) reproduces the resurrection
+        // when this ordering is violated.
         fed::orchestrator::supervisor::signal_stop_and_wait(
             orchestrator.work_dir(),
             std::time::Duration::from_secs(10),
@@ -35,9 +37,8 @@ pub async fn run_stop(
         // one upfront batch, before any kill signal goes out below. This
         // closes the race window where a per-service interleaved
         // write-then-kill loop could leave some rows still `Running` while
-        // their processes are already being torn down — see
-        // `07-supervisor.md` Design §1. Best-effort: an empty/missing state
-        // DB is not an error here.
+        // their processes are already being torn down. Best-effort: an
+        // empty/missing state DB is not an error here.
         let _ = orchestrator
             .state_tracker
             .write()
@@ -159,7 +160,7 @@ async fn stop_remaining_state_services(orchestrator: &Orchestrator, out: &dyn Us
     // Write the stop intent for every active service *before* any of them
     // are actually killed below. `stop_service_by_state` has no tracker
     // access (it only knows PID/container), so its callers own this
-    // responsibility — see `07-supervisor.md` Design §1.
+    // responsibility.
     {
         let mut tracker = orchestrator.state_tracker.write().await;
         for (name, state) in &services {
@@ -260,8 +261,7 @@ pub async fn run_stop_from_state(
     // are actually killed below — this closes the config-can't-load
     // fallback gap: without it, `fed stop` run against a broken config would
     // still let a restart-policy supervisor resurrect a service, since this
-    // path never goes through `stop_service_impl`. See `07-supervisor.md`
-    // Design §1.
+    // path never goes through `stop_service_impl`.
     for (name, state) in &services_to_stop {
         if !state_status_is_active(state.status) {
             continue;

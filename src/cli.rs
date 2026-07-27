@@ -241,12 +241,12 @@ pub enum Commands {
     External(Vec<String>),
 
     /// Internal: run the restart-policy supervisor daemon for this
-    /// workspace (`07-supervisor.md`). Spawned automatically by `fed
-    /// start`/`fed restart` when a started service has a `restart:`
-    /// policy — never invoke this directly.
+    /// workspace. Spawned automatically by `fed start`/`fed restart` when
+    /// a started service has a `restart:` policy — never invoke this
+    /// directly.
     ///
-    /// Named `supervise`, not `__supervise` as originally sketched in the
-    /// design doc: clap_complete's bash generator uses a literal `__` as
+    /// Named `supervise`, not `__supervise` as originally sketched:
+    /// clap_complete's bash generator uses a literal `__` as
     /// its internal subcommand-path separator (it joins/splits function
     /// names on it), and a subcommand whose own name already contains `__`
     /// desyncs that reconstruction — `fed completions bash` panicked

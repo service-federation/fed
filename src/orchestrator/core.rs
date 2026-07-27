@@ -640,16 +640,14 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Initialization path for the supervisor's attach-and-reconcile flow
-    /// (`07-supervisor.md` Design §1). Used exclusively via
-    /// `OrchestratorBuilder::supervisor_attach(true)` — never called
-    /// directly by CLI commands.
+    /// Initialization path for the supervisor's attach-and-reconcile flow.
+    /// Used exclusively via `OrchestratorBuilder::supervisor_attach(true)` —
+    /// never called directly by CLI commands.
     ///
     /// Unlike every other `initialize*` variant, this one must never let
     /// [`crate::state::SqliteStateTracker::mark_dead_services`]'s stale-row filtering silently
-    /// swallow a service that crashed while genuinely unsupervised (the
-    /// exact case this whole feature exists for — see the module-level
-    /// "Attach/self-heal reality" note in `07-supervisor.md`). It:
+    /// swallow a service that crashed while genuinely unsupervised — the
+    /// exact case this whole feature exists for. It:
     ///
     /// 1. Swaps in the unlocked, supervisor-safe state tracker
     ///    ([`crate::state::StateTracker::new_for_supervisor`]) — the
@@ -1442,9 +1440,9 @@ impl Orchestrator {
             ServiceState::new(name.to_string(), service_type, self.namespace.clone());
         if let Some(service_config) = self.config.services.get(name) {
             service_state.startup_message = service_config.startup_message.clone();
-            // 07-supervisor.md Design §3: captured once at registration
-            // (an already-registered row is left untouched, so this only
-            // ever matters for a fresh row) — read back by
+            // Captured once at registration (an already-registered row is
+            // left untouched, so this only ever matters for a fresh row) —
+            // read back by
             // `mark_dead_services` to decide whether this service's
             // container-liveness check gets a stale-grace period.
             service_state.native_restart_enabled = service_config.docker_native_restart_enabled();
@@ -1562,7 +1560,6 @@ impl Orchestrator {
             // (see `ServiceState::new`'s default), so this is not
             // load-bearing for the common case — but it's cheap and keeps
             // intent explicit at every place a service is confirmed started.
-            // See `07-supervisor.md` Design §1.
             tracker
                 .set_desired_state(name, DesiredState::Running)
                 .await?;
@@ -1896,10 +1893,10 @@ impl Orchestrator {
     /// the state entry is kept so the still-running process remains tracked.
     async fn force_kill_service(&self, name: &str) -> Result<()> {
         // Persist the stop intent *before* the kill signal goes out. A
-        // separate `fed` process (a future restart-policy supervisor) reads
-        // this column, not this in-process manager's `Status` — see
-        // `07-supervisor.md` Design §1. Best-effort: a missing row (never
-        // registered) is not an error here.
+        // separate `fed` process (e.g. the `fed supervise` restart-policy
+        // daemon) reads this column, not this in-process manager's
+        // `Status`. Best-effort: a missing row (never registered) is not an
+        // error here.
         let _ = self
             .state_tracker
             .write()
@@ -2634,9 +2631,9 @@ impl Orchestrator {
     ///
     /// This is the narrow shutdown used by every supervisor-exit path
     /// (SIGTERM from `fed stop`'s teardown check, the watch/tui pre-flight
-    /// handoff, the "nothing supervised left running" self-exit condition —
-    /// `07-supervisor.md` Design §1): cancels the monitoring loop's
-    /// cancellation token and awaits the monitoring task with a timeout, but
+    /// handoff, the "nothing supervised left running" self-exit condition):
+    /// cancels the monitoring loop's cancellation token and awaits the
+    /// monitoring task with a timeout, but
     /// **never** calls [`Orchestrator::stop_all`] and never calls
     /// `manager.stop()` on anything.
     ///
@@ -2686,11 +2683,11 @@ impl Orchestrator {
     /// scope ([`super::monitoring::supervised_service_names`]) is currently
     /// `desired_state == Running`.
     ///
-    /// Used by `fed supervise`'s per-tick self-exit check
-    /// (`07-supervisor.md` Design §1/§7): once nothing the supervisor
-    /// cares about remains desired-running (every such service has either
-    /// been explicitly `fed stop`'d or was never started), the daemon has
-    /// nothing left to protect and should exit rather than run forever.
+    /// Used by `fed supervise`'s per-tick self-exit check: once nothing the
+    /// supervisor cares about remains desired-running (every such service
+    /// has either been explicitly `fed stop`'d or was never started), the
+    /// daemon has nothing left to protect and should exit rather than run
+    /// forever.
     ///
     /// A service in scope with no persisted row at all (never started)
     /// correctly counts as "not desired-running" here — see
@@ -3195,15 +3192,15 @@ mod tests {
         );
     }
 
-    // --- initialize_supervisor (07-supervisor.md Design §1) ---
+    // --- initialize_supervisor ---
 
-    /// Direct test for the "attach" half of Design §1 step 4: a row that's
-    /// genuinely still alive (not stale) and `desired_state == Running` must
-    /// get its manager restored/attached, while a row with
-    /// `desired_state == Stopped` must not — even though its row still
-    /// exists (not yet purged) and nothing about it looks stale on its own
-    /// (a `Stopped` status with no PID/container is never considered stale
-    /// by `mark_dead_services`).
+    /// Direct test for step 3 of [`Orchestrator::initialize_supervisor`]'s
+    /// doc comment (the "attach" half): a row that's genuinely still alive
+    /// (not stale) and `desired_state == Running` must get its manager
+    /// restored/attached, while a row with `desired_state == Stopped` must
+    /// not — even though its row still exists (not yet purged) and nothing
+    /// about it looks stale on its own (a `Stopped` status with no
+    /// PID/container is never considered stale by `mark_dead_services`).
     #[tokio::test]
     async fn test_initialize_supervisor_restores_only_desired_running_rows() {
         use crate::config::Service;

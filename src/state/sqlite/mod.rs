@@ -125,7 +125,7 @@ impl SqliteStateTracker {
     /// concurrency instead — already the actual data-safety mechanism;
     /// `.fed/.lock` has always been a courtesy warning layer on top. The
     /// supervisor's own single-instance enforcement is the separate
-    /// `.fed/supervisor.lock` file (see `07-supervisor.md` Design §1),
+    /// `.fed/supervisor.lock` file (see [`crate::orchestrator::supervisor`]),
     /// unrelated to this tracker.
     ///
     /// Unlike [`SqliteStateTracker::new_ephemeral`] (in-memory, no `.fed/`
@@ -419,12 +419,11 @@ impl SqliteStateTracker {
     /// is `initialize()` -> `validate_and_cleanup()` -> `mark_dead_services()`,
     /// and until now the outer two layers both returned plain `Result<()>`,
     /// discarding the innermost function's `Vec<String>`. The supervisor
-    /// attach path (`Orchestrator::initialize_supervisor`,
-    /// `07-supervisor.md` Design §1) needs exactly this: which rows just
-    /// went stale, before they become invisible to `get_services()`, so it
-    /// can immediately re-derive whether each one should be restarted
-    /// (crashed while unsupervised, `desired_state == 'running'`) or left
-    /// alone (`desired_state == 'stopped'`).
+    /// attach path (`Orchestrator::initialize_supervisor`) needs exactly
+    /// this: which rows just went stale, before they become invisible to
+    /// `get_services()`, so it can immediately re-derive whether each one
+    /// should be restarted (crashed while unsupervised, `desired_state ==
+    /// 'running'`) or left alone (`desired_state == 'stopped'`).
     ///
     /// A brand-new `.fed/` directory has nothing to stale — this returns an
     /// empty vec on the fresh-schema branch, matching `initialize()`'s own
@@ -885,7 +884,7 @@ mod tests {
         );
     }
 
-    // --- new_for_supervisor: unlocked concurrent access (07-supervisor.md Design §1) ---
+    // --- new_for_supervisor: unlocked concurrent access ---
 
     /// A `new_for_supervisor` tracker must never hold `.fed/.lock` — a normal,
     /// locked `SqliteStateTracker::new` on the *same* directory must be able

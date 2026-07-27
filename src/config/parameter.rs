@@ -27,8 +27,7 @@ pub struct Parameter {
     // `Config::validate()` can detect an old config that still sets one of
     // these and produce a specific migration error, instead of serde
     // silently dropping the override with no warning at all (`Parameter` has
-    // no `unknown_fields` catch-all the way `Config`/`Service` do). See
-    // `08-environments-removal.md` Design §1.
+    // no `unknown_fields` catch-all the way `Config`/`Service` do).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub development: Option<serde_yaml::Value>,
 

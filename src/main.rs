@@ -164,11 +164,11 @@ async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // `fed supervise` ignores SIGHUP at the very start, before anything
-    // else runs — this is what lets the daemon survive terminal close
-    // (`07-supervisor.md` Design §5). Unlike a user `process:` command
-    // (which needs the `nohup bash -c` shell-wrapper trick because it's an
-    // opaque shell string), `supervise` is fed's own binary, so it can
-    // just ignore the signal directly rather than needing a wrapping shell.
+    // else runs — this is what lets the daemon survive terminal close.
+    // Unlike a user `process:` command (which needs the `nohup bash -c`
+    // shell-wrapper trick because it's an opaque shell string), `supervise`
+    // is fed's own binary, so it can just ignore the signal directly rather
+    // than needing a wrapping shell.
     // Placed here, immediately after argv parsing and before tracing/config
     // I/O, so there's no window where a terminal-close SIGHUP could still
     // reach the default handler.
@@ -541,18 +541,17 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
-    // Watch/tui pre-flight handoff (`07-supervisor.md` Design §6): a
-    // foreground `--watch`/`fed tui` orchestrator starts its own in-process
-    // monitoring loop as part of `initialize()`, *before* `run_watch_mode`/
-    // `run_tui` is ever reached — so tearing down a leftover background
-    // supervisor has to happen here, before `Orchestrator::builder()...
-    // build()` below, not inside the watch loop after the fact. Otherwise
-    // there would be a window (however brief) with two live monitoring
-    // loops racing over the same services. A plain lock-file read/SIGTERM;
-    // no `Orchestrator`/`StateTracker` needed for this step. Once this
-    // foreground session exits, nothing auto-respawns the daemon — it comes
-    // back only via the next `fed start`/`fed restart`, per the scaled-back
-    // self-heal promise (`spawn_if_needed`, wired into both below).
+    // Watch/tui pre-flight handoff: a foreground `--watch`/`fed tui`
+    // orchestrator starts its own in-process monitoring loop as part of
+    // `initialize()`, *before* `run_watch_mode`/`run_tui` is ever reached —
+    // so tearing down a leftover background supervisor has to happen here,
+    // before `Orchestrator::builder()...build()` below, not inside the
+    // watch loop after the fact. Otherwise there would be a window (however
+    // brief) with two live monitoring loops racing over the same services.
+    // A plain lock-file read/SIGTERM; no `Orchestrator`/`StateTracker`
+    // needed for this step. Once this foreground session exits, nothing
+    // auto-respawns the daemon — it comes back only via the next `fed
+    // start`/`fed restart` (`spawn_if_needed`, wired into both below).
     let is_watch_or_tui = matches!(
         &cli.command,
         Commands::Start { watch: true, .. } | Commands::Tui { .. }
@@ -796,7 +795,7 @@ fn init_tracing(
     if is_supervise {
         // The supervisor daemon has no attached terminal to print to —
         // logs go to `.fed/logs/supervisor.log`, matching the existing
-        // per-service log convention (`07-supervisor.md` Design §4).
+        // per-service log convention.
         // `--workdir` is always passed explicitly by `spawn_if_needed`
         // (the only thing that ever spawns `fed supervise`), so this is
         // reliable; a bare manual invocation without `--workdir` falls back

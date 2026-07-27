@@ -38,9 +38,9 @@ pub struct OrchestratorBuilder {
     work_dir: Option<PathBuf>,
     /// Session-scoped run settings — see `RunContext`'s doc comment for the
     /// context-vs-operation-flag split. Applied to the built `Orchestrator`
-    /// in one call to `apply_run_context`, replacing what used to be 5
-    /// separate fields (`output_mode`, `secret_cache`, `is_interactive`,
-    /// `offline`, `required_secret_names`, `profiles`).
+    /// in one call to `apply_run_context`, replacing what used to be separate
+    /// fields (`output_mode`, `secret_cache`, `is_interactive`, `offline`,
+    /// `required_secret_names`, `profiles`).
     run_context: RunContext,
     auto_resolve_conflicts: bool,
     randomize_ports: bool,
@@ -164,15 +164,17 @@ impl OrchestratorBuilder {
     /// When enabled, `build()` calls `initialize_supervisor()` instead of
     /// `initialize()`/`initialize_readonly()`/`initialize_dry_run()` — the
     /// attach-and-reconcile path used exclusively by the `fed supervise`
-    /// process (`07-supervisor.md` Design §1). This is the operation flag
-    /// this plan adds alongside `.readonly()`/`.dry_run()`, per
-    /// `01-run-context.md`'s categorization of per-orchestrator behavior
-    /// switches as operation flags rather than `RunContext` session state —
-    /// and per this plan's own re-anchoring note, it is the *only*
-    /// construction path that keeps both `clippy::disallowed_methods` and
-    /// `scripts/check-orchestrator-construction.sh` green, so no
-    /// `ALLOW-RAW-ORCHESTRATOR-CONSTRUCTION` marker is needed anywhere for
-    /// the supervisor's construction.
+    /// process. This is a per-call operation flag on the builder, alongside
+    /// `.readonly()`/`.dry_run()`, rather than `RunContext` session state:
+    /// `RunContext` carries session-wide settings applied uniformly by
+    /// `apply_run_context` (offline, secret_cache, profiles, ...), while
+    /// this flag instead picks which `initialize_*` variant `build()`
+    /// invokes below. Because it goes through `OrchestratorBuilder` like
+    /// every other construction path, it is also the only way to reach the
+    /// supervisor's initialization that keeps both
+    /// `clippy::disallowed_methods` (see `clippy.toml`) and
+    /// `scripts/check-orchestrator-construction.sh` green without an
+    /// `ALLOW-RAW-ORCHESTRATOR-CONSTRUCTION` marker.
     pub fn supervisor_attach(mut self, supervisor_attach: bool) -> Self {
         self.supervisor_attach = supervisor_attach;
         self
@@ -224,7 +226,7 @@ impl OrchestratorBuilder {
         // supervisor's construction never touches `.fed/.lock` at any point
         // — not even transiently during `Orchestrator::new`'s own
         // lock-then-immediately-drop, which would otherwise be a brief but
-        // real acquisition (`07-supervisor.md` Design §1).
+        // real acquisition.
         let work_dir = self.work_dir.unwrap_or_else(|| PathBuf::from("."));
         #[allow(clippy::disallowed_methods)]
         let mut orchestrator = if self.dry_run || self.supervisor_attach {
@@ -264,7 +266,6 @@ impl OrchestratorBuilder {
         // - dry_run: resolve-only preview path (no persistent state writes)
         // - readonly: status/logs path (skip parameter resolution)
         // - supervisor_attach: `fed supervise`'s attach-and-reconcile path
-        //   (`07-supervisor.md` Design §1)
         // - default: full initialization
         if self.dry_run {
             orchestrator.initialize_dry_run().await?;
@@ -328,7 +329,7 @@ mod tests {
         assert!(result.is_ok(), "Builder failed: {:?}", result.err());
     }
 
-    /// The fourth arm added by `07-supervisor.md` Design §1:
+    /// The fourth arm of `build()`'s initialize-mode selection:
     /// `.supervisor_attach(true)` must route through
     /// `Orchestrator::initialize_supervisor()`, not `initialize()`/
     /// `initialize_readonly()`/`initialize_dry_run()`. Verified two ways:

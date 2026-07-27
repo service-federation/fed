@@ -2,7 +2,7 @@
 use super::*;
 
 /// Outcome of consulting the team vault for a set of queried names, after the
-/// grace window / freshness policy has been applied (see 02-cold-vault.md).
+/// grace window / freshness policy has been applied.
 enum VaultOutcome {
     /// The vault answered with values (within grace, or after an honest block).
     /// Authoritative — the cache is rewritten with fresh stamps.
@@ -148,7 +148,7 @@ impl Resolver {
     }
 
     /// Consult the team vault for `queried_names`, applying the grace-window +
-    /// freshness policy (see 02-cold-vault.md).
+    /// freshness policy.
     ///
     /// The single async fetch is fired here and joined with a short grace: a
     /// warm vault (~0.17s) answers well inside it, so values are fresh every
@@ -323,19 +323,17 @@ impl Resolver {
         // values are picked up. Requires `fed login` + `fed link`; skipped
         // with --offline.
         //
-        // Pre-network TTL skip (04-vault-ttl-cache.md): if the cache already
-        // freshly covers every queried name — within `FED_VAULT_TTL` (default
-        // 5m) of its last fetch — the vault stays authoritative but is never
-        // even queried: no fetch fires, no thread spawns. This used to be
-        // gated to `Environment::Development` only, since the local cache
+        // Pre-network TTL skip: if the cache already freshly covers every
+        // queried name — within `FED_VAULT_TTL` (default 5m) of its last
+        // fetch — the vault stays authoritative but is never even queried:
+        // no fetch fires, no thread spawns. This used to be gated to
+        // `Environment::Development` only, since the local cache
         // (`.fed/secrets.cache.env`) is a single project-wide file, not
         // partitioned by environment, and a pre-network skip with no
-        // environment check could let a fresh `staging` cache silently answer
-        // a `production` run within the TTL window (Sol's adversarial
-        // finding, see Design §4 in 04-vault-ttl-cache.md). The environment
-        // axis was removed entirely in fed 8.0
-        // (`08-environments-removal.md`), so the guard is gone too — the skip
-        // is now unconditional on TTL/cache-freshness alone.
+        // environment check could let a fresh `staging` cache silently
+        // answer a `production` run within the TTL window. The environment
+        // axis was removed entirely in fed 8.0, so the guard is gone too —
+        // the skip is now unconditional on TTL/cache-freshness alone.
         let mut vault_resolved: Vec<(String, String)> = Vec::new();
         let mut vault_query_succeeded = false;
         // Captures why the vault lookup failed (network/auth), so a later
@@ -505,10 +503,10 @@ impl Resolver {
 
         // Fail on missing manual secrets — user must provide these. Only
         // names in scope for this run count: a script must not fail on a
-        // project-wide secret it never references (that is the whole point of
-        // scoping — see 01-secret-scoping.md). Unscoped names stay in the
-        // analysis (so the cache logic above is unaffected) but are excluded
-        // from the failure here.
+        // project-wide secret it never references (that is the whole point
+        // of scoping). Unscoped names stay in the analysis (so the cache
+        // logic above is unaffected) but are excluded from the failure
+        // here.
         let unmet: Vec<&(String, Option<String>)> = analysis
             .missing_manual
             .iter()
@@ -1267,7 +1265,7 @@ mod tests {
         assert!(cache.contains("API_KEY=cached_old"));
     }
 
-    // ── FED_VAULT_TTL pre-network skip (04-vault-ttl-cache.md) ────────────
+    // ── FED_VAULT_TTL pre-network skip ─────────────────────────────────────
     //
     // These all use `test_vault_values` with a value DIFFERENT from the
     // pre-populated cache. That's deliberate: the only way the resolved value

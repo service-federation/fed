@@ -336,8 +336,8 @@ impl Service {
     }
 
     /// Whether this service qualifies for Docker's native `--restart
-    /// unless-stopped` reboot-survival flag (`07-supervisor.md` Design §3):
-    /// image-backed (`ServiceType::Docker`) with `restart: always`.
+    /// unless-stopped` reboot-survival flag: image-backed
+    /// (`ServiceType::Docker`) with `restart: always`.
     ///
     /// `restart: on_failure` is deliberately **not** included even though it
     /// looks like it should map to Docker's `--restart on-failure:N`: the
@@ -350,9 +350,9 @@ impl Service {
     /// silently exhaust Docker's own safety net during ordinary operation,
     /// well before the host-reboot scenario the native flag exists to
     /// protect against. fed's own supervisor already fully implements
-    /// `on_failure` semantics whenever any fed process is alive (Design §3);
-    /// only `always`, whose native counterpart has no such cap, gets the
-    /// extra native flag. `DockerService::start()` reads this to decide the
+    /// `on_failure` semantics whenever any fed process is alive; only
+    /// `always`, whose native counterpart has no such cap, gets the extra
+    /// native flag. `DockerService::start()` reads this to decide the
     /// `docker run` args; the supervisor's stale-row grace period
     /// (`mark_dead_services`) reads the persisted equivalent
     /// (`ServiceState::native_restart_enabled`) to decide whether a failed

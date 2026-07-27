@@ -7,10 +7,10 @@
 //!
 //! # Soundness
 //!
-//! A script cannot consume a fed-resolved secret without a `{{NAME}}` reference
-//! somewhere in its config subtree (see `01-secret-scoping.md`): fed never
-//! writes a resolved secret into its own environment, and children inherit only
-//! the ambient shell plus the script's own (interpolated) `environment` map.
+//! A script cannot consume a fed-resolved secret without a `{{NAME}}`
+//! reference somewhere in its config subtree: fed never writes a resolved
+//! secret into its own environment, and children inherit only the ambient
+//! shell plus the script's own (interpolated) `environment` map.
 //! So scanning the transitive config subtree for `{{NAME}}` references captures
 //! everything the script can read.
 //!

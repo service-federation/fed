@@ -1,5 +1,4 @@
-//! `fed supervise` — the restart-policy supervisor daemon
-//! (`07-supervisor.md`).
+//! `fed supervise` — the restart-policy supervisor daemon.
 //!
 //! This file has two halves:
 //! - [`run_supervise`]: the daemon's own body, invoked by `main.rs` when
@@ -127,22 +126,23 @@ async fn run_until_done(orchestrator: &Orchestrator) {
 
 #[cfg(not(unix))]
 async fn run_until_done(_orchestrator: &Orchestrator) {
-    // No supervisor daemon on non-unix platforms (07-supervisor.md: macOS +
-    // Linux only) — this function is unreachable in practice since
-    // `spawn_if_needed` never spawns one there, but is kept total.
+    // No supervisor daemon outside `cfg(unix)` — this function is
+    // unreachable in practice since `spawn_if_needed` never spawns one
+    // there, but is kept total.
 }
 
 /// Spawn a detached `fed supervise` for `work_dir`, unless one is already
 /// running.
 ///
 /// Called from `fed start`'s non-watch branch (when any started service has
-/// a `restart:` policy) and from `fed restart` (per the scaled-back
-/// self-heal promise — `fed status` calls neither this nor any respawn
-/// logic; it only reads the lock file for display).
+/// a `restart:` policy) and from `fed restart` — both spawn or respawn a
+/// missing supervisor after mutating state. `fed status` calls neither this
+/// nor any other respawn logic; it only reads the lock file for display,
+/// staying strictly read-only.
 ///
-/// Daemonization (`07-supervisor.md` Design §5): `fed supervise` is fed's
-/// own binary, so detachment doesn't need the `nohup bash -c` shell-wrapper
-/// trick `ProcessService` uses for opaque user commands — SIGHUP is ignored
+/// Daemonization: `fed supervise` is fed's own binary, so detachment
+/// doesn't need the `nohup bash -c` shell-wrapper trick `ProcessService`
+/// uses for opaque user commands — SIGHUP is ignored
 /// directly at the top of `main()` (see `main.rs`), and `.process_group(0)`
 /// here isolates the daemon from job-control signals the same way
 /// `ProcessService::spawn_process` does for detached services

@@ -511,16 +511,15 @@ impl Config {
     }
 
     /// Warn (once, aggregated) when a docker-compose-backed service
-    /// (`compose_file` + `compose_service`) also sets `restart:`.
-    /// `07-supervisor.md` Design §3: fed does not rewrite a user-owned
-    /// `docker-compose.yml`, so this `restart:` has no native-mapping
-    /// effect the way it does for `image`-backed services (which get
-    /// `--restart unless-stopped` on `docker run`, `Always` only —
-    /// `DockerService::start()`). fed's own healthcheck/circuit-breaker
-    /// supervision still applies as configured either way; this is only
-    /// flagging that the *native* Docker-level safety net a user may be
-    /// expecting isn't there unless they set `restart:` inside the compose
-    /// file itself.
+    /// (`compose_file` + `compose_service`) also sets `restart:`. fed does
+    /// not rewrite a user-owned `docker-compose.yml`, so this `restart:`
+    /// has no native-mapping effect the way it does for `image`-backed
+    /// services (which get `--restart unless-stopped` on `docker run`,
+    /// `Always` only — `DockerService::start()`). fed's own
+    /// healthcheck/circuit-breaker supervision still applies as configured
+    /// either way; this is only flagging that the *native* Docker-level
+    /// safety net a user may be expecting isn't there unless they set
+    /// `restart:` inside the compose file itself.
     fn warn_on_compose_restart(&self) {
         let findings = self.compose_restart_findings();
         if !findings.is_empty() {
@@ -1885,7 +1884,7 @@ mod tests {
         // string/port parameter) that still sets one of the four legacy
         // environment fields must fail validate() with the same migration
         // guidance, since `Parameter` has no unknown-field catch-all to fall
-        // back on (see 08-environments-removal.md Design §1).
+        // back on.
         let mut config = Config::default();
         config.parameters.insert(
             "API_URL".to_string(),

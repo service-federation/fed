@@ -21,8 +21,7 @@ pub struct StartOptions<'a> {
     pub jobs: usize,
     pub config_path: &'a std::path::Path,
     /// Threaded to `spawn_if_needed` so a spawned `fed supervise` sees the
-    /// same `--offline`/`--profile` session settings as this invocation
-    /// (`07-supervisor.md` Design §1's note on settings-threading).
+    /// same `--offline`/`--profile` session settings as this invocation.
     pub offline: bool,
     pub profiles: Vec<String>,
     /// Scope-wide guard acquired before orchestrator initialization. Kept
@@ -582,9 +581,9 @@ pub async fn run_start(
 
         // A plain, non-watch `fed start` backgrounds services and this
         // process exits immediately — without a supervisor, a `restart:`
-        // policy would never fire again (`07-supervisor.md`). Spawn one iff
-        // it's actually needed and not already running; `fed status` never
-        // does this (Design's scaled-back self-heal promise).
+        // policy would never fire again. Spawn one iff it's actually needed
+        // and not already running; `fed status` never does this, staying
+        // strictly read-only.
         if super::supervise::any_has_restart_policy(config, started.iter()) {
             let work_dir = orchestrator.work_dir().to_path_buf();
             if let Err(e) =

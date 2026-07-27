@@ -105,12 +105,12 @@ impl Orchestrator {
     /// Like [`Orchestrator::create_services`], but restores PID/container/
     /// status only for rows whose persisted `desired_state` is `Running`.
     ///
-    /// Used by the supervisor attach path (`Orchestrator::initialize_supervisor`,
-    /// `07-supervisor.md` Design §1): a row the user explicitly stopped
-    /// (`desired_state == Stopped`) must never look "attached" to the
-    /// supervisor, even if it's still technically alive and hasn't been
-    /// purged yet (the design's own words: "rows where desired_state ==
-    /// 'stopped' are left alone entirely — not attached, not restarted").
+    /// Used by the supervisor attach path (`Orchestrator::initialize_supervisor`):
+    /// a row the user explicitly stopped (`desired_state == Stopped`) must
+    /// never look "attached" to the supervisor, even if it's still
+    /// technically alive and hasn't been purged yet — the `retain` call
+    /// below drops every non-`Running` row before restoration, so those
+    /// rows are left alone entirely: not attached, not restarted.
     /// Every configured service still gets a fresh manager object (so the
     /// supervisor can drive a newly-stale, restart-worthy service through
     /// `manager.start()` afterward) — only the *restoration* step is

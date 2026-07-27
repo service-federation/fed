@@ -374,8 +374,8 @@ impl SqliteStateTracker {
     /// Persists whether a service is *meant* to be running, independent of
     /// `status` (last-observed reality). Every stop path writes `'stopped'`
     /// here before sending any kill signal; registration defaults new rows to
-    /// `'running'`. See `07-supervisor.md` Design §1 — this is the
-    /// cross-process signal a future restart-policy supervisor consults
+    /// `'running'`. This is the cross-process signal a separate `fed`
+    /// process (e.g. the `fed supervise` restart-policy daemon) consults
     /// instead of an in-process manager object it never touched.
     async fn migrate_v6_to_v7(&self) -> Result<()> {
         debug!("Running migration v6 -> v7: Adding desired_state column");
@@ -432,11 +432,11 @@ impl SqliteStateTracker {
     /// [`crate::config::Service::docker_native_restart_enabled`], captured
     /// at registration time. `stale_grace_count` is the consecutive-failure
     /// counter `mark_dead_services` uses for those services instead of
-    /// one-shot staleness — see `07-supervisor.md` Design §3's
-    /// state-reconciliation gap: a concurrent `fed` command's
-    /// container-liveness check would otherwise mark a row `'stale'`
-    /// (permanently filtering it from `get_services()`) during Docker's own
-    /// brief native-restart backoff window.
+    /// one-shot staleness — this closes a state-reconciliation gap: a
+    /// concurrent `fed` command's container-liveness check would otherwise
+    /// mark a row `'stale'` (permanently filtering it from
+    /// `get_services()`) during Docker's own brief native-restart backoff
+    /// window.
     async fn migrate_v7_to_v8(&self) -> Result<()> {
         debug!(
             "Running migration v7 -> v8: Adding native_restart_enabled and stale_grace_count columns"
@@ -783,10 +783,11 @@ mod desired_state_migration_tests {
     }
 
     /// A brand-new `.fed/` directory (the `create_schema` path, not the
-    /// migration path) must get `desired_state` directly — the "two touch
-    /// points" note in `07-supervisor.md` Design §1: forgetting to also add
-    /// the column to `create_schema` would leave fresh projects one
-    /// migration behind their own schema version.
+    /// migration path) must get `desired_state` directly — a new column
+    /// needs both a migration (for existing databases) and a matching
+    /// change to `create_schema` (for new ones); forgetting the latter
+    /// would leave fresh projects one migration behind their own schema
+    /// version.
     #[tokio::test]
     async fn fresh_database_has_desired_state_column_without_migrating() {
         let temp_dir = TempDir::new().unwrap();

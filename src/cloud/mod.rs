@@ -302,8 +302,7 @@ mod cloud_link_tests {
 //
 // A booting (scale-to-zero) backend is not a failing one: the timeout must be
 // a function of whether we can proceed without the answer, not a constant.
-// Four knobs realize that (see 02-cold-vault.md and 04-vault-ttl-cache.md),
-// each with a default chosen so it rarely matters:
+// Four knobs realize that, each with a default chosen so it rarely matters:
 //
 // - `FED_VAULT_GRACE` (2s): how long the resolver waits before falling back to
 //   a fresh cache. Warm vaults answer in ~0.17s, well inside this.
@@ -699,7 +698,7 @@ pub struct SecretValues {
 
 /// Why a vault fetch could not return values, classified so the caller can
 /// pick the right wait. `reqwest` distinguishes the two cases and the cold
-/// probe confirms which fires (see 02-cold-vault.md):
+/// probe confirms which fires:
 ///
 /// - `Unreachable`: `is_connect()` / DNS — nothing is listening, or we're
 ///   offline. Waiting is pointless; fall back to cache immediately.
@@ -848,7 +847,7 @@ where
     }
 }
 
-// ── Logout revocation (05-token-scope.md "Logout revocation") ───────────
+// ── Logout revocation ───────────────────────────────────────────────────
 
 /// Outcome of asking the server to revoke the presented bearer token via
 /// `DELETE /api/v1/cli/session`. The endpoint is idempotent: it revokes the

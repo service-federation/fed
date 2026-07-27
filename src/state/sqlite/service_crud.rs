@@ -243,9 +243,9 @@ impl SqliteStateTracker {
     /// Set a single service's persisted desired state (running/stopped).
     ///
     /// This is the intent signal every stop path must write **before** any
-    /// kill signal is sent — see `07-supervisor.md` Design §1. Unlike
-    /// `status`, this is never overwritten by health-check observations; it
-    /// only changes on an explicit stop or (re-)registration.
+    /// kill signal is sent. Unlike `status`, this is never overwritten by
+    /// health-check observations; it only changes on an explicit stop or
+    /// (re-)registration.
     #[must_use = "ignoring this result may cause state loss - the desired_state update will not be persisted"]
     pub async fn set_desired_state(
         &mut self,
@@ -279,7 +279,7 @@ impl SqliteStateTracker {
     /// `Stopped` in one batch *before* any kill signal goes out — closing the
     /// race window where a per-service interleaved write-then-kill loop could
     /// leave some rows still `Running` while their processes are already
-    /// being torn down (`07-supervisor.md` Design §1).
+    /// being torn down.
     #[must_use = "ignoring this result may cause state loss - the desired_state update will not be persisted"]
     pub async fn set_all_desired_state(&mut self, desired_state: DesiredState) -> Result<()> {
         let desired_state = desired_state.to_string();
@@ -298,11 +298,11 @@ impl SqliteStateTracker {
     /// Whether a service's persisted `desired_state` is `Running`.
     ///
     /// This is the signal the supervisor consults **instead of** any
-    /// in-process manager's `Status` before ever attempting a restart
-    /// (`07-supervisor.md` Design §1) — a separate `fed stop` process never
-    /// touches the supervisor's manager objects, but it does write this
-    /// column, so gating on it (rather than `manager.status()`) is what
-    /// makes `fed stop` reliably prevent resurrection across processes.
+    /// in-process manager's `Status` before ever attempting a restart — a
+    /// separate `fed stop` process never touches the supervisor's manager
+    /// objects, but it does write this column, so gating on it (rather than
+    /// `manager.status()`) is what makes `fed stop` reliably prevent
+    /// resurrection across processes.
     ///
     /// Returns `false` if the row doesn't exist. A service with no
     /// persisted row has nothing for the supervisor to protect, so
@@ -780,11 +780,11 @@ impl SqliteStateTracker {
 
     /// Consecutive failed liveness checks a native-restart-enabled service
     /// (`ServiceState::native_restart_enabled`) tolerates before being marked
-    /// `'stale'` — `07-supervisor.md` Design §3's state-reconciliation gap
-    /// mitigation. Docker's own restart backoff after a container-exit event
-    /// is brief; this spans the same order of magnitude rather than an
-    /// arbitrary long timeout, so a service genuinely gone (not just
-    /// mid-backoff) is still caught within a few `fed` invocations.
+    /// `'stale'` — this mitigates a state-reconciliation gap. Docker's own
+    /// restart backoff after a container-exit event is brief; this spans
+    /// the same order of magnitude rather than an arbitrary long timeout,
+    /// so a service genuinely gone (not just mid-backoff) is still caught
+    /// within a few `fed` invocations.
     const STALE_GRACE_THRESHOLD: u32 = 3;
 
     /// Mark dead/stale services in state without deleting them.
@@ -795,15 +795,15 @@ impl SqliteStateTracker {
     ///
     /// Returns the ids of the services just marked stale (not the ids of
     /// services that were already stale from a previous pass) — needed by
-    /// the supervisor attach path (`Orchestrator::initialize_supervisor`,
-    /// `07-supervisor.md` Design §1) to notice a crashed, restart-worthy
-    /// service *before* it becomes permanently invisible to `get_services()`.
+    /// the supervisor attach path (`Orchestrator::initialize_supervisor`) to
+    /// notice a crashed, restart-worthy service *before* it becomes
+    /// permanently invisible to `get_services()`.
     /// Plain `initialize()` discards this value (see `validate_and_cleanup`).
     ///
     /// Services with `native_restart_enabled` (Docker services with
     /// `restart: always` — see
     /// `crate::config::Service::docker_native_restart_enabled`) get a short
-    /// grace period instead of one-shot staleness (Design §3): a concurrent
+    /// grace period instead of one-shot staleness: a concurrent
     /// `fed` command's liveness check can catch the container mid-backoff
     /// while Docker's own `--restart unless-stopped` is bringing it back up,
     /// and a single such snapshot marking the row `'stale'` would filter it
@@ -1653,9 +1653,9 @@ mod tests {
     }
 
     /// The supervisor attach path (`Orchestrator::initialize_supervisor`)
-    /// needs the *ids* of services just marked stale, not just a count —
-    /// `07-supervisor.md` Design §1's `initialize_for_supervisor()` hop
-    /// depends on this to know which specific rows just went stale.
+    /// needs the *ids* of services just marked stale, not just a count — its
+    /// `initialize_for_supervisor()` hop depends on this to know which
+    /// specific rows just went stale.
     #[tokio::test]
     async fn test_mark_dead_services_returns_stale_ids() {
         let mut tracker = create_ephemeral_tracker().await;
@@ -1970,7 +1970,7 @@ mod tests {
         assert!(!applied);
     }
 
-    // --- 07-supervisor.md Design §3: native-restart stale-grace period ---
+    // --- native-restart stale-grace period ---
     //
     // These exercise the grace-period *mechanism* directly against a
     // Process-backed row with `native_restart_enabled` forced to `true` —
@@ -2166,7 +2166,7 @@ mod tests {
     }
 
     // ========================================================================
-    // desired_state round-trip tests (07-supervisor.md Design §1, Phase 1)
+    // desired_state round-trip tests
     // ========================================================================
 
     #[tokio::test]
