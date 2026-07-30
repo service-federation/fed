@@ -5,9 +5,15 @@
 
 pub mod client;
 pub mod error;
+pub mod runtime;
+pub mod stderr;
 
 pub use client::DockerClient;
 pub use error::DockerError;
+pub use runtime::binary as runtime_binary;
+pub use stderr::{
+    stderr_indicates_missing_container, stderr_indicates_not_running, stderr_indicates_pull_noop,
+};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};

@@ -1,5 +1,6 @@
 use super::{BaseService, ServiceManager, Status};
 use crate::config::Service as ServiceConfig;
+use crate::docker::runtime;
 use crate::error::{Error, Result};
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -26,8 +27,9 @@ static COMPOSE_COMMAND: OnceCell<ComposeCommand> = OnceCell::const_new();
 impl ComposeCommand {
     /// Detect which docker compose command is available
     async fn detect() -> Result<ComposeCommand> {
-        // Try docker compose (v2) first
-        let v2_check = tokio::process::Command::new("docker")
+        // Try docker compose (v2) first. v2 is a plugin of the container
+        // runtime, so its program name is whatever the runtime resolved to.
+        let v2_check = tokio::process::Command::new(runtime::binary())
             .args(["compose", "version"])
             .output()
             .await;
@@ -38,8 +40,9 @@ impl ComposeCommand {
             return Ok(ComposeCommand::V2);
         }
 
-        // Try docker-compose (v1) as fallback
-        let v1_check = tokio::process::Command::new("docker-compose")
+        // Try docker-compose (v1) as fallback — a standalone binary with a
+        // fixed name, unrelated to the resolved runtime.
+        let v1_check = tokio::process::Command::new(runtime::COMPOSE_V1_BINARY)
             .args(["--version"])
             .output()
             .await;
@@ -50,9 +53,13 @@ impl ComposeCommand {
             return Ok(ComposeCommand::V1);
         }
 
-        Err(Error::Config(
-            "Neither 'docker compose' (v2) nor 'docker-compose' (v1) found. Please install Docker Compose.".to_string(),
-        ))
+        // Renders the binaries actually probed above, so the message stays
+        // truthful when the runtime is overridden.
+        Err(Error::Config(format!(
+            "Neither '{} compose' (v2) nor '{}' (v1) found. Please install Docker Compose.",
+            runtime::binary(),
+            runtime::COMPOSE_V1_BINARY,
+        )))
     }
 
     /// Get the compose command (cached)
@@ -64,10 +71,10 @@ impl ComposeCommand {
     }
 
     /// Get command and args for running compose
-    fn command_and_args(&self) -> (&str, Vec<&str>) {
+    fn command_and_args(&self) -> (&'static str, Vec<&'static str>) {
         match self {
-            ComposeCommand::V2 => ("docker", vec!["compose"]),
-            ComposeCommand::V1 => ("docker-compose", vec![]),
+            ComposeCommand::V2 => (runtime::binary(), vec!["compose"]),
+            ComposeCommand::V1 => (runtime::COMPOSE_V1_BINARY, vec![]),
         }
     }
 }

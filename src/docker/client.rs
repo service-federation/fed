@@ -2,10 +2,17 @@
 //!
 //! All Docker CLI interactions go through `DockerClient`, which provides
 //! consistent timeout handling, error mapping to [`DockerError`], and a single
-//! point where `Command::new("docker")` is constructed.
+//! point where the container-runtime subprocess is constructed. The program
+//! name itself comes from [`runtime::binary`] — never a literal — so switching
+//! runtimes is a change in one module rather than here.
 
 use super::DockerError;
+use super::runtime::{self, COMPOSE_V1_BINARY};
+use super::stderr::{
+    stderr_indicates_missing_container, stderr_indicates_not_running, stderr_indicates_pull_noop,
+};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Output;
 use std::time::Duration;
 
@@ -14,6 +21,28 @@ use std::time::Duration;
 /// created by this fed (an older fed, or a user's own), so it is never auto-deleted.
 pub const FED_MANAGED_LABEL: &str = "com.service-federation.managed=true";
 const FED_MANAGED_LABEL_FILTER: &str = "label=com.service-federation.managed=true";
+
+/// Stderr text attributed to a build that exited non-zero. The runtime already
+/// printed the real diagnostics to the inherited stderr, so this is only a
+/// label for the failure, not an explanation of it.
+const DEFAULT_BUILD_FAILURE_MESSAGE: &str = "build failed";
+
+/// Per-invocation knobs for [`DockerClient::build_with`].
+///
+/// Every field is optional and defaults to the plain-`build` behavior, so a
+/// caller only names what it actually needs to change.
+#[derive(Debug, Default, Clone)]
+pub struct BuildOptions {
+    /// Working directory for the child. The build context argument (`.`) is
+    /// resolved against it, so it is not merely cosmetic.
+    pub cwd: Option<PathBuf>,
+    /// Extra environment for the child, merged over the inherited environment.
+    pub env: HashMap<String, String>,
+    /// Replaces the rendered argv in error messages.
+    pub command_label: Option<String>,
+    /// Replaces [`DEFAULT_BUILD_FAILURE_MESSAGE`] in the non-zero-exit error.
+    pub failure_message: Option<String>,
+}
 
 /// Centralized client for Docker CLI operations.
 ///
@@ -32,6 +61,12 @@ impl DockerClient {
     // Internal helpers
     // ========================================================================
 
+    /// Render a command for error messages. Uses the resolved binary so the
+    /// text names the process that actually ran (or failed to).
+    fn cmd_str(args: &[&str]) -> String {
+        format!("{} {}", runtime::binary(), args.join(" "))
+    }
+
     /// Run a docker command with a timeout, returning raw Output.
     async fn run(&self, args: &[&str], timeout: Duration) -> Result<Output, DockerError> {
         // kill_on_drop: when the timeout wins the race and drops the output
@@ -39,14 +74,14 @@ impl DockerClient {
         // timeout against a hung daemon leaks a subprocess.
         let result = tokio::time::timeout(
             timeout,
-            tokio::process::Command::new("docker")
+            tokio::process::Command::new(runtime::binary())
                 .args(args)
                 .kill_on_drop(true)
                 .output(),
         )
         .await;
 
-        let cmd_str = format!("docker {}", args.join(" "));
+        let cmd_str = Self::cmd_str(args);
 
         match result {
             Ok(Ok(output)) => Ok(output),
@@ -61,15 +96,15 @@ impl DockerClient {
         if output.status.success() {
             Ok(output)
         } else {
-            let cmd_str = format!("docker {}", args.join(" "));
+            let cmd_str = Self::cmd_str(args);
             Err(DockerError::failed(&cmd_str, &output))
         }
     }
 
     /// Run a docker command synchronously, returning raw Output.
     fn run_sync(&self, args: &[&str]) -> Result<Output, DockerError> {
-        let cmd_str = format!("docker {}", args.join(" "));
-        std::process::Command::new("docker")
+        let cmd_str = Self::cmd_str(args);
+        std::process::Command::new(runtime::binary())
             .args(args)
             .output()
             .map_err(|e| DockerError::exec_failed(cmd_str, e))
@@ -92,10 +127,10 @@ impl DockerClient {
             return Ok(());
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("No such container") {
+        if stderr_indicates_missing_container(&stderr) {
             return Ok(());
         }
-        Err(DockerError::failed("docker rm -f", &output))
+        Err(DockerError::failed(Self::cmd_str(&["rm", "-f"]), &output))
     }
 
     /// Force-remove a container (synchronous). Returns `Ok(())` if container doesn't exist.
@@ -107,10 +142,10 @@ impl DockerClient {
             return Ok(());
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("No such container") {
+        if stderr_indicates_missing_container(&stderr) {
             return Ok(());
         }
-        Err(DockerError::failed("docker rm -f", &output))
+        Err(DockerError::failed(Self::cmd_str(&["rm", "-f"]), &output))
     }
 
     /// Stop a container gracefully.
@@ -119,7 +154,7 @@ impl DockerClient {
         if output.status.success() {
             return Ok(());
         }
-        Err(DockerError::failed("docker stop", &output))
+        Err(DockerError::failed(Self::cmd_str(&["stop"]), &output))
     }
 
     /// Stop a container with a specific grace period, then remove it.
@@ -147,10 +182,10 @@ impl DockerClient {
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         // Container already stopped or doesn't exist — not an error
-        if stderr.contains("No such container") || stderr.contains("is not running") {
+        if stderr_indicates_missing_container(&stderr) || stderr_indicates_not_running(&stderr) {
             return Ok(());
         }
-        Err(DockerError::failed("docker kill", &output))
+        Err(DockerError::failed(Self::cmd_str(&["kill"]), &output))
     }
 
     /// Run a container in detached mode. Returns the container ID on success.
@@ -172,10 +207,10 @@ impl DockerClient {
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         // "up to date" or "already exists" aren't real failures
-        if stderr.contains("up to date") || stderr.contains("already exists") {
+        if stderr_indicates_pull_noop(&stderr) {
             return Ok(());
         }
-        Err(DockerError::failed("docker pull", &output))
+        Err(DockerError::failed(Self::cmd_str(&["pull"]), &output))
     }
 
     // ========================================================================
@@ -395,12 +430,39 @@ impl DockerClient {
 
     /// Build a Docker image. Inherits stdio for interactive output.
     pub async fn build(&self, args: &[&str]) -> Result<(), DockerError> {
+        self.build_with(args, &BuildOptions::default()).await
+    }
+
+    /// Build a Docker image with control over the child's working directory,
+    /// environment, and error wording.
+    ///
+    /// The extra knobs exist because a build is the one runtime invocation that
+    /// is not self-contained: the build context is a path resolved against the
+    /// service's `cwd`, and `--build-arg` values may reference the service's
+    /// environment. Without them a caller has to spawn the runtime itself,
+    /// which is exactly the bypass this client exists to prevent.
+    pub async fn build_with(
+        &self,
+        args: &[&str],
+        options: &BuildOptions,
+    ) -> Result<(), DockerError> {
         let mut full_args = vec!["build"];
         full_args.extend_from_slice(args);
 
-        let cmd_str = format!("docker {}", full_args.join(" "));
-        let status = tokio::process::Command::new("docker")
-            .args(&full_args)
+        // A build's full argv is long enough to be noise in an error; callers
+        // that have a better name for the operation supply one.
+        let cmd_str = options
+            .command_label
+            .clone()
+            .unwrap_or_else(|| Self::cmd_str(&full_args));
+
+        let mut command = tokio::process::Command::new(runtime::binary());
+        command.args(&full_args);
+        if let Some(cwd) = &options.cwd {
+            command.current_dir(cwd);
+        }
+        let status = command
+            .envs(&options.env)
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
@@ -413,7 +475,10 @@ impl DockerClient {
         } else {
             Err(DockerError::cmd_failed(
                 cmd_str,
-                "build failed",
+                options
+                    .failure_message
+                    .as_deref()
+                    .unwrap_or(DEFAULT_BUILD_FAILURE_MESSAGE),
                 status.code(),
             ))
         }
@@ -421,8 +486,8 @@ impl DockerClient {
 
     /// Push a Docker image. Inherits stdio for interactive output.
     pub async fn push(&self, image: &str) -> Result<(), DockerError> {
-        let cmd_str = format!("docker push {}", image);
-        let status = tokio::process::Command::new("docker")
+        let cmd_str = Self::cmd_str(&["push", image]);
+        let status = tokio::process::Command::new(runtime::binary())
             .args(["push", image])
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
@@ -491,7 +556,10 @@ impl DockerClient {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let output = self.run(&arg_refs, Duration::from_secs(10)).await?;
         if !output.status.success() {
-            return Err(DockerError::failed("docker volume ls", &output));
+            return Err(DockerError::failed(
+                Self::cmd_str(&["volume", "ls"]),
+                &output,
+            ));
         }
         Ok(String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -602,9 +670,10 @@ impl DockerClient {
         {
             return v2;
         }
-        // Fall back to v1 binary
-        let cmd_str = "docker-compose --version";
-        let result = tokio::process::Command::new("docker-compose")
+        // Fall back to v1's standalone binary — never a subcommand of the
+        // runtime, so it does not go through `runtime::binary()`.
+        let cmd_str = format!("{} --version", COMPOSE_V1_BINARY);
+        let result = tokio::process::Command::new(COMPOSE_V1_BINARY)
             .args(["--version"])
             .output()
             .await

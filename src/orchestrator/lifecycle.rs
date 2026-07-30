@@ -6,7 +6,8 @@
 //! orchestrator core more focused on service coordination.
 
 use crate::config::Config;
-use crate::docker::{DockerClient, DockerError};
+use crate::docker::DockerClient;
+use crate::docker::client::BuildOptions;
 use crate::error::{Error, Result};
 use std::path::Path;
 use std::process::Stdio;
@@ -476,42 +477,44 @@ impl<'a> ServiceLifecycleCommands<'a> {
                     full_image
                 );
 
-                let mut cmd = tokio::process::Command::new("docker");
-                cmd.args(["build", "-t", &full_image, "-f", &docker_config.dockerfile]);
+                let mut build_args: Vec<String> = vec![
+                    "-t".to_string(),
+                    full_image.clone(),
+                    "-f".to_string(),
+                    docker_config.dockerfile.clone(),
+                ];
 
                 // Add build args from config
                 for (key, value) in &docker_config.args {
-                    cmd.arg("--build-arg");
-                    cmd.arg(format!("{}={}", key, value));
+                    build_args.push("--build-arg".to_string());
+                    build_args.push(format!("{}={}", key, value));
                 }
 
                 // Add build args from CLI
                 for arg in cli_build_args {
-                    cmd.arg("--build-arg");
-                    cmd.arg(arg);
+                    build_args.push("--build-arg".to_string());
+                    build_args.push(arg.clone());
                 }
 
                 // Context is the cwd
-                cmd.arg(".");
+                build_args.push(".".to_string());
 
-                cmd.current_dir(&cwd)
-                    .envs(&env_vars)
-                    .stdin(Stdio::inherit())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit());
+                let arg_refs: Vec<&str> = build_args.iter().map(String::as_str).collect();
+                // The service name, not the argv, identifies the build in
+                // errors — `fed build` runs one of these per service and the
+                // full argv buries which one failed.
+                let options = BuildOptions {
+                    cwd: Some(cwd),
+                    env: env_vars,
+                    command_label: Some(format!(
+                        "{} build ({})",
+                        crate::docker::runtime::binary(),
+                        service_name
+                    )),
+                    failure_message: Some(format!("Docker build failed for '{}'", service_name)),
+                };
 
-                let status = cmd.status().await.map_err(|e| {
-                    DockerError::exec_failed(format!("docker build ({})", service_name), e)
-                })?;
-
-                if !status.success() {
-                    return Err(DockerError::cmd_failed(
-                        format!("docker build ({})", service_name),
-                        format!("Docker build failed for '{}'", service_name),
-                        status.code(),
-                    )
-                    .into());
-                }
+                DockerClient::new().build_with(&arg_refs, &options).await?;
 
                 tracing::info!(
                     "Successfully completed build for service '{}'",
