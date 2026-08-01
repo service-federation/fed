@@ -40,7 +40,7 @@ pub struct BuildOptions {
     pub env: HashMap<String, String>,
     /// Replaces the rendered argv in error messages.
     pub command_label: Option<String>,
-    /// Replaces [`DEFAULT_BUILD_FAILURE_MESSAGE`] in the non-zero-exit error.
+    /// Replaces the default build-failure message in the non-zero-exit error.
     pub failure_message: Option<String>,
 }
 
