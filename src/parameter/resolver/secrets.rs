@@ -208,7 +208,7 @@ impl Resolver {
         }
 
         // Phase 2: the cache can't cover it — block honestly on the cold start.
-        eprintln!("waking vault… (cold start can take ~20s)");
+        eprintln!("Fetching secrets from the team vault…");
         match classify(handle.join(crate::cloud::vault_timeout()), &handle.url) {
             Some(outcome) => outcome,
             None => VaultOutcome::Failed(format!(
@@ -270,7 +270,9 @@ impl Resolver {
                     ))
                 })?;
             }
-            tracing::info!("Team-vault cache is memory-only; fetched values will not be persisted");
+            tracing::debug!(
+                "team-vault cache is memory-only; fetched values will not be persisted"
+            );
             false
         } else {
             let (in_repo, ignored) = crate::parameter::secret::path_git_status(&cache_path);

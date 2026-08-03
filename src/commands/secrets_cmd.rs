@@ -39,9 +39,9 @@ pub async fn run_secrets(
 
             let (creds, link) = context(workdir)?;
             // Cloud-first and blocking: the user is deliberately asking the
-            // cloud, so correctness wins — generous budget + waking hint, never
-            // a cache fallback (D5).
-            let secrets = cloud::with_waking_hint(cloud::list_secrets(&creds, &link)).await?;
+            // cloud, so correctness wins — generous budget + progress hint,
+            // never a cache fallback (D5).
+            let secrets = cloud::with_slow_fetch_hint(cloud::list_secrets(&creds, &link)).await?;
             if secrets.is_empty() {
                 out.status(&format!(
                     "No secrets in {}/{} yet — add one in the dashboard.",

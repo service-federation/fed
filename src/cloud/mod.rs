@@ -888,12 +888,12 @@ pub fn spawn_fetch_values(work_dir: &Path, names: &[String]) -> Option<VaultHand
     Some(VaultHandle { rx, url })
 }
 
-/// Run a cloud future, printing a one-line "waking vault…" hint to stderr if it
+/// Run a cloud future, printing a one-line progress hint to stderr if it
 /// takes longer than the grace window. Used by the deliberately-blocking
 /// `fed secrets ls` command (D5): the user asked the cloud a question, so
 /// correctness wins over latency — they get the generous budget and the hint,
 /// never a cache fallback.
-pub async fn with_waking_hint<F, T>(fut: F) -> T
+pub async fn with_slow_fetch_hint<F, T>(fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
@@ -901,7 +901,7 @@ where
     match tokio::time::timeout(vault_grace(), &mut fut).await {
         Ok(v) => v,
         Err(_) => {
-            eprintln!("waking vault… (cold start can take ~20s)");
+            eprintln!("Fetching secrets from the team vault…");
             fut.await
         }
     }
