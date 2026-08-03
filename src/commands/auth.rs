@@ -3,17 +3,6 @@
 use crate::output::UserOutput;
 use anyhow::{Result, anyhow, bail};
 use fed::cloud;
-use std::io::{Read, Write};
-use std::net::TcpListener;
-
-fn random_state() -> String {
-    use rand::Rng;
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::thread_rng();
-    (0..32)
-        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
-        .collect()
-}
 
 fn hostname() -> String {
     std::process::Command::new("hostname")
@@ -37,15 +26,26 @@ fn open_browser(url: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn http_response(status: u16, body: &str) -> String {
-    let reason = if status == 200 { "OK" } else { "Bad Request" };
-    format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
-        status,
-        reason,
-        body.len(),
-        body
-    )
+/// Whether attempting to open a browser on THIS machine is worth it, judged
+/// from the environment (`have` reports whether a variable is set and
+/// non-empty). Sign-in itself never depends on this — the URL is always
+/// printed and the CLI collects its code by polling the server — so a miss
+/// costs only noise: over SSH the browser would open on the wrong machine
+/// (or xdg-open would spam "command not found" for every terminal browser it
+/// tries), and a display-less Linux box has nothing for xdg-open to launch.
+fn browser_login_viable(have: impl Fn(&str) -> bool) -> bool {
+    if have("SSH_CONNECTION") || have("SSH_TTY") || have("SSH_CLIENT") {
+        return false;
+    }
+    // macOS and Windows always have their GUI; elsewhere a real browser
+    // needs a display server.
+    cfg!(any(target_os = "macos", target_os = "windows"))
+        || have("DISPLAY")
+        || have("WAYLAND_DISPLAY")
+}
+
+fn env_is_set(key: &str) -> bool {
+    std::env::var_os(key).is_some_and(|v| !v.is_empty())
 }
 
 /// Shape check for server-minted login identifiers: `prefix` followed by
@@ -61,132 +61,34 @@ fn valid_prefixed_id(s: &str, prefix: &str) -> bool {
     })
 }
 
-/// Wait for the browser to hit http://127.0.0.1:<port>/callback?code=..&state=..
-/// Hand-parsed — not a web server.
+/// Poll the server until approval yields the exchange code.
 ///
-/// The callback carries a short-lived, single-use EXCHANGE CODE — never the
-/// bearer token; the token is only minted later, when the code is redeemed
-/// over HTTPS. `state` is CSRF/correlation defense in depth between this CLI
-/// and its own loopback callback: it is not a bearer credential and not the
-/// single-use mechanism (the server enforces single use atomically).
-///
-/// Hardening, since anything local can hit this port:
-/// - only `GET /callback` is considered; everything else gets a 404 and the
-///   listener KEEPS WAITING — a stray probe must not kill the login;
-/// - a wrong/missing state or malformed/missing code gets a 400 and the
-///   listener keeps waiting too — only the 5-minute deadline ends the flow;
-/// - the 200 "Signed in" page is sent ONLY for a valid code+state;
-/// - no response or error message ever contains a received value;
-/// - each connection is bounded by an ABSOLUTE 10-second deadline and an
-///   8 KB cap on the request line (see [`read_request_line`]) — the residual
-///   local-DoS bound is one connection at a time for at most 10s each.
-fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<String> {
-    // Non-blocking accept + poll, so an abandoned browser flow actually hits the
-    // deadline instead of blocking in accept() forever.
-    listener.set_nonblocking(true)?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+/// One immediate poll, then a ~1.5s cadence. The client-side deadline sits
+/// just past the server's 5-minute request expiry as a second line of
+/// defense: the server answers `Gone` for an expired request, so even a CLI
+/// with a broken clock stops within one poll of expiry — no abandoned fleet
+/// of logins keeps hammering the endpoint. A 429 backs off to 5s; transient
+/// transport errors are retried until the deadline (this machine's network
+/// blipping while the user approves elsewhere must not kill the login).
+async fn poll_for_code(base_url: &str, auth: &cloud::AuthRequest) -> Result<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(330);
     loop {
-        if std::time::Instant::now() > deadline {
-            bail!("timed out waiting for the browser (5 minutes) — run `fed login` again");
-        }
-        let (mut stream, _) = match listener.accept() {
-            Ok(conn) => conn,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                continue;
+        let wait = match cloud::poll_auth_request(base_url, auth).await {
+            Ok(cloud::PollOutcome::Code(code)) => return Ok(code),
+            Ok(cloud::PollOutcome::Gone) => {
+                bail!("the sign-in request expired or was already used — run `fed login` again")
             }
-            Err(e) => return Err(e.into()),
+            Ok(cloud::PollOutcome::Pending) => std::time::Duration::from_millis(1500),
+            Ok(cloud::PollOutcome::RateLimited) => std::time::Duration::from_secs(5),
+            Err(e) => {
+                tracing::debug!("login poll attempt failed (will retry): {}", e);
+                std::time::Duration::from_millis(1500)
+            }
         };
-        // The accepted socket inherits O_NONBLOCK on some platforms; clear it.
-        stream.set_nonblocking(false)?;
-        let Some(request_line) = read_request_line(&mut stream) else {
-            // Timed out, oversized, closed early, or unreadable: drop the
-            // connection and keep waiting for the real callback.
-            continue;
-        };
-        // "GET /callback?code=...&state=... HTTP/1.1"
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or("");
-        let target = parts.next().unwrap_or("");
-        let (path, query) = target.split_once('?').unwrap_or((target, ""));
-        if method != "GET" || path != "/callback" {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
-            continue;
+        if std::time::Instant::now() + wait > deadline {
+            bail!("timed out waiting for approval (5 minutes) — run `fed login` again");
         }
-        let mut code = None;
-        let mut state = None;
-        for pair in query.split('&') {
-            match pair.split_once('=') {
-                Some(("code", v)) => code = Some(v.to_string()),
-                Some(("state", v)) => state = Some(v.to_string()),
-                _ => {}
-            }
-        }
-        // Validate BEFORE telling the browser anything worked: the state must
-        // be ours and the code must be shaped like a real exchange code. A
-        // failed callback gets a 400 (with a static page — never the received
-        // values) and the listener continues: a local port-scanner must not
-        // be able to abort a login, and the genuine callback still needs the
-        // correct state to be accepted.
-        let state_ok = state.as_deref() == Some(expected_state);
-        let code_ok = code
-            .as_deref()
-            .is_some_and(|c| valid_prefixed_id(c, "fedac_"));
-        if !(state_ok && code_ok) {
-            let body = "<!doctype html><meta charset=utf-8><title>fed login</title>\
-                <body style=\"font-family:sans-serif;padding:40px\">\
-                <h2>Login failed.</h2><p>Return to your terminal and run <code>fed login</code> again.</p>";
-            let _ = stream.write_all(http_response(400, body).as_bytes());
-            continue;
-        }
-        let body = "<!doctype html><meta charset=utf-8><title>fed login</title>\
-            <body style=\"font-family:sans-serif;padding:40px\">\
-            <h2>Signed in.</h2><p>You can close this tab and return to your terminal.</p>";
-        let _ = stream.write_all(http_response(200, body).as_bytes());
-        return code.ok_or_else(|| anyhow!("no code in login callback"));
-    }
-}
-
-/// Read the first LF-terminated line of an HTTP request, bounded for the
-/// WHOLE connection: an absolute 10-second deadline plus an 8 KB size cap.
-///
-/// A socket read timeout alone bounds each individual read, not the
-/// connection — a client trickling one byte per read (slowloris) would reset
-/// it forever. So this uses a manual read loop with a short per-read timeout
-/// purely so the absolute deadline gets re-checked between reads. Returns
-/// `None` on deadline, overflow, early close, or error; the caller drops the
-/// connection and keeps listening.
-fn read_request_line(stream: &mut std::net::TcpStream) -> Option<String> {
-    const MAX: usize = 8192;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
-        .ok()?;
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 1024];
-    loop {
-        if std::time::Instant::now() > deadline || buf.len() >= MAX {
-            return None;
-        }
-        let want = chunk.len().min(MAX - buf.len());
-        match stream.read(&mut chunk[..want]) {
-            Ok(0) => return None, // closed before a full request line
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                    return Some(String::from_utf8_lossy(&buf[..pos]).into_owned());
-                }
-            }
-            // Per-read timeout (WouldBlock on unix, TimedOut on windows):
-            // loop back around so the absolute deadline gets checked.
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
-            Err(_) => return None,
-        }
+        tokio::time::sleep(wait).await;
     }
 }
 
@@ -207,20 +109,22 @@ fn mask_email(email: &str) -> String {
 /// arity. `label` identifies this device on the authorization page and in the
 /// token list — it travels only in the request body over HTTPS, never in a URL.
 struct LoginOptions {
+    /// Skip the browser-open attempt (explicit `--no-browser`, an SSH
+    /// session, or a display-less box). The flow is otherwise identical: the
+    /// URL is printed and approval arrives via polling.
     no_browser: bool,
-    print_url: bool,
     label: String,
 }
 
 /// Core of `fed login`, separated from `run_login` (which supplies the real
-/// browser opener, stdin prompt, and credential file) so the whole flow is
-/// unit-testable against stub HTTP servers — the `logout_flow` pattern.
+/// browser opener and credential files) so the whole flow is unit-testable
+/// against stub HTTP servers — the `logout_flow` pattern.
 ///
 /// Output invariants (asserted by tests): the bearer token, the exchange
-/// code, and the callback URL are NEVER printed — in any mode, on any path.
-/// The authorize URL (safe: it carries only the opaque request id) is printed
-/// only when the browser could not be opened, when `--print-url` was given,
-/// or always in `--no-browser` mode.
+/// code, and the poll secret are NEVER printed — on any path. The authorize
+/// URL is safe to always print (and always is): it carries only the opaque
+/// request id, and polling additionally requires the poll secret, so the URL
+/// alone can neither approve nor collect anything.
 ///
 /// Ordering after the code is obtained: exchange → stage to the PENDING file
 /// → ACTIVATE → PROMOTE pending over the active credentials → whoami. The
@@ -241,53 +145,28 @@ async fn login_flow(
     base_url: &str,
     opts: &LoginOptions,
     opener: &dyn Fn(&str) -> bool,
-    read_code: impl FnOnce() -> Result<String>,
     files: &cloud::CredentialFiles,
     out: &dyn UserOutput,
 ) -> Result<()> {
-    let code = if opts.no_browser {
-        let request = checked_auth_request(
-            base_url,
-            &cloud::AuthRequestBody::manual(opts.label.clone()),
-        )
-        .await?;
-        // Manual mode always prints the URL — there is no browser to open.
-        let authorize = authorize_url(base_url, &request);
-        out.status("Open this URL, sign in, and approve the request:");
-        out.status(&format!("  {}", authorize));
-        out.blank();
-        read_code()?
+    let auth = checked_auth_request(base_url, &opts.label).await?;
+    let authorize = authorize_url(base_url, &auth.request);
+    // The URL is ALWAYS printed, even when a browser opens: an opener can
+    // "succeed" without landing anywhere useful (xdg-open falling through
+    // to terminal browsers), and the printed URL works from any machine —
+    // approval comes back via the server, not this machine's loopback.
+    if !opts.no_browser && opener(&authorize) {
+        out.status("Opening your browser to sign in… or use this URL on any machine:");
     } else {
-        // Bind the loopback listener first so the port sent to the server is
-        // already ours, then register the authorization request. The label,
-        // port, and state travel only in the POST body over HTTPS — the
-        // browser URL carries nothing but the opaque request id.
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let state = random_state();
-        let request = checked_auth_request(
-            base_url,
-            &cloud::AuthRequestBody::browser(port, state.clone(), opts.label.clone()),
-        )
-        .await?;
-        let authorize = authorize_url(base_url, &request);
-        out.status("Opening your browser to sign in…");
-        if !opener(&authorize) {
-            out.warning("Could not open a browser — open this URL manually:");
-            out.status(&format!("  {}", authorize));
-        } else if opts.print_url {
-            out.status(&format!("  {}", authorize));
-        }
-        out.status("Waiting for approval in the browser… (times out after 5 minutes)");
-        // Blocking accept on a dedicated thread so tokio stays happy.
-        let expected = state;
-        tokio::task::spawn_blocking(move || wait_for_callback(listener, &expected)).await??
-    };
+        out.status("Open this URL on any machine, sign in, and approve the request:");
+    }
+    out.status(&format!("  {}", authorize));
+    out.status("Waiting for approval… (times out after 5 minutes)");
+    let code = poll_for_code(base_url, &auth).await?;
 
-    // The browser path already validated the code shape; re-checking here
-    // covers the pasted --no-browser code too, without echoing it.
+    // The code came over HTTPS from the server; anything not shaped like our
+    // exchange code is contract drift. Checked without echoing it.
     if !valid_prefixed_id(&code, "fedac_") {
-        bail!("that doesn't look like a sign-in code — run `fed login` again");
+        bail!("cloud: malformed sign-in code from server — run `fed login` again");
     }
 
     // Redeem the single-use code for the bearer token over HTTPS. The token
@@ -438,20 +317,25 @@ async fn recover_pending_login(
     }
 }
 
-/// Create an authorization request and validate the returned id's shape
-/// (`fedar_` + 43 base64url chars) before it goes anywhere near a URL.
-/// Contract drift fails here, early — without echoing the received value.
-async fn checked_auth_request(base_url: &str, body: &cloud::AuthRequestBody) -> Result<String> {
-    let request = cloud::create_auth_request(base_url, body).await?;
-    if !valid_prefixed_id(&request, "fedar_") {
+/// Create an authorization request and validate the shapes of the returned
+/// id (`fedar_` + 43 base64url chars, the only thing that may go near a URL)
+/// and poll secret (`fedps_` + 43, which never does). Contract drift fails
+/// here, early — without echoing either received value.
+async fn checked_auth_request(base_url: &str, label: &str) -> Result<cloud::AuthRequest> {
+    let auth = cloud::create_auth_request(base_url, label).await?;
+    if !valid_prefixed_id(&auth.request, "fedar_") {
         bail!("cloud: malformed authorize request id from server — run `fed login` again");
     }
-    Ok(request)
+    if !valid_prefixed_id(&auth.poll_secret, "fedps_") {
+        bail!("cloud: malformed poll secret from server — run `fed login` again");
+    }
+    Ok(auth)
 }
 
 pub async fn run_login(
     no_browser: bool,
-    print_url: bool,
+    // Accepted for compatibility; the sign-in URL is now always printed.
+    _print_url: bool,
     label: Option<String>,
     url_override: Option<String>,
     out: &dyn UserOutput,
@@ -471,28 +355,17 @@ pub async fn run_login(
     if recover_pending_login(&files, out).await? {
         return Ok(());
     }
+    // Sign-in works the same either way (the URL is printed and approval
+    // arrives via polling); skipping the opener over SSH or without a
+    // display just avoids launching a browser nobody is looking at.
     let opts = LoginOptions {
-        no_browser,
-        print_url,
+        no_browser: no_browser || !browser_login_viable(env_is_set),
         label: label
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
             .unwrap_or_else(hostname),
     };
-    login_flow(
-        &base_url,
-        &opts,
-        &open_browser,
-        || {
-            eprint!("Paste the code here: ");
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
-            Ok(input.trim().to_string())
-        },
-        &files,
-        out,
-    )
-    .await
+    login_flow(&base_url, &opts, &open_browser, &files, out).await
 }
 
 /// The browser URL: base + the opaque request id, nothing else — no port, no
@@ -608,6 +481,8 @@ fn urlencoding_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
     use std::time::{Duration, Instant};
 
     /// One-shot HTTP server: replies to the first request with `status_line`
@@ -757,12 +632,14 @@ mod tests {
     // contract regressions. `stub_ids_are_production_valid` keeps them honest.
     const STUB_CODE: &str = "fedac_c0dec0dec0dec0dec0dec0dec0dec0dec0dec0deZx-";
     const STUB_REQUEST: &str = "fedar_reqidreqidreqidreqidreqidreqidreqidreqidQz_";
+    const STUB_POLL_SECRET: &str = "fedps_p0llp0llp0llp0llp0llp0llp0llp0llp0llp0llQw_";
     const STUB_TOKEN: &str = "fed_stub-bearer-token-value";
 
     #[test]
     fn stub_ids_are_production_valid() {
         assert!(valid_prefixed_id(STUB_CODE, "fedac_"));
         assert!(valid_prefixed_id(STUB_REQUEST, "fedar_"));
+        assert!(valid_prefixed_id(STUB_POLL_SECRET, "fedps_"));
         assert!(STUB_TOKEN.starts_with("fed_"));
     }
 
@@ -776,32 +653,6 @@ mod tests {
         // right length, invalid character
         let bad = format!("fedac_{}!", &STUB_CODE[7..49]);
         assert!(!valid_prefixed_id(&bad, "fedac_"));
-    }
-
-    /// Send a raw HTTP request to the CLI's loopback listener and return the
-    /// full response (so tests can assert on status and on what the response
-    /// does NOT contain).
-    fn hit_raw(port: u16, request: &str) -> String {
-        use std::io::Read;
-        // The listener is already bound when the port becomes known, so the
-        // connect lands in its backlog even before accept() runs.
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let _ = stream.write_all(request.as_bytes());
-        let mut buf = Vec::new();
-        let _ = stream.read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
-    }
-
-    /// Play the approving browser: hit the CLI's loopback callback with the
-    /// exchange code and a state value. Returns the HTTP response.
-    fn hit_callback(port: u16, code: &str, state: &str) -> String {
-        hit_raw(
-            port,
-            &format!(
-                "GET /callback?code={}&state={} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-                code, state
-            ),
-        )
     }
 
     /// Read one HTTP request (line + headers + Content-Length body) off a
@@ -851,11 +702,10 @@ mod tests {
 
     /// Stub of the cloud API with call recording, for full login-flow tests.
     /// Serves every endpoint the flow can touch; behaviors are configurable
-    /// so failure paths (activate down, whoami down) can be exercised. When
-    /// an authorize request carries port+state it also plays the approving
-    /// browser, hitting the CLI's loopback callback with [`STUB_CODE`] and
-    /// the CLI's own state. The token is only issued for the right code, so
-    /// a flow that completes proves the exchange happened.
+    /// so failure paths (activate down, whoami down, expired request) can be
+    /// exercised. The poll endpoint verifies the CLI presents BOTH the
+    /// request id and the poll secret, and the token is only issued for the
+    /// right code — a flow that completes proves the whole chain ran.
     struct StubCloud {
         base: String,
         calls: Arc<Mutex<Vec<String>>>,
@@ -877,15 +727,30 @@ mod tests {
         spawn_stub_cloud_cfg(activate_status, me_ok, true)
     }
 
+    fn spawn_stub_cloud_cfg(activate_status: u16, me_ok: bool, revoke_ok: bool) -> StubCloud {
+        spawn_stub_cloud_full(activate_status, me_ok, revoke_ok, 0, false)
+    }
+
     /// `activate_status`: HTTP status for `POST /api/v1/cli/activate`
     /// (200 → activated, 401 → dead token, anything else → 500-style outage).
     /// `revoke_ok`: whether `DELETE /api/v1/cli/session` confirms the revoke
     /// (false models "both responses lost" — the ambiguous worst case).
-    fn spawn_stub_cloud_cfg(activate_status: u16, me_ok: bool, revoke_ok: bool) -> StubCloud {
+    /// `pending_polls`: how many polls answer "pending" before the code is
+    /// delivered (the user approving while the CLI waits).
+    /// `poll_gone`: every poll answers 410 — an expired or already-used
+    /// request.
+    fn spawn_stub_cloud_full(
+        activate_status: u16,
+        me_ok: bool,
+        revoke_ok: bool,
+        pending_polls: u32,
+        poll_gone: bool,
+    ) -> StubCloud {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let recorded = calls.clone();
+        let pending_left = Arc::new(Mutex::new(pending_polls));
         std::thread::spawn(move || {
             loop {
                 let Ok((stream, _)) = listener.accept() else {
@@ -905,19 +770,42 @@ mod tests {
                 match (method.as_str(), path.as_str()) {
                     ("POST", "/api/v1/cli/authorize-request") => {
                         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-                        if let (Some(cb_port), Some(state)) =
-                            (v["port"].as_u64(), v["state"].as_str())
-                        {
-                            let state = state.to_string();
-                            std::thread::spawn(move || {
-                                hit_callback(cb_port as u16, STUB_CODE, &state)
-                            });
-                        }
+                        assert_eq!(
+                            v["poll"].as_bool(),
+                            Some(true),
+                            "the CLI must register poll-mode requests"
+                        );
                         respond_json(
                             &stream,
                             "201 Created",
-                            &format!("{{\"request\":\"{}\",\"expires_in\":300}}", STUB_REQUEST),
+                            &format!(
+                                "{{\"request\":\"{}\",\"poll_secret\":\"{}\",\"expires_in\":300}}",
+                                STUB_REQUEST, STUB_POLL_SECRET
+                            ),
                         );
+                    }
+                    ("POST", "/api/v1/cli/poll") => {
+                        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                        if v["request"].as_str() != Some(STUB_REQUEST)
+                            || v["secret"].as_str() != Some(STUB_POLL_SECRET)
+                        {
+                            // Wrong or missing credentials never yield a code.
+                            respond_json(&stream, "410 Gone", "{\"error\":\"request_gone\"}");
+                        } else if poll_gone {
+                            respond_json(&stream, "410 Gone", "{\"error\":\"request_gone\"}");
+                        } else {
+                            let mut left = pending_left.lock().unwrap();
+                            if *left > 0 {
+                                *left -= 1;
+                                respond_json(&stream, "200 OK", "{\"status\":\"pending\"}");
+                            } else {
+                                respond_json(
+                                    &stream,
+                                    "200 OK",
+                                    &format!("{{\"code\":\"{}\"}}", STUB_CODE),
+                                );
+                            }
+                        }
                     }
                     ("POST", "/api/v1/cli/token") => {
                         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -966,10 +854,9 @@ mod tests {
         }
     }
 
-    fn login_opts(no_browser: bool, print_url: bool) -> LoginOptions {
+    fn login_opts(no_browser: bool) -> LoginOptions {
         LoginOptions {
             no_browser,
-            print_url,
             label: "test-device".to_string(),
         }
     }
@@ -995,7 +882,7 @@ mod tests {
     }
 
     /// Assert none of the secret material — bearer token, exchange code,
-    /// callback URL — appears in the recorded output.
+    /// poll secret — appears in the recorded output.
     fn assert_no_secrets(text: &str) {
         assert!(
             !text.contains(STUB_TOKEN),
@@ -1008,173 +895,30 @@ mod tests {
             text
         );
         assert!(
-            !text.contains("/callback"),
-            "output leaked the callback URL: {}",
+            !text.contains(STUB_POLL_SECRET) && !text.contains("fedps_"),
+            "output leaked the poll secret: {}",
             text
         );
     }
 
-    /// The callback parses `code` (not the old `token`) and returns it when
-    /// the state matches — replying 200 only then.
-    #[test]
-    fn callback_parses_code_when_state_matches() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let browser = std::thread::spawn(move || {
-            let resp = hit_callback(port, STUB_CODE, "expected-state-value");
-            assert!(
-                resp.starts_with("HTTP/1.1 200"),
-                "valid callback must get 200: {}",
-                resp
-            );
-        });
-        let code = wait_for_callback(listener, "expected-state-value").unwrap();
-        assert_eq!(code, STUB_CODE);
-        browser.join().unwrap();
-    }
-
-    /// Hostile or stray local requests — wrong state, malformed code, wrong
-    /// path, wrong method, an oversized request line — each get an error
-    /// response that never echoes the received values, and the listener KEEPS
-    /// WAITING: a local port-scanner must not be able to abort a login. The
-    /// genuine callback afterwards still completes the flow.
-    #[test]
-    fn callback_survives_bad_requests_then_completes() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let browser = std::thread::spawn(move || {
-            // Wrong state (correct-shaped code): 400, nothing echoed.
-            let resp = hit_callback(port, STUB_CODE, "attacker-supplied-state");
-            assert!(
-                resp.starts_with("HTTP/1.1 400"),
-                "wrong state must get 400: {}",
-                resp
-            );
-            assert!(
-                !resp.contains(STUB_CODE) && !resp.contains("attacker-supplied-state"),
-                "400 response echoed received values: {}",
-                resp
-            );
-            // Malformed code with the correct state: still 400, not echoed.
-            let resp = hit_callback(port, "not-a-real-code", "expected-state-value");
-            assert!(
-                resp.starts_with("HTTP/1.1 400"),
-                "bad code must get 400: {}",
-                resp
-            );
-            assert!(
-                !resp.contains("not-a-real-code"),
-                "400 echoed the code: {}",
-                resp
-            );
-            // Missing code entirely: 400.
-            let resp = hit_raw(
-                port,
-                "GET /callback?state=expected-state-value HTTP/1.1\r\nConnection: close\r\n\r\n",
-            );
-            assert!(
-                resp.starts_with("HTTP/1.1 400"),
-                "missing code must get 400: {}",
-                resp
-            );
-            // Wrong path: 404.
-            let resp = hit_raw(port, "GET /admin HTTP/1.1\r\nConnection: close\r\n\r\n");
-            assert!(
-                resp.starts_with("HTTP/1.1 404"),
-                "wrong path must get 404: {}",
-                resp
-            );
-            // Wrong method on the right path: 404 (only GET is served).
-            let resp = hit_raw(port, "POST /callback HTTP/1.1\r\nConnection: close\r\n\r\n");
-            assert!(
-                resp.starts_with("HTTP/1.1 404"),
-                "POST must get 404: {}",
-                resp
-            );
-            // Oversized request line: the 8 KB cap stops the read; the flow
-            // survives (response may or may not arrive before the reset).
-            let _ = hit_raw(
-                port,
-                &format!(
-                    "GET /{} HTTP/1.1\r\nConnection: close\r\n\r\n",
-                    "A".repeat(100_000)
-                ),
-            );
-            // The genuine callback still works after all of the above.
-            let resp = hit_callback(port, STUB_CODE, "expected-state-value");
-            assert!(
-                resp.starts_with("HTTP/1.1 200"),
-                "real callback must get 200: {}",
-                resp
-            );
-        });
-        let code = wait_for_callback(listener, "expected-state-value").unwrap();
-        assert_eq!(code, STUB_CODE, "the login must still complete");
-        browser.join().unwrap();
-    }
-
-    /// A slowloris-style client (bytes trickled forever, never a full request
-    /// line) is cut off near the 10-second absolute per-connection deadline —
-    /// a per-read timeout alone would be reset by every byte — and the flow
-    /// survives to serve the genuine callback afterwards.
-    #[test]
-    fn callback_cuts_off_slowloris_and_still_completes() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let browser = std::thread::spawn(move || {
-            let start = Instant::now();
-            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            // Trickle one byte at a time; each write resets a naive per-read
-            // timeout, so only an absolute deadline can end this.
-            loop {
-                if stream.write_all(b"A").is_err() {
-                    break; // server hung up on us — the deadline fired
-                }
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                assert!(
-                    start.elapsed() < Duration::from_secs(30),
-                    "server never cut the slow connection"
-                );
-            }
-            let cut = start.elapsed();
-            // Loose bounds for CI: the deadline is 10s; detection lags a
-            // write or two behind the close.
-            assert!(
-                cut >= Duration::from_secs(5) && cut <= Duration::from_secs(25),
-                "cutoff should land near the 10s deadline, got {:?}",
-                cut
-            );
-            // The genuine callback still completes the login.
-            let resp = hit_callback(port, STUB_CODE, "expected-state-value");
-            assert!(
-                resp.starts_with("HTTP/1.1 200"),
-                "real callback must get 200: {}",
-                resp
-            );
-        });
-        let code = wait_for_callback(listener, "expected-state-value").unwrap();
-        assert_eq!(code, STUB_CODE, "the login must survive a slowloris client");
-        browser.join().unwrap();
-    }
-
-    /// Full simulated browser flow: create-request → stub 'browser' hits the
-    /// loopback callback → code exchange → whoami. With a succeeding opener,
-    /// the authorize URL is NOT printed, and no secret material ever is. The
-    /// success line masks the email and gives an org count, not slugs.
+    /// Full flow: create-request → poll (approved immediately) → code
+    /// exchange → activate → whoami. The URL is printed even though the
+    /// opener succeeded (an opener can "succeed" into nothing useful), the
+    /// opener gets the id-only URL, and no secret material appears anywhere.
+    /// The success line masks the email and gives an org count, not slugs.
     #[tokio::test]
-    async fn browser_flow_hides_url_and_secrets_when_open_succeeds() {
+    async fn login_completes_via_polling_and_prints_the_url() {
         let stub = spawn_stub_cloud();
         let out = RecordingOutput::new();
         let opened = RefCell::new(None::<String>);
         let (dir, files) = temp_files();
         login_flow(
             &stub.base,
-            &login_opts(false, false),
+            &login_opts(false),
             &|url: &str| {
                 opened.replace(Some(url.to_string()));
                 true
             },
-            || Err(anyhow!("the prompt must not be used in browser mode")),
             &files,
             &out,
         )
@@ -1188,17 +932,18 @@ mod tests {
             !pending_exists(&dir),
             "promotion must consume the pending file"
         );
-        // …and the token got nowhere near the terminal.
+        // …and neither the token nor the poll secret got near the terminal.
         let text = out.combined();
         assert_no_secrets(&text);
 
-        // The full server-side sequence, in order: register → exchange →
-        // ACTIVATE (authenticated, before any success output can be built) →
-        // whoami. No revoke.
+        // The full server-side sequence, in order: register → poll → exchange
+        // → ACTIVATE (authenticated, before any success output can be built)
+        // → whoami. No revoke.
         assert_eq!(
             stub.calls(),
             vec![
                 "POST /api/v1/cli/authorize-request",
+                "POST /api/v1/cli/poll",
                 "POST /api/v1/cli/token",
                 "POST /api/v1/cli/activate (auth)",
                 "GET /api/v1/me (auth)",
@@ -1206,17 +951,18 @@ mod tests {
             "unexpected call sequence"
         );
 
-        // The opener got the id-only authorize URL; the output did not.
+        // The opener got the id-only authorize URL; the printed URL is the
+        // same one, and neither carries the poll secret.
         let authorize = opened.borrow().clone().expect("opener must be called");
         assert!(authorize.contains(&format!("/cli/authorize?request={}", STUB_REQUEST)));
         assert!(
-            !authorize.contains("port") && !authorize.contains("state"),
+            !authorize.contains("secret") && !authorize.contains("fedps_"),
             "authorize URL must carry only the request id: {}",
             authorize
         );
         assert!(
-            !text.contains("/cli/authorize"),
-            "authorize URL must not be printed when the browser opened: {}",
+            text.contains(&format!("/cli/authorize?request={}", STUB_REQUEST)),
+            "the URL must be printed even when the browser opens: {}",
             text
         );
 
@@ -1239,23 +985,23 @@ mod tests {
         );
     }
 
-    /// When the browser cannot be opened, the authorize URL IS printed (the
-    /// user has to get there somehow) — still with no secret material.
+    /// A failing opener changes nothing but the wording: the URL is printed
+    /// and polling completes the login.
     #[tokio::test]
-    async fn browser_flow_prints_url_when_open_fails() {
+    async fn login_completes_when_the_browser_cannot_open() {
         let stub = spawn_stub_cloud();
         let out = RecordingOutput::new();
-        let (_dir, files) = temp_files();
+        let (dir, files) = temp_files();
         login_flow(
             &stub.base,
-            &login_opts(false, false),
+            &login_opts(false),
             &|_: &str| false,
-            || Err(anyhow!("the prompt must not be used in browser mode")),
             &files,
             &out,
         )
         .await
         .unwrap();
+        assert_eq!(active_token(&dir).as_deref(), Some(STUB_TOKEN));
         let text = out.combined();
         assert!(
             text.contains(&format!("/cli/authorize?request={}", STUB_REQUEST)),
@@ -1265,36 +1011,78 @@ mod tests {
         assert_no_secrets(&text);
     }
 
-    /// `--print-url` prints the authorize URL even when the browser opens.
+    /// Pending answers are retried until approval delivers the code — the
+    /// user taking a moment in the browser while the CLI waits.
     #[tokio::test]
-    async fn browser_flow_print_url_flag_always_prints_url() {
-        let stub = spawn_stub_cloud();
+    async fn pending_polls_are_retried_until_the_code_arrives() {
+        let stub = spawn_stub_cloud_full(200, true, true, 1, false);
         let out = RecordingOutput::new();
-        let (_dir, files) = temp_files();
-        login_flow(
-            &stub.base,
-            &login_opts(false, true),
-            &|_: &str| true,
-            || Err(anyhow!("the prompt must not be used in browser mode")),
-            &files,
-            &out,
-        )
-        .await
-        .unwrap();
-        let text = out.combined();
-        assert!(
-            text.contains(&format!("/cli/authorize?request={}", STUB_REQUEST)),
-            "--print-url must print the URL: {}",
-            text
+        let (dir, files) = temp_files();
+        login_flow(&stub.base, &login_opts(true), &|_: &str| true, &files, &out)
+            .await
+            .unwrap();
+        assert_eq!(active_token(&dir).as_deref(), Some(STUB_TOKEN));
+        let polls = stub
+            .calls()
+            .iter()
+            .filter(|c| c.as_str() == "POST /api/v1/cli/poll")
+            .count();
+        assert_eq!(
+            polls,
+            2,
+            "one pending answer, then the code: {:?}",
+            stub.calls()
         );
-        assert_no_secrets(&text);
+        assert_no_secrets(&out.combined());
     }
 
-    /// --no-browser: the URL is always printed, the pasted code (injected
-    /// reader) is exchanged for the token, and neither code nor token reach
-    /// the output.
+    /// A `gone` poll answer (expired or already-used request) fails the
+    /// login with an actionable message that leaks nothing.
     #[tokio::test]
-    async fn no_browser_flow_prints_url_and_exchanges_pasted_code() {
+    async fn gone_poll_answer_fails_with_a_friendly_error() {
+        let stub = spawn_stub_cloud_full(200, true, true, 0, true);
+        let out = RecordingOutput::new();
+        let (dir, files) = temp_files();
+        let err = login_flow(&stub.base, &login_opts(true), &|_: &str| true, &files, &out)
+            .await
+            .expect_err("a gone request must fail the login");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("expired or was already used") && msg.contains("fed login"),
+            "unexpected gone message: {}",
+            msg
+        );
+        assert_no_secrets(&msg);
+        assert_no_secrets(&out.combined());
+        assert!(active_token(&dir).is_none(), "nothing may be installed");
+        assert!(!pending_exists(&dir), "nothing may be staged");
+    }
+
+    /// SSH sessions are never browser-viable (the URL opens on a different
+    /// machine); otherwise a display marks a Linux box viable. macOS/Windows
+    /// without SSH are always viable, which the DISPLAY case subsumes here.
+    #[test]
+    fn browser_viability_from_environment() {
+        let with = |vars: &'static [&'static str]| move |k: &str| vars.contains(&k);
+        assert!(!browser_login_viable(with(&["SSH_CONNECTION", "DISPLAY"])));
+        assert!(!browser_login_viable(with(&["SSH_TTY"])));
+        assert!(!browser_login_viable(with(&["SSH_CLIENT"])));
+        assert!(browser_login_viable(with(&["DISPLAY"])));
+        assert!(browser_login_viable(with(&["WAYLAND_DISPLAY"])));
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert!(
+            !browser_login_viable(with(&[])),
+            "a display-less Linux box must fall back to code sign-in"
+        );
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert!(browser_login_viable(with(&[])));
+    }
+
+    /// --no-browser: the opener is never invoked, the URL is printed, and
+    /// polling completes the login exactly as in browser mode — replacing a
+    /// pre-existing credential on promotion.
+    #[tokio::test]
+    async fn no_browser_flow_skips_the_opener_and_completes_via_polling() {
         let stub = spawn_stub_cloud();
         let out = RecordingOutput::new();
         let (dir, files) = temp_files();
@@ -1306,9 +1094,8 @@ mod tests {
         .unwrap();
         login_flow(
             &stub.base,
-            &login_opts(true, false),
+            &login_opts(true),
             &|_: &str| panic!("no browser may be opened in --no-browser mode"),
-            || Ok(STUB_CODE.to_string()),
             &files,
             &out,
         )
@@ -1349,9 +1136,8 @@ mod tests {
         let (dir, files) = temp_files();
         login_flow(
             &stub.base,
-            &login_opts(true, false),
+            &login_opts(true),
             &|_: &str| panic!("no browser in --no-browser mode"),
-            || Ok(STUB_CODE.to_string()),
             &files,
             &out,
         )
@@ -1408,9 +1194,8 @@ mod tests {
 
         let result = login_flow(
             &stub.base,
-            &login_opts(true, false),
+            &login_opts(true),
             &|_: &str| panic!("no browser in --no-browser mode"),
-            || Ok(STUB_CODE.to_string()),
             &files,
             &out,
         )
@@ -1450,9 +1235,8 @@ mod tests {
 
         let err = login_flow(
             &stub.base,
-            &login_opts(true, false),
+            &login_opts(true),
             &|_: &str| panic!("no browser in --no-browser mode"),
-            || Ok(STUB_CODE.to_string()),
             &files,
             &out,
         )
@@ -1502,9 +1286,8 @@ mod tests {
 
         let err = login_flow(
             &stub.base,
-            &login_opts(true, false),
+            &login_opts(true),
             &|_: &str| panic!("no browser in --no-browser mode"),
-            || Ok(STUB_CODE.to_string()),
             &files,
             &out,
         )
@@ -1554,9 +1337,8 @@ mod tests {
 
         let err = login_flow(
             &stub.base,
-            &login_opts(true, false),
+            &login_opts(true),
             &|_: &str| panic!("no browser in --no-browser mode"),
-            || Ok(STUB_CODE.to_string()),
             &files,
             &out,
         )
@@ -1619,9 +1401,8 @@ mod tests {
         let out = RecordingOutput::new();
         login_flow(
             &stub.base,
-            &login_opts(true, false),
+            &login_opts(true),
             &|_: &str| panic!("no browser in --no-browser mode"),
-            || Ok(STUB_CODE.to_string()),
             &files,
             &out,
         )

@@ -451,69 +451,59 @@ pub async fn whoami(creds: &Credentials) -> Result<Me> {
         .map_err(|e| Error::Validation(format!("cloud: bad whoami response: {}", e)))
 }
 
-// ── Login: authorization request + code exchange ──────────────────────
+// ── Login: authorization request + poll + code exchange ───────────────
 //
 // `fed login` never receives the bearer token through the browser. The CLI
-// first registers an AUTHORIZATION REQUEST server-side; the browser URL
-// carries only that request's opaque id — an unguessable handle, not a
+// first registers a poll-mode AUTHORIZATION REQUEST server-side; the browser
+// URL carries only that request's opaque id — an unguessable handle, not a
 // credential: approval still requires an authenticated browser session plus
-// an explicit click. Approval yields a short-lived, single-use EXCHANGE CODE
-// (hashed at rest server-side), which the CLI redeems for the bearer token
-// over HTTPS via `POST /api/v1/cli/token`. The token therefore never appears
-// in a URL, browser page, redirect, log line, or terminal output.
+// an explicit click. The CLI then POLLS the server (with the poll secret,
+// which never travels in a URL) until approval yields the short-lived,
+// single-use EXCHANGE CODE, redeemed for the bearer token over HTTPS via
+// `POST /api/v1/cli/token`. Nothing loopback, so the approving browser can
+// be on any machine — this one or one that reaches it over SSH. The token
+// never appears in a URL, browser page, redirect, log line, or terminal
+// output.
 
-/// Body for `POST /api/v1/cli/authorize-request`. Built via [`Self::browser`]
-/// or [`Self::manual`] so the two shapes the server accepts (`{port, state,
-/// label}` and `{manual: true, label}`) cannot be mixed. The device label
-/// travels only in this POST body over HTTPS — never in a URL.
-#[derive(Serialize)]
-pub struct AuthRequestBody {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    state: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    manual: Option<bool>,
-    label: String,
+/// A registered authorization request: the opaque id (the only thing that
+/// may ever appear in the authorize URL) and the poll secret the CLI
+/// presents to collect the exchange code. Holding the URL alone is never
+/// enough to poll — the secret exists only in the create response and the
+/// poll bodies, all over HTTPS.
+pub struct AuthRequest {
+    pub request: String,
+    pub poll_secret: String,
 }
 
-impl AuthRequestBody {
-    /// Browser mode: the server will redirect the approving browser to the
-    /// CLI's loopback listener on `port`, echoing `state` (CSRF/correlation
-    /// defense in depth between the CLI and its own callback — not a bearer
-    /// credential).
-    pub fn browser(port: u16, state: String, label: String) -> Self {
-        Self {
-            port: Some(port),
-            state: Some(state),
-            manual: None,
-            label,
-        }
+/// Redacting Debug: the poll secret must never reach a log line or panic
+/// message, and the request id is kept out for good measure.
+impl std::fmt::Debug for AuthRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthRequest")
+            .field("request", &"<redacted>")
+            .field("poll_secret", &"<redacted>")
+            .finish()
     }
+}
 
-    /// Manual (`--no-browser`) mode: the approval page displays the exchange
-    /// code for copy-paste instead of redirecting to a loopback port.
-    pub fn manual(label: String) -> Self {
-        Self {
-            port: None,
-            state: None,
-            manual: Some(true),
-            label,
-        }
-    }
+#[derive(Serialize)]
+struct AuthRequestBody<'a> {
+    poll: bool,
+    label: &'a str,
 }
 
 #[derive(Deserialize)]
 struct AuthRequestResponse {
     request: String,
+    poll_secret: String,
 }
 
-/// Create a server-side authorization request and return its opaque id — the
-/// only thing that may ever appear in the authorize URL.
-pub async fn create_auth_request(base_url: &str, body: &AuthRequestBody) -> Result<String> {
+/// Create a server-side poll-mode authorization request. The device label
+/// travels only in this POST body over HTTPS — never in a URL.
+pub async fn create_auth_request(base_url: &str, label: &str) -> Result<AuthRequest> {
     let res = client()
         .post(format!("{}/api/v1/cli/authorize-request", base_url))
-        .json(body)
+        .json(&AuthRequestBody { poll: true, label })
         .send()
         .await
         .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", base_url, e)))?;
@@ -524,7 +514,77 @@ pub async fn create_auth_request(base_url: &str, body: &AuthRequestBody) -> Resu
         .json()
         .await
         .map_err(|e| Error::Validation(format!("cloud: bad authorize-request response: {}", e)))?;
-    Ok(body.request)
+    Ok(AuthRequest {
+        request: body.request,
+        poll_secret: body.poll_secret,
+    })
+}
+
+/// One poll answer. `Gone` is terminal (expired, already delivered, or never
+/// ours); `RateLimited` asks the caller to back off; transport errors are
+/// `Err` so the caller can keep trying until its own deadline.
+pub enum PollOutcome {
+    Pending,
+    Code(String),
+    RateLimited,
+    Gone,
+}
+
+/// Redacting Debug: `Code` carries the single-use exchange code, which must
+/// never reach a log line or panic message.
+impl std::fmt::Debug for PollOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => f.write_str("Pending"),
+            Self::Code(_) => f.write_str("Code(<redacted>)"),
+            Self::RateLimited => f.write_str("RateLimited"),
+            Self::Gone => f.write_str("Gone"),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PollBody<'a> {
+    request: &'a str,
+    secret: &'a str,
+}
+
+#[derive(Deserialize)]
+struct PollResponse {
+    status: Option<String>,
+    code: Option<String>,
+}
+
+/// Ask once whether the authorization request has been approved, collecting
+/// the exchange code when it has. The code never appears in any error.
+pub async fn poll_auth_request(base_url: &str, auth: &AuthRequest) -> Result<PollOutcome> {
+    let res = client()
+        .post(format!("{}/api/v1/cli/poll", base_url))
+        .json(&PollBody {
+            request: &auth.request,
+            secret: &auth.poll_secret,
+        })
+        .send()
+        .await
+        .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", base_url, e)))?;
+    match res.status().as_u16() {
+        410 => Ok(PollOutcome::Gone),
+        429 => Ok(PollOutcome::RateLimited),
+        s if !(200..300).contains(&s) => Err(api_error(res.status(), "waiting for approval")),
+        _ => {
+            let body: PollResponse = res
+                .json()
+                .await
+                .map_err(|e| Error::Validation(format!("cloud: bad poll response: {}", e)))?;
+            match (body.code, body.status.as_deref()) {
+                (Some(code), _) => Ok(PollOutcome::Code(code)),
+                (None, Some("pending")) => Ok(PollOutcome::Pending),
+                _ => Err(Error::Validation(
+                    "cloud: bad poll response — run `fed login` again".to_string(),
+                )),
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1425,17 +1485,65 @@ mod tests {
         assert!(!files.delete_pending_credentials().unwrap());
     }
 
-    /// A 201 from the authorize-request endpoint yields the opaque request id.
+    /// A 201 from the authorize-request endpoint yields the opaque request
+    /// id and the poll secret.
     #[tokio::test]
-    async fn create_auth_request_returns_request_id() {
+    async fn create_auth_request_returns_id_and_poll_secret() {
         let url = spawn_one_shot(
             "201 Created",
-            "{\"request\":\"fedar_stub-request-id\",\"expires_in\":300}",
+            "{\"request\":\"fedar_stub-request-id\",\"poll_secret\":\"fedps_stub-poll-secret\",\"expires_in\":300}",
         );
-        let id = create_auth_request(&url, &AuthRequestBody::manual("dev-box".to_string()))
-            .await
-            .unwrap();
-        assert_eq!(id, "fedar_stub-request-id");
+        let auth = create_auth_request(&url, "dev-box").await.unwrap();
+        assert_eq!(auth.request, "fedar_stub-request-id");
+        assert_eq!(auth.poll_secret, "fedps_stub-poll-secret");
+    }
+
+    fn stub_auth() -> AuthRequest {
+        AuthRequest {
+            request: "fedar_stub-request-id".to_string(),
+            poll_secret: "fedps_stub-poll-secret".to_string(),
+        }
+    }
+
+    /// The poll answers map onto their outcomes; 410 and 429 are outcomes,
+    /// not errors, so the caller's retry logic can tell them apart.
+    #[tokio::test]
+    async fn poll_auth_request_maps_answers_to_outcomes() {
+        let url = spawn_one_shot("200 OK", "{\"status\":\"pending\"}");
+        assert!(matches!(
+            poll_auth_request(&url, &stub_auth()).await.unwrap(),
+            PollOutcome::Pending
+        ));
+        let url = spawn_one_shot("200 OK", "{\"code\":\"fedac_stub-code\"}");
+        match poll_auth_request(&url, &stub_auth()).await.unwrap() {
+            PollOutcome::Code(code) => assert_eq!(code, "fedac_stub-code"),
+            _ => panic!("a code answer must map to PollOutcome::Code"),
+        }
+        let url = spawn_one_shot("410 Gone", "{\"error\":\"request_gone\"}");
+        assert!(matches!(
+            poll_auth_request(&url, &stub_auth()).await.unwrap(),
+            PollOutcome::Gone
+        ));
+        let url = spawn_one_shot("429 Too Many Requests", "{\"error\":\"rate_limited\"}");
+        assert!(matches!(
+            poll_auth_request(&url, &stub_auth()).await.unwrap(),
+            PollOutcome::RateLimited
+        ));
+    }
+
+    /// A 200 with neither a code nor a pending status is contract drift and
+    /// must fail — without echoing the poll secret anywhere.
+    #[tokio::test]
+    async fn poll_auth_request_rejects_malformed_answers() {
+        let url = spawn_one_shot("200 OK", "{\"unexpected\":true}");
+        let err = poll_auth_request(&url, &stub_auth()).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("fed login"), "actionable message: {}", msg);
+        assert!(
+            !msg.contains("fedps_stub-poll-secret"),
+            "poll errors must never carry the secret: {}",
+            msg
+        );
     }
 
     /// A 426 (Upgrade Required — the server refusing this CLI's protocol
@@ -1444,9 +1552,7 @@ mod tests {
     #[tokio::test]
     async fn status_426_maps_to_upgrade_hint_on_login_start() {
         let url = spawn_one_shot("426 Upgrade Required", "{\"error\":\"upgrade_fed\"}");
-        let err = create_auth_request(&url, &AuthRequestBody::manual("dev-box".to_string()))
-            .await
-            .unwrap_err();
+        let err = create_auth_request(&url, "dev-box").await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("too old") && msg.contains("upgrade fed"),

@@ -204,11 +204,12 @@ pub enum Commands {
 
     /// Sign in to Service Federation Cloud
     Login {
-        /// Print the sign-in URL and paste the one-time code manually (for SSH sessions)
+        /// Don't try to open a browser; just print the sign-in URL (openable
+        /// on any machine — approval reaches this terminal automatically)
         #[arg(long)]
         no_browser: bool,
-        /// Always print the sign-in URL (hidden by default when the browser opens)
-        #[arg(long)]
+        /// Deprecated: the sign-in URL is now always printed
+        #[arg(long, hide = true)]
         print_url: bool,
         /// Label identifying this device on the authorization page and in the
         /// token list (defaults to this machine's hostname). Sent in the
