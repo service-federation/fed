@@ -1,0 +1,12 @@
+services:
+  database:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - database_data:/data
+
+  cache:
+    image: redis:7-alpine
+
+volumes:
+  database_data:

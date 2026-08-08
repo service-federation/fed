@@ -1,0 +1,60 @@
+services:
+  root:
+    migrate: |
+      mkdir -p .runtime
+      generation=0
+      test ! -f .runtime/generation || generation=$(cat .runtime/generation)
+      generation=$((generation + 1))
+      printf '%s\n' "$generation" > .runtime/generation
+      printf '%s root\n' "$generation" >> .runtime/events
+    process: exec sleep 300
+
+  hook-a:
+    migrate: |
+      generation=$(cat .runtime/generation)
+      printf '%s hook-a\n' "$generation" >> .runtime/events
+      printf '%s\n' "$generation" > .runtime/hook-a.ready
+    depends_on:
+      - root
+
+  hook-b:
+    migrate: |
+      generation=$(cat .runtime/generation)
+      printf '%s hook-b\n' "$generation" >> .runtime/events
+      printf '%s\n' "$generation" > .runtime/hook-b.ready
+    depends_on:
+      - root
+
+  worker:
+    migrate: |
+      generation=$(cat .runtime/generation)
+      test "$(cat .runtime/hook-a.ready)" = "$generation"
+      printf '%s worker\n' "$generation" >> .runtime/events
+      printf '%s\n' "$generation" > .runtime/worker.ready
+    depends_on:
+      - hook-a
+
+  shared:
+    migrate: |
+      generation=$(cat .runtime/generation)
+      test "$(cat .runtime/hook-a.ready)" = "$generation"
+      test "$(cat .runtime/hook-b.ready)" = "$generation"
+      printf '%s shared\n' "$generation" >> .runtime/events
+      printf '%s\n' "$generation" > .runtime/shared.ready
+    depends_on:
+      - hook-a
+      - hook-b
+
+  web:
+    process: |
+      generation=$(cat .runtime/generation)
+      test "$(cat .runtime/worker.ready)" = "$generation"
+      test "$(cat .runtime/shared.ready)" = "$generation"
+      printf '%s web\n' "$generation" >> .runtime/events
+      exec sleep 300
+    depends_on:
+      - root
+      - worker
+      - shared
+
+entrypoint: web
