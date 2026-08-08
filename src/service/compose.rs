@@ -85,6 +85,8 @@ pub struct DockerComposeService {
     base: Arc<RwLock<BaseService>>,
     compose_file: PathBuf,
     compose_service: String,
+    compose_profiles: Vec<String>,
+    compose_imported: bool,
     project_name: String,
     /// Container id captured after `compose up`, so the state tracker can do
     /// real container-liveness checks across processes. Without it a compose
@@ -156,6 +158,8 @@ impl DockerComposeService {
             base: Arc::new(RwLock::new(BaseService::new(name, environment, work_dir))),
             compose_file: compose_file_path,
             compose_service,
+            compose_profiles: config.compose_profiles,
+            compose_imported: config.compose_imported,
             project_name,
             container_id: None,
             // Initialize with empty cache that's already expired
@@ -191,10 +195,10 @@ impl DockerComposeService {
         format!("fed-{}", Self::hash_path(compose_file_path))
     }
 
-    /// Restore status from persisted state. Compose services have no PID or
-    /// container id to restore; a fresh process would otherwise report a
-    /// running compose project as Stopped. Callers should verify against
-    /// `health()` (a real `compose ps`) before restoring a live status.
+    /// Restore status from persisted state. Compose services have no PID; a
+    /// fresh process would otherwise report a running Compose child as
+    /// Stopped. Callers should verify against `health()` (a real `compose ps`)
+    /// before restoring a live status.
     pub fn restore_status(&mut self, status: Status) {
         self.base.write().set_status(status);
     }
@@ -216,6 +220,14 @@ impl DockerComposeService {
             "-p",
             &self.project_name,
         ]);
+
+        for profile in &self.compose_profiles {
+            command.args(["--profile", profile]);
+        }
+
+        // Compose parses and interpolates its model for every subcommand, not
+        // only `up`; every lifecycle command must see the same environment.
+        command.envs(self.get_environment_vars());
 
         Ok(command)
     }
@@ -239,17 +251,19 @@ impl DockerComposeService {
         let output = match tokio::time::timeout(HEALTH_CHECK_TIMEOUT, command.output()).await {
             Ok(result) => result?,
             Err(_) => {
-                tracing::warn!(
+                return Err(Error::DockerCompose(format!(
                     "compose ps for '{}' timed out after {:?}",
-                    self.name,
-                    HEALTH_CHECK_TIMEOUT
-                );
-                return Ok(false);
+                    self.name, HEALTH_CHECK_TIMEOUT
+                )));
             }
         };
 
         if !output.status.success() {
-            return Ok(false);
+            return Err(Error::DockerCompose(format!(
+                "compose ps for '{}' failed: {}",
+                self.name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
         }
 
         // Parse JSON output to check if service is running
@@ -289,6 +303,37 @@ impl DockerComposeService {
         // This handles edge cases where compose output format is unexpected
         Ok(stdout.contains("running") || stdout.contains("Up"))
     }
+
+    /// Remove project-level resources only after every Compose container in
+    /// the project is gone. This keeps sibling services intact while still
+    /// cleaning the network after the last managed service stops.
+    async fn cleanup_project_if_empty(&self) -> Result<()> {
+        let mut ps = self.build_base_command().await?;
+        ps.args(["ps", "-q"]);
+        let output = ps.output().await?;
+        if !output.status.success() {
+            return Err(Error::DockerCompose(format!(
+                "could not verify whether Compose project '{}' is empty: {}",
+                self.project_name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        if !String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+            return Ok(());
+        }
+
+        let mut down = self.build_base_command().await?;
+        down.args(["down", "--remove-orphans"]);
+        let output = down.output().await?;
+        if !output.status.success() {
+            return Err(Error::DockerCompose(format!(
+                "could not clean empty Compose project '{}': {}",
+                self.project_name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -303,18 +348,13 @@ impl ServiceManager for DockerComposeService {
         }
         self.clear_health_cache().await;
 
-        // Clean up any orphaned containers/networks from previous runs
-        // This handles cases where tests failed or were interrupted
-        {
-            let mut cleanup_cmd = self.build_base_command().await?;
-            cleanup_cmd.args(["down", "--remove-orphans"]);
-            let _ = cleanup_cmd.output().await; // Ignore errors, might not exist
-        }
-
         let mut command = self.build_base_command().await?;
 
         // Add up command with detached mode
         command.arg("up").arg("-d");
+        if self.compose_imported {
+            command.arg("--no-deps");
+        }
 
         // Add environment variables via command environment (not -e flag)
         let env_vars = self.get_environment_vars();
@@ -363,10 +403,10 @@ impl ServiceManager for DockerComposeService {
                 // Lock is dropped here before await
             };
 
-            // Clean up any partially created resources on failure
-            // This prevents network leaks when compose up fails after creating networks
+            // Clean up only this service. Project-wide `down` would destroy
+            // healthy sibling services backed by the same Compose file.
             let mut cleanup_cmd = self.build_base_command().await?;
-            cleanup_cmd.args(["down", "--remove-orphans"]);
+            cleanup_cmd.args(["rm", "-f", "-s", &self.compose_service]);
             let _ = cleanup_cmd.output().await; // Best effort cleanup
 
             return Err(Error::ServiceStartFailed(service_name, error_msg));
@@ -399,9 +439,21 @@ impl ServiceManager for DockerComposeService {
         if thinks_stopped {
             // In-memory status is per-process: a fresh `fed stop` starts at
             // Stopped even when the compose project is up. Trust it only when
-            // `compose ps` agrees, otherwise fall through and run `down`.
-            if !self.health().await.unwrap_or(false) {
-                return Ok(());
+            // `compose ps` agrees, otherwise fall through to service-scoped
+            // removal.
+            match self.health().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Err(error) = self.cleanup_project_if_empty().await {
+                        self.base.write().set_status(Status::Failing);
+                        return Err(error);
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.base.write().set_status(Status::Failing);
+                    return Err(error);
+                }
             }
         }
         {
@@ -409,31 +461,48 @@ impl ServiceManager for DockerComposeService {
             base.set_status(Status::Stopping);
         }
 
-        // Use 'down' instead of 'stop' to properly clean up networks
-        // Note: This removes the entire compose project, not just this service
-        // This is intentional to prevent network resource leaks
+        // Stop and remove only the selected service. Multiple fed services may
+        // intentionally share one Compose project, so project-wide `down`
+        // would destroy their healthy siblings.
         let mut command = self.build_base_command().await?;
-        command.args(["down"]);
+        command.args(["rm", "-f", "-s", &self.compose_service]);
 
-        let output = command.output().await;
-
-        // Log warnings but don't fail the stop operation
-        if let Ok(out) = output
-            && !out.status.success()
-        {
-            let error = String::from_utf8_lossy(&out.stderr);
-            tracing::warn!(
-                "Compose down for project '{}' had warnings: {}",
+        let output = command.output().await?;
+        if !output.status.success() {
+            self.base.write().set_status(Status::Failing);
+            return Err(Error::DockerCompose(format!(
+                "could not stop Compose service '{}' in project '{}': {}",
+                self.compose_service,
                 self.project_name,
-                error
-            );
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        self.clear_health_cache().await;
+        match self.check_health_uncached().await {
+            Ok(false) => {}
+            Ok(true) => {
+                self.base.write().set_status(Status::Failing);
+                return Err(Error::DockerCompose(format!(
+                    "Compose reported that '{}' stopped, but its container is still running",
+                    self.compose_service
+                )));
+            }
+            Err(error) => {
+                self.base.write().set_status(Status::Failing);
+                return Err(error);
+            }
+        }
+
+        if let Err(error) = self.cleanup_project_if_empty().await {
+            self.base.write().set_status(Status::Failing);
+            return Err(error);
         }
 
         {
             let mut base = self.base.write();
             base.set_status(Status::Stopped);
         }
-        self.clear_health_cache().await;
 
         Ok(())
     }
@@ -442,7 +511,14 @@ impl ServiceManager for DockerComposeService {
         let mut command = self.build_base_command().await?;
         command.args(["kill", &self.compose_service]);
 
-        let _ = command.output().await;
+        let output = command.output().await?;
+        if !output.status.success() {
+            return Err(Error::DockerCompose(format!(
+                "could not kill Compose service '{}': {}",
+                self.compose_service,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
 
         self.stop().await
     }

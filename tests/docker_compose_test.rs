@@ -17,10 +17,9 @@ const COMPOSE_FIXTURE: &str = concat!(
     "/tests/fixtures/compose/test-services.yml"
 );
 
-/// Serialize these tests: they share one compose fixture and therefore ONE
-/// compose project (the project name is derived from the compose file path),
-/// and stopping any service runs `compose down` on the whole project. Run in
-/// parallel, tests tear down each other's containers mid-test.
+/// Serialize these tests because they share one Compose fixture and therefore
+/// one project name. The lifecycle is service-scoped, but test setup/final
+/// cleanup intentionally runs project-wide `compose down`.
 static COMPOSE_PROJECT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Compute the compose project name from a compose file path (same logic as DockerComposeService).

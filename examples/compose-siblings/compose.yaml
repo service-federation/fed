@@ -1,0 +1,29 @@
+services:
+  database:
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    environment:
+      POSTGRES_DB: example
+      POSTGRES_PASSWORD: example
+      POSTGRES_USER: example
+    ports:
+      - "${DATABASE_PORT:?DATABASE_PORT must be supplied by fed}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U example -d example"]
+      interval: 1s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - database_data:/var/lib/postgresql/data
+
+  cache:
+    image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "${CACHE_PORT:?CACHE_PORT must be supplied by fed}:6379"
+
+volumes:
+  database_data:

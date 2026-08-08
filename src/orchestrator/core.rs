@@ -894,7 +894,7 @@ impl Orchestrator {
         // Resolve templates in full config.
         self.resolver.set_work_dir(&self.work_dir);
         let resolved = self.resolver.resolve_config(&self.config)?;
-        self.config = resolved;
+        self.config = crate::compose_import::expand(resolved, &self.work_dir).await?;
 
         // Apply profile filtering (same semantics as full initialize).
         let active_profiles = &self.active_profiles;
@@ -1007,7 +1007,7 @@ impl Orchestrator {
 
         // Second pass: full config resolution including external services
         let resolved = self.resolver.resolve_config(&self.config)?;
-        self.config = resolved;
+        self.config = crate::compose_import::expand(resolved, &self.work_dir).await?;
 
         // Track allocated ports in state
         for port in self.resolver.get_allocated_ports() {
@@ -1963,15 +1963,15 @@ impl Orchestrator {
         visited: &mut std::collections::HashSet<String>,
         result: &mut Vec<String>,
     ) {
-        if visited.contains(service_name) {
-            return;
-        }
-        visited.insert(service_name.to_string());
-
         let dependents = self.dep_graph.get_dependents(service_name);
         for dependent in dependents {
-            self.traverse_dependents(&dependent, visited, result);
-            result.push(dependent);
+            // Mark before descending and append only when this is the first
+            // visit. Appending after a no-op recursive visit emitted shared
+            // descendants more than once in diamond-shaped graphs.
+            if visited.insert(dependent.clone()) {
+                self.traverse_dependents(&dependent, visited, result);
+                result.push(dependent);
+            }
         }
     }
 
@@ -2098,7 +2098,8 @@ impl Orchestrator {
     /// `stop` cascades down to dependents; `start` only walks dependencies.
     /// A naive stop+start therefore leaves dependents stopped. This method:
     ///
-    /// 1. Snapshots which transitive dependents are `Running`/`Healthy`.
+    /// 1. Snapshots which transitive dependents are active, including
+    ///    successfully completed hook-only nodes.
     /// 2. Stops the service (cascades to all dependents).
     /// 3. Starts the service back (with its dependencies).
     /// 4. Restarts each previously-running dependent in shallowest-first
@@ -2114,12 +2115,16 @@ impl Orchestrator {
     pub async fn restart(&self, service_name: &str) -> Result<StartOutcome> {
         let dependents = self.get_all_dependents(service_name);
         let statuses = self.get_status_passive().await;
-        let was_running: Vec<String> = dependents
+        let was_active: Vec<String> = dependents
             .iter()
             .filter(|name| {
                 matches!(
                     statuses.get(name.as_str()).copied(),
-                    Some(Status::Running) | Some(Status::Healthy)
+                    Some(Status::Starting)
+                        | Some(Status::Running)
+                        | Some(Status::Healthy)
+                        | Some(Status::Failing)
+                        | Some(Status::Completed)
                 )
             })
             .cloned()
@@ -2135,7 +2140,7 @@ impl Orchestrator {
 
         // Dependents come back in shallowest-first order (reverse of the
         // stop iteration) so each one's own dependencies are already up.
-        for dependent in was_running.iter().rev() {
+        for dependent in was_active.iter().rev() {
             if self.cancellation_token.is_cancelled() {
                 return Err(Error::Cancelled(dependent.clone()));
             }
@@ -3155,6 +3160,56 @@ mod tests {
             "expected b and c in dependents; got {:?}",
             dependents
         );
+    }
+
+    /// A shared descendant must be emitted once, and before both of its
+    /// dependencies, so the reverse is a valid dependency-first start plan.
+    #[tokio::test]
+    async fn test_get_all_dependents_diamond_is_unique_and_deepest_first() {
+        use crate::config::{DependsOn, Service};
+
+        let mut config = Config::default();
+        for name in ["root", "left", "right", "shared"] {
+            config.services.insert(
+                name.to_string(),
+                Service {
+                    process: Some("sleep 1".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        config.services.get_mut("left").unwrap().depends_on =
+            vec![DependsOn::Simple("root".to_string())];
+        config.services.get_mut("right").unwrap().depends_on =
+            vec![DependsOn::Simple("root".to_string())];
+        config.services.get_mut("shared").unwrap().depends_on = vec![
+            DependsOn::Simple("left".to_string()),
+            DependsOn::Simple("right".to_string()),
+        ];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        orchestrator.build_dependency_graph().unwrap();
+        std::mem::forget(temp_dir);
+
+        let dependents = orchestrator.get_all_dependents("root");
+        assert_eq!(
+            dependents.len(),
+            3,
+            "shared must not be duplicated: {dependents:?}"
+        );
+        assert_eq!(
+            dependents
+                .iter()
+                .filter(|name| name.as_str() == "shared")
+                .count(),
+            1
+        );
+        let shared = dependents.iter().position(|name| name == "shared").unwrap();
+        assert!(shared < dependents.iter().position(|name| name == "left").unwrap());
+        assert!(shared < dependents.iter().position(|name| name == "right").unwrap());
     }
 
     /// `apply_run_context` followed by `current_run_context` must reproduce

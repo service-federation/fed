@@ -71,4 +71,11 @@ pub fn emit_config_warnings(config: &fed::Config, out: &dyn crate::output::UserO
             u.location, u.legacy, u.canonical
         ));
     }
+    let legacy_compose = config.legacy_compose_service_names();
+    if !legacy_compose.is_empty() {
+        out.warning(&format!(
+            "services {} use deprecated per-service compose_file/compose_service configuration; prefer a top-level `compose:` import",
+            legacy_compose.join(", ")
+        ));
+    }
 }

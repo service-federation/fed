@@ -1,0 +1,13 @@
+parameters:
+  DATABASE_PORT:
+    type: port
+    default: 15432
+  CACHE_PORT:
+    type: port
+    default: 16379
+
+compose:
+  - file: ./compose.yaml
+    environment:
+      DATABASE_PORT: "{{DATABASE_PORT}}"
+      CACHE_PORT: "{{CACHE_PORT}}"
