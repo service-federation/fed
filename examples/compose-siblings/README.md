@@ -4,9 +4,11 @@ This is a small, usable local data stack: durable Postgres for application data
 and Redis for disposable caching. Both images are pinned by version and manifest
 digest, and both expose Compose healthchecks.
 
-Each Fed service selects a different child from the same Compose file. Starting,
-restarting, or stopping Redis must not recreate or remove Postgres—the exact shape
-used by applications that want to operate infrastructure services independently.
+Fed includes the Compose file once and expands both children into its service graph.
+Starting, restarting, or stopping Redis must not recreate or remove Postgres—the
+exact shape used by applications that want to operate infrastructure independently.
+Fed-allocated ports are passed once at import scope and consumed through normal
+Compose variable interpolation.
 
 ```sh
 cargo build

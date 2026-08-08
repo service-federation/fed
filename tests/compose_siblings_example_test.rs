@@ -46,6 +46,10 @@ fn compose(temp: &TempDir, args: &[&str]) -> Output {
         .arg(temp.path().join("compose.yaml"))
         .args(["-p", &project_name(&temp.path().join("compose.yaml"))])
         .args(args)
+        // Compose interpolates on every command. Fed supplies the real resolved
+        // values; direct inspection commands only need valid parse-time values.
+        .env("DATABASE_PORT", "15432")
+        .env("CACHE_PORT", "16379")
         .output()
         .expect("run docker compose")
 }
@@ -137,4 +141,25 @@ fn compose_siblings_keep_container_identity_and_data() {
 
     assert_success("stop database", &fed(&temp, &["stop", "database"]));
     assert!(container_id(&temp, "database").is_empty());
+}
+
+#[test]
+#[cfg_attr(not(feature = "docker-tests"), ignore)]
+fn complete_compose_file_expands_and_starts_in_one_fed_invocation() {
+    let temp = TempDir::new().expect("temp project");
+    copy_example(&temp);
+    let _cleanup = Cleanup(&temp);
+
+    assert_success(
+        "start expanded Compose project",
+        &fed(&temp, &["start", "database", "cache"]),
+    );
+    let database = container_id(&temp, "database");
+    let cache = container_id(&temp, "cache");
+    assert!(!database.is_empty());
+    assert!(!cache.is_empty());
+    wait_for_example_database(&database);
+    assert_success("stop expanded Compose project", &fed(&temp, &["stop"]));
+    assert!(container_id(&temp, "database").is_empty());
+    assert!(container_id(&temp, "cache").is_empty());
 }

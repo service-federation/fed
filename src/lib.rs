@@ -48,6 +48,7 @@
 //! - Cleanup runs exactly once even with concurrent calls
 
 pub mod cloud;
+pub mod compose_import;
 pub mod config;
 pub mod dependency;
 pub mod docker;

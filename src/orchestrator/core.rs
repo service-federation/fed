@@ -894,7 +894,7 @@ impl Orchestrator {
         // Resolve templates in full config.
         self.resolver.set_work_dir(&self.work_dir);
         let resolved = self.resolver.resolve_config(&self.config)?;
-        self.config = resolved;
+        self.config = crate::compose_import::expand(resolved, &self.work_dir).await?;
 
         // Apply profile filtering (same semantics as full initialize).
         let active_profiles = &self.active_profiles;
@@ -1007,7 +1007,7 @@ impl Orchestrator {
 
         // Second pass: full config resolution including external services
         let resolved = self.resolver.resolve_config(&self.config)?;
-        self.config = resolved;
+        self.config = crate::compose_import::expand(resolved, &self.work_dir).await?;
 
         // Track allocated ports in state
         for port in self.resolver.get_allocated_ports() {

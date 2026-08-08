@@ -176,6 +176,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_compose_import_shorthand_and_options() {
+        let config = Parser::new()
+            .parse_config(
+                r#"
+compose:
+  - ./compose.yaml
+  - file: ./observability.yaml
+    namespace: observability
+    profiles: [debug]
+    environment:
+      HTTP_PORT: "{{PORT}}"
+"#,
+            )
+            .unwrap();
+        assert_eq!(config.compose.len(), 2);
+        assert_eq!(config.compose[0].options().file, "./compose.yaml");
+        let options = config.compose[1].options();
+        assert_eq!(options.namespace.as_deref(), Some("observability"));
+        assert_eq!(options.profiles, ["debug"]);
+        assert_eq!(options.environment["HTTP_PORT"], "{{PORT}}");
+    }
+
+    #[test]
     fn test_parse_simple_config() {
         let yaml = r#"
 parameters:

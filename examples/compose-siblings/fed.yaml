@@ -1,8 +1,13 @@
-services:
-  database:
-    compose_file: ./compose.yaml
-    compose_service: database
+parameters:
+  DATABASE_PORT:
+    type: port
+    default: 15432
+  CACHE_PORT:
+    type: port
+    default: 16379
 
-  cache:
-    compose_file: ./compose.yaml
-    compose_service: cache
+compose:
+  - file: ./compose.yaml
+    environment:
+      DATABASE_PORT: "{{DATABASE_PORT}}"
+      CACHE_PORT: "{{CACHE_PORT}}"

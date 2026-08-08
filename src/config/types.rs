@@ -10,6 +10,39 @@ use super::{Dependency, Metadata, Parameter, Script, Service};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// A Compose file imported as first-class Fed services.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ComposeImport {
+    File(String),
+    Options(ComposeImportOptions),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeImportOptions {
+    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub environment: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<String>,
+}
+
+impl ComposeImport {
+    pub fn options(&self) -> ComposeImportOptions {
+        match self {
+            Self::File(file) => ComposeImportOptions {
+                file: file.clone(),
+                namespace: None,
+                environment: HashMap::new(),
+                profiles: vec![],
+            },
+            Self::Options(options) => options.clone(),
+        }
+    }
+}
+
 /// Root configuration structure for fed.yaml (or service-federation.yaml)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -19,6 +52,10 @@ pub struct Config {
 
     #[serde(default)]
     pub services: HashMap<String, Service>,
+
+    /// Compose projects whose services are expanded into the Fed graph.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compose: Vec<ComposeImport>,
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub templates: HashMap<String, Service>,
@@ -92,6 +129,19 @@ pub struct LegacyKeyUsage {
 }
 
 impl Config {
+    pub fn legacy_compose_service_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self
+            .services
+            .iter()
+            .filter(|(_, service)| {
+                service.compose_file.is_some() && service.compose_service.is_some()
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// The parameters declared for this config.
     pub fn get_effective_parameters(&self) -> &HashMap<String, Parameter> {
         &self.parameters
@@ -107,6 +157,7 @@ impl Config {
         &[
             "parameters",
             "services",
+            "compose",
             "templates",
             "dependencies",
             "entrypoint",

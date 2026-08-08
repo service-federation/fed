@@ -175,37 +175,39 @@ See [Scripts and tests](https://www.service-federation.com/docs/scripts/) for li
 
 ## Existing Docker Compose projects
 
-You do not need to translate every container into fed. A service can point at an existing Compose service while your application stays native:
+You do not need to translate every container into fed. Include the Compose file once and fed expands its services and dependency edges into the same graph as native services:
 
 ```yaml
-services:
-  database:
-    compose_file: ./compose.yaml
-    compose_service: postgres
+compose:
+  - ./compose.yaml
 
+services:
   api:
     process: npm run dev
-    depends_on: [database]
+    depends_on: [postgres]
 ```
 
-One `fed.yaml` can point at as many Compose files as you like, so a monorepo keeps each service's file where it already lives:
+Use a namespace when names could collide, and pass Fed parameters to Compose interpolation once for the whole project:
 
 ```yaml
-services:
-  auth-cache:
-    compose_file: ./services/auth/compose.yaml
-    compose_service: cache
+parameters:
+  DATABASE_PORT:
+    type: port
 
-  billing-cache:
-    compose_file: ./services/billing/compose.yaml
-    compose_service: cache
+compose:
+  - file: ./compose.yaml
+    namespace: infrastructure
+    environment:
+      DATABASE_PORT: "{{DATABASE_PORT}}"
 ```
 
-fed starts those as separate Compose projects, each with its own containers, volumes, and ports.
+That exposes names such as `infrastructure/postgres` and `infrastructure/redis`. The Compose file consumes values with its normal `${DATABASE_PORT}` syntax. Its own `.env`, `env_file`, and container `environment` behavior remain Compose-owned.
+
+The older per-service `compose_file` + `compose_service` form is still accepted for compatibility but is deprecated; use a top-level import for new configurations.
 
 Compose files with hardcoded host ports work as they are. One checkout starts exactly as it does today. You only need `${VAR}` substitution on a port when you want *two* checkouts of that service running at the same time, because fed exports the allocated value and Compose's own substitution picks it up. Leave a port hardcoded and the second checkout stops on the bind rather than quietly sharing the first one's container. So you can retrofit ports when you actually hit a collision.
 
-[`examples/compose-worktrees/`](examples/compose-worktrees/) is a runnable version of all of this, with a `verify.sh` that checks each claim against a real Docker daemon.
+[`examples/compose-siblings/`](examples/compose-siblings/) is a runnable Postgres and Redis project exercised against a real Docker daemon by the integration suite.
 
 ## Secrets
 

@@ -85,6 +85,8 @@ pub struct DockerComposeService {
     base: Arc<RwLock<BaseService>>,
     compose_file: PathBuf,
     compose_service: String,
+    compose_profiles: Vec<String>,
+    compose_imported: bool,
     project_name: String,
     /// Container id captured after `compose up`, so the state tracker can do
     /// real container-liveness checks across processes. Without it a compose
@@ -156,6 +158,8 @@ impl DockerComposeService {
             base: Arc::new(RwLock::new(BaseService::new(name, environment, work_dir))),
             compose_file: compose_file_path,
             compose_service,
+            compose_profiles: config.compose_profiles,
+            compose_imported: config.compose_imported,
             project_name,
             container_id: None,
             // Initialize with empty cache that's already expired
@@ -216,6 +220,14 @@ impl DockerComposeService {
             "-p",
             &self.project_name,
         ]);
+
+        for profile in &self.compose_profiles {
+            command.args(["--profile", profile]);
+        }
+
+        // Compose parses and interpolates its model for every subcommand, not
+        // only `up`; every lifecycle command must see the same environment.
+        command.envs(self.get_environment_vars());
 
         Ok(command)
     }
@@ -340,6 +352,9 @@ impl ServiceManager for DockerComposeService {
 
         // Add up command with detached mode
         command.arg("up").arg("-d");
+        if self.compose_imported {
+            command.arg("--no-deps");
+        }
 
         // Add environment variables via command environment (not -e flag)
         let env_vars = self.get_environment_vars();

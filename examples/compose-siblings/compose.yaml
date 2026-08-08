@@ -5,6 +5,8 @@ services:
       POSTGRES_DB: example
       POSTGRES_PASSWORD: example
       POSTGRES_USER: example
+    ports:
+      - "${DATABASE_PORT:?DATABASE_PORT must be supplied by fed}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U example -d example"]
       interval: 1s
@@ -20,6 +22,8 @@ services:
       interval: 1s
       timeout: 3s
       retries: 20
+    ports:
+      - "${CACHE_PORT:?CACHE_PORT must be supplied by fed}:6379"
 
 volumes:
   database_data:

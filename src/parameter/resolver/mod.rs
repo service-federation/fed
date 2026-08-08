@@ -649,6 +649,19 @@ impl Resolver {
         // Create resolved config
         let mut resolved = config.clone();
 
+        for import in &mut resolved.compose {
+            if let crate::config::ComposeImport::Options(options) = import {
+                options.environment = self
+                    .resolve_environment(&options.environment, &parameters)
+                    .map_err(|e| {
+                        Error::TemplateResolution(format!(
+                            "Failed to resolve environment for Compose import '{}': {}",
+                            options.file, e
+                        ))
+                    })?;
+            }
+        }
+
         // Resolve services - environment variables now only come from inline config
         // (.env files are applied to parameters, not directly to service environments)
         //
