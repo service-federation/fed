@@ -1,6 +1,9 @@
 use std::fs;
 use std::path::Path;
+use std::process::Stdio;
 use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -62,6 +65,41 @@ fn container_id(temp: &TempDir, service: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn wait_for_postgres(container: &str) {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(30) {
+        if Command::new("docker")
+            .args([
+                "exec",
+                container,
+                "pg_isready",
+                "-U",
+                "example",
+                "-d",
+                "example",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    panic!("Postgres did not become ready");
+}
+
+fn psql(container: &str, sql: &str) -> Output {
+    Command::new("docker")
+        .args([
+            "exec", container, "psql", "-U", "example", "-d", "example", "-Atc", sql,
+        ])
+        .output()
+        .expect("run psql")
+}
+
 struct Cleanup<'a>(&'a TempDir);
 
 impl Drop for Cleanup<'_> {
@@ -80,19 +118,13 @@ fn compose_siblings_keep_container_identity_and_data() {
     assert_success("start database", &fed(&temp, &["start", "database"]));
     let database_id = container_id(&temp, "database");
     assert!(!database_id.is_empty(), "database container must exist");
+    wait_for_postgres(&database_id);
 
-    let set = Command::new("docker")
-        .args([
-            "exec",
-            &database_id,
-            "redis-cli",
-            "SET",
-            "sentinel",
-            "preserved",
-        ])
-        .output()
-        .expect("write database sentinel");
-    assert_success("write database sentinel", &set);
+    let create = psql(
+        &database_id,
+        "CREATE TABLE notes(body text); INSERT INTO notes VALUES ('preserved');",
+    );
+    assert_success("create durable Postgres data", &create);
 
     assert_success("start cache", &fed(&temp, &["start", "cache"]));
     assert_eq!(
@@ -105,12 +137,9 @@ fn compose_siblings_keep_container_identity_and_data() {
     assert!(container_id(&temp, "cache").is_empty());
     assert_eq!(container_id(&temp, "database"), database_id);
 
-    let get = Command::new("docker")
-        .args(["exec", &database_id, "redis-cli", "GET", "sentinel"])
-        .output()
-        .expect("read database sentinel");
-    assert_success("read database sentinel", &get);
-    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "preserved");
+    let query = psql(&database_id, "SELECT body FROM notes;");
+    assert_success("read durable Postgres data", &query);
+    assert_eq!(String::from_utf8_lossy(&query.stdout).trim(), "preserved");
 
     assert_success("stop database", &fed(&temp, &["stop", "database"]));
     assert!(container_id(&temp, "database").is_empty());

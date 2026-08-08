@@ -58,7 +58,14 @@ fn events_by_generation(path: &Path) -> HashMap<u32, Vec<String>> {
 }
 
 fn assert_generation_order(events: &[String]) {
-    let expected = ["root", "hook-a", "hook-b", "worker", "shared", "web"];
+    let expected = [
+        "datastore",
+        "schema-ready",
+        "stream-ready",
+        "worker-ready",
+        "application-ready",
+        "web",
+    ];
     assert_eq!(
         events.len(),
         expected.len(),
@@ -78,13 +85,13 @@ fn assert_generation_order(events: &[String]) {
             .position(|event| event == name)
             .expect("expected service event")
     };
-    assert!(position("root") < position("hook-a"));
-    assert!(position("root") < position("hook-b"));
-    assert!(position("hook-a") < position("worker"));
-    assert!(position("hook-a") < position("shared"));
-    assert!(position("hook-b") < position("shared"));
-    assert!(position("worker") < position("web"));
-    assert!(position("shared") < position("web"));
+    assert!(position("datastore") < position("schema-ready"));
+    assert!(position("datastore") < position("stream-ready"));
+    assert!(position("schema-ready") < position("worker-ready"));
+    assert!(position("schema-ready") < position("application-ready"));
+    assert!(position("stream-ready") < position("application-ready"));
+    assert!(position("worker-ready") < position("web"));
+    assert!(position("application-ready") < position("web"));
 }
 
 #[test]
@@ -97,7 +104,7 @@ fn targeted_restart_replays_the_real_example_in_dependency_order() {
     };
 
     assert_success("start", &run_fed(temp.path(), &["start"]));
-    assert_success("restart", &run_fed(temp.path(), &["restart", "root"]));
+    assert_success("restart", &run_fed(temp.path(), &["restart", "datastore"]));
 
     let generations = events_by_generation(&temp.path().join(".runtime/events"));
     assert_eq!(
@@ -111,7 +118,7 @@ fn targeted_restart_replays_the_real_example_in_dependency_order() {
     let status = run_fed(temp.path(), &["status", "--json"]);
     assert_success("status", &status);
     let status = String::from_utf8_lossy(&status.stdout);
-    assert!(status.contains("\"hook-a\""));
-    assert!(status.contains("\"hook-b\""));
+    assert!(status.contains("\"schema-ready\""));
+    assert!(status.contains("\"stream-ready\""));
     assert!(status.contains("completed"));
 }
