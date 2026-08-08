@@ -65,18 +65,12 @@ fn container_id(temp: &TempDir, service: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-fn wait_for_postgres(container: &str) {
+fn wait_for_example_database(container: &str) {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(30) {
         if Command::new("docker")
             .args([
-                "exec",
-                container,
-                "pg_isready",
-                "-U",
-                "example",
-                "-d",
-                "example",
+                "exec", container, "psql", "-U", "example", "-d", "example", "-Atc", "SELECT 1",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -88,7 +82,7 @@ fn wait_for_postgres(container: &str) {
         }
         thread::sleep(Duration::from_millis(250));
     }
-    panic!("Postgres did not become ready");
+    panic!("the configured Postgres database did not become queryable");
 }
 
 fn psql(container: &str, sql: &str) -> Output {
@@ -118,7 +112,7 @@ fn compose_siblings_keep_container_identity_and_data() {
     assert_success("start database", &fed(&temp, &["start", "database"]));
     let database_id = container_id(&temp, "database");
     assert!(!database_id.is_empty(), "database container must exist");
-    wait_for_postgres(&database_id);
+    wait_for_example_database(&database_id);
 
     let create = psql(
         &database_id,
