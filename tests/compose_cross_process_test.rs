@@ -69,8 +69,8 @@ fn compose_service_survives_process_boundary() {
         "fresh-process status should report running: {status_text}"
     );
 
-    // And a brand-new fed process must actually stop it (run `compose down`),
-    // not early-return off in-memory Stopped state.
+    // And a brand-new fed process must actually remove it, not early-return
+    // from its default in-memory Stopped state.
     let stop = fed(&temp_dir, &["stop"]);
     assert!(stop.status.success(), "stop failed: {}", combined(&stop));
 

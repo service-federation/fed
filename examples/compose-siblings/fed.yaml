@@ -1,0 +1,8 @@
+services:
+  database:
+    compose_file: ./compose.yaml
+    compose_service: database
+
+  cache:
+    compose_file: ./compose.yaml
+    compose_service: cache

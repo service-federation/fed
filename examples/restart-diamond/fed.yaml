@@ -1,0 +1,60 @@
+services:
+  datastore:
+    migrate: |
+      mkdir -p .runtime
+      generation=0
+      test ! -f .runtime/generation || generation=$(cat .runtime/generation)
+      generation=$((generation + 1))
+      printf '%s\n' "$generation" > .runtime/generation
+      printf '%s datastore\n' "$generation" >> .runtime/events
+    process: exec sleep 300
+
+  schema-ready:
+    migrate: |
+      generation=$(cat .runtime/generation)
+      printf '%s schema-ready\n' "$generation" >> .runtime/events
+      printf '%s\n' "$generation" > .runtime/schema-ready.ready
+    depends_on:
+      - datastore
+
+  stream-ready:
+    migrate: |
+      generation=$(cat .runtime/generation)
+      printf '%s stream-ready\n' "$generation" >> .runtime/events
+      printf '%s\n' "$generation" > .runtime/stream-ready.ready
+    depends_on:
+      - datastore
+
+  worker-ready:
+    migrate: |
+      generation=$(cat .runtime/generation)
+      test "$(cat .runtime/schema-ready.ready)" = "$generation"
+      printf '%s worker-ready\n' "$generation" >> .runtime/events
+      printf '%s\n' "$generation" > .runtime/worker-ready.ready
+    depends_on:
+      - schema-ready
+
+  application-ready:
+    migrate: |
+      generation=$(cat .runtime/generation)
+      test "$(cat .runtime/schema-ready.ready)" = "$generation"
+      test "$(cat .runtime/stream-ready.ready)" = "$generation"
+      printf '%s application-ready\n' "$generation" >> .runtime/events
+      printf '%s\n' "$generation" > .runtime/application-ready.ready
+    depends_on:
+      - schema-ready
+      - stream-ready
+
+  web:
+    process: |
+      generation=$(cat .runtime/generation)
+      test "$(cat .runtime/worker-ready.ready)" = "$generation"
+      test "$(cat .runtime/application-ready.ready)" = "$generation"
+      printf '%s web\n' "$generation" >> .runtime/events
+      exec sleep 300
+    depends_on:
+      - datastore
+      - worker-ready
+      - application-ready
+
+entrypoint: web
