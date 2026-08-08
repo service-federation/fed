@@ -472,10 +472,10 @@ async fn run() -> anyhow::Result<()> {
         _ => OutputMode::Captured,
     };
 
-    // Observational commands skip parameter resolution and Docker cleanup.
-    // Stop must fully resolve imported Compose projects because Compose
-    // interpolates its model even while stopping/removing containers.
-    let readonly = matches!(cli.command, Commands::Status { .. } | Commands::Logs { .. });
+    // Status reads persisted state without resolving parameters. Logs and stop
+    // must fully resolve imported Compose projects because Compose interpolates
+    // its model for those commands too.
+    let readonly = matches!(cli.command, Commands::Status { .. });
 
     // --isolate enables isolation mode (randomize ports + unique container names)
     let isolate = matches!(&cli.command, Commands::Start { isolate: true, .. });

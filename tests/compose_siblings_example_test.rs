@@ -159,6 +159,10 @@ fn complete_compose_file_expands_and_starts_in_one_fed_invocation() {
     assert!(!database.is_empty());
     assert!(!cache.is_empty());
     wait_for_example_database(&database);
+    assert_success(
+        "read imported service logs from a fresh process",
+        &fed(&temp, &["logs", "database"]),
+    );
     assert_success("stop expanded Compose project", &fed(&temp, &["stop"]));
     assert!(container_id(&temp, "database").is_empty());
     assert!(container_id(&temp, "cache").is_empty());
