@@ -35,7 +35,7 @@ fn compose_project_name(compose_file: &Path) -> String {
         hash ^= byte as u32;
         hash = hash.wrapping_mul(FNV_PRIME);
     }
-    format!("fed-{:04x}", hash & 0xFFFF)
+    format!("fed-{hash:08x}")
 }
 
 /// Helper to clean up compose projects after tests

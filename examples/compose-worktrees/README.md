@@ -31,8 +31,8 @@ networks, and named volumes by project. A worktree gets its own everything and b
 checkouts run at the same time:
 
 ```
-main       fed-1a2b-cache-1   0.0.0.0:6399->6379/tcp    volume fed-1a2b_cache_data
-worktree   fed-3c4d-cache-1   0.0.0.0:54746->6379/tcp   volume fed-3c4d_cache_data
+main       fed-1a2b3c4d-cache-1   0.0.0.0:6399->6379/tcp    volume fed-1a2b3c4d_cache_data
+worktree   fed-3c4d5e6f-cache-1   0.0.0.0:54746->6379/tcp   volume fed-3c4d5e6f_cache_data
 ```
 
 Ports isolate because `compose.yaml` reads `${CACHE_PORT:-6399}` and fed exports
@@ -56,7 +56,7 @@ freshly allocated `CACHE_PORT` that nothing reads, then dies on the bind:
 
 ```
 Error response from daemon: driver failed programming external connectivity on
-endpoint fed-54a6-cache-1: Bind for 0.0.0.0:6399 failed: port is already allocated
+endpoint fed-54a6b7c8-cache-1: Bind for 0.0.0.0:6399 failed: port is already allocated
 ```
 
 This is the one real trap, and it fails loudly rather than silently sharing a

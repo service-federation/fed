@@ -58,7 +58,7 @@ fn container_is_running(temp: &TempDir) -> bool {
         hash ^= byte as u32;
         hash = hash.wrapping_mul(16_777_619);
     }
-    let project = format!("fed-{:04x}", hash & 0xffff);
+    let project = format!("fed-{hash:08x}");
     Command::new("docker")
         .args(["compose", "-f"])
         .arg(compose_file)

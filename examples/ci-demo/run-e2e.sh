@@ -18,15 +18,22 @@ trap cleanup EXIT
 # different port instead of letting it crash with EADDRINUSE.
 node -e 'require("net").createServer().listen({host: "::", port: 3000}, () => console.log("squatting [::]:3000"))' &
 SQUATTER_PID=$!
+port_3000_listening() {
+  node -e '
+    const socket = require("net").connect({ host: "::1", port: 3000 });
+    socket.once("connect", () => { socket.destroy(); process.exit(0); });
+    socket.once("error", () => process.exit(1));
+  '
+}
 # Wait until the squatter actually holds the port — on a cold CI runner node
 # can take >1s to bind, and if fed starts first it wins the port and the
 # squatter crashes, failing the test for the wrong reason.
 for _ in $(seq 1 50); do
-  nc -z localhost 3000 2>/dev/null && break
+  port_3000_listening && break
   kill -0 "$SQUATTER_PID" 2>/dev/null || fail "squatter died before binding :3000"
   sleep 0.2
 done
-nc -z localhost 3000 2>/dev/null || fail "squatter never bound :3000 within 10s"
+port_3000_listening || fail "squatter never bound :3000 within 10s"
 
 echo "== fed start =="
 "$FED" start

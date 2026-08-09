@@ -185,7 +185,7 @@ impl DockerComposeService {
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let bytes = canonical.as_os_str().as_encoded_bytes();
         let hash = super::fnv1a_32(bytes);
-        format!("{:04x}", hash & 0xFFFF) // 4 hex chars
+        format!("{hash:08x}")
     }
 
     /// Get project name from hash of compose file path.

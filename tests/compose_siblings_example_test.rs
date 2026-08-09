@@ -37,7 +37,7 @@ fn project_name(compose_file: &Path) -> String {
         hash ^= byte as u32;
         hash = hash.wrapping_mul(16_777_619);
     }
-    format!("fed-{:04x}", hash & 0xffff)
+    format!("fed-{hash:08x}")
 }
 
 fn compose(temp: &TempDir, args: &[&str]) -> Output {

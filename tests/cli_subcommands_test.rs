@@ -1113,23 +1113,52 @@ fn test_config_flag() {
 #[test]
 fn test_workdir_flag() {
     let temp_dir = TempDir::new().unwrap();
-    let config_path = create_test_config(&temp_dir);
+    create_test_config(&temp_dir);
 
-    // -w sets working directory for execution, but still needs -c to find config
+    // -w is the directory config discovery starts from; callers should not
+    // need to repeat the same location with -c.
     let output = Command::new(fed_binary())
-        .args([
-            "-c",
-            &config_path,
-            "-w",
-            temp_dir.path().to_str().unwrap(),
-            "validate",
-        ])
+        .args(["-w", temp_dir.path().to_str().unwrap(), "validate"])
         .output()
         .expect("Failed to run fed");
 
     assert!(
         output.status.success(),
         "-w flag not working: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(fed_binary())
+        .args([
+            "-w",
+            temp_dir.path().to_str().unwrap(),
+            "start",
+            "--dry-run",
+        ])
+        .output()
+        .expect("Failed to run fed");
+    assert!(
+        output.status.success(),
+        "-w config discovery failed for start: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let parent = TempDir::new().unwrap();
+    let relative_project = parent.path().join("project");
+    std::fs::create_dir(&relative_project).unwrap();
+    std::fs::write(
+        relative_project.join("fed.yaml"),
+        "services:\n  app:\n    process: echo ready\nentrypoint: app\n",
+    )
+    .unwrap();
+    let output = Command::new(fed_binary())
+        .current_dir(parent.path())
+        .args(["-w", "project", "start", "--dry-run"])
+        .output()
+        .expect("Failed to run fed with relative workdir");
+    assert!(
+        output.status.success(),
+        "relative -w config discovery failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

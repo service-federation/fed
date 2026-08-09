@@ -231,7 +231,13 @@ async fn run() -> anyhow::Result<()> {
             return commands::run_init(output, *force, &out);
         }
         Commands::Validate => {
-            return commands::run_validate(cli.config.clone(), cli.offline, &out).await;
+            return commands::run_validate(
+                cli.config.clone(),
+                cli.workdir.clone(),
+                cli.offline,
+                &out,
+            )
+            .await;
         }
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -300,7 +306,11 @@ async fn run() -> anyhow::Result<()> {
     let config_path = if let Some(path) = cli.config.clone() {
         path
     } else {
-        parser.find_config_file()?
+        if let Some(workdir) = cli.workdir.as_deref() {
+            ConfigParser::find_config_in_dir(workdir)?
+        } else {
+            parser.find_config_file()?
+        }
     };
 
     // ── Tier 2: Commands that need config but NOT orchestrator ──────
@@ -770,7 +780,13 @@ fn resolve_work_dir(
     config_path: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
     if let Some(workdir) = workdir {
-        return Ok(workdir);
+        return std::fs::canonicalize(&workdir).map_err(|error| {
+            anyhow::anyhow!(
+                "Cannot resolve working directory '{}': {}",
+                workdir.display(),
+                error
+            )
+        });
     }
     if let Some(parent) = config_path.parent() {
         if parent.as_os_str().is_empty() {

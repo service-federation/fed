@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 pub async fn run_validate(
     config_path: Option<PathBuf>,
+    workdir: Option<PathBuf>,
     offline: bool,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
@@ -11,12 +12,19 @@ pub async fn run_validate(
     let config_path = if let Some(path) = config_path {
         path
     } else {
-        match parser.find_config_file() {
+        match workdir
+            .as_deref()
+            .map(ConfigParser::find_config_in_dir)
+            .unwrap_or_else(|| parser.find_config_file())
+        {
             Ok(path) => path,
             Err(_) => {
                 anyhow::bail!(
                     "No configuration file found.\n\nSearched for fed.yaml in:\n  - Current directory: {}\n  - Parent directories up to root\n\nRun 'fed init' to create a starter fed.yaml.",
-                    std::env::current_dir()?.display()
+                    workdir
+                        .as_deref()
+                        .unwrap_or(&std::env::current_dir()?)
+                        .display()
                 );
             }
         }

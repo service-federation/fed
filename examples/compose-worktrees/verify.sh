@@ -45,7 +45,7 @@ is_fed_project() { # $1 = docker object kind, $2 = id
 }
 
 cleanup() {
-  for d in "$ROOT"/hardcoded/wt "$ROOT"/hardcoded "$ROOT"/repo/wt "$ROOT"/repo; do
+  for d in "$ROOT"/hardcoded-wt "$ROOT"/hardcoded "$ROOT"/wt "$ROOT"/repo; do
     [ -d "$d" ] && ( cd "$d" && "$FED" stop >/dev/null 2>&1 )
   done
 
@@ -91,11 +91,11 @@ MAIN_PORT="$(port_of "$ROOT/repo")"
 MAIN_CT="$(containers)"
 MAIN_PROJ="$(project_of "$MAIN_CT")"
 
-git worktree add -q -b agent-1 "$ROOT/repo/wt"
-cd "$ROOT/repo/wt"
+git worktree add -q -b agent-1 "$ROOT/wt"
+cd "$ROOT/wt"
 "$FED" isolate enable >/dev/null 2>&1
 "$FED" start >/dev/null 2>&1
-WT_PORT="$(port_of "$ROOT/repo/wt")"
+WT_PORT="$(port_of "$ROOT/wt")"
 ALL_CT="$(containers)"
 WT_CT="$(echo "$ALL_CT" | tr ' ' '\n' | grep -v "^$MAIN_CT$" | head -1)"
 WT_PROJ="$(project_of "$WT_CT")"
@@ -110,7 +110,7 @@ WT_VOL="$(docker volume ls  --format '{{.Name}}' | grep "^${WT_PROJ}_cache_data$
 isnt "named volumes are separate too"             "$MAIN_VOL" "$WT_VOL"
 [ -n "$WT_VOL" ] && ok "worktree volume exists ($WT_VOL)" || bad "worktree volume missing"
 
-( cd "$ROOT/repo/wt" && "$FED" stop >/dev/null 2>&1 )
+( cd "$ROOT/wt"      && "$FED" stop >/dev/null 2>&1 )
 ( cd "$ROOT/repo"    && "$FED" stop >/dev/null 2>&1 )
 
 # ---------------------------------------------------------------------------
@@ -133,10 +133,10 @@ echo
 echo "3. a hardcoded host port in compose.yaml — the one real trap"
 seed "$ROOT/hardcoded" '6399:6379'
 "$FED" start >/dev/null 2>&1
-git worktree add -q -b agent-1 "$ROOT/hardcoded/wt"
-cd "$ROOT/hardcoded/wt"
+git worktree add -q -b agent-1 "$ROOT/hardcoded-wt"
+cd "$ROOT/hardcoded-wt"
 "$FED" isolate enable >/dev/null 2>&1
-HC_PORT="$(port_of "$ROOT/hardcoded/wt")"
+HC_PORT="$(port_of "$ROOT/hardcoded-wt")"
 OUT="$("$FED" start 2>&1)"
 isnt "fed still allocates a fresh port" "$HC_PORT" "6399"
 if echo "$OUT" | grep -qi "already allocated"; then

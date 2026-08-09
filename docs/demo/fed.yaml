@@ -24,6 +24,7 @@ services:
       POSTGRES_PASSWORD: "{{DB_PASSWORD}}"
     healthcheck:
       command: "pg_isready -h 127.0.0.1 -U {{DB_USER}} -d {{DB_NAME}}"
+      timeout: "30s"
 
   schema:
     depends_on: [database]
