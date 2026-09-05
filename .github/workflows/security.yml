@@ -1,0 +1,29 @@
+name: Dependency security
+
+on:
+  pull_request:
+    paths: [Cargo.toml, Cargo.lock, .github/workflows/security.yml]
+  push:
+    branches: [main]
+    paths: [Cargo.toml, Cargo.lock, .github/workflows/security.yml]
+  schedule:
+    - cron: '23 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      # Fail on vulnerability advisories; keep informational warnings visible.
+      # Current transitive lru/paste warnings are assessed in docs/security-review-2026-09-05.md.
+      - run: cargo audit

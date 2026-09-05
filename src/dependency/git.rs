@@ -63,10 +63,51 @@ impl GitOperations {
         let repo = Repository::open(path)?;
         let head = repo.head()?;
 
-        if let Some(branch_name) = head.shorthand() {
+        if let Ok(branch_name) = head.shorthand() {
             Ok(branch_name.to_string())
         } else {
             Ok("HEAD".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_dependency_transports_remain_enabled() {
+        let version = git2::Version::get();
+        assert!(version.https(), "HTTPS repository dependencies must work");
+        assert!(version.ssh(), "SSH repository dependencies must work");
+    }
+
+    #[test]
+    fn branch_detection_handles_named_and_detached_heads() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let author = git2::Signature::now("Test", "test@example.invalid").unwrap();
+        let commit = repo
+            .commit(
+                Some("refs/heads/audit"),
+                &author,
+                &author,
+                "test",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        repo.set_head("refs/heads/audit").unwrap();
+        assert_eq!(
+            GitOperations::get_current_branch(dir.path()).unwrap(),
+            "audit"
+        );
+        repo.set_head_detached(commit).unwrap();
+        assert_eq!(
+            GitOperations::get_current_branch(dir.path()).unwrap(),
+            "HEAD"
+        );
     }
 }
