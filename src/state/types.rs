@@ -123,6 +123,15 @@ pub enum DesiredState {
     /// The service was explicitly stopped; nothing should try to bring it
     /// back until it's started again.
     Stopped,
+    /// The service is owned by a foreground `fed start -i`: a supervisor
+    /// must neither restart it nor stop it, because the terminal that
+    /// launched it decides when it goes.
+    ///
+    /// [`crate::state::SqliteStateTracker::is_desired_running`] parses an
+    /// unknown value as `Running`, so a supervisor from a fed older than
+    /// this variant reads such a row as desired-running and may restart the
+    /// service after it exits. That mixed-version case is accepted.
+    Foreground,
 }
 
 impl fmt::Display for DesiredState {
@@ -130,6 +139,7 @@ impl fmt::Display for DesiredState {
         match self {
             DesiredState::Running => write!(f, "running"),
             DesiredState::Stopped => write!(f, "stopped"),
+            DesiredState::Foreground => write!(f, "foreground"),
         }
     }
 }
@@ -140,6 +150,7 @@ impl FromStr for DesiredState {
         match s {
             "running" => Ok(DesiredState::Running),
             "stopped" => Ok(DesiredState::Stopped),
+            "foreground" => Ok(DesiredState::Foreground),
             other => Err(format!("Invalid desired_state: {}", other)),
         }
     }
@@ -194,4 +205,24 @@ pub enum RegistrationOutcome {
     /// Service already exists in the state tracker with this status.
     /// The caller should not attempt to start it again.
     AlreadyExists { status: Status },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `desired_state` is persisted as the `Display` string and read back
+    /// through `FromStr`, so the two must agree for every variant.
+    #[test]
+    fn desired_state_round_trips_through_its_persisted_form() {
+        for state in [
+            DesiredState::Running,
+            DesiredState::Stopped,
+            DesiredState::Foreground,
+        ] {
+            assert_eq!(state.to_string().parse::<DesiredState>(), Ok(state));
+        }
+        assert_eq!(DesiredState::Foreground.to_string(), "foreground");
+        assert!("sideways".parse::<DesiredState>().is_err());
+    }
 }

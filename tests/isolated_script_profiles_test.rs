@@ -35,6 +35,7 @@ scripts:
         output_mode: fed::OutputMode::Captured,
         profiles: vec!["with-db".to_string()],
         required_secret_names: None,
+        foreground: None,
     };
 
     let orchestrator = fed::Orchestrator::builder()

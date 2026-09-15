@@ -63,6 +63,12 @@ pub enum Commands {
         #[arg(long, value_name = "MODE", value_parser = ["file", "captured", "passthrough"])]
         output: Option<String>,
 
+        /// Run a single process service in the foreground: it inherits fed's
+        /// terminal, so it can read stdin, and fed waits for it and exits with
+        /// its exit code. Its dependencies still start in the background.
+        #[arg(short, long, conflicts_with_all = ["watch", "output", "dry_run"])]
+        interactive: bool,
+
         /// Preview what would happen without actually starting services
         #[arg(long)]
         dry_run: bool,
@@ -463,5 +469,33 @@ mod tests {
             Cli::try_parse_from(["fed", "secrets", "set", "API_KEY"]).is_err(),
             "`fed secrets set` must be rejected after fed 7.0",
         );
+    }
+
+    #[test]
+    fn start_interactive_parses() {
+        let cli = Cli::try_parse_from(["fed", "start", "-i", "shell"])
+            .expect("`fed start -i shell` must parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Start {
+                interactive: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn start_interactive_conflicts_with_lifecycle_flags() {
+        for conflicting in [
+            vec!["fed", "start", "-i", "--watch", "shell"],
+            vec!["fed", "start", "-i", "--output", "passthrough", "shell"],
+            vec!["fed", "start", "-i", "--dry-run", "shell"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&conflicting).is_err(),
+                "{:?} must be rejected",
+                conflicting
+            );
+        }
     }
 }

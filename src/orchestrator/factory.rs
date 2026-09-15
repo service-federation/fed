@@ -10,7 +10,7 @@ use crate::config::ServiceType;
 use crate::error::{Error, Result, validate_pid_for_check};
 use crate::service::{
     DockerComposeService, DockerService, ExternalService, GradleService, OneshotService,
-    ProcessService, ServiceManager,
+    OutputMode, ProcessService, ServiceManager,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -269,7 +269,16 @@ impl Orchestrator {
         env: HashMap<String, String>,
         work_dir: String,
     ) -> Box<dyn ServiceManager> {
-        let log_file_path = if self.output_mode.is_file() {
+        // The foreground service keeps the caller's terminal instead of a
+        // log file, whatever this run's output mode is.
+        let foreground = self.foreground.as_deref() == Some(name);
+        let output_mode = if foreground {
+            OutputMode::Passthrough
+        } else {
+            self.output_mode
+        };
+
+        let log_file_path = if output_mode.is_file() {
             let logs_dir = crate::fed_dir::fed_dir(self.work_dir()).join("logs");
             if let Err(e) = crate::fed_dir::ensure_fed_dir(self.work_dir()) {
                 tracing::warn!("Failed to create .fed directory: {}", e);
@@ -294,14 +303,19 @@ impl Orchestrator {
             None
         };
 
-        Box::new(ProcessService::new(
+        let process_service = ProcessService::new(
             name.to_string(),
             service.clone(),
             env,
             work_dir,
-            self.output_mode,
+            output_mode,
             log_file_path,
-        ))
+        );
+        if foreground {
+            Box::new(process_service.run_in_foreground())
+        } else {
+            Box::new(process_service)
+        }
     }
 
     /// Create a docker service manager

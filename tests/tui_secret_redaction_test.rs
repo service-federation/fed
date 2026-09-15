@@ -42,6 +42,7 @@ parameters:
         output_mode: OutputMode::Captured,
         profiles: vec![],
         required_secret_names: None,
+        foreground: None,
     };
 
     let orchestrator = fed::Orchestrator::builder()

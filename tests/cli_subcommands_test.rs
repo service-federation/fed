@@ -108,6 +108,10 @@ services:
         stderr.contains("background services have no stdin"),
         "expected a stdin explanation, got:\n{stderr}"
     );
+    assert!(
+        stderr.contains("Run it in the foreground with: fed start -i shell"),
+        "expected a pointer at interactive mode, got:\n{stderr}"
+    );
 }
 
 // ============================================================================

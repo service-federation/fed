@@ -223,6 +223,7 @@ async fn run() -> anyhow::Result<()> {
         output_mode: OutputMode::default(),
         profiles: cli.profile.clone(),
         required_secret_names: None,
+        foreground: None,
     };
 
     // ── Tier 1: Commands that need NO config ──────────────────────────
@@ -411,6 +412,21 @@ async fn run() -> anyhow::Result<()> {
         .unwrap_or_default()
         .effective();
 
+    // Resolved before the start lock and any orchestrator, so a rejected
+    // `fed start -i` leaves the stack untouched.
+    if let Commands::Start {
+        interactive: true,
+        services,
+        ..
+    } = &cli.command
+    {
+        run_context.foreground = Some(commands::resolve_foreground_target(
+            &config,
+            services,
+            &cli.profile,
+        )?);
+    }
+
     // Parameter resolution and service registration are two separate phases.
     // Serialize real `fed start` invocations before either phase so concurrent
     // commands cannot resolve different port sets and then split registration
@@ -591,11 +607,12 @@ async fn run() -> anyhow::Result<()> {
             watch,
             replace,
             output: _,
+            interactive: _,
             dry_run,
             isolate: _,
             jobs,
         } => {
-            commands::run_start(
+            let exit_code = commands::run_start(
                 &mut orchestrator,
                 &config,
                 services,
@@ -612,6 +629,15 @@ async fn run() -> anyhow::Result<()> {
                 &out,
             )
             .await?;
+
+            // Every state write is already committed, so exiting here
+            // only skips the remaining drops.
+            if let Some(code) = exit_code {
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().flush();
+                std::process::exit(code);
+            }
         }
         Commands::Stop { services } => {
             commands::run_stop(&mut orchestrator, &config, services, &out).await?;

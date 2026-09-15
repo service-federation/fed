@@ -30,13 +30,18 @@ pub struct StartOptions<'a> {
     pub start_lock: Option<StartLock>,
 }
 
+/// Run `fed start`.
+///
+/// Returns the exit code fed must exit with when this run owns one: an
+/// interactive start adopts its foreground service's exit status. `None`
+/// means the ordinary "finished successfully" exit.
 pub async fn run_start(
     orchestrator: &mut Orchestrator,
     config: &Config,
     services: Vec<String>,
     opts: StartOptions<'_>,
     out: &dyn UserOutput,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<i32>> {
     let StartOptions {
         watch,
         replace,
@@ -69,7 +74,7 @@ pub async fn run_start(
                 }
             }
             out.status(&msg);
-            return Ok(());
+            return Ok(None);
         }
     } else {
         // Expand tag references (e.g., @backend) into service names
@@ -78,8 +83,11 @@ pub async fn run_start(
 
     // Handle dry run mode - show what would happen without starting services
     if dry_run {
-        return run_dry_run(orchestrator, config, services_to_start, out).await;
+        run_dry_run(orchestrator, config, services_to_start, out).await?;
+        return Ok(None);
     }
+
+    let foreground = orchestrator.foreground_service().map(str::to_string);
 
     // If --replace is set, first stop any fed-managed services gracefully,
     // then kill any remaining external processes occupying required ports
@@ -156,6 +164,10 @@ pub async fn run_start(
         }
     }
 
+    if let Some(name) = foreground.as_deref() {
+        ensure_not_already_running(orchestrator, name).await?;
+    }
+
     // Show what we're about to start with their dependencies
     let dep_graph = orchestrator.get_dependency_graph();
     for service in &services_to_start {
@@ -229,6 +241,8 @@ pub async fn run_start(
 
     // Full startup plan: dependencies first, then targets, deduplicated,
     // in dependency order.
+    // The foreground service is excluded here; it starts after all output
+    // below, because from its spawn onward the terminal belongs to it.
     let mut plan: Vec<String> = Vec::new();
     {
         let dep_graph = orchestrator.get_dependency_graph();
@@ -238,11 +252,15 @@ pub async fn run_start(
                     plan.push(dep);
                 }
             }
-            if !plan.contains(service) {
+            if !plan.contains(service) && foreground.as_deref() != Some(service.as_str()) {
                 plan.push(service.clone());
             }
         }
     }
+
+    // An interactive start with no dependencies leaves the plan empty;
+    // the summary and status snapshot below have nothing to report.
+    let report_background_start = !plan.is_empty();
     let name_width = plan.iter().map(|s| s.chars().count()).max().unwrap_or(0);
 
     // Track which services we've already started (to avoid duplicate messages)
@@ -279,7 +297,7 @@ pub async fn run_start(
             out.status("\n\nStartup aborted. Cleaning up...");
             orchestrator.cleanup_failed_start().await;
             out.status("Cleanup complete");
-            return Ok(());
+            return Ok(None);
         }
 
         let group: Vec<&String> = group.iter().filter(|s| !started.contains(*s)).collect();
@@ -356,21 +374,23 @@ pub async fn run_start(
     // still exits 0 — but the summary must say which services were never
     // verified healthy.
     let elapsed = fmt_duration(startup_timer.elapsed());
-    if warnings.is_empty() {
-        out.success(&format!(
-            "\nAll services started successfully! ({} services in {})",
-            started.len(),
-            elapsed
-        ));
-    } else {
-        out.warning(&format!(
-            "\nServices started with {} health warning(s) ({} services in {}):",
-            warnings.len(),
-            started.len(),
-            elapsed
-        ));
-        for (name, health) in &warnings {
-            out.warning(&format!("  - {}", start_warning_line(name, health)));
+    if report_background_start {
+        if warnings.is_empty() {
+            out.success(&format!(
+                "\nAll services started successfully! ({} services in {})",
+                started.len(),
+                elapsed
+            ));
+        } else {
+            out.warning(&format!(
+                "\nServices started with {} health warning(s) ({} services in {}):",
+                warnings.len(),
+                started.len(),
+                elapsed
+            ));
+            for (name, health) in &warnings {
+                out.warning(&format!("  - {}", start_warning_line(name, health)));
+            }
         }
     }
 
@@ -382,9 +402,13 @@ pub async fn run_start(
 
     // Brief delay to let processes bind ports and potentially fail with EADDRINUSE.
     // Then use active status check to detect processes that crashed after spawn.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    out.status("\nService Status:");
-    let status = orchestrator.get_status().await;
+    let status = if report_background_start {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        out.status("\nService Status:");
+        orchestrator.get_status().await
+    } else {
+        std::collections::HashMap::new()
+    };
 
     // Collect port conflicts for all port parameters
     let mut port_conflicts: Vec<(String, u16, String, Option<u32>)> = Vec::new();
@@ -572,6 +596,36 @@ pub async fn run_start(
         }
     }
 
+    if let Some(name) = foreground.as_deref() {
+        // `started` holds the dependencies only, so the foreground service
+        // is never supervised.
+        spawn_restart_supervisor(
+            orchestrator,
+            config,
+            &started,
+            config_path,
+            offline,
+            &profiles,
+            out,
+        );
+        warn_ignored_restart_policy(config, name, out);
+
+        // Registration of the foreground service is serialized like every
+        // other start; only the wait that follows it happens unlocked.
+        let start_result = start_foreground_service(orchestrator, config, name, out).await;
+        drop(start_lock);
+        let started_anything = !started.is_empty();
+        return match start_result {
+            Ok(()) => wait_for_foreground_service(orchestrator, name, started_anything, out)
+                .await
+                .map(Some),
+            Err(e) => {
+                orchestrator.cleanup_failed_start().await;
+                Err(e.into())
+            }
+        };
+    }
+
     // Parameter resolution, hooks, process spawn, health checks, and the
     // post-start liveness snapshot have converged. A waiting invocation can
     // now initialize afresh from this run's committed state. In watch mode
@@ -588,22 +642,249 @@ pub async fn run_start(
         // policy would never fire again. Spawn one iff it's actually needed
         // and not already running; `fed status` never does this, staying
         // strictly read-only.
-        if super::supervise::any_has_restart_policy(config, started.iter()) {
-            let work_dir = orchestrator.work_dir().to_path_buf();
-            if let Err(e) =
-                super::supervise::spawn_if_needed(&work_dir, config_path, offline, &profiles)
-            {
-                out.warning(&format!(
-                    "Warning: failed to start the restart-policy supervisor: {}",
-                    e
-                ));
-            }
-        }
+        spawn_restart_supervisor(
+            orchestrator,
+            config,
+            &started,
+            config_path,
+            offline,
+            &profiles,
+            out,
+        );
     } else {
         run_watch_mode(orchestrator, config, config_path, out).await?;
     }
 
+    Ok(None)
+}
+
+/// Spawn the `fed supervise` daemon if any service started by this run has a
+/// `restart:` policy and no supervisor is live yet.
+fn spawn_restart_supervisor(
+    orchestrator: &Orchestrator,
+    config: &Config,
+    started: &std::collections::HashSet<String>,
+    config_path: &std::path::Path,
+    offline: bool,
+    profiles: &[String],
+    out: &dyn UserOutput,
+) {
+    if !super::supervise::any_has_restart_policy(config, started.iter()) {
+        return;
+    }
+    let work_dir = orchestrator.work_dir().to_path_buf();
+    if let Err(e) = super::supervise::spawn_if_needed(&work_dir, config_path, offline, profiles) {
+        out.warning(&format!(
+            "Warning: failed to start the restart-policy supervisor: {}",
+            e
+        ));
+    }
+}
+
+/// Say that `-i` ignores the service's `restart:` policy, before its output
+/// starts arriving and a warning would be lost in it.
+fn warn_ignored_restart_policy(config: &Config, name: &str, out: &dyn UserOutput) {
+    let has_policy = config
+        .services
+        .get(name)
+        .and_then(|s| s.restart.clone())
+        .is_some_and(|policy| !matches!(policy, fed::config::RestartPolicy::No));
+    if has_policy {
+        out.warning(&format!(
+            "Note: '{}' has a restart policy; it is ignored in interactive mode.",
+            name
+        ));
+    }
+}
+
+/// Start the foreground service, with fed's own output silenced from the
+/// spawn onward: the terminal belongs to the service from here to its exit.
+async fn start_foreground_service(
+    orchestrator: &Orchestrator,
+    config: &Config,
+    name: &str,
+    out: &dyn UserOutput,
+) -> Result<(), FedError> {
+    fed::progress::set_silent(true);
+    let result = start_one_service(orchestrator, config, name, name.chars().count(), false, out)
+        .await
+        .map(|_| ());
+    if result.is_err() {
+        fed::progress::set_silent(false);
+    }
+    result
+}
+
+/// Wait for the foreground service to exit, clean up after it, and report
+/// the exit code fed should adopt.
+async fn wait_for_foreground_service(
+    orchestrator: &Orchestrator,
+    name: &str,
+    started_anything: bool,
+    out: &dyn UserOutput,
+) -> anyhow::Result<i32> {
+    // Read before the wait: `wait_foreground` holds the service manager's
+    // lock until the process exits.
+    let pid = orchestrator.get_service_pid(name).await.ok().flatten();
+    let signals = spawn_foreground_signal_handling(pid);
+
+    let status = orchestrator.wait_foreground(name).await;
+
+    signals.abort();
+    fed::progress::set_silent(false);
+
+    if let Err(e) = orchestrator.unregister_foreground(name).await {
+        out.warning(&format!(
+            "Warning: failed to remove '{}' from fed's state: {}",
+            name, e
+        ));
+    }
+
+    let code = exit_code_for(status?);
+    let mut summary = format!("{} exited (code {}).", name, code);
+    if started_anything {
+        summary.push_str(" Dependencies are still running, use 'fed stop' to stop them.");
+    }
+    fed::progress::eprintln_above(&summary);
+
+    Ok(code)
+}
+
+/// fed's exit code for a foreground service's exit status: its own code, or
+/// the shell convention of 128 + signal number when a signal killed it.
+fn exit_code_for(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    1
+}
+
+/// Swallow SIGINT, which the terminal already delivered to the service
+/// itself, and forward a SIGTERM aimed at fed to the service.
+#[cfg(unix)]
+fn spawn_foreground_signal_handling(child_pid: Option<u32>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut sigint = signal(SignalKind::interrupt())
+            .inspect_err(|e| tracing::warn!("Failed to create SIGINT handler: {}", e))
+            .ok();
+        let mut sigterm = signal(SignalKind::terminate())
+            .inspect_err(|e| tracing::warn!("Failed to create SIGTERM handler: {}", e))
+            .ok();
+
+        loop {
+            tokio::select! {
+                _ = async {
+                    if let Some(ref mut s) = sigint {
+                        s.recv().await
+                    } else {
+                        std::future::pending::<Option<()>>().await
+                    }
+                } => {}
+                _ = async {
+                    if let Some(ref mut s) = sigterm {
+                        s.recv().await
+                    } else {
+                        std::future::pending::<Option<()>>().await
+                    }
+                } => {
+                    if let Some(pid) = child_pid.and_then(|p| i32::try_from(p).ok()) {
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid),
+                            nix::sys::signal::Signal::SIGTERM,
+                        );
+                    }
+                }
+            }
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn spawn_foreground_signal_handling(_child_pid: Option<u32>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(std::future::pending())
+}
+
+/// Refuse to take over a service that is already running in the background.
+async fn ensure_not_already_running(orchestrator: &Orchestrator, name: &str) -> anyhow::Result<()> {
+    let services = orchestrator.state_tracker.read().await.get_services().await;
+    let Some(state) = services.get(name) else {
+        return Ok(());
+    };
+
+    let alive = match state.pid {
+        #[cfg(unix)]
+        Some(pid) => {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+                && validate_pid_start_time(pid, state.started_at)
+        }
+        #[cfg(not(unix))]
+        Some(_) => true,
+        None => state.container_id.is_some(),
+    };
+
+    if alive {
+        anyhow::bail!(
+            "{} is already running. Stop it first: fed stop {}",
+            name,
+            name
+        );
+    }
     Ok(())
+}
+
+/// Resolve the single service `fed start -i` will run in the foreground.
+///
+/// Runs before anything starts, so a rejected invocation leaves the stack
+/// exactly as it found it.
+pub fn resolve_foreground_target(
+    config: &Config,
+    services: &[String],
+    profiles: &[String],
+) -> anyhow::Result<String> {
+    let targets = config.expand_service_selection(services);
+
+    let name = match targets.len() {
+        1 => targets.into_iter().next().expect("one target"),
+        0 => anyhow::bail!(
+            "interactive mode runs a single service; name the one to run: fed start -i <service>"
+        ),
+        _ => anyhow::bail!(
+            "interactive mode runs a single service; start the others first with 'fed start'"
+        ),
+    };
+
+    let Some(service) = config.services.get(&name) else {
+        anyhow::bail!(unknown_service_error(config, &name, profiles));
+    };
+
+    // `config` here is unfiltered: a profile-gated service is still in it,
+    // and reaches the orchestrator's filtered service map as a bare
+    // "not found" unless it is caught with its own explanation first.
+    let profile_enabled =
+        service.profiles.is_empty() || service.profiles.iter().any(|p| profiles.contains(p));
+    if !profile_enabled {
+        anyhow::bail!(unknown_service_error(config, &name, profiles));
+    }
+
+    let kind = service.service_type();
+    if kind != ServiceType::Process {
+        anyhow::bail!(
+            "interactive mode supports process services; '{}' is a {} service",
+            name,
+            kind
+        );
+    }
+
+    Ok(name)
 }
 
 /// Group `plan` into dependency levels using the graph's parallel groups.
@@ -1627,6 +1908,101 @@ services:
             msg.contains("  - web\n") || msg.ends_with("  - web"),
             "{msg}"
         );
+    }
+
+    fn interactive_config() -> Config {
+        fed::Parser::new()
+            .parse_config(
+                r#"
+services:
+  shell:
+    process: sh
+  db:
+    image: postgres:16
+  worker:
+    process: "sleep 30"
+"#,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn foreground_target_accepts_a_single_process_service() {
+        let name = resolve_foreground_target(&interactive_config(), &["shell".to_string()], &[])
+            .expect("a lone process service is a valid target");
+        assert_eq!(name, "shell");
+    }
+
+    #[test]
+    fn foreground_target_rejects_more_than_one_service() {
+        let services = vec!["shell".to_string(), "worker".to_string()];
+        let err = resolve_foreground_target(&interactive_config(), &services, &[])
+            .expect_err("two targets must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "interactive mode runs a single service; start the others first with 'fed start'"
+        );
+    }
+
+    #[test]
+    fn foreground_target_rejects_no_service() {
+        let err = resolve_foreground_target(&interactive_config(), &[], &[])
+            .expect_err("interactive mode has no default target");
+        assert!(
+            err.to_string()
+                .starts_with("interactive mode runs a single service"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn foreground_target_rejects_non_process_services() {
+        let err = resolve_foreground_target(&interactive_config(), &["db".to_string()], &[])
+            .expect_err("docker services are out of scope for interactive mode");
+        assert_eq!(
+            err.to_string(),
+            "interactive mode supports process services; 'db' is a docker service"
+        );
+    }
+
+    #[test]
+    fn foreground_target_explains_profile_gated_services() {
+        let err = resolve_foreground_target(&profile_config(), &["test".to_string()], &[])
+            .expect_err("a service gated behind an inactive profile must not resolve");
+        assert!(
+            err.to_string()
+                .starts_with("Service 'test' must be run with the profile 'test'"),
+            "{err}"
+        );
+
+        let active = vec!["test".to_string()];
+        let name = resolve_foreground_target(&profile_config(), &["test".to_string()], &active)
+            .expect("an active profile makes the service a valid target");
+        assert_eq!(name, "test");
+    }
+
+    #[test]
+    fn foreground_target_reports_unknown_services_like_start_does() {
+        let err = resolve_foreground_target(&interactive_config(), &["shel".to_string()], &[])
+            .expect_err("a typo must not resolve");
+        assert!(
+            err.to_string()
+                .starts_with("Service 'shel' not found. Did you mean 'shell'?"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn foreground_exit_code_follows_the_shell_convention() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        assert_eq!(exit_code_for(ExitStatus::from_raw(0)), 0);
+        // Wait status layout: exit code in the high byte, signal in the low
+        // seven bits.
+        assert_eq!(exit_code_for(ExitStatus::from_raw(3 << 8)), 3);
+        assert_eq!(exit_code_for(ExitStatus::from_raw(15)), 143);
     }
 
     #[test]

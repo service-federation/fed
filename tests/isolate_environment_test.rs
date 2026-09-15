@@ -42,6 +42,7 @@ services:
         output_mode: fed::OutputMode::Captured,
         profiles: vec![],
         required_secret_names: None,
+        foreground: None,
     };
 
     let orchestrator = fed::Orchestrator::builder()

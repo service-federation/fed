@@ -123,7 +123,15 @@ In `fed status`, `running` means the process is up but no healthcheck has confir
 
 ### Services run in the background
 
-`fed start` detaches every process service: it gets no stdin, and its output goes to `.fed/logs/<service>.log`. Follow it with `fed logs -f <service>` or watch everything in `fed tui`. A program that waits for terminal input, such as a shell or a REPL, exits as soon as it starts, because there is nothing to read. fed does not host interactive programs the way `docker run -it` does.
+`fed start` detaches every process service: it gets no stdin, and its output goes to `.fed/logs/<service>.log`. Follow it with `fed logs -f <service>` or watch everything in `fed tui`. A program that waits for terminal input, such as a shell or a REPL, exits as soon as it starts, because there is nothing to read.
+
+To run one such service in your terminal instead, start it with `-i`:
+
+```console
+$ fed start -i shell
+```
+
+fed starts that service's dependencies in the background as usual, hands it your terminal, and waits for it. Ctrl+C goes to the service, not to fed. When it exits, fed exits with the same code and leaves the dependencies running for `fed stop`. One service at a time, process services only.
 
 ## One stack per worktree
 
