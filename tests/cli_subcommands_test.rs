@@ -79,6 +79,38 @@ services:
 }
 
 // ============================================================================
+// Background service startup errors
+// ============================================================================
+
+#[test]
+fn test_start_stdin_reading_service_explains_missing_stdin() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("fed.yaml");
+    fs::write(
+        &config_path,
+        r#"
+services:
+  shell:
+    process: sh
+"#,
+    )
+    .expect("Failed to write config");
+
+    let output = Command::new(fed_binary())
+        .current_dir(temp_dir.path())
+        .args(["-c", config_path.to_str().unwrap(), "start", "shell"])
+        .output()
+        .expect("Failed to run fed");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("background services have no stdin"),
+        "expected a stdin explanation, got:\n{stderr}"
+    );
+}
+
+// ============================================================================
 // Help and version tests
 // ============================================================================
 

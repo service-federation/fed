@@ -121,6 +121,10 @@ fed stop
 
 In `fed status`, `running` means the process is up but no healthcheck has confirmed it; only `healthy` means verified. `fed status --json` reports the same distinction as `"status": "running"` with `"health": "unknown"`.
 
+### Services run in the background
+
+`fed start` detaches every process service: it gets no stdin, and its output goes to `.fed/logs/<service>.log`. Follow it with `fed logs -f <service>` or watch everything in `fed tui`. A program that waits for terminal input, such as a shell or a REPL, exits as soon as it starts, because there is nothing to read. fed does not host interactive programs the way `docker run -it` does.
+
 ## One stack per worktree
 
 Git isolates files. fed isolates the runtime state that usually still collides.

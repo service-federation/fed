@@ -460,8 +460,13 @@ impl ServiceManager for ProcessService {
                             let last_lines: Vec<&str> =
                                 lines.iter().rev().take(15).rev().cloned().collect();
                             if last_lines.is_empty() {
-                                "Log file is empty (process may have crashed before writing output)"
-                                    .to_string()
+                                concat!(
+                                    "Log file is empty (process may have crashed before writing output).\n\n",
+                                    "Note: background services have no stdin. A process that waits for ",
+                                    "terminal input, such as a shell or a REPL, exits as soon as ",
+                                    "'fed start' launches it."
+                                )
+                                .to_string()
                             } else {
                                 format!(
                                     "Last {} lines from logs:\n{}",

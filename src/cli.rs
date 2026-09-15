@@ -55,9 +55,11 @@ pub enum Commands {
         #[arg(long)]
         replace: bool,
 
-        /// Output mode for process services: file = logs to files (default for
-        /// start), captured = logs to memory (default for watch/tui),
-        /// passthrough = inherit stdio (for testing/CI)
+        /// Output mode for process services. file: append output to
+        /// .fed/logs/<service>.log and return (default). captured: keep output in
+        /// memory (default for --watch and the TUI). passthrough: inherit fed's
+        /// stdin/stdout/stderr with no log capture; fed still returns after
+        /// startup, so this suits CI log visibility, not interactive programs.
         #[arg(long, value_name = "MODE", value_parser = ["file", "captured", "passthrough"])]
         output: Option<String>,
 
