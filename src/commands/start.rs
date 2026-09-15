@@ -258,7 +258,9 @@ pub async fn run_start(
         match parallel_groups_for_plan(orchestrator.get_dependency_graph(), &plan) {
             Ok(groups) => groups,
             Err(FedError::ServiceNotFound(missing)) => {
-                return Err(unknown_service_error(config, &missing));
+                return Err(anyhow::anyhow!(unknown_service_error(
+                    config, &missing, &profiles
+                )));
             }
             Err(e) => {
                 return Err(anyhow::anyhow!(
@@ -339,7 +341,9 @@ pub async fn run_start(
             // Unknown service: build one rich error (did-you-mean + service
             // list) and let main print it once.
             if let FedError::ServiceNotFound(ref missing) = e {
-                return Err(unknown_service_error(config, missing));
+                return Err(anyhow::anyhow!(unknown_service_error(
+                    config, missing, &profiles
+                )));
             }
 
             return Err(e.into());
@@ -628,8 +632,42 @@ fn parallel_groups_for_plan(
     Ok(groups)
 }
 
-/// Rich unknown-service error: did-you-mean plus the configured service list.
-fn unknown_service_error(config: &Config, missing: &str) -> anyhow::Error {
+/// Unknown-service error for `fed start`. `config` is unfiltered, so a
+/// profile-gated name is still present here even though the plan rejected it.
+fn unknown_service_error(config: &Config, missing: &str, active_profiles: &[String]) -> String {
+    if let Some(service) = config
+        .services
+        .get(missing)
+        .filter(|s| !s.profiles.is_empty())
+    {
+        let requirement = if service.profiles.len() == 1 {
+            format!("the profile '{}'", service.profiles[0])
+        } else {
+            let quoted: Vec<String> = service
+                .profiles
+                .iter()
+                .map(|p| format!("'{}'", p))
+                .collect();
+            format!("one of the profiles {}", quoted.join(", "))
+        };
+        let active = if active_profiles.is_empty() {
+            "no profile is active".to_string()
+        } else {
+            format!("active profiles: {}", active_profiles.join(", "))
+        };
+        let mut msg = format!(
+            "Service '{}' must be run with {} ({}).\n\nDid you mean:\n",
+            missing, requirement, active
+        );
+        for profile in &service.profiles {
+            msg.push_str(&format!(
+                "\n    fed --profile {} start {}",
+                profile, missing
+            ));
+        }
+        return msg;
+    }
+
     let mut msg = super::suggest::with_did_you_mean(
         &format!("Service '{}' not found.", missing),
         missing,
@@ -637,13 +675,21 @@ fn unknown_service_error(config: &Config, missing: &str) -> anyhow::Error {
     );
     if !config.services.is_empty() {
         msg.push_str("\n\nAvailable services:");
-        let mut names: Vec<_> = config.services.keys().collect();
-        names.sort();
-        for name in names {
-            msg.push_str(&format!("\n  - {}", name));
+        let mut names: Vec<_> = config.services.iter().collect();
+        names.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, service) in names {
+            if service.profiles.is_empty() {
+                msg.push_str(&format!("\n  - {}", name));
+            } else {
+                msg.push_str(&format!(
+                    "\n  - {} (profile: {})",
+                    name,
+                    service.profiles.join(", ")
+                ));
+            }
         }
     }
-    anyhow::anyhow!(msg)
+    msg
 }
 
 /// Human-friendly duration: "0.4s", "12.3s", "2m05s".
@@ -1523,6 +1569,64 @@ mod tests {
         let plan = vec!["a".to_string(), "c".to_string()];
         let groups = parallel_groups_for_plan(&graph, &plan).unwrap();
         assert_eq!(groups, vec![vec!["a", "c"]]);
+    }
+
+    fn profile_config() -> Config {
+        fed::Parser::new()
+            .parse_config(
+                r#"
+services:
+  test:
+    profiles: [test]
+    process: "echo hello"
+  web:
+    process: "echo web"
+  metrics:
+    profiles: [prod, staging]
+    process: "echo metrics"
+"#,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn unknown_service_error_names_the_profile_flag_for_gated_services() {
+        let msg = unknown_service_error(&profile_config(), "test", &[]);
+        assert_eq!(
+            msg,
+            "Service 'test' must be run with the profile 'test' (no profile is active).\n\n\
+             Did you mean:\n\n    fed --profile test start test"
+        );
+    }
+
+    #[test]
+    fn unknown_service_error_reports_active_profiles_when_they_do_not_match() {
+        let active = vec!["dev".to_string()];
+        let msg = unknown_service_error(&profile_config(), "metrics", &active);
+        assert_eq!(
+            msg,
+            "Service 'metrics' must be run with one of the profiles 'prod', 'staging' \
+             (active profiles: dev).\n\nDid you mean:\n\n    \
+             fed --profile prod start metrics\n    fed --profile staging start metrics"
+        );
+    }
+
+    #[test]
+    fn unknown_service_error_keeps_did_you_mean_for_real_typos() {
+        let msg = unknown_service_error(&profile_config(), "wbe", &[]);
+        assert!(
+            msg.starts_with("Service 'wbe' not found. Did you mean 'web'?"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("  - metrics (profile: prod, staging)"),
+            "{msg}"
+        );
+        assert!(msg.contains("  - test (profile: test)"), "{msg}");
+        assert!(
+            msg.contains("  - web\n") || msg.ends_with("  - web"),
+            "{msg}"
+        );
     }
 
     #[test]

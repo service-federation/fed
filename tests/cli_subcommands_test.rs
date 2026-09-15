@@ -37,6 +37,48 @@ scripts:
 }
 
 // ============================================================================
+// Profile-gated service errors
+// ============================================================================
+
+#[test]
+fn test_start_profile_gated_service_explains_profile_flag() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("fed.yaml");
+    fs::write(
+        &config_path,
+        r#"
+services:
+  test:
+    profiles: [test]
+    process: "echo 'Hello, World!'"
+"#,
+    )
+    .expect("Failed to write config");
+
+    let output = Command::new(fed_binary())
+        .current_dir(temp_dir.path())
+        .args(["-c", config_path.to_str().unwrap(), "start", "test"])
+        .output()
+        .expect("Failed to run fed");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr
+            .contains("Service 'test' must be run with the profile 'test' (no profile is active)."),
+        "expected profile explanation, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Did you mean:\n\n    fed --profile test start test"),
+        "expected a runnable hint, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Did you mean 'test'"),
+        "must not suggest the name the user typed, got:\n{stderr}"
+    );
+}
+
+// ============================================================================
 // Help and version tests
 // ============================================================================
 
