@@ -2,6 +2,7 @@
 
 /// Find the candidate closest to `input`, if it's close enough to be a
 /// plausible typo (edit distance ≤ 1/3 of the input length, minimum 2).
+/// An exact match is never returned.
 pub(crate) fn closest_match<'a, I>(input: &str, candidates: I) -> Option<&'a str>
 where
     I: IntoIterator<Item = &'a str>,
@@ -10,7 +11,7 @@ where
     candidates
         .into_iter()
         .map(|c| (levenshtein(input, c), c))
-        .filter(|(d, _)| *d <= max_distance)
+        .filter(|(d, _)| *d > 0 && *d <= max_distance)
         .min_by_key(|(d, _)| *d)
         .map(|(_, c)| c)
 }
@@ -72,6 +73,25 @@ mod tests {
     fn test_closest_match_rejects_distant_names() {
         let candidates = ["backend", "frontend"];
         assert_eq!(closest_match("zzzzzzz", candidates.iter().copied()), None);
+    }
+
+    #[test]
+    fn test_closest_match_never_suggests_the_input_itself() {
+        let candidates = ["test", "tests"];
+        assert_eq!(
+            closest_match("test", candidates.iter().copied()),
+            Some("tests")
+        );
+        let only_exact = ["test"];
+        assert_eq!(closest_match("test", only_exact.iter().copied()), None);
+        assert_eq!(
+            with_did_you_mean(
+                "Service 'test' not found.",
+                "test",
+                only_exact.iter().copied()
+            ),
+            "Service 'test' not found."
+        );
     }
 
     #[test]
