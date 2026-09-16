@@ -112,7 +112,7 @@ pub struct RunContext {
     /// commands).
     pub required_secret_names: Option<HashSet<String>>,
     /// Service to run in the foreground, from `fed start -i <service>`.
-    /// Lifecycle, not log routing: it inherits fed's terminal and process
-    /// group, and fed waits for it. Hence not a fourth [`OutputMode`].
+    /// Lifecycle, not log routing: it is handed fed's terminal and fed
+    /// waits for it. Hence not a fourth [`OutputMode`].
     pub foreground: Option<String>,
 }

@@ -52,14 +52,45 @@ fn run_fed(config: &str, args: &[&str], timeout: Duration) -> Output {
     child.wait_with_output().expect("collect fed output")
 }
 
-fn status_line(config: &str, service: &str) -> String {
-    let output = run_fed(config, &["status"], Duration::from_secs(30));
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    stdout
-        .lines()
-        .find(|line| line.contains(service))
-        .unwrap_or_default()
+/// `fed status --json`, parsed. Runs in its own process, so against a live
+/// `fed start -i` session this is the "other terminal" view of the stack.
+fn status_json(config: &str) -> serde_json::Value {
+    let output = run_fed(config, &["status", "--json"], Duration::from_secs(30));
+    assert!(output.status.success(), "fed status --json must succeed");
+    serde_json::from_slice(&output.stdout).expect("status output is json")
+}
+
+fn service_status(status: &serde_json::Value, service: &str) -> String {
+    status[service]["status"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{service} missing from status: {status}"))
         .to_string()
+}
+
+fn supervisor_running(status: &serde_json::Value, service: &str) -> bool {
+    status[service]["supervisor_running"]
+        .as_bool()
+        .unwrap_or(false)
+}
+
+/// Wait for fed to exit and return its exit code.
+///
+/// Polls the process rather than waiting for EOF on the pty: rexpect leaks
+/// its pty descriptors into the child, and from there into the nohup'd
+/// services and supervisor fed spawns, so on Linux the slave stays open
+/// (and EOF never comes) for as long as those daemons live.
+fn exit_code(session: &mut rexpect::session::PtySession) -> i32 {
+    use rexpect::process::wait::WaitStatus;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match session.process.status() {
+            Some(WaitStatus::Exited(_, code)) => return code,
+            Some(WaitStatus::StillAlive) | None => {}
+            Some(other) => panic!("expected fed to exit normally, got {:?}", other),
+        }
+        assert!(Instant::now() < deadline, "fed did not exit within 30s");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Stops everything this test file started, even when an assertion panics
@@ -124,20 +155,23 @@ services:
         .expect("send command");
     session.exp_string("marker-42").expect("service output");
 
+    // The other-terminal view of a live session: the row is there and
+    // reads as running.
+    let status = status_json(&config);
+    assert_eq!(service_status(&status, "shell"), "running");
+
     session.send_line("exit 3").expect("send exit");
-    session.exp_eof().expect("fed exits with the service");
+    assert_eq!(
+        exit_code(&mut session),
+        3,
+        "fed must exit with the service's exit code"
+    );
 
-    match session.process.wait().expect("reap fed") {
-        rexpect::process::wait::WaitStatus::Exited(_, code) => {
-            assert_eq!(code, 3, "fed must exit with the service's exit code");
-        }
-        other => panic!("expected a normal exit, got {:?}", other),
-    }
-
-    let line = status_line(&config, "shell");
-    assert!(
-        !line.contains("running"),
-        "shell should be unregistered after it exits, got: {line}"
+    let status = status_json(&config);
+    assert_eq!(
+        service_status(&status, "shell"),
+        "stopped",
+        "shell must be unregistered after it exits"
     );
 }
 
@@ -180,38 +214,130 @@ services:
         .exp_string("has a restart policy")
         .expect("the ignored restart policy must be announced");
 
-    // Outlives one supervisor poll tick. The marker proves the service was
-    // still alive and reading the terminal on the other side of it.
+    // The supervisor must be live for the rest of this test to mean
+    // anything: it is what could wrongly restart or stop the session.
+    let status = status_json(&config);
+    assert!(
+        supervisor_running(&status, "dep"),
+        "a restart policy must have spawned the supervisor, got: {status}"
+    );
+    assert_eq!(service_status(&status, "shell"), "running");
+
+    // Outlives one supervisor poll tick (5s). The marker proves the service
+    // was still alive and reading the terminal on the other side of it.
     session
-        .send_line("sleep 7; printf 'marker-%s\n' 99")
+        .send_line("sleep 7; printf 'marker-%s\\n' 99")
         .expect("send command");
     session.exp_string("marker-99").expect("service output");
 
     session.send_line("exit 0").expect("send exit");
-    session.exp_eof().expect("fed exits with the service");
+    assert_eq!(exit_code(&mut session), 0);
 
-    match session.process.wait().expect("reap fed") {
-        rexpect::process::wait::WaitStatus::Exited(_, code) => assert_eq!(code, 0),
-        other => panic!("expected a normal exit, got {:?}", other),
-    }
-
-    let dep = status_line(&config, "dep");
-    assert!(
-        dep.contains("running"),
-        "dependency must survive the interactive service, got: {dep}"
+    let status = status_json(&config);
+    assert_eq!(
+        service_status(&status, "dep"),
+        "running",
+        "dependency must survive the interactive service"
     );
 
     run_fed(&config, &["stop"], Duration::from_secs(60));
-    let status = run_fed(&config, &["status"], Duration::from_secs(30));
-    let stdout = String::from_utf8_lossy(&status.stdout);
+    let status = status_json(&config);
     assert!(
-        stdout.contains("Supervisor: none"),
-        "fed stop must take the supervisor with it, got:\n{stdout}"
+        !supervisor_running(&status, "dep"),
+        "fed stop must take the supervisor with it, got: {status}"
     );
+    for service in ["dep", "shell"] {
+        assert_eq!(
+            service_status(&status, service),
+            "stopped",
+            "fed stop must leave nothing running"
+        );
+    }
+}
+
+/// Ctrl+C typed at the terminal goes to the service alone: the service
+/// dies of SIGINT, fed survives to report it and exits 130.
+#[test]
+fn ctrl_c_reaches_the_service_not_fed() {
+    let dir = TempDir::new().expect("temp dir");
+    let config = write_config(
+        &dir,
+        r#"
+services:
+  napper:
+    process: "sleep 6011"
+"#,
+    );
+
+    let mut session = rexpect::spawn(
+        &format!("{} -c {} start -i napper", fed_binary(), config),
+        Some(20_000),
+    )
+    .expect("spawn fed under a pty");
+    session.exp_string("Starting: napper").expect("start line");
+
+    let status = status_json(&config);
+    assert_eq!(service_status(&status, "napper"), "running");
+
+    session.send_control('c').expect("send ctrl-c");
+    session
+        .exp_string("napper exited (code 130)")
+        .expect("fed reports the signal exit");
+    assert_eq!(exit_code(&mut session), 130);
+    assert!(!process_alive("sleep 6011"), "the service must be gone");
+}
+
+/// `fed stop <service>` from another terminal ends the session: it signals
+/// the service's own process group, so a compound command's real program
+/// dies too, and fed exits with the service's status instead of being
+/// killed along with it.
+#[test]
+fn fed_stop_from_another_terminal_ends_the_session() {
+    let dir = TempDir::new().expect("temp dir");
+    let config = write_config(
+        &dir,
+        r#"
+services:
+  compound:
+    process: "true && sleep 6012"
+"#,
+    );
+
+    let mut session = rexpect::spawn(
+        &format!("{} -c {} start -i compound", fed_binary(), config),
+        Some(30_000),
+    )
+    .expect("spawn fed under a pty");
+    session
+        .exp_string("Starting: compound")
+        .expect("start line");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !process_alive("sleep 6012") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(process_alive("sleep 6012"), "the service must have started");
+
+    let stop = run_fed(&config, &["stop", "compound"], Duration::from_secs(60));
+    assert!(stop.status.success(), "fed stop must succeed");
+
+    session
+        .exp_string("compound exited (code 143)")
+        .expect("fed reports the stop");
+    assert_eq!(exit_code(&mut session), 143);
     assert!(
-        !stdout.contains("running"),
-        "fed stop must leave nothing running, got:\n{stdout}"
+        !process_alive("sleep 6012"),
+        "the compound command's program must be gone"
     );
+}
+
+/// Whether a process whose command line contains `needle` is running.
+fn process_alive(needle: &str) -> bool {
+    let output = Command::new("pgrep")
+        .args(["-f", needle])
+        .output()
+        .expect("pgrep");
+    output.status.success()
 }
 
 /// Two targets is a usage error, and it lands before anything is started.
@@ -238,11 +364,12 @@ services:
         "expected the usage error, got:\n{stderr}"
     );
 
+    let status = status_json(&config);
     for service in ["a", "b"] {
-        let line = status_line(&config, service);
-        assert!(
-            !line.contains("running"),
-            "{service} must not have been started, got: {line}"
+        assert_eq!(
+            service_status(&status, service),
+            "stopped",
+            "{service} must not have been started"
         );
     }
 }

@@ -724,7 +724,8 @@ async fn wait_for_foreground_service(
     out: &dyn UserOutput,
 ) -> anyhow::Result<i32> {
     // Read before the wait: `wait_foreground` holds the service manager's
-    // lock until the process exits.
+    // lock until the process exits. The service leads its own process
+    // group, so its PID doubles as the group to forward signals to.
     let pid = orchestrator.get_service_pid(name).await.ok().flatten();
     let signals = spawn_foreground_signal_handling(pid);
 
@@ -733,14 +734,16 @@ async fn wait_for_foreground_service(
     signals.abort();
     fed::progress::set_silent(false);
 
+    // A failed wait says nothing about the process, so its row stays for
+    // `fed stop` to act on.
+    let code = exit_code_for(status?);
+
     if let Err(e) = orchestrator.unregister_foreground(name).await {
         out.warning(&format!(
             "Warning: failed to remove '{}' from fed's state: {}",
             name, e
         ));
     }
-
-    let code = exit_code_for(status?);
     let mut summary = format!("{} exited (code {}).", name, code);
     if started_anything {
         summary.push_str(" Dependencies are still running, use 'fed stop' to stop them.");
@@ -766,43 +769,49 @@ fn exit_code_for(status: std::process::ExitStatus) -> i32 {
     1
 }
 
-/// Swallow SIGINT, which the terminal already delivered to the service
-/// itself, and forward a SIGTERM aimed at fed to the service.
+/// Forward SIGINT, SIGTERM, and SIGHUP aimed at fed to the foreground
+/// service's process group, and keep waiting: the session ends when the
+/// service exits.
+///
+/// The service holds the terminal, so keystrokes never reach fed here;
+/// these arrive from `kill`, a closing terminal, or fed's own stdin not
+/// being a tty. fed's shell sees fed as the job, so a SIGHUP on hangup is
+/// only delivered to fed and has to be passed on by hand.
 #[cfg(unix)]
-fn spawn_foreground_signal_handling(child_pid: Option<u32>) -> tokio::task::JoinHandle<()> {
+fn spawn_foreground_signal_handling(child_pgid: Option<u32>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
         use tokio::signal::unix::{SignalKind, signal};
 
-        let mut sigint = signal(SignalKind::interrupt())
-            .inspect_err(|e| tracing::warn!("Failed to create SIGINT handler: {}", e))
-            .ok();
-        let mut sigterm = signal(SignalKind::terminate())
-            .inspect_err(|e| tracing::warn!("Failed to create SIGTERM handler: {}", e))
-            .ok();
+        let forwarded = [
+            (SignalKind::interrupt(), Signal::SIGINT),
+            (SignalKind::terminate(), Signal::SIGTERM),
+            (SignalKind::hangup(), Signal::SIGHUP),
+        ];
+        let mut streams = Vec::new();
+        for (kind, sig) in forwarded {
+            match signal(kind) {
+                Ok(stream) => streams.push((stream, sig)),
+                Err(e) => tracing::warn!("Failed to create {:?} handler: {}", sig, e),
+            }
+        }
+        let Some(pgid) = child_pgid.and_then(|p| i32::try_from(p).ok()) else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        if streams.is_empty() {
+            std::future::pending::<()>().await;
+            return;
+        }
 
         loop {
-            tokio::select! {
-                _ = async {
-                    if let Some(ref mut s) = sigint {
-                        s.recv().await
-                    } else {
-                        std::future::pending::<Option<()>>().await
-                    }
-                } => {}
-                _ = async {
-                    if let Some(ref mut s) = sigterm {
-                        s.recv().await
-                    } else {
-                        std::future::pending::<Option<()>>().await
-                    }
-                } => {
-                    if let Some(pid) = child_pid.and_then(|p| i32::try_from(p).ok()) {
-                        let _ = nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(pid),
-                            nix::sys::signal::Signal::SIGTERM,
-                        );
-                    }
-                }
+            let next = streams
+                .iter_mut()
+                .map(|(stream, sig)| Box::pin(async move { stream.recv().await.map(|_| *sig) }));
+            let (received, _, _) = futures::future::select_all(next).await;
+            if let Some(sig) = received {
+                let _ = killpg(Pid::from_raw(pgid), sig);
             }
         }
     })

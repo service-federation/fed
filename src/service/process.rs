@@ -61,8 +61,8 @@ pub struct ProcessService {
     grace_period: Duration,
     /// When the process was started (used to detect PID reuse in detached stop)
     started_at: Arc<SyncMutex<Option<DateTime<Utc>>>>,
-    /// Run this service in fed's own terminal and process group, with fed
-    /// waiting for it (`fed start -i`). See [`Self::run_in_foreground`].
+    /// Run this service in fed's terminal, with fed waiting for it
+    /// (`fed start -i`). See [`Self::run_in_foreground`].
     foreground: bool,
 }
 
@@ -97,7 +97,8 @@ impl ProcessService {
     }
 
     /// Run this service in the foreground: inherited stdio, no log capture,
-    /// no new process group, no crash window.
+    /// no crash window, and its own process group made the terminal's
+    /// foreground group (see [`super::foreground`]).
     ///
     /// Expects [`OutputMode::Passthrough`], which is what gives it inherited
     /// stdio and an inert [`LogCapture`].
@@ -282,13 +283,20 @@ impl ProcessService {
             }
         }
 
-        cmd.kill_on_drop(false); // Don't kill on drop to support detach mode
-        if !self.foreground {
-            // Create new process group for proper signal handling. The
-            // foreground service is the exception: it stays in fed's group,
-            // which is the terminal's foreground group, so it can read the
-            // tty without SIGTTIN and receives Ctrl+C directly.
-            cmd.process_group(0);
+        cmd.kill_on_drop(false) // Don't kill on drop to support detach mode
+            .process_group(0); // Create new process group for proper signal handling
+
+        // The foreground service's group becomes the terminal's foreground
+        // group before exec, so its first tty read never stops it with
+        // SIGTTIN and Ctrl+C reaches it rather than fed.
+        if self.foreground
+            && let Some(tty) = super::foreground::controlling_tty()
+        {
+            // SAFETY: the closure only changes a signal disposition and the
+            // terminal's foreground group, both async-signal-safe.
+            unsafe {
+                cmd.pre_exec(move || super::foreground::claim_terminal_in_child(tty));
+            }
         }
 
         // Apply resource limits on Unix systems
@@ -853,19 +861,36 @@ impl ServiceManager for ProcessService {
         // stop()/health() must fall back to the (now cleared) PID rather
         // than wait on an already-reaped handle.
         let child = self.process.lock().await.take();
-        let Some(mut child) = child else {
+        let Some(child) = child else {
             return Err(Error::Process(format!(
                 "Service '{}' has no foreground process to wait for",
                 self.name
             )));
         };
+        let Some(pid) = child.id() else {
+            return Err(Error::Process(format!(
+                "Service '{}' foreground process has already exited",
+                self.name
+            )));
+        };
 
-        let status = child.wait().await.map_err(|e| {
+        // A blocking wait with job control (see `super::foreground`), not
+        // `child.wait()`: stops and continues have to be relayed between
+        // the child and the shell. The tokio handle stays alive until the
+        // wait is over so tokio never reaps the child underneath it.
+        let tty = super::foreground::controlling_tty();
+        let status = tokio::task::spawn_blocking(move || {
+            super::foreground::wait_with_job_control(nix::unistd::Pid::from_raw(pid as i32), tty)
+        })
+        .await
+        .map_err(|e| Error::Process(format!("Foreground wait task failed: {}", e)))?
+        .map_err(|e| {
             Error::Process(format!(
                 "Failed to wait for foreground service '{}': {}",
                 self.name, e
             ))
         })?;
+        drop(child);
 
         *self.pid.lock() = None;
         *self.process_group_id.lock() = None;

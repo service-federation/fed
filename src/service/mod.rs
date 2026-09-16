@@ -23,6 +23,7 @@
 mod compose;
 mod docker;
 mod external;
+mod foreground;
 mod gradle;
 mod log_capture;
 mod oneshot;
