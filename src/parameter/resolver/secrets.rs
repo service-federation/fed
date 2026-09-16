@@ -2246,8 +2246,6 @@ mod tests {
         let cache_path = temp_dir.path().join(".fed/secrets.cache.env");
         std::fs::write(&cache_path, "API_KEY=left_by_an_older_fed\n").unwrap();
 
-        // No set_secret_cache call: this is what a resolver does when nothing
-        // (cloud.yaml, --secret-cache) selects a policy.
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
         assert_eq!(
@@ -2276,7 +2274,7 @@ mod tests {
         );
         assert!(
             !cache_path.exists(),
-            "the default policy must remove a file cache left by an older fed and never write one"
+            "default policy must remove a stale file cache and never write one"
         );
     }
 

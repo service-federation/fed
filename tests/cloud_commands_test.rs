@@ -66,9 +66,7 @@ fn cloud_config_memory_policy_removes_and_refuses_the_file_cache() {
     assert_memory_policy_for_link("org: acme\nproject: web\nsecret_cache: memory\n");
 }
 
-/// A cloud.yaml without a `secret_cache` key (written by an older fed, or
-/// hand-edited) gets the memory default: an existing file cache is removed and
-/// never consulted.
+/// A cloud.yaml without a `secret_cache` key gets the memory default.
 #[test]
 fn cloud_config_without_policy_defaults_to_memory() {
     assert_memory_policy_for_link("org: acme\nproject: web\n");

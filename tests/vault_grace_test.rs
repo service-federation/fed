@@ -119,8 +119,6 @@ fn cold_vault_with_fresh_cache_proceeds_within_grace_child() {
 
     let mut resolver = Resolver::new();
     resolver.set_work_dir(work_dir);
-    // The grace fallback reads the file cache, which is opt-in since memory
-    // became the default policy.
     resolver.set_secret_cache(fed::SecretCacheMode::File);
 
     let start = Instant::now();

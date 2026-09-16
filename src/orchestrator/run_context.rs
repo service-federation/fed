@@ -16,13 +16,10 @@ use std::collections::HashSet;
 #[serde(rename_all = "lowercase")]
 pub enum SecretCacheMode {
     /// Read and atomically update the owner-only `.fed/secrets.cache.env`
-    /// fallback used for offline starts. Opt-in via `secret_cache: file` in
-    /// `.fed/cloud.yaml` or `--secret-cache file`.
+    /// fallback used for offline starts. Opt-in.
     File,
     /// Resolve vault values for this invocation and its child processes only.
     /// Any existing vault cache is removed and no cache is read or written.
-    /// This is the default: a checkout whose `.fed/cloud.yaml` does not set
-    /// `secret_cache` never leaves plaintext vault values on disk.
     #[default]
     Memory,
     /// Removed in fed 7.7. Retained only so a `secret_cache: keychain` written

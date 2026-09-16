@@ -264,8 +264,6 @@ mod cloud_link_tests {
 
     #[test]
     fn link_without_policy_defaults_to_memory_cache() {
-        // A cloud.yaml that predates the `secret_cache` key, or simply omits
-        // it, gets the safe default: no plaintext vault cache on disk.
         let link: CloudLink = serde_yaml::from_str("org: acme\nproject: web\n").unwrap();
         assert_eq!(
             link.secret_cache,
