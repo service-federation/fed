@@ -44,7 +44,7 @@ pub use prune::run_prune;
 pub use restart::run_restart;
 pub use script::run_script;
 pub use secrets_cmd::run_secrets;
-pub use start::{StartOptions, run_start};
+pub use start::{StartOptions, resolve_foreground_target, run_start};
 pub use status::run_status;
 pub use stop::{run_stop, run_stop_from_state};
 pub use supervise::run_supervise;

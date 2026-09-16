@@ -133,6 +133,8 @@ pub struct Orchestrator {
     /// running from a previous start, must survive this run's failed start.
     /// Leaf lock: never held across an await or another lock acquisition.
     owned_services: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Service this invocation runs in the foreground (`fed start -i`).
+    pub(super) foreground: Option<String>,
 }
 
 impl Orchestrator {
@@ -192,6 +194,7 @@ impl Orchestrator {
             randomize_ports: false,
             isolation_id: None,
             owned_services: std::sync::Mutex::new(std::collections::HashSet::new()),
+            foreground: None,
         })
     }
 
@@ -227,6 +230,7 @@ impl Orchestrator {
             randomize_ports: false,
             isolation_id: None,
             owned_services: std::sync::Mutex::new(std::collections::HashSet::new()),
+            foreground: None,
         })
     }
 
@@ -264,6 +268,7 @@ impl Orchestrator {
             randomize_ports: false,
             isolation_id: None,
             owned_services: std::sync::Mutex::new(std::collections::HashSet::new()),
+            foreground: None,
         })
     }
 
@@ -423,6 +428,7 @@ impl Orchestrator {
         self.set_is_interactive(ctx.is_interactive);
         self.set_output_mode(ctx.output_mode);
         self.active_profiles = ctx.profiles.clone();
+        self.foreground = ctx.foreground.clone();
     }
 
     /// Build a `RunContext` describing this orchestrator's current session
@@ -440,6 +446,7 @@ impl Orchestrator {
             output_mode: self.output_mode,
             profiles: self.active_profiles.clone(),
             required_secret_names: self.get_required_secret_names(),
+            foreground: self.foreground.clone(),
         }
     }
 
@@ -1565,9 +1572,15 @@ impl Orchestrator {
             // (see `ServiceState::new`'s default), so this is not
             // load-bearing for the common case — but it's cheap and keeps
             // intent explicit at every place a service is confirmed started.
-            tracker
-                .set_desired_state(name, DesiredState::Running)
-                .await?;
+            //
+            // `Foreground` is neither running-by-intent nor stopped: a
+            // supervisor must neither restart nor stop such a service.
+            let desired = if self.foreground.as_deref() == Some(name) {
+                DesiredState::Foreground
+            } else {
+                DesiredState::Running
+            };
+            tracker.set_desired_state(name, desired).await?;
 
             tracker.update_service_status(name, Status::Running).await?;
 
@@ -1580,6 +1593,12 @@ impl Orchestrator {
 
         // Service is Running in DB — commit the guard so Drop won't unregister.
         registration.commit();
+
+        // The foreground service's caller waits for it to exit, not to
+        // become ready, and a poll here would print over its output.
+        if self.foreground.as_deref() == Some(name) {
+            return Ok(StartHealth::Unchecked);
+        }
 
         // If a healthcheck is registered, poll it before declaring the service ready.
         // This ensures services that crash immediately or need warmup time are detected
@@ -2326,6 +2345,39 @@ impl Orchestrator {
         Ok(manager.get_pid())
     }
 
+    /// The service this invocation runs in the foreground, if any.
+    pub fn foreground_service(&self) -> Option<&str> {
+        self.foreground.as_deref()
+    }
+
+    /// Wait for the foreground service (`fed start -i`) to exit and report
+    /// its exit status.
+    ///
+    /// The manager lock is held for the whole wait, so anything else this
+    /// process needs from the manager (its PID, for signal forwarding) has
+    /// to be read before the call.
+    pub async fn wait_foreground(&self, service_name: &str) -> Result<std::process::ExitStatus> {
+        let manager_arc = {
+            let services = self.services.read().await;
+            match services.get(service_name) {
+                Some(arc) => Arc::clone(arc),
+                None => return Err(Error::ServiceNotFound(service_name.to_string())),
+            }
+        };
+
+        let mut manager = manager_arc.lock().await;
+        manager.wait_foreground().await
+    }
+
+    /// Drop the exited foreground service's state row, releasing the ports
+    /// it held. Its dependencies keep running and keep their rows.
+    pub async fn unregister_foreground(&self, service_name: &str) -> Result<()> {
+        let mut tracker = self.state_tracker.write().await;
+        tracker.unregister_service(service_name).await?;
+        tracker.save().await?;
+        Ok(())
+    }
+
     /// Run a script non-interactively, capturing output.
     ///
     /// This is a top-level entry point: services started to satisfy the script's
@@ -2724,6 +2776,10 @@ impl Orchestrator {
     /// services; a restart already in flight when a partial `fed stop`
     /// wrote Stopped lands after the kill and leaves a live process the
     /// user asked to stop. Called from the supervisor's poll tick.
+    ///
+    /// Only an explicit `Stopped` qualifies. A `Foreground` row is a live
+    /// `fed start -i` session, and a row that is gone was already torn down
+    /// by whoever removed it.
     pub async fn stop_supervised_not_desired_running(&self) {
         let scope = super::monitoring::supervised_service_names(&self.config);
         if scope.is_empty() {
@@ -2738,7 +2794,8 @@ impl Orchestrator {
                 let live = statuses
                     .get(name)
                     .is_some_and(|s| !matches!(s, crate::service::Status::Stopped));
-                if live && !tracker.is_desired_running(name).await {
+                let desired = tracker.get_service(name).await.map(|s| s.desired_state);
+                if live && desired == Some(DesiredState::Stopped) {
                     to_stop.push(name.clone());
                 }
             }
@@ -3236,6 +3293,7 @@ mod tests {
             output_mode: OutputMode::Passthrough,
             profiles: vec!["a".to_string(), "b".to_string()],
             required_secret_names: Some(required_secret_names),
+            foreground: Some("svc".to_string()),
         };
 
         orchestrator.apply_run_context(&ctx);
@@ -3250,6 +3308,7 @@ mod tests {
             round_tripped.required_secret_names,
             ctx.required_secret_names
         );
+        assert_eq!(round_tripped.foreground, ctx.foreground);
     }
 
     // --- initialize_supervisor ---
@@ -3375,6 +3434,112 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// The supervisor's reconcile tick stops a live service the user
+    /// stopped, and must leave a live `fed start -i` session alone: a
+    /// `Foreground` row is owned by the terminal that started it, not by
+    /// the daemon.
+    #[tokio::test]
+    async fn test_reconcile_stops_stopped_rows_but_not_foreground_rows() {
+        use crate::config::{RestartPolicy, Service};
+        use crate::state::{DesiredState, ServiceState};
+
+        // Real children so the rows restore as live and the reconcile stop
+        // has something to signal. Their own process group: the stop path
+        // signals the group, which would otherwise be the test runner's.
+        use std::os::unix::process::CommandExt;
+        let mut foreground_child = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .expect("spawn foreground helper");
+        let mut stopped_child = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .expect("spawn stopped helper");
+        let foreground_pid = foreground_child.id();
+        let stopped_pid = stopped_child.id();
+
+        // A restart policy is what puts a service in the supervised scope.
+        let mut config = Config::default();
+        for name in ["fg", "bg"] {
+            config.services.insert(
+                name.to_string(),
+                Service {
+                    process: Some("sleep 300".to_string()),
+                    restart: Some(RestartPolicy::Always),
+                    // The helper children are never reaped here, so a
+                    // SIGTERMed one lingers as a zombie for the whole grace
+                    // period the stop path polls.
+                    grace_period: Some("500ms".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut orchestrator = Orchestrator::new(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        {
+            let mut tracker = orchestrator.state_tracker.write().await;
+            tracker.initialize().await.unwrap();
+            for (id, pid, desired_state) in [
+                ("fg", foreground_pid, DesiredState::Foreground),
+                ("bg", stopped_pid, DesiredState::Stopped),
+            ] {
+                tracker
+                    .register_service(ServiceState {
+                        id: id.to_string(),
+                        status: Status::Running,
+                        service_type: ServiceType::Process,
+                        pid: Some(pid),
+                        container_id: None,
+                        started_at: chrono::Utc::now(),
+                        external_repo: None,
+                        namespace: "root".to_string(),
+                        restart_count: 0,
+                        last_restart_at: None,
+                        consecutive_failures: 0,
+                        port_allocations: Default::default(),
+                        startup_message: None,
+                        desired_state,
+                        native_restart_enabled: false,
+                    })
+                    .await
+                    .unwrap();
+                tracker.set_desired_state(id, desired_state).await.unwrap();
+            }
+        }
+
+        // Attach managers to both rows, so `get_status_passive` sees them
+        // as live regardless of desired_state (the supervisor's own
+        // adoption filter is a separate defense, tested above).
+        orchestrator.create_services().await.unwrap();
+
+        orchestrator.stop_supervised_not_desired_running().await;
+
+        let rows = orchestrator.state_tracker.read().await.get_services().await;
+        assert!(
+            rows.contains_key("fg"),
+            "a Foreground row must survive the reconcile tick"
+        );
+        assert!(
+            !rows.contains_key("bg"),
+            "a Stopped row that is still alive must be stopped and unregistered"
+        );
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(foreground_pid as i32), None).is_ok(),
+            "the foreground service's process must still be running"
+        );
+
+        let _ = foreground_child.kill();
+        let _ = foreground_child.wait();
+        let _ = stopped_child.kill();
+        let _ = stopped_child.wait();
     }
 
     /// Direct test for the "crash-then-nobody-was-watching" half of Design

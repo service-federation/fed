@@ -61,6 +61,9 @@ pub struct ProcessService {
     grace_period: Duration,
     /// When the process was started (used to detect PID reuse in detached stop)
     started_at: Arc<SyncMutex<Option<DateTime<Utc>>>>,
+    /// Run this service in fed's own terminal and process group, with fed
+    /// waiting for it (`fed start -i`). See [`Self::run_in_foreground`].
+    foreground: bool,
 }
 
 impl ProcessService {
@@ -89,7 +92,18 @@ impl ProcessService {
             health_cache: Arc::new(tokio::sync::Mutex::new((None, Instant::now()))),
             grace_period,
             started_at: Arc::new(SyncMutex::new(None)),
+            foreground: false,
         }
+    }
+
+    /// Run this service in the foreground: inherited stdio, no log capture,
+    /// no new process group, no crash window.
+    ///
+    /// Expects [`OutputMode::Passthrough`], which is what gives it inherited
+    /// stdio and an inert [`LogCapture`].
+    pub fn run_in_foreground(mut self) -> Self {
+        self.foreground = true;
+        self
     }
 
     /// Restore PID from state (used when reattaching to detached processes)
@@ -268,8 +282,14 @@ impl ProcessService {
             }
         }
 
-        cmd.kill_on_drop(false) // Don't kill on drop to support detach mode
-            .process_group(0); // Create new process group for proper signal handling
+        cmd.kill_on_drop(false); // Don't kill on drop to support detach mode
+        if !self.foreground {
+            // Create new process group for proper signal handling. The
+            // foreground service is the exception: it stays in fed's group,
+            // which is the terminal's foreground group, so it can read the
+            // tty without SIGTTIN and receives Ctrl+C directly.
+            cmd.process_group(0);
+        }
 
         // Apply resource limits on Unix systems
         #[cfg(unix)]
@@ -460,8 +480,14 @@ impl ServiceManager for ProcessService {
                             let last_lines: Vec<&str> =
                                 lines.iter().rev().take(15).rev().cloned().collect();
                             if last_lines.is_empty() {
-                                "Log file is empty (process may have crashed before writing output)"
-                                    .to_string()
+                                format!(
+                                    "Log file is empty (process may have crashed before writing \
+                                     output).\n\nNote: background services have no stdin. A \
+                                     process that waits for terminal input, such as a shell or a \
+                                     REPL, exits as soon as 'fed start' launches it.\n\
+                                     Run it in the foreground with: fed start -i {}",
+                                    self.name
+                                )
                             } else {
                                 format!(
                                     "Last {} lines from logs:\n{}",
@@ -509,7 +535,7 @@ impl ServiceManager for ProcessService {
         // DX improvement: Wait briefly to catch immediate crashes and capture startup logs
         // This helps detect processes that fail within the first few hundred milliseconds
         // (Only in Captured/Passthrough modes - File mode has its own crash detection above)
-        if !self.output_mode.is_file() {
+        if !self.output_mode.is_file() && !self.foreground {
             tokio::time::sleep(Duration::from_millis(300)).await;
 
             // Check if the process is still alive
@@ -813,6 +839,39 @@ impl ServiceManager for ProcessService {
     fn get_pid(&self) -> Option<u32> {
         // Return stored PID (works for both detached and interactive mode)
         *self.pid.lock()
+    }
+
+    async fn wait_foreground(&mut self) -> Result<std::process::ExitStatus> {
+        if !self.foreground {
+            return Err(Error::Validation(format!(
+                "Service '{}' is not running in the foreground",
+                self.name
+            )));
+        }
+
+        // Taken out of the option: the child is reaped here, so a later
+        // stop()/health() must fall back to the (now cleared) PID rather
+        // than wait on an already-reaped handle.
+        let child = self.process.lock().await.take();
+        let Some(mut child) = child else {
+            return Err(Error::Process(format!(
+                "Service '{}' has no foreground process to wait for",
+                self.name
+            )));
+        };
+
+        let status = child.wait().await.map_err(|e| {
+            Error::Process(format!(
+                "Failed to wait for foreground service '{}': {}",
+                self.name, e
+            ))
+        })?;
+
+        *self.pid.lock() = None;
+        *self.process_group_id.lock() = None;
+        self.base.write().set_status(Status::Stopped);
+
+        Ok(status)
     }
 
     fn get_process_group_id(&self) -> Option<u32> {

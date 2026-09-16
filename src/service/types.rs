@@ -410,6 +410,15 @@ pub trait ServiceManager: Send + Sync {
     /// Get the service name/identifier.
     fn name(&self) -> &str;
 
+    /// Wait for a service started in the foreground (`fed start -i`) to
+    /// exit. Only a process service holding an inherited-stdio child can.
+    async fn wait_foreground(&mut self) -> Result<std::process::ExitStatus> {
+        Err(crate::error::Error::Validation(format!(
+            "Service '{}' is not running in the foreground",
+            self.name()
+        )))
+    }
+
     /// Get service logs (if available)
     async fn logs(&self, _tail: Option<usize>) -> Result<Vec<String>> {
         // Default implementation returns empty logs
