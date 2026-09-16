@@ -163,16 +163,16 @@ async fn run() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // `fed supervise` ignores SIGHUP at the very start, before anything
-    // else runs — this is what lets the daemon survive terminal close.
-    // Unlike a user `process:` command (which needs the `nohup bash -c`
-    // shell-wrapper trick because it's an opaque shell string), `supervise`
-    // is fed's own binary, so it can just ignore the signal directly rather
-    // than needing a wrapping shell.
+    // The detached commands (`fed supervise`, `fed host`) ignore SIGHUP at
+    // the very start, before anything else runs, which is what lets them
+    // survive terminal close. Unlike a user `process:` command (which needs
+    // the `nohup bash -c` shell-wrapper trick because it's an opaque shell
+    // string), they are fed's own binary, so they can just ignore the
+    // signal directly rather than needing a wrapping shell.
     // Placed here, immediately after argv parsing and before tracing/config
     // I/O, so there's no window where a terminal-close SIGHUP could still
     // reach the default handler.
-    if matches!(cli.command, Commands::Supervise) {
+    if is_daemon_command(&cli.command) {
         #[cfg(unix)]
         unsafe {
             let _ = nix::sys::signal::signal(
@@ -196,16 +196,17 @@ async fn run() -> anyhow::Result<()> {
 
     // Initialize tracing and output
     let is_tui = matches!(cli.command, Commands::Tui { .. });
-    let is_supervise = matches!(cli.command, Commands::Supervise);
+    // Detached commands have no terminal to print to, so their tracing
+    // output goes to a file under `.fed/logs/` instead.
+    let daemon_log = match &cli.command {
+        Commands::Supervise => Some("supervisor.log".to_string()),
+        #[cfg(unix)]
+        Commands::Host { service } => Some(format!("{}-host.log", service)),
+        _ => None,
+    };
     let is_tty = std::io::stderr().is_terminal();
     let is_interactive = std::io::stdin().is_terminal();
-    init_tracing(
-        is_tui,
-        is_supervise,
-        cli.workdir.clone(),
-        cli.verbose,
-        is_tty,
-    )?;
+    init_tracing(is_tui, daemon_log, cli.workdir.clone(), cli.verbose, is_tty)?;
     let out = output::CliOutput::new(is_tty);
 
     // Session-scoped run settings, threaded through every command and into
@@ -223,6 +224,7 @@ async fn run() -> anyhow::Result<()> {
         output_mode: OutputMode::default(),
         profiles: cli.profile.clone(),
         required_secret_names: None,
+        foreground: None,
     };
 
     // ── Tier 1: Commands that need NO config ──────────────────────────
@@ -348,6 +350,19 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }
+        #[cfg(unix)]
+        Commands::Host { service } => {
+            let config = parser.load_config(&config_path)?;
+            let work_dir = resolve_work_dir(cli.workdir, &config_path)?;
+            return commands::run_host(&config, &work_dir, service);
+        }
+        // The client needs a socket path, which needs the work dir. The
+        // config itself is the host's business, not the client's.
+        #[cfg(unix)]
+        Commands::Attach { service } => {
+            let work_dir = resolve_work_dir(cli.workdir, &config_path)?;
+            return commands::run_attach(&work_dir, service);
+        }
         Commands::Debug(debug_cmd) => {
             let config = parser.load_config(&config_path)?;
             let work_dir = resolve_work_dir(cli.workdir, &config_path)?;
@@ -410,6 +425,21 @@ async fn run() -> anyhow::Result<()> {
         .or_else(|| fed::cloud::load_link(&work_dir).map(|link| link.secret_cache))
         .unwrap_or_default()
         .effective();
+
+    // Resolved before the start lock and any orchestrator, so a rejected
+    // `fed start -i` leaves the stack untouched.
+    if let Commands::Start {
+        interactive: true,
+        services,
+        ..
+    } = &cli.command
+    {
+        run_context.foreground = Some(commands::resolve_foreground_target(
+            &config,
+            services,
+            &cli.profile,
+        )?);
+    }
 
     // Parameter resolution and service registration are two separate phases.
     // Serialize real `fed start` invocations before either phase so concurrent
@@ -591,11 +621,12 @@ async fn run() -> anyhow::Result<()> {
             watch,
             replace,
             output: _,
+            interactive: _,
             dry_run,
             isolate: _,
             jobs,
         } => {
-            commands::run_start(
+            let exit_code = commands::run_start(
                 &mut orchestrator,
                 &config,
                 services,
@@ -612,6 +643,15 @@ async fn run() -> anyhow::Result<()> {
                 &out,
             )
             .await?;
+
+            // Every state write is already committed, so exiting here
+            // only skips the remaining drops.
+            if let Some(code) = exit_code {
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().flush();
+                std::process::exit(code);
+            }
         }
         Commands::Stop { services } => {
             commands::run_stop(&mut orchestrator, &config, services, &out).await?;
@@ -769,9 +809,23 @@ async fn run() -> anyhow::Result<()> {
         | Commands::Supervise => {
             unreachable!("handled in earlier dispatch tiers");
         }
+        #[cfg(unix)]
+        Commands::Host { .. } | Commands::Attach { .. } => {
+            unreachable!("handled in earlier dispatch tiers");
+        }
     }
 
     Ok(())
+}
+
+/// True for the subcommands that run detached from the caller's terminal
+/// and must therefore ignore SIGHUP and log to a file.
+fn is_daemon_command(command: &Commands) -> bool {
+    #[cfg(unix)]
+    if matches!(command, Commands::Host { .. }) {
+        return true;
+    }
+    matches!(command, Commands::Supervise)
 }
 
 /// Resolve the work directory from CLI `--workdir` or the config file's parent directory.
@@ -801,15 +855,15 @@ fn resolve_work_dir(
 
 fn init_tracing(
     is_tui: bool,
-    is_supervise: bool,
+    daemon_log: Option<String>,
     workdir: Option<PathBuf>,
     verbose: bool,
     is_tty: bool,
 ) -> anyhow::Result<()> {
-    if is_supervise {
-        // The supervisor daemon has no attached terminal to print to —
-        // logs go to `.fed/logs/supervisor.log`, matching the existing
-        // per-service log convention.
+    if let Some(daemon_log) = daemon_log {
+        // A detached daemon has no attached terminal to print to, so logs
+        // go to `.fed/logs/<daemon>.log`, matching the existing per-service
+        // log convention.
         // `--workdir` is always passed explicitly by `spawn_if_needed`
         // (the only thing that ever spawns `fed supervise`), so this is
         // reliable; a bare manual invocation without `--workdir` falls back
@@ -818,7 +872,7 @@ fn init_tracing(
         let log_dir = work_dir.join(".fed").join("logs");
         std::fs::create_dir_all(&log_dir)?;
 
-        let log_path = log_dir.join("supervisor.log");
+        let log_path = log_dir.join(daemon_log);
         let log_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

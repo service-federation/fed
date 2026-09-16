@@ -76,6 +76,53 @@ pub fn ensure_fed_dir(work_dir: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Longest path a `sockaddr_un` can hold on this platform, excluding the
+/// terminating NUL: 103 bytes on macOS, 107 on Linux.
+#[cfg(unix)]
+pub fn max_socket_path_len() -> usize {
+    std::mem::size_of::<nix::libc::sockaddr_un>()
+        - std::mem::offset_of!(nix::libc::sockaddr_un, sun_path)
+        - 1
+}
+
+/// Where the attach host for `service` listens.
+///
+/// `.fed/attach/<service>.sock` keeps the socket with the rest of the
+/// checkout's state, but a unix socket path has to fit in `sun_path`, and a
+/// realistic workspace path plus `.fed/attach/` often does not (measured:
+/// a 135-character workspace under macOS's per-user `$TMPDIR` produces a
+/// 161-byte socket path against a 103-byte limit). When it does not fit,
+/// fall back to a short path under `$TMPDIR` keyed by a hash of the work
+/// dir. Both sides of the socket call this, so they agree without having to
+/// store the path anywhere.
+#[cfg(unix)]
+pub fn attach_socket_path(work_dir: &Path, service: &str) -> PathBuf {
+    let file = format!("{}.sock", sanitize_service_name(service));
+    let in_checkout = fed_dir(work_dir).join("attach").join(&file);
+    if in_checkout.as_os_str().len() <= max_socket_path_len() {
+        return in_checkout;
+    }
+    std::env::temp_dir()
+        .join(format!("fed-{}", crate::service::hash_work_dir(work_dir)))
+        .join(file)
+}
+
+/// Service names reach the filesystem here, so restrict them the same way
+/// the log file name does in `orchestrator::factory`.
+#[cfg(unix)]
+fn sanitize_service_name(service: &str) -> String {
+    service
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +145,33 @@ mod tests {
         ensure_fed_dir(tmp.path()).unwrap();
         let content = std::fs::read_to_string(&gi).unwrap();
         assert!(content.contains("!extra.yaml"), "user edits must survive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn short_workspace_keeps_the_socket_in_the_checkout() {
+        let path = attach_socket_path(Path::new("/w"), "echo-svc");
+        assert_eq!(path, PathBuf::from("/w/.fed/attach/echo-svc.sock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deep_workspace_moves_the_socket_under_tmpdir() {
+        let deep = PathBuf::from("/w").join("x".repeat(max_socket_path_len()));
+        let path = attach_socket_path(&deep, "echo-svc");
+        assert!(
+            path.starts_with(std::env::temp_dir()),
+            "expected a $TMPDIR fallback, got {}",
+            path.display()
+        );
+        assert!(path.as_os_str().len() <= max_socket_path_len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_file_name_cannot_escape_its_directory() {
+        let path = attach_socket_path(Path::new("/w"), "../../etc/x");
+        assert_eq!(path, PathBuf::from("/w/.fed/attach/______etc_x.sock"));
     }
 
     #[test]

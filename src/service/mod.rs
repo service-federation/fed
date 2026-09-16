@@ -27,6 +27,8 @@ mod gradle;
 mod log_capture;
 mod oneshot;
 mod process;
+#[cfg(unix)]
+pub mod pty;
 mod resources;
 mod types;
 
