@@ -98,7 +98,7 @@ impl ProcessService {
 
     /// Run this service in the foreground: inherited stdio, no log capture,
     /// no crash window, and its own process group made the terminal's
-    /// foreground group (see [`super::foreground`]).
+    /// foreground group (see the `foreground` module).
     ///
     /// Expects [`OutputMode::Passthrough`], which is what gives it inherited
     /// stdio and an inert [`LogCapture`].
