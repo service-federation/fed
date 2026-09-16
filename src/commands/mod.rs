@@ -1,9 +1,13 @@
+#[cfg(unix)]
+mod attach;
 mod auth;
 mod build;
 mod clean;
 mod debug;
 mod docker;
 mod doctor;
+#[cfg(unix)]
+mod host;
 mod init;
 mod install;
 mod isolate;
@@ -27,12 +31,16 @@ mod workspace;
 
 pub(crate) mod suggest;
 
+#[cfg(unix)]
+pub use attach::run_attach;
 pub use auth::{run_login, run_logout, run_whoami};
 pub use build::run_build;
 pub use clean::run_clean;
 pub use debug::{DebugCommand, run_debug};
 pub use docker::{run_docker_build, run_docker_push};
 pub use doctor::run_doctor;
+#[cfg(unix)]
+pub use host::run_host;
 pub use init::run_init;
 pub use install::run_install;
 pub use isolate::run_isolate;

@@ -267,6 +267,24 @@ pub enum Commands {
     /// of `--help`/normal discovery.
     #[command(hide = true)]
     Supervise,
+
+    /// Internal (spike): own a service's pty and serve it over a unix
+    /// socket for `fed attach`. Unix only.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    Host {
+        /// Service to host
+        service: String,
+    },
+
+    /// Connect this terminal to a hosted service's pty (spike). Detach
+    /// with ctrl-p ctrl-q. Unix only.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    Attach {
+        /// Service to attach to
+        service: String,
+    },
 }
 
 #[derive(Subcommand)]
