@@ -936,6 +936,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_test_vault_values(HashMap::from([(
             "STRIPE_KEY".to_string(),
             "sk_test_from_vault".to_string(),
@@ -982,6 +983,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         // Vault reachable but has no value for this name
         resolver.set_test_vault_values(HashMap::new());
 
@@ -1036,6 +1038,7 @@ mod tests {
         // First run: online, vault supplies the value → cached.
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_test_vault_values(HashMap::from([(
             "API_KEY".to_string(),
             "vault_value".to_string(),
@@ -1047,6 +1050,7 @@ mod tests {
         // Second run: offline — the cache alone must resolve it.
         let mut offline_resolver = Resolver::new();
         offline_resolver.set_work_dir(temp_dir.path());
+        offline_resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         offline_resolver.set_offline(true);
         let mut config = make_config();
         offline_resolver.resolve_parameters(&mut config).unwrap();
@@ -1081,6 +1085,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
 
         let mut config = Config::default();
         config.parameters.insert(
@@ -1120,6 +1125,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
 
         let mut config = Config::default();
         config.parameters.insert(
@@ -1242,6 +1248,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_test_vault_failure("cloud: cannot reach https://app.service-federation.com");
 
         let mut config = Config::default();
@@ -1291,6 +1298,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_test_vault_values(HashMap::from([(
             "API_KEY".to_string(),
             "vault-value".to_string(),
@@ -1330,6 +1338,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_test_vault_values(HashMap::from([(
             "API_KEY".to_string(),
             "vault-value".to_string(),
@@ -1376,6 +1385,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_test_vault_values(HashMap::from([
             ("API_KEY".to_string(), "vault-api-key".to_string()),
             ("OTHER_KEY".to_string(), "vault-other-key".to_string()),
@@ -1431,6 +1441,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_test_vault_values(HashMap::from([(
             "API_KEY".to_string(),
             "vault-value".to_string(),
@@ -1464,6 +1475,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_test_vault_values(HashMap::from([(
             "API_KEY".to_string(),
             "fresh".to_string(),
@@ -1500,6 +1512,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         // Scope excludes STRIPE_SECRET entirely.
         resolver.set_required_names(Some(HashSet::new()));
         // If anything were queried, this failure would surface — it must not.
@@ -1797,6 +1810,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_required_names(Some(HashSet::from(["API_KEY".to_string()])));
         resolver.set_test_vault_values(HashMap::from([
             ("API_KEY".to_string(), "from_vault".to_string()),
@@ -1848,6 +1862,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_required_names(Some(HashSet::from(["API_KEY".to_string()])));
         resolver.set_test_vault_values(HashMap::from([(
             "API_KEY".to_string(),
@@ -1977,6 +1992,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_test_vault_values(HashMap::from([(
             "API_KEY".to_string(),
             "rotated_value".to_string(),
@@ -2021,6 +2037,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_test_vault_values(HashMap::from([(
             "API_KEY".to_string(),
             "fresh".to_string(),
@@ -2066,6 +2083,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_offline(true);
 
         let mut config = Config::default();
@@ -2100,6 +2118,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_test_vault_values(HashMap::from([(
             "API_KEY".to_string(),
             "vault_value".to_string(),
@@ -2148,6 +2167,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_test_vault_values(HashMap::from([(
             "API_KEY".to_string(),
             "vault_value".to_string(),
@@ -2195,6 +2215,7 @@ mod tests {
 
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
         resolver.set_offline(true);
 
         let mut config = Config::default();
@@ -2212,6 +2233,50 @@ mod tests {
         assert!(
             !temp_dir.path().join(".fed/secrets.cache.env").exists(),
             "unsafe cache file must be deleted"
+        );
+    }
+
+    #[test]
+    fn default_policy_is_memory_and_never_writes_a_file_cache() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+        let cache_path = temp_dir.path().join(".fed/secrets.cache.env");
+        std::fs::write(&cache_path, "API_KEY=left_by_an_older_fed\n").unwrap();
+
+        // No set_secret_cache call: this is what a resolver does when nothing
+        // (cloud.yaml, --secret-cache) selects a policy.
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        assert_eq!(
+            resolver.get_secret_cache(),
+            crate::orchestrator::SecretCacheMode::Memory
+        );
+        resolver.set_test_vault_values(HashMap::from([(
+            "API_KEY".to_string(),
+            "vault_value".to_string(),
+        )]));
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(
+            resolver.get_resolved_parameters().get("API_KEY").unwrap(),
+            "vault_value"
+        );
+        assert!(
+            !cache_path.exists(),
+            "the default policy must remove a file cache left by an older fed and never write one"
         );
     }
 

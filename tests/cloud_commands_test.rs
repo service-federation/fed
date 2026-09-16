@@ -53,7 +53,7 @@ fn test_link_writes_cloud_yaml() {
     let written = std::fs::read_to_string(tmp.path().join(".fed/cloud.yaml")).unwrap();
     assert!(written.contains("org: acme"));
     assert!(written.contains("project: web"));
-    assert!(written.contains("secret_cache: file"));
+    assert!(written.contains("secret_cache: memory"));
 
     // fed self-manages .fed/.gitignore: everything ignored except cloud.yaml
     // (and the .gitignore itself).
@@ -63,13 +63,21 @@ fn test_link_writes_cloud_yaml() {
 
 #[test]
 fn cloud_config_memory_policy_removes_and_refuses_the_file_cache() {
+    assert_memory_policy_for_link("org: acme\nproject: web\nsecret_cache: memory\n");
+}
+
+/// A cloud.yaml without a `secret_cache` key (written by an older fed, or
+/// hand-edited) gets the memory default: an existing file cache is removed and
+/// never consulted.
+#[test]
+fn cloud_config_without_policy_defaults_to_memory() {
+    assert_memory_policy_for_link("org: acme\nproject: web\n");
+}
+
+fn assert_memory_policy_for_link(cloud_yaml: &str) {
     let tmp = TempDir::new().unwrap();
     std::fs::create_dir_all(tmp.path().join(".fed")).unwrap();
-    std::fs::write(
-        tmp.path().join(".fed/cloud.yaml"),
-        "org: acme\nproject: web\nsecret_cache: memory\n",
-    )
-    .unwrap();
+    std::fs::write(tmp.path().join(".fed/cloud.yaml"), cloud_yaml).unwrap();
     std::fs::write(
         tmp.path().join(".fed/secrets.cache.env"),
         "API_KEY=must_not_be_used\n",
