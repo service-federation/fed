@@ -263,8 +263,18 @@ mod cloud_link_tests {
     use super::*;
 
     #[test]
-    fn legacy_link_defaults_to_file_cache() {
+    fn link_without_policy_defaults_to_memory_cache() {
         let link: CloudLink = serde_yaml::from_str("org: acme\nproject: web\n").unwrap();
+        assert_eq!(
+            link.secret_cache,
+            crate::orchestrator::SecretCacheMode::Memory
+        );
+    }
+
+    #[test]
+    fn file_cache_is_an_explicit_opt_in() {
+        let link: CloudLink =
+            serde_yaml::from_str("org: acme\nproject: web\nsecret_cache: file\n").unwrap();
         assert_eq!(
             link.secret_cache,
             crate::orchestrator::SecretCacheMode::File

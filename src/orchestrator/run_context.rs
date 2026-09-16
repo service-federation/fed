@@ -16,11 +16,11 @@ use std::collections::HashSet;
 #[serde(rename_all = "lowercase")]
 pub enum SecretCacheMode {
     /// Read and atomically update the owner-only `.fed/secrets.cache.env`
-    /// fallback used for offline starts.
-    #[default]
+    /// fallback used for offline starts. Opt-in.
     File,
     /// Resolve vault values for this invocation and its child processes only.
     /// Any existing vault cache is removed and no cache is read or written.
+    #[default]
     Memory,
     /// Removed in fed 7.7. Retained only so a `secret_cache: keychain` written
     /// by fed 7.6.x still parses instead of failing the whole `.fed/cloud.yaml`
@@ -44,9 +44,9 @@ impl SecretCacheMode {
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| {
                     tracing::warn!(
-                        "secret_cache: keychain was removed — falling back to memory mode, so \
-                         vault values are not persisted and offline starts won't have them. \
-                         Set `secret_cache: file` in .fed/cloud.yaml (or drop the key) to \
+                        "secret_cache: keychain was removed — falling back to memory mode (now \
+                         the default), so vault values are not persisted and offline starts \
+                         won't have them. Set `secret_cache: file` in .fed/cloud.yaml to \
                          restore an offline fallback; `fed link` rewrites the file for you. \
                          Any credential-store items fed already wrote are left in place; \
                          remove them with `security delete-generic-password -s \

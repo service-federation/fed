@@ -28,6 +28,7 @@ pub struct Cli {
     pub offline: bool,
 
     /// Override `.fed/cloud.yaml`'s team-vault cache policy for this invocation
+    /// (memory unless the linked project sets `secret_cache: file`)
     #[arg(long, global = true, value_enum)]
     pub secret_cache: Option<SecretCacheMode>,
 

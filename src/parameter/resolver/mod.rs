@@ -185,7 +185,7 @@ impl Resolver {
             prefer_config_defaults: true,
             is_interactive: false,
             offline: false,
-            secret_cache: crate::orchestrator::SecretCacheMode::File,
+            secret_cache: crate::orchestrator::SecretCacheMode::default(),
             test_vault_values: None,
             test_vault_failure: None,
             required_names: None,
