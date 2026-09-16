@@ -240,17 +240,17 @@ impl ProcessService {
             if let Some(log_path) = self.log_capture.log_file_path() {
                 cmd.arg(log_path.to_string_lossy().into_owned()); // $2 for the outer script
             }
-        } else if process_cmd.contains('\n') {
-            // Non-detached, multi-line script: `exec` would replace the shell with
-            // only the FIRST command (the rest of the script would never run, and
-            // when that command exited the process would look like it crashed on
-            // startup). Run the script directly instead. stop() kills the whole
-            // process group (set via process_group(0) below), so children still go.
-            cmd.arg("-ec").arg(process_cmd);
         } else {
-            // Non-detached, single-line: exec replaces the shell so the process's
-            // PID is the real command rather than a wrapper bash.
-            cmd.arg("-ec").arg(format!("exec {}", process_cmd));
+            // Non-detached: hand bash the command as written. For a single
+            // simple command bash execs it in place, so the PID fed tracks
+            // is the real program. Anything else (`a && b`, pipelines,
+            // multi-line scripts) keeps bash as the parent; stop() signals
+            // the process group, so its children go with it. fed used to
+            // prefix single-line commands with `exec` itself, which turned
+            // `mkdir -p data && cargo run` into an exec of mkdir alone:
+            // the rest of the line never ran and the service exited 0 at
+            // once.
+            cmd.arg("-ec").arg(process_cmd);
         }
 
         cmd.current_dir(&work_dir)
@@ -2043,6 +2043,72 @@ mod tests {
             "backtick command substitution should still run and produce \
              two words (year + 'static'), got: {:?}",
             logs
+        );
+
+        service.stop().await.expect("stop should succeed");
+    }
+
+    /// A compound one-liner in a non-file mode must run in full. fed used
+    /// to prefix single-line commands with `exec`, so `mkdir && sleep`
+    /// exec'd mkdir alone and the service was gone before it began.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_compound_one_liner_runs_past_its_first_command() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let marker = temp_dir.path().join("made");
+        let config = crate::config::Service {
+            process: Some(format!("mkdir -p {} && sleep 30", marker.display())),
+            ..Default::default()
+        };
+        let mut service = ProcessService::new(
+            "test-service".to_string(),
+            config,
+            HashMap::new(),
+            temp_dir.path().to_string_lossy().into_owned(),
+            OutputMode::Captured,
+            None,
+        );
+
+        service.start().await.expect("start should succeed");
+        assert!(marker.is_dir(), "the first command must have run");
+        assert!(
+            service.health().await.unwrap_or(false),
+            "the service must still be alive on its second command"
+        );
+
+        service.stop().await.expect("stop should succeed");
+    }
+
+    /// A single simple command in a non-file mode is exec'd by bash, so the
+    /// tracked PID is the program itself rather than a wrapper shell.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_simple_command_pid_is_the_program() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = crate::config::Service {
+            process: Some("sleep 30".to_string()),
+            ..Default::default()
+        };
+        let mut service = ProcessService::new(
+            "test-service".to_string(),
+            config,
+            HashMap::new(),
+            temp_dir.path().to_string_lossy().into_owned(),
+            OutputMode::Captured,
+            None,
+        );
+
+        service.start().await.expect("start should succeed");
+        let pid = service.get_pid().expect("a pid");
+        let comm = tokio::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .await
+            .expect("ps");
+        let comm = String::from_utf8_lossy(&comm.stdout).trim().to_string();
+        assert!(
+            comm.ends_with("sleep"),
+            "tracked pid should be the program, got {comm:?}"
         );
 
         service.stop().await.expect("stop should succeed");
