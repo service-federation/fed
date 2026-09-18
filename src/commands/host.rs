@@ -1,6 +1,6 @@
 //! `fed host <service>`: the per-service pty host.
 //!
-//! Spike-only. The host owns one service's pty for the service's whole
+//! Prototype only. The host owns one service's pty for the service's whole
 //! lifetime: it tees everything the service writes to the service's log file
 //! and to every attached client, and forwards client input back to the pty.
 //! It exits when the service exits.

@@ -1,6 +1,6 @@
 //! `fed attach <service>`: connect this terminal to a hosted service.
 //!
-//! Spike-only. Puts the terminal in raw mode, pumps raw bytes to and from
+//! Prototype only. Puts the terminal in raw mode, pumps raw bytes to and from
 //! the host's unix socket, and detaches on Ctrl-P Ctrl-Q.
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
