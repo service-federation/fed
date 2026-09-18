@@ -874,7 +874,7 @@ pub fn resolve_foreground_target(
     let kind = service.service_type();
     if kind != ServiceType::Process {
         let mut msg = format!(
-            "'{}' is a {} service. Only a process service can run in your terminal.",
+            "'{}' is a {} service. Only a process service can run interactively.",
             name, kind
         );
         let mut process_services: Vec<&str> = config
@@ -896,7 +896,7 @@ pub fn resolve_foreground_target(
     Ok(name)
 }
 
-const ONE_AT_A_TIME: &str = "Only one service can run in your terminal at a time.";
+const ONE_AT_A_TIME: &str = "Only one service can run interactively at a time.";
 
 fn named_foreground_target(config: &Config, services: &[String]) -> anyhow::Result<String> {
     let targets = config.expand_service_selection(services);
@@ -908,7 +908,7 @@ fn named_foreground_target(config: &Config, services: &[String]) -> anyhow::Resu
             if !tags.is_empty() {
                 msg.push_str(&format!(" Tags in this config: {}.", tags.join(", ")));
             }
-            msg.push_str(" Pick a service to run in your terminal: fed start -i <service>");
+            msg.push_str(" Pick a service to run interactively: fed start -i <service>");
             anyhow::bail!(msg)
         }
         [first, ..] => {
@@ -919,7 +919,7 @@ fn named_foreground_target(config: &Config, services: &[String]) -> anyhow::Resu
                 _ => format!("You gave {} services", targets.len()),
             };
             anyhow::bail!(
-                "{}: {}. {} Start the rest with 'fed start' and pick one for the terminal: \
+                "{}: {}. {} Start the rest with 'fed start' and pick one to run interactively: \
                  fed start -i {}",
                 given,
                 targets.join(", "),
@@ -939,7 +939,7 @@ fn entrypoint_foreground_target(config: &Config) -> anyhow::Result<String> {
         [name] => name.clone(),
         [] => anyhow::bail!(
             "No service given and no entrypoint configured.\n\n\
-             Run a service in your terminal with 'fed start -i <service>' or set an \
+             Run a service interactively with 'fed start -i <service>' or set an \
              'entrypoint:' in your config.{}",
             configured_services_list(config)
         ),
@@ -969,14 +969,14 @@ fn entrypoint_foreground_target(config: &Config) -> anyhow::Result<String> {
         match deps.first() {
             Some(first) => anyhow::bail!(
                 "Entrypoint '{}' has no process of its own. It only groups other services \
-                 ({}), so there is nothing to run in your terminal. Pick one: fed start -i {}",
+                 ({}), so there is nothing to run interactively. Pick one: fed start -i {}",
                 name,
                 deps.join(", "),
                 first
             ),
             None => anyhow::bail!(
-                "Entrypoint '{}' has no process of its own, so there is nothing to run in \
-                 your terminal. Pick a process service: fed start -i <service>",
+                "Entrypoint '{}' has no process of its own, so there is nothing to run \
+                 interactively. Pick a process service: fed start -i <service>",
                 name
             ),
         }
@@ -2065,8 +2065,8 @@ services:
             .expect_err("two targets must be rejected");
         assert_eq!(
             err.to_string(),
-            "You gave 2 services: shell, worker. Only one service can run in your terminal \
-             at a time. Start the rest with 'fed start' and pick one for the terminal: \
+            "You gave 2 services: shell, worker. Only one service can run interactively \
+             at a time. Start the rest with 'fed start' and pick one to run interactively: \
              fed start -i shell"
         );
     }
@@ -2093,9 +2093,9 @@ services:
             .expect_err("a tag with two members is not one target");
         assert_eq!(
             err.to_string(),
-            "Tag '@backend' matches 2 services: api, worker. Only one service can run in \
-             your terminal at a time. Start the rest with 'fed start' and pick one for the \
-             terminal: fed start -i api"
+            "Tag '@backend' matches 2 services: api, worker. Only one service can run interactively \
+             at a time. Start the rest with 'fed start' and pick one to run \
+             interactively: fed start -i api"
         );
     }
 
@@ -2106,7 +2106,7 @@ services:
         assert_eq!(
             err.to_string(),
             "No service matches '@frontend'. Tags in this config: @async, @backend. \
-             Pick a service to run in your terminal: fed start -i <service>"
+             Pick a service to run interactively: fed start -i <service>"
         );
     }
 
@@ -2172,8 +2172,8 @@ services:
             .expect_err("several entrypoints are not one target");
         assert_eq!(
             err.to_string(),
-            "This config has 2 entrypoints: shell, worker. Only one service can run in your \
-             terminal at a time. Pick one: fed start -i shell"
+            "This config has 2 entrypoints: shell, worker. Only one service can run interactively \
+             at a time. Pick one: fed start -i shell"
         );
     }
 
@@ -2197,7 +2197,7 @@ services:
         assert_eq!(
             err.to_string(),
             "Entrypoint 'dev' has no process of its own. It only groups other services \
-             (model, next), so there is nothing to run in your terminal. Pick one: \
+             (model, next), so there is nothing to run interactively. Pick one: \
              fed start -i model"
         );
     }
@@ -2216,7 +2216,7 @@ services:
             .expect_err("docker entrypoints are out of scope for interactive mode");
         assert_eq!(
             err.to_string(),
-            "'db' is a docker service. Only a process service can run in your terminal."
+            "'db' is a docker service. Only a process service can run interactively."
         );
     }
 
@@ -2226,7 +2226,7 @@ services:
             .expect_err("docker services are out of scope for interactive mode");
         assert_eq!(
             err.to_string(),
-            "'db' is a docker service. Only a process service can run in your terminal. \
+            "'db' is a docker service. Only a process service can run interactively. \
              Process services in this config: shell, worker."
         );
     }
