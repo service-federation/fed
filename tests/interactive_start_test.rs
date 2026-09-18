@@ -360,7 +360,7 @@ services:
 
     assert!(!output.status.success(), "two targets must fail");
     assert!(
-        stderr.contains("interactive mode runs a single service"),
+        stderr.contains("Only one service can run interactively at a time"),
         "expected the usage error, got:\n{stderr}"
     );
 
