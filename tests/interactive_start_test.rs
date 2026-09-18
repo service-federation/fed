@@ -360,7 +360,7 @@ services:
 
     assert!(!output.status.success(), "two targets must fail");
     assert!(
-        stderr.contains("fed start -i needs one service"),
+        stderr.contains("Only one service can run in your terminal at a time"),
         "expected the usage error, got:\n{stderr}"
     );
 

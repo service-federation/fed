@@ -65,14 +65,7 @@ pub async fn run_start(
                  Start a specific service with 'fed start <service>' or set an \
                  'entrypoint:' in your config.",
             );
-            if !config.services.is_empty() {
-                msg.push_str("\n\nConfigured services:");
-                let mut names: Vec<_> = config.services.keys().collect();
-                names.sort();
-                for name in names {
-                    msg.push_str(&format!("\n  - {}", name));
-                }
-            }
+            msg.push_str(&configured_services_list(config));
             out.status(&msg);
             return Ok(None);
         }
@@ -880,22 +873,59 @@ pub fn resolve_foreground_target(
 
     let kind = service.service_type();
     if kind != ServiceType::Process {
-        anyhow::bail!(
-            "interactive mode supports process services; '{}' is a {} service",
-            name,
-            kind
+        let mut msg = format!(
+            "'{}' is a {} service. Only a process service can run in your terminal.",
+            name, kind
         );
+        let mut process_services: Vec<&str> = config
+            .services
+            .iter()
+            .filter(|(_, s)| s.service_type() == ServiceType::Process)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        process_services.sort_unstable();
+        if !process_services.is_empty() {
+            msg.push_str(&format!(
+                " Process services in this config: {}.",
+                process_services.join(", ")
+            ));
+        }
+        anyhow::bail!(msg);
     }
 
     Ok(name)
 }
 
+const ONE_AT_A_TIME: &str = "Only one service can run in your terminal at a time.";
+
 fn named_foreground_target(config: &Config, services: &[String]) -> anyhow::Result<String> {
-    match config.expand_service_selection(services).as_slice() {
+    let targets = config.expand_service_selection(services);
+    match targets.as_slice() {
         [name] => Ok(name.clone()),
-        [] => anyhow::bail!("fed start -i needs one service: fed start -i <service>"),
-        _ => {
-            anyhow::bail!("fed start -i needs one service. Start the rest first with 'fed start'.")
+        [] => {
+            let mut msg = format!("No service matches '{}'.", services.join(" "));
+            let tags = config_tags(config);
+            if !tags.is_empty() {
+                msg.push_str(&format!(" Tags in this config: {}.", tags.join(", ")));
+            }
+            msg.push_str(" Pick a service to run in your terminal: fed start -i <service>");
+            anyhow::bail!(msg)
+        }
+        [first, ..] => {
+            let given = match services {
+                [tag] if tag.starts_with('@') => {
+                    format!("Tag '{}' matches {} services", tag, targets.len())
+                }
+                _ => format!("You gave {} services", targets.len()),
+            };
+            anyhow::bail!(
+                "{}: {}. {} Start the rest with 'fed start' and pick one for the terminal: \
+                 fed start -i {}",
+                given,
+                targets.join(", "),
+                ONE_AT_A_TIME,
+                first
+            )
         }
     }
 }
@@ -907,11 +937,18 @@ fn entrypoint_foreground_target(config: &Config) -> anyhow::Result<String> {
     };
     let name = match entrypoints {
         [name] => name.clone(),
-        [] => anyhow::bail!("fed start -i needs one service: fed start -i <service>"),
-        many => anyhow::bail!(
-            "fed start -i needs one service. This config has {} entrypoints, so pass one: \
-             fed start -i <service>",
-            many.len()
+        [] => anyhow::bail!(
+            "No service given and no entrypoint configured.\n\n\
+             Run a service in your terminal with 'fed start -i <service>' or set an \
+             'entrypoint:' in your config.{}",
+            configured_services_list(config)
+        ),
+        [first, ..] => anyhow::bail!(
+            "This config has {} entrypoints: {}. {} Pick one: fed start -i {}",
+            entrypoints.len(),
+            entrypoints.join(", "),
+            ONE_AT_A_TIME,
+            first
         ),
     };
 
@@ -929,19 +966,50 @@ fn entrypoint_foreground_target(config: &Config) -> anyhow::Result<String> {
             .map(|d| d.service_name())
             .collect();
         deps.sort_unstable();
-        let hint = if deps.is_empty() {
-            String::new()
-        } else {
-            format!(" of {}", deps.join(", "))
-        };
-        anyhow::bail!(
-            "entrypoint '{}' has no process of its own. Pass one{}: fed start -i <service>",
-            name,
-            hint
-        );
+        match deps.first() {
+            Some(first) => anyhow::bail!(
+                "Entrypoint '{}' has no process of its own. It only groups other services \
+                 ({}), so there is nothing to run in your terminal. Pick one: fed start -i {}",
+                name,
+                deps.join(", "),
+                first
+            ),
+            None => anyhow::bail!(
+                "Entrypoint '{}' has no process of its own, so there is nothing to run in \
+                 your terminal. Pick a process service: fed start -i <service>",
+                name
+            ),
+        }
     }
 
     Ok(name)
+}
+
+/// Every tag in the config, as typed on the command line (`@backend`).
+fn config_tags(config: &Config) -> Vec<String> {
+    let mut tags: Vec<String> = config
+        .services
+        .values()
+        .flat_map(|s| s.tags.iter())
+        .map(|t| format!("@{}", t))
+        .collect();
+    tags.sort_unstable();
+    tags.dedup();
+    tags
+}
+
+/// "Configured services:" and one line per service, or nothing.
+fn configured_services_list(config: &Config) -> String {
+    if config.services.is_empty() {
+        return String::new();
+    }
+    let mut names: Vec<_> = config.services.keys().collect();
+    names.sort();
+    let mut out = String::from("\n\nConfigured services:");
+    for name in names {
+        out.push_str(&format!("\n  - {}", name));
+    }
+    out
 }
 
 /// Group `plan` into dependency levels using the graph's parallel groups.
@@ -1997,7 +2065,48 @@ services:
             .expect_err("two targets must be rejected");
         assert_eq!(
             err.to_string(),
-            "fed start -i needs one service. Start the rest first with 'fed start'."
+            "You gave 2 services: shell, worker. Only one service can run in your terminal \
+             at a time. Start the rest with 'fed start' and pick one for the terminal: \
+             fed start -i shell"
+        );
+    }
+
+    fn tagged_config() -> Config {
+        fed::Parser::new()
+            .parse_config(
+                r#"
+services:
+  api:
+    process: "sleep 30"
+    tags: [backend]
+  worker:
+    process: "sleep 30"
+    tags: [backend, async]
+"#,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn foreground_target_rejects_a_tag_matching_several_services() {
+        let err = resolve_foreground_target(&tagged_config(), &["@backend".to_string()], &[])
+            .expect_err("a tag with two members is not one target");
+        assert_eq!(
+            err.to_string(),
+            "Tag '@backend' matches 2 services: api, worker. Only one service can run in \
+             your terminal at a time. Start the rest with 'fed start' and pick one for the \
+             terminal: fed start -i api"
+        );
+    }
+
+    #[test]
+    fn foreground_target_rejects_a_tag_matching_nothing() {
+        let err = resolve_foreground_target(&tagged_config(), &["@frontend".to_string()], &[])
+            .expect_err("a tag with no members is not a target");
+        assert_eq!(
+            err.to_string(),
+            "No service matches '@frontend'. Tags in this config: @async, @backend. \
+             Pick a service to run in your terminal: fed start -i <service>"
         );
     }
 
@@ -2007,7 +2116,7 @@ services:
             .expect_err("no target and no entrypoint");
         assert!(
             err.to_string()
-                .starts_with("fed start -i needs one service"),
+                .starts_with("No service given and no entrypoint configured."),
             "{err}"
         );
     }
@@ -2063,8 +2172,8 @@ services:
             .expect_err("several entrypoints are not one target");
         assert_eq!(
             err.to_string(),
-            "fed start -i needs one service. This config has 2 entrypoints, so pass one: \
-             fed start -i <service>"
+            "This config has 2 entrypoints: shell, worker. Only one service can run in your \
+             terminal at a time. Pick one: fed start -i shell"
         );
     }
 
@@ -2087,7 +2196,9 @@ services:
             .expect_err("an aggregate entrypoint has nothing to run");
         assert_eq!(
             err.to_string(),
-            "entrypoint 'dev' has no process of its own. Pass one of model, next: fed start -i <service>"
+            "Entrypoint 'dev' has no process of its own. It only groups other services \
+             (model, next), so there is nothing to run in your terminal. Pick one: \
+             fed start -i model"
         );
     }
 
@@ -2105,7 +2216,7 @@ services:
             .expect_err("docker entrypoints are out of scope for interactive mode");
         assert_eq!(
             err.to_string(),
-            "interactive mode supports process services; 'db' is a docker service"
+            "'db' is a docker service. Only a process service can run in your terminal."
         );
     }
 
@@ -2115,7 +2226,8 @@ services:
             .expect_err("docker services are out of scope for interactive mode");
         assert_eq!(
             err.to_string(),
-            "interactive mode supports process services; 'db' is a docker service"
+            "'db' is a docker service. Only a process service can run in your terminal. \
+             Process services in this config: shell, worker."
         );
     }
 
