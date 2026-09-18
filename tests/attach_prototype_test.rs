@@ -1,4 +1,4 @@
-//! Spike: `fed host` (a pty-owning host process) and `fed attach` (a raw
+//! Prototype: `fed host` (a pty-owning host process) and `fed attach` (a raw
 //! client that proxies bytes over its unix socket).
 //!
 //! These tests drive the real binary. The client half only means anything

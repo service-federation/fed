@@ -268,7 +268,7 @@ pub enum Commands {
     #[command(hide = true)]
     Supervise,
 
-    /// Internal (spike): own a service's pty and serve it over a unix
+    /// Internal prototype: own a service's pty and serve it over a unix
     /// socket for `fed attach`. Unix only.
     #[cfg(unix)]
     #[command(hide = true)]
@@ -277,7 +277,7 @@ pub enum Commands {
         service: String,
     },
 
-    /// Connect this terminal to a hosted service's pty (spike). Detach
+    /// Connect this terminal to a hosted service's pty. Prototype. Detach
     /// with ctrl-p ctrl-q. Unix only.
     #[cfg(unix)]
     #[command(hide = true)]
