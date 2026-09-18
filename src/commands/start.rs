@@ -852,9 +852,6 @@ async fn ensure_not_already_running(orchestrator: &Orchestrator, name: &str) -> 
 
 /// Resolve the single service `fed start -i` will run in the foreground.
 ///
-/// When `fed start -i` doesn't receive a service, it uses the entrypoint.
-/// Just like `fed start`.
-///
 /// Runs before anything starts, so a rejected invocation leaves the stack
 /// exactly as it found it.
 pub fn resolve_foreground_target(
@@ -893,8 +890,6 @@ pub fn resolve_foreground_target(
     Ok(name)
 }
 
-/// The target of `fed start -i <service>`: the service given, or one tag
-/// that expands to one service.
 fn named_foreground_target(config: &Config, services: &[String]) -> anyhow::Result<String> {
     match config.expand_service_selection(services).as_slice() {
         [name] => Ok(name.clone()),
@@ -905,8 +900,6 @@ fn named_foreground_target(config: &Config, services: &[String]) -> anyhow::Resu
     }
 }
 
-/// The target of a bare `fed start -i`: the config's entrypoint, when it is
-/// one service with a process of its own.
 fn entrypoint_foreground_target(config: &Config) -> anyhow::Result<String> {
     let entrypoints = match &config.entrypoint {
         Some(ep) => std::slice::from_ref(ep),
