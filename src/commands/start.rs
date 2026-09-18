@@ -852,7 +852,7 @@ async fn ensure_not_already_running(orchestrator: &Orchestrator, name: &str) -> 
 
 /// Resolve the single service `fed start -i` will run in the foreground.
 ///
-/// With no service named, the entrypoint is the target, as for `fed start`.
+/// With no service given, the entrypoint is the target, as for `fed start`.
 ///
 /// Runs before anything starts, so a rejected invocation leaves the stack
 /// exactly as it found it.
@@ -892,17 +892,15 @@ pub fn resolve_foreground_target(
     Ok(name)
 }
 
-/// The target of `fed start -i <service>`: one named service, or one tag
+/// The target of `fed start -i <service>`: the service given, or one tag
 /// that expands to one service.
 fn named_foreground_target(config: &Config, services: &[String]) -> anyhow::Result<String> {
     match config.expand_service_selection(services).as_slice() {
         [name] => Ok(name.clone()),
-        [] => anyhow::bail!(
-            "interactive mode runs a single service; name the one to run: fed start -i <service>"
-        ),
-        _ => anyhow::bail!(
-            "interactive mode runs a single service; start the others first with 'fed start'"
-        ),
+        [] => anyhow::bail!("fed start -i needs one service: fed start -i <service>"),
+        _ => {
+            anyhow::bail!("fed start -i needs one service. Start the rest first with 'fed start'.")
+        }
     }
 }
 
@@ -915,12 +913,10 @@ fn entrypoint_foreground_target(config: &Config) -> anyhow::Result<String> {
     };
     let name = match entrypoints {
         [name] => name.clone(),
-        [] => anyhow::bail!(
-            "interactive mode runs a single service; name the one to run: fed start -i <service>"
-        ),
+        [] => anyhow::bail!("fed start -i needs one service: fed start -i <service>"),
         many => anyhow::bail!(
-            "interactive mode runs a single service, and this config has {} entrypoints; \
-             name the one to run: fed start -i <service>",
+            "fed start -i needs one service. This config has {} entrypoints, so pass one: \
+             fed start -i <service>",
             many.len()
         ),
     };
@@ -942,11 +938,10 @@ fn entrypoint_foreground_target(config: &Config) -> anyhow::Result<String> {
         let hint = if deps.is_empty() {
             String::new()
         } else {
-            format!(" (one of: {})", deps.join(", "))
+            format!(" of {}", deps.join(", "))
         };
         anyhow::bail!(
-            "entrypoint '{}' has no process to run in the foreground; \
-             name the service to run{}: fed start -i <service>",
+            "entrypoint '{}' has no process of its own. Pass one{}: fed start -i <service>",
             name,
             hint
         );
@@ -2008,7 +2003,7 @@ services:
             .expect_err("two targets must be rejected");
         assert_eq!(
             err.to_string(),
-            "interactive mode runs a single service; start the others first with 'fed start'"
+            "fed start -i needs one service. Start the rest first with 'fed start'."
         );
     }
 
@@ -2018,7 +2013,7 @@ services:
             .expect_err("no target and no entrypoint");
         assert!(
             err.to_string()
-                .starts_with("interactive mode runs a single service"),
+                .starts_with("fed start -i needs one service"),
             "{err}"
         );
     }
@@ -2074,8 +2069,8 @@ services:
             .expect_err("several entrypoints are not one target");
         assert_eq!(
             err.to_string(),
-            "interactive mode runs a single service, and this config has 2 entrypoints; \
-             name the one to run: fed start -i <service>"
+            "fed start -i needs one service. This config has 2 entrypoints, so pass one: \
+             fed start -i <service>"
         );
     }
 
@@ -2098,8 +2093,7 @@ services:
             .expect_err("an aggregate entrypoint has nothing to run");
         assert_eq!(
             err.to_string(),
-            "entrypoint 'dev' has no process to run in the foreground; \
-             name the service to run (one of: model, next): fed start -i <service>"
+            "entrypoint 'dev' has no process of its own. Pass one of model, next: fed start -i <service>"
         );
     }
 

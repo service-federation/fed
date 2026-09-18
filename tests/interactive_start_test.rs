@@ -360,7 +360,7 @@ services:
 
     assert!(!output.status.success(), "two targets must fail");
     assert!(
-        stderr.contains("interactive mode runs a single service"),
+        stderr.contains("fed start -i needs one service"),
         "expected the usage error, got:\n{stderr}"
     );
 
