@@ -133,7 +133,7 @@ $ fed start -i shell
 
 fed starts that service's dependencies in the background as usual, hands it your terminal, and waits for it. Ctrl+C goes to the service, not to fed. When it exits, fed exits with the same code and leaves the dependencies running for `fed stop`. One service at a time, process services only.
 
-When you don't provide a service to `fed start -i`, it uses the entrypoint. That works when the entrypoint is itself a process service. An entrypoint that only groups other services (a `depends_on:` list with no `process:`) has nothing to hand the terminal to, so fed asks you to pass one of them.
+When `fed start -i` doesn't receive a service, it uses the entrypoint. Just like `fed start`. That works when the entrypoint is itself a process service. An entrypoint that only groups other services (a `depends_on:` list with no `process:`) has nothing to hand the terminal to, so fed asks you to pass one of them.
 
 ## One stack per worktree
 

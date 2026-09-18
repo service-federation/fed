@@ -852,8 +852,8 @@ async fn ensure_not_already_running(orchestrator: &Orchestrator, name: &str) -> 
 
 /// Resolve the single service `fed start -i` will run in the foreground.
 ///
-/// When you don't provide a service, `fed start -i` uses the entrypoint,
-/// like `fed start`.
+/// When `fed start -i` doesn't receive a service, it uses the entrypoint.
+/// Just like `fed start`.
 ///
 /// Runs before anything starts, so a rejected invocation leaves the stack
 /// exactly as it found it.
