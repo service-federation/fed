@@ -852,6 +852,10 @@ async fn ensure_not_already_running(orchestrator: &Orchestrator, name: &str) -> 
 
 /// Resolve the single service `fed start -i` will run in the foreground.
 ///
+/// With no service named, the entrypoint is the target, as for `fed start`.
+/// An entrypoint that only aggregates other services has nothing to run in
+/// the foreground itself, so it is rejected with a pointer at naming one.
+///
 /// Runs before anything starts, so a rejected invocation leaves the stack
 /// exactly as it found it.
 pub fn resolve_foreground_target(
@@ -859,14 +863,27 @@ pub fn resolve_foreground_target(
     services: &[String],
     profiles: &[String],
 ) -> anyhow::Result<String> {
-    let targets = config.expand_service_selection(services);
+    let from_entrypoint = services.is_empty();
+    let targets = if from_entrypoint {
+        match &config.entrypoint {
+            Some(ep) => vec![ep.clone()],
+            None => config.entrypoints.clone(),
+        }
+    } else {
+        config.expand_service_selection(services)
+    };
 
-    let name = match targets.len() {
-        1 => targets.into_iter().next().expect("one target"),
-        0 => anyhow::bail!(
+    let name = match (targets.len(), from_entrypoint) {
+        (1, _) => targets.into_iter().next().expect("one target"),
+        (0, _) => anyhow::bail!(
             "interactive mode runs a single service; name the one to run: fed start -i <service>"
         ),
-        _ => anyhow::bail!(
+        (_, true) => anyhow::bail!(
+            "interactive mode runs a single service, and this config has {} entrypoints; \
+             name the one to run: fed start -i <service>",
+            targets.len()
+        ),
+        (_, false) => anyhow::bail!(
             "interactive mode runs a single service; start the others first with 'fed start'"
         ),
     };
@@ -874,6 +891,33 @@ pub fn resolve_foreground_target(
     let Some(service) = config.services.get(&name) else {
         anyhow::bail!(unknown_service_error(config, &name, profiles));
     };
+
+    // An entrypoint like `dev: {depends_on: [web, api]}` is a grouping, not
+    // a program: there is no process to hand the terminal to.
+    if from_entrypoint
+        && matches!(
+            service.service_type(),
+            ServiceType::Oneshot | ServiceType::Undefined
+        )
+    {
+        let mut deps: Vec<&str> = service
+            .depends_on
+            .iter()
+            .map(|d| d.service_name())
+            .collect();
+        deps.sort_unstable();
+        let hint = if deps.is_empty() {
+            String::new()
+        } else {
+            format!(" (one of: {})", deps.join(", "))
+        };
+        anyhow::bail!(
+            "entrypoint '{}' has no process to run in the foreground; \
+             name the service to run{}: fed start -i <service>",
+            name,
+            hint
+        );
+    }
 
     // `config` here is unfiltered: a profile-gated service is still in it,
     // and reaches the orchestrator's filtered service map as a bare
@@ -1954,13 +1998,111 @@ services:
     }
 
     #[test]
-    fn foreground_target_rejects_no_service() {
+    fn foreground_target_rejects_no_service_without_an_entrypoint() {
         let err = resolve_foreground_target(&interactive_config(), &[], &[])
-            .expect_err("interactive mode has no default target");
+            .expect_err("no target and no entrypoint");
         assert!(
             err.to_string()
                 .starts_with("interactive mode runs a single service"),
             "{err}"
+        );
+    }
+
+    fn entrypoint_config(yaml: &str) -> Config {
+        fed::Parser::new().parse_config(yaml).unwrap()
+    }
+
+    #[test]
+    fn foreground_target_defaults_to_a_process_entrypoint() {
+        let config = entrypoint_config(
+            r#"
+entrypoint: shell
+services:
+  shell:
+    process: sh
+"#,
+        );
+        let name = resolve_foreground_target(&config, &[], &[])
+            .expect("a process entrypoint is the default target");
+        assert_eq!(name, "shell");
+    }
+
+    #[test]
+    fn foreground_target_defaults_to_a_lone_plural_entrypoint() {
+        let config = entrypoint_config(
+            r#"
+entrypoints: [shell]
+services:
+  shell:
+    process: sh
+"#,
+        );
+        assert_eq!(
+            resolve_foreground_target(&config, &[], &[]).unwrap(),
+            "shell"
+        );
+    }
+
+    #[test]
+    fn foreground_target_rejects_several_entrypoints() {
+        let config = entrypoint_config(
+            r#"
+entrypoints: [shell, worker]
+services:
+  shell:
+    process: sh
+  worker:
+    process: "sleep 30"
+"#,
+        );
+        let err = resolve_foreground_target(&config, &[], &[])
+            .expect_err("several entrypoints are not one target");
+        assert_eq!(
+            err.to_string(),
+            "interactive mode runs a single service, and this config has 2 entrypoints; \
+             name the one to run: fed start -i <service>"
+        );
+    }
+
+    #[test]
+    fn foreground_target_rejects_an_aggregate_entrypoint() {
+        let config = entrypoint_config(
+            r#"
+entrypoint: dev
+services:
+  dev:
+    depends_on: [next, model]
+    migrate: "true"
+  next:
+    process: "sleep 30"
+  model:
+    process: "sleep 30"
+"#,
+        );
+        let err = resolve_foreground_target(&config, &[], &[])
+            .expect_err("an aggregate entrypoint has nothing to run");
+        assert_eq!(
+            err.to_string(),
+            "entrypoint 'dev' has no process to run in the foreground; \
+             name the service to run (one of: model, next): fed start -i <service>"
+        );
+    }
+
+    #[test]
+    fn foreground_target_rejects_a_docker_entrypoint() {
+        let config = entrypoint_config(
+            r#"
+entrypoint: db
+services:
+  db:
+    image: postgres:16
+"#,
+        );
+        let err = resolve_foreground_target(&config, &[], &[])
+            .expect_err("docker entrypoints are out of scope for interactive mode");
+        assert_eq!(
+            err.to_string(),
+            "interactive mode supports process services; 'db' is a docker service"
         );
     }
 
