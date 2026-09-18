@@ -67,8 +67,8 @@ pub enum Commands {
         /// Run a single process service in the foreground: it inherits fed's
         /// terminal, so it can read stdin, and fed waits for it and exits with
         /// its exit code. Its dependencies still start in the background.
-        /// With no service given, runs the entrypoint, which must itself be
-        /// a process service.
+        /// Without a service, the entrypoint gets the terminal. It must be a
+        /// process service.
         #[arg(short, long, conflicts_with_all = ["watch", "output", "dry_run"])]
         interactive: bool,
 
