@@ -853,8 +853,6 @@ async fn ensure_not_already_running(orchestrator: &Orchestrator, name: &str) -> 
 /// Resolve the single service `fed start -i` will run in the foreground.
 ///
 /// With no service named, the entrypoint is the target, as for `fed start`.
-/// An entrypoint that only aggregates other services has nothing to run in
-/// the foreground itself, so it is rejected with a pointer at naming one.
 ///
 /// Runs before anything starts, so a rejected invocation leaves the stack
 /// exactly as it found it.
@@ -863,38 +861,73 @@ pub fn resolve_foreground_target(
     services: &[String],
     profiles: &[String],
 ) -> anyhow::Result<String> {
-    let from_entrypoint = services.is_empty();
-    let targets = if from_entrypoint {
-        match &config.entrypoint {
-            Some(ep) => vec![ep.clone()],
-            None => config.entrypoints.clone(),
-        }
+    let name = if services.is_empty() {
+        entrypoint_foreground_target(config)?
     } else {
-        config.expand_service_selection(services)
-    };
-
-    let name = match (targets.len(), from_entrypoint) {
-        (1, _) => targets.into_iter().next().expect("one target"),
-        (0, _) => anyhow::bail!(
-            "interactive mode runs a single service; name the one to run: fed start -i <service>"
-        ),
-        (_, true) => anyhow::bail!(
-            "interactive mode runs a single service, and this config has {} entrypoints; \
-             name the one to run: fed start -i <service>",
-            targets.len()
-        ),
-        (_, false) => anyhow::bail!(
-            "interactive mode runs a single service; start the others first with 'fed start'"
-        ),
+        named_foreground_target(config, services)?
     };
 
     let Some(service) = config.services.get(&name) else {
         anyhow::bail!(unknown_service_error(config, &name, profiles));
     };
 
+    // `config` here is unfiltered: a profile-gated service is still in it,
+    // and reaches the orchestrator's filtered service map as a bare
+    // "not found" unless it is caught with its own explanation first.
+    let profile_enabled =
+        service.profiles.is_empty() || service.profiles.iter().any(|p| profiles.contains(p));
+    if !profile_enabled {
+        anyhow::bail!(unknown_service_error(config, &name, profiles));
+    }
+
+    let kind = service.service_type();
+    if kind != ServiceType::Process {
+        anyhow::bail!(
+            "interactive mode supports process services; '{}' is a {} service",
+            name,
+            kind
+        );
+    }
+
+    Ok(name)
+}
+
+/// The target of `fed start -i <service>`: one named service, or one tag
+/// that expands to one service.
+fn named_foreground_target(config: &Config, services: &[String]) -> anyhow::Result<String> {
+    match config.expand_service_selection(services).as_slice() {
+        [name] => Ok(name.clone()),
+        [] => anyhow::bail!(
+            "interactive mode runs a single service; name the one to run: fed start -i <service>"
+        ),
+        _ => anyhow::bail!(
+            "interactive mode runs a single service; start the others first with 'fed start'"
+        ),
+    }
+}
+
+/// The target of a bare `fed start -i`: the config's entrypoint, when it is
+/// one service with a process of its own.
+fn entrypoint_foreground_target(config: &Config) -> anyhow::Result<String> {
+    let entrypoints = match &config.entrypoint {
+        Some(ep) => std::slice::from_ref(ep),
+        None => config.entrypoints.as_slice(),
+    };
+    let name = match entrypoints {
+        [name] => name.clone(),
+        [] => anyhow::bail!(
+            "interactive mode runs a single service; name the one to run: fed start -i <service>"
+        ),
+        many => anyhow::bail!(
+            "interactive mode runs a single service, and this config has {} entrypoints; \
+             name the one to run: fed start -i <service>",
+            many.len()
+        ),
+    };
+
     // An entrypoint like `dev: {depends_on: [web, api]}` is a grouping, not
     // a program: there is no process to hand the terminal to.
-    if from_entrypoint
+    if let Some(service) = config.services.get(&name)
         && matches!(
             service.service_type(),
             ServiceType::Oneshot | ServiceType::Undefined
@@ -916,24 +949,6 @@ pub fn resolve_foreground_target(
              name the service to run{}: fed start -i <service>",
             name,
             hint
-        );
-    }
-
-    // `config` here is unfiltered: a profile-gated service is still in it,
-    // and reaches the orchestrator's filtered service map as a bare
-    // "not found" unless it is caught with its own explanation first.
-    let profile_enabled =
-        service.profiles.is_empty() || service.profiles.iter().any(|p| profiles.contains(p));
-    if !profile_enabled {
-        anyhow::bail!(unknown_service_error(config, &name, profiles));
-    }
-
-    let kind = service.service_type();
-    if kind != ServiceType::Process {
-        anyhow::bail!(
-            "interactive mode supports process services; '{}' is a {} service",
-            name,
-            kind
         );
     }
 
