@@ -712,3 +712,199 @@ fn detach_exits_successfully_when_host_does_not_read_input() {
     release.send(()).unwrap();
     host.join().unwrap();
 }
+
+#[test]
+fn application_display_modes_are_restored_on_every_exit_path() {
+    for ending in ["detach", "signal", "exit", "disconnect", "no-stdin"] {
+        let dir = TempDir::new().unwrap();
+        let listener = fake_host(dir.path());
+        let (release, released) = std::sync::mpsc::channel();
+        let host = std::thread::spawn(move || {
+            let (mut stream, mut reader, _) = hello(listener);
+            stream
+                .write_all(&encode(&Frame::Scrollback(
+                    b"\x1b[?1049h\x1b[?2004h\x1b[?25lDISPLAY_READY\r\n".to_vec(),
+                )))
+                .unwrap();
+            released.recv_timeout(Duration::from_secs(10)).unwrap();
+            if ending == "exit" {
+                stream
+                    .write_all(&encode(&Frame::Exit { status: 7 << 8 }))
+                    .unwrap();
+            } else if ending != "disconnect" {
+                while reader.read_frame().is_ok() {}
+            }
+        });
+        let args = if ending == "no-stdin" {
+            "--no-stdin"
+        } else {
+            ""
+        };
+        let mut session = rexpect::spawn(&pty_command(dir.path(), args), Some(10000)).unwrap();
+        session.exp_string("DISPLAY_READY").unwrap();
+        release.send(()).unwrap();
+        match ending {
+            "detach" => {
+                session.send("\x10\x11").unwrap();
+            }
+            "signal" | "no-stdin" => nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(session.process.child_pid.as_raw()),
+                if ending == "no-stdin" {
+                    nix::sys::signal::Signal::SIGINT
+                } else {
+                    nix::sys::signal::Signal::SIGTERM
+                },
+            )
+            .unwrap(),
+            _ => {}
+        }
+        session.flush().unwrap();
+        session.exp_string("\x1b[?1049l").unwrap();
+        session.exp_string("\x1b[?2004l").unwrap();
+        session.exp_string("\x1b[?25h").unwrap();
+        let expected = match ending {
+            "exit" => 7,
+            "signal" | "disconnect" => 1,
+            _ => 0,
+        };
+        assert_eq!(exit_code(&mut session), expected, "{ending}");
+        host.join().unwrap();
+    }
+}
+
+#[test]
+fn redirected_application_output_is_not_modified_by_display_cleanup() {
+    let dir = TempDir::new().unwrap();
+    let listener = fake_host(dir.path());
+    let bytes = b"\x1b[?1049h\x1b[?25lapplication output";
+    let host = std::thread::spawn(move || {
+        let (mut stream, _, _) = hello(listener);
+        stream
+            .write_all(&encode(&Frame::Scrollback(bytes.to_vec())))
+            .unwrap();
+        stream
+            .write_all(&encode(&Frame::Exit { status: 0 }))
+            .unwrap();
+    });
+    let output = attach(dir.path(), &["--no-stdin"]).output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, bytes);
+    host.join().unwrap();
+}
+
+#[test]
+fn blocked_terminal_cleanup_is_bounded_and_follows_the_last_output() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let dir = TempDir::new().unwrap();
+    let listener = fake_host(dir.path());
+    let (saturated, saturation) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let host = std::thread::spawn(move || {
+        let (mut stream, _, _) = hello(listener);
+        stream
+            .set_write_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        stream
+            .write_all(&encode(&Frame::Scrollback(Vec::new())))
+            .unwrap();
+        let mut bytes = vec![b'x'; 65536];
+        bytes.extend_from_slice(b"\x1b[?25l");
+        let frame = encode(&Frame::Output(bytes));
+        let blocked = (0..256).any(|_| stream.write_all(&frame).is_err());
+        saturated.send(blocked).unwrap();
+        released.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let slave = std::fs::File::from(pty.slave);
+    let mut master = std::fs::File::from(pty.master);
+    let initial_flags = unsafe { nix::libc::fcntl(slave.as_raw_fd(), nix::libc::F_GETFL) };
+    assert!(initial_flags >= 0);
+    unsafe {
+        let flags = nix::libc::fcntl(master.as_raw_fd(), nix::libc::F_GETFL);
+        assert_eq!(
+            nix::libc::fcntl(
+                master.as_raw_fd(),
+                nix::libc::F_SETFL,
+                flags | nix::libc::O_NONBLOCK
+            ),
+            0
+        );
+    }
+    let mut command = attach(dir.path(), &[]);
+    command
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(Stdio::null());
+    // SAFETY: setsid and ioctl are async-signal-safe and operate only on the child's tty.
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() == -1 || nix::libc::ioctl(0, nix::libc::TIOCSCTTY as _, 0) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    assert!(
+        saturation.recv_timeout(Duration::from_secs(10)).unwrap(),
+        "terminal never applied backpressure"
+    );
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 65536];
+    loop {
+        loop {
+            match master.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(nix::libc::EIO) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("reading terminal: {error}"),
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(1));
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            drop(master);
+            let _ = child.wait();
+            panic!("terminal cleanup blocked exit");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    while let Ok(count) = master.read(&mut buffer) {
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    let show = bytes
+        .windows(6)
+        .rposition(|bytes| bytes == b"\x1b[?25h")
+        .expect("cursor was not restored");
+    if let Some(hide) = bytes.windows(6).rposition(|bytes| bytes == b"\x1b[?25l") {
+        assert!(show > hide, "output hid the cursor after cleanup");
+    }
+    assert_eq!(
+        unsafe { nix::libc::fcntl(slave.as_raw_fd(), nix::libc::F_GETFL) },
+        initial_flags,
+        "client changed the parent's stdout flags"
+    );
+    release.send(()).unwrap();
+    host.join().unwrap();
+}

@@ -1,11 +1,12 @@
 use std::io::{IsTerminal, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
@@ -14,9 +15,84 @@ use fed::attach::protocol::{FLAG_NO_STDIN, Frame, FrameReader, VERSION, encode};
 use rusqlite::OptionalExtension;
 use tokio::signal::unix::{SignalKind, signal};
 
-struct TerminalGuard;
+// Leave application display modes without clearing the shell's scrollback.
+const RESTORE_DISPLAY: &[u8] = b"\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[0m\x1b[?25h";
+
+struct TerminalState {
+    file: std::fs::File,
+    restored: bool,
+}
+
+struct TerminalOutput(Mutex<TerminalState>);
+
+impl TerminalOutput {
+    fn open() -> anyhow::Result<Option<Arc<Self>>> {
+        if !std::io::stdout().is_terminal() {
+            return Ok(None);
+        }
+        // A separate open file description keeps O_NONBLOCK off the caller's stdout.
+        let path = nix::unistd::ttyname(std::io::stdout())?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
+            .open(path)?;
+        Ok(Some(Arc::new(Self(Mutex::new(TerminalState {
+            file,
+            restored: false,
+        })))))
+    }
+
+    fn write_all(&self, mut bytes: &[u8]) -> std::io::Result<()> {
+        while !bytes.is_empty() {
+            let result = {
+                let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+                if state.restored {
+                    return Ok(());
+                }
+                state.file.write(bytes)
+            };
+            match result {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(count) => bytes = &bytes[count..],
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn restore(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if state.restored {
+            return;
+        }
+        // Serialize cleanup after the last write; queued output cannot hide the cursor again.
+        state.restored = true;
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let mut remaining = RESTORE_DISPLAY;
+        while !remaining.is_empty() && Instant::now() < deadline {
+            match state.file.write(remaining) {
+                Ok(0) => break,
+                Ok(count) => remaining = &remaining[count..],
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+struct TerminalGuard(Option<Arc<TerminalOutput>>);
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if let Some(display) = &self.0 {
+            display.restore();
+        }
         let _ = disable_raw_mode();
     }
 }
@@ -91,8 +167,13 @@ pub async fn run_attach(
     let mut hangup = signal(SignalKind::hangup())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut resize = signal(SignalKind::window_change())?;
+    let display = TerminalOutput::open().context("could not open the output terminal")?;
+    let panic_display = display.clone();
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if let Some(display) = &panic_display {
+            display.restore();
+        }
         let _ = disable_raw_mode();
         previous_hook(info);
     }));
@@ -108,7 +189,7 @@ pub async fn run_attach(
         );
         enable_raw_mode().context("could not put the terminal in raw mode")?;
     }
-    let terminal = TerminalGuard;
+    let terminal = TerminalGuard(display.clone());
     let (cols, rows) = size().unwrap_or((80, 24));
     let (events, mut controls) = tokio::sync::mpsc::unbounded_channel();
     let (input, outgoing) = std::sync::mpsc::sync_channel(16);
@@ -177,7 +258,12 @@ pub async fn run_attach(
         while let Some(event) = output_rx.blocking_recv() {
             match event {
                 Event::Frame(Frame::Output(bytes) | Frame::Scrollback(bytes)) => {
-                    if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+                    let result = if let Some(display) = &display {
+                        display.write_all(&bytes)
+                    } else {
+                        stdout.write_all(&bytes).and_then(|()| stdout.flush())
+                    };
+                    if let Err(error) = result {
                         let _ = output_events.send(Event::Failed(error.to_string()));
                         return;
                     }
