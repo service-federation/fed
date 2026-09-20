@@ -20,6 +20,10 @@ pub struct LaunchSpec {
     pub service: String,
     /// The `process:` string, run as `bash -ec <command>`.
     pub command: String,
+    /// The workspace root, the directory that holds `fed.yaml`. The service
+    /// receives it as `FED_SPAWNED_FROM_WORKSPACE`, and `cwd` may sit below
+    /// it.
+    pub work_dir: PathBuf,
     /// Already resolved against the work dir.
     pub cwd: PathBuf,
     /// The service's resolved environment.
@@ -88,6 +92,7 @@ mod tests {
         LaunchSpec {
             service: "repl".to_string(),
             command: "node".to_string(),
+            work_dir: PathBuf::from("/w"),
             cwd: PathBuf::from("/w/api"),
             environment: HashMap::from([("PORT".to_string(), "8080".to_string())]),
             log_path: PathBuf::from("/w/.fed/logs/repl.log"),
@@ -104,6 +109,7 @@ mod tests {
 
         let back = LaunchSpec::from_line(&line).unwrap();
         assert_eq!(back.service, "repl");
+        assert_eq!(back.work_dir, PathBuf::from("/w"));
         assert_eq!(back.cwd, PathBuf::from("/w/api"));
         assert_eq!(back.environment["PORT"], "8080");
         assert_eq!(back.socket_path, PathBuf::from("/tmp/fed-abc/repl.sock"));
