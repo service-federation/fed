@@ -175,6 +175,52 @@ services:
     );
 }
 
+/// `-i` on a service that declares `tty: true` runs in the caller's terminal
+/// like any other process service: same output, same exit code.
+#[test]
+fn interactive_tty_service_runs_in_the_callers_terminal() {
+    let dir = TempDir::new().expect("temp dir");
+    let config = write_config(
+        &dir,
+        r#"
+services:
+  shell:
+    process: sh
+    tty: true
+"#,
+    );
+
+    let mut session = rexpect::spawn(
+        &format!("{} -c {} start -i shell", fed_binary(), config),
+        Some(10_000),
+    )
+    .expect("spawn fed under a pty");
+
+    session.exp_string("Starting: shell").expect("start line");
+
+    session
+        .send_line("printf 'marker-%s\\n' 7")
+        .expect("send command");
+    session.exp_string("marker-7").expect("service output");
+
+    let status = status_json(&config);
+    assert_eq!(service_status(&status, "shell"), "running");
+
+    session.send_line("exit 5").expect("send exit");
+    assert_eq!(
+        exit_code(&mut session),
+        5,
+        "fed must exit with the service's exit code"
+    );
+
+    let status = status_json(&config);
+    assert_eq!(
+        service_status(&status, "shell"),
+        "stopped",
+        "shell must be unregistered after it exits"
+    );
+}
+
 /// Dependencies start in the background as usual and keep running after the
 /// foreground service exits. `fed stop` is what stops them.
 ///

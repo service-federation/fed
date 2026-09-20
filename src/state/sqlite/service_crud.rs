@@ -109,6 +109,11 @@ impl SqliteStateTracker {
         let desired_state = service_state.desired_state.to_string();
         let native_restart_enabled = service_state.native_restart_enabled;
         let variant = service_state.variant.clone();
+        let host_pid = service_state.host_pid;
+        let attach_socket = service_state
+            .attach_socket
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
 
         self.conn
             .call(move |conn: &mut rusqlite::Connection| {
@@ -140,8 +145,8 @@ impl SqliteStateTracker {
                 // startup_message, since an already-registered row is left
                 // untouched above.
                 tx.execute(
-                    "INSERT INTO services (id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled, variant)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    "INSERT INTO services (id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled, host_pid, attach_socket, variant)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                     rusqlite::params![
                         &id,
                         &status,
@@ -157,6 +162,8 @@ impl SqliteStateTracker {
                         startup_message.as_deref(),
                         &desired_state,
                         native_restart_enabled,
+                        host_pid,
+                        attach_socket.as_deref(),
                         variant.as_deref(),
                     ],
                 )?;
@@ -397,6 +404,63 @@ impl SqliteStateTracker {
                 tx.execute(
                     "UPDATE services SET process_group_id = ?1 WHERE id = ?2",
                     rusqlite::params![process_group_id, &service_id_for_tx],
+                )
+            })
+            .await?;
+
+        if rows == 0 {
+            return Err(Error::ServiceNotFound(service_id));
+        }
+
+        Ok(())
+    }
+
+    /// Persist the `fed host` process and the socket it listens on for a
+    /// service running under a pseudo-terminal.
+    ///
+    /// `fed stop` reads the PID to reap a host that outlives its service, and
+    /// `fed attach` reads the path to find the socket.
+    pub async fn update_service_host(
+        &mut self,
+        service_id: &str,
+        host_pid: u32,
+        attach_socket: &Path,
+    ) -> Result<()> {
+        if host_pid <= 1 || host_pid > i32::MAX as u32 {
+            return Err(Error::Validation(format!(
+                "Service '{}': host PID {} is unsafe for signal operations",
+                service_id, host_pid
+            )));
+        }
+
+        let service_id = service_id.to_string();
+        let service_id_for_tx = service_id.clone();
+        let attach_socket = attach_socket.to_string_lossy().into_owned();
+        let rows = self
+            .with_transaction(move |tx| {
+                tx.execute(
+                    "UPDATE services SET host_pid = ?1, attach_socket = ?2 WHERE id = ?3",
+                    rusqlite::params![host_pid, &attach_socket, &service_id_for_tx],
+                )
+            })
+            .await?;
+
+        if rows == 0 {
+            return Err(Error::ServiceNotFound(service_id));
+        }
+
+        Ok(())
+    }
+
+    /// Drop the host PID and socket path from a service's row.
+    pub async fn clear_service_host(&mut self, service_id: &str) -> Result<()> {
+        let service_id = service_id.to_string();
+        let service_id_for_tx = service_id.clone();
+        let rows = self
+            .with_transaction(move |tx| {
+                tx.execute(
+                    "UPDATE services SET host_pid = NULL, attach_socket = NULL WHERE id = ?1",
+                    rusqlite::params![&service_id_for_tx],
                 )
             })
             .await?;
@@ -729,7 +793,7 @@ impl SqliteStateTracker {
     pub async fn get_services(&self) -> HashMap<String, ServiceState> {
         match self.conn.call(|conn: &mut rusqlite::Connection| {
             let mut stmt = conn.prepare(
-                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled, variant FROM services"
+                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled, host_pid, attach_socket, variant FROM services"
             )?;
 
             let services_iter = stmt.query_map([], |row| {
@@ -740,6 +804,7 @@ impl SqliteStateTracker {
                 let last_restart_str: Option<String> = row.get(9)?;
                 let desired_state_str: String = row.get(12)?;
                 let native_restart_enabled: bool = row.get(13)?;
+                let attach_socket: Option<String> = row.get(15)?;
 
                 Ok((
                     id.clone(),
@@ -760,9 +825,11 @@ impl SqliteStateTracker {
                         consecutive_failures: row.get(10)?,
                         port_allocations: HashMap::new(), // Will be populated below
                         startup_message: row.get(11)?,
-                        variant: row.get(14)?,
+                        variant: row.get(16)?,
                         desired_state: desired_state_str.parse::<DesiredState>().unwrap_or(DesiredState::Running),
                         native_restart_enabled,
+                        host_pid: row.get(14)?,
+                        attach_socket: attach_socket.map(PathBuf::from),
                     },
                 ))
             })?;
@@ -833,7 +900,7 @@ impl SqliteStateTracker {
 
         self.conn.call(move |conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<ServiceState>> {
             let service = match conn.query_row(
-                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled, variant FROM services WHERE id = ?1",
+                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled, host_pid, attach_socket, variant FROM services WHERE id = ?1",
                 rusqlite::params![&service_id],
                 |row| {
                     let id: String = row.get(0)?;
@@ -843,6 +910,7 @@ impl SqliteStateTracker {
                     let last_restart_str: Option<String> = row.get(9)?;
                     let desired_state_str: String = row.get(12)?;
                     let native_restart_enabled: bool = row.get(13)?;
+                    let attach_socket: Option<String> = row.get(15)?;
 
                     Ok(ServiceState {
                         id,
@@ -858,9 +926,11 @@ impl SqliteStateTracker {
                         consecutive_failures: row.get(10)?,
                         port_allocations: HashMap::new(),
                         startup_message: row.get(11)?,
-                        variant: row.get(14)?,
+                        variant: row.get(16)?,
                         desired_state: desired_state_str.parse::<DesiredState>().unwrap_or(DesiredState::Running),
                         native_restart_enabled,
+                        host_pid: row.get(14)?,
+                        attach_socket: attach_socket.map(PathBuf::from),
                     })
                 }
             ) {
@@ -961,6 +1031,19 @@ impl SqliteStateTracker {
 
             let is_stale = if let Some(pid) = service_state.pid {
                 let launcher_is_dead = !Self::is_process_running(pid).await;
+                #[cfg(unix)]
+                if launcher_is_dead && service_state.host_pid.is_some() {
+                    // A wedged host may be keeping the dead group leader as
+                    // a zombie. Reap the host before testing group cleanup.
+                    crate::service::hosted::reap_host(
+                        service_id.rsplit('/').next().unwrap_or(service_id),
+                        service_state.host_pid,
+                        service_state.attach_socket.as_deref(),
+                        service_state.started_at,
+                        std::path::Path::new(&self.work_dir),
+                    )
+                    .await;
+                }
                 if launcher_is_dead
                     && service_state.service_type == ServiceType::Process
                     && let Some(process_group_id) =
@@ -994,6 +1077,17 @@ impl SqliteStateTracker {
             };
 
             if is_stale {
+                #[cfg(unix)]
+                if service_state.pid.is_none() {
+                    crate::service::hosted::reap_host(
+                        service_id.rsplit('/').next().unwrap_or(service_id),
+                        service_state.host_pid,
+                        service_state.attach_socket.as_deref(),
+                        service_state.started_at,
+                        std::path::Path::new(&self.work_dir),
+                    )
+                    .await;
+                }
                 if service_state.native_restart_enabled {
                     grace_hit.push(service_id.clone());
                 } else {
@@ -1490,6 +1584,8 @@ mod tests {
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
             variant: None,
+            host_pid: None,
+            attach_socket: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1613,6 +1709,8 @@ mod tests {
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
             variant: None,
+            host_pid: None,
+            attach_socket: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1701,6 +1799,8 @@ mod tests {
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
             variant: None,
+            host_pid: None,
+            attach_socket: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1737,6 +1837,8 @@ mod tests {
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
             variant: None,
+            host_pid: None,
+            attach_socket: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1778,6 +1880,8 @@ mod tests {
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
             variant: None,
+            host_pid: None,
+            attach_socket: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1817,6 +1921,8 @@ mod tests {
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
             variant: None,
+            host_pid: None,
+            attach_socket: None,
         };
         tracker.register_service(dead).await.unwrap();
         register_stopped_service(&mut tracker, "stopped-one").await;
@@ -1862,6 +1968,8 @@ mod tests {
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
             variant: None,
+            host_pid: None,
+            attach_socket: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1902,6 +2010,8 @@ mod tests {
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
             variant: None,
+            host_pid: None,
+            attach_socket: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1961,6 +2071,8 @@ mod tests {
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
             variant: None,
+            host_pid: None,
+            attach_socket: None,
         }
     }
 
@@ -2146,6 +2258,8 @@ mod tests {
             desired_state: DesiredState::Running,
             native_restart_enabled: true,
             variant: None,
+            host_pid: None,
+            attach_socket: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -2201,6 +2315,8 @@ mod tests {
             desired_state: DesiredState::Running,
             native_restart_enabled: true,
             variant: None,
+            host_pid: None,
+            attach_socket: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -2265,6 +2381,8 @@ mod tests {
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
             variant: None,
+            host_pid: None,
+            attach_socket: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -2286,6 +2404,8 @@ mod tests {
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
             variant: None,
+            host_pid: None,
+            attach_socket: None,
         };
         let outcome = tracker.register_service(new_state).await.unwrap();
         assert_eq!(

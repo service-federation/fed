@@ -1,4 +1,4 @@
-use super::{Config, HealthCheck, ServiceType, parse_duration_string};
+use super::{Config, HealthCheck, RestartPolicy, ServiceType, parse_duration_string};
 use crate::error::{Error, Result};
 use std::collections::HashSet;
 
@@ -640,6 +640,27 @@ impl Config {
 
 /// Validate fields shared by ordinary services and merged variants.
 fn check_service_fields(name: &str, service: &super::Service) -> Result<()> {
+    if service.tty && service.variants.is_empty() {
+        if service.service_type() != ServiceType::Process {
+            return Err(Error::Validation(format!(
+                "Service '{name}': tty: true needs a process: command. Only process services can run under a terminal."
+            )));
+        }
+        if service
+            .restart
+            .as_ref()
+            .is_some_and(|policy| !matches!(policy, RestartPolicy::No))
+        {
+            return Err(Error::Validation(format!(
+                "Service '{name}': tty: true cannot be combined with restart:. A restarted tty service would lose its terminal."
+            )));
+        }
+        #[cfg(not(unix))]
+        return Err(Error::Validation(format!(
+            "Service '{name}': tty: true is not supported on this platform."
+        )));
+    }
+
     if let Some(ref gp) = service.grace_period
         && parse_duration_string(gp).is_none()
     {

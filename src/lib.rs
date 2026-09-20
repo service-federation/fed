@@ -47,6 +47,8 @@
 //! - Timeouts prevent hanging on stuck services
 //! - Cleanup runs exactly once even with concurrent calls
 
+#[cfg(unix)]
+pub mod attach;
 pub mod cloud;
 pub mod compose_import;
 pub mod config;

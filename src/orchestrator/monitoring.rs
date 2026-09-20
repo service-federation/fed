@@ -543,6 +543,14 @@ async fn restart_single_service(
                         e
                     );
                 }
+                if let (Some(host_pid), Some(attach_socket)) =
+                    (manager.get_host_pid(), manager.attach_socket())
+                    && let Err(e) = tracker
+                        .update_service_host(name, host_pid, attach_socket)
+                        .await
+                {
+                    tracing::warn!("Failed to update host for restarted '{}': {}", name, e);
+                }
             }
             if let Err(e) = tracker.save().await {
                 tracing::warn!("Failed to save state after restarting '{}': {}", name, e);

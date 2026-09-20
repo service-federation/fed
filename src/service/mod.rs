@@ -25,9 +25,13 @@ mod docker;
 mod external;
 mod foreground;
 mod gradle;
+#[cfg(unix)]
+pub mod hosted;
 mod log_capture;
 mod oneshot;
 mod process;
+#[cfg(unix)]
+mod pty;
 mod resources;
 mod types;
 
@@ -42,5 +46,7 @@ pub use gradle::*;
 pub use log_capture::*;
 pub use oneshot::*;
 pub use process::*;
+#[cfg(unix)]
+pub use pty::{PtyChild, PtyLaunch, set_window_size, spawn_on_pty};
 pub use resources::*;
 pub use types::*;

@@ -125,6 +125,8 @@ In `fed status`, `running` means the process is up but no healthcheck has confir
 
 `fed start` detaches every process service: it gets no stdin, and its output goes to `.fed/logs/<service>.log`. Follow it with `fed logs -f <service>` or watch everything in `fed tui`. A program that waits for terminal input, such as a shell or a REPL, exits as soon as it starts, because there is nothing to read.
 
+To keep such a program running in the background, give it `tty: true` in `fed.yaml`. fed then runs it under a terminal of its own, so a shell or a REPL stays up with nothing to read from. Everything the program shows on that terminal goes to the log file, including the input it echoes back. Process services only, and not on Windows.
+
 To run one such service in your terminal instead, start it with `-i`:
 
 ```console

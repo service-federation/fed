@@ -72,9 +72,14 @@ impl SqliteStateTracker {
             self.migrate_v8_to_v9().await?;
         }
 
-        // Migration from v9 to v10: Record which variant a service started as.
+        // Migration from v9 to v10: Add host_pid and attach_socket columns
         if current_version < 10 {
             self.migrate_v9_to_v10().await?;
+        }
+
+        // v11 reconciles host metadata with persisted variant selection.
+        if current_version < 11 {
+            self.migrate_v10_to_v11().await?;
         }
 
         Ok(())
@@ -566,15 +571,15 @@ impl SqliteStateTracker {
         Ok(())
     }
 
-    /// Migration v9 -> v10: Add the `variant` column.
+    /// Migration v9 -> v10: Add the `fed host` process and its socket.
     ///
-    /// A service that declares `variants:` is started as exactly one of them,
-    /// chosen from flags that a later `fed status` in a different shell never
-    /// saw. Persisting the choice at registration is what lets status and the
-    /// TUI report the implementation that is actually running rather than the
-    /// one the config would pick today.
+    /// A service declared `tty: true` runs under a host process that owns its
+    /// pseudo-terminal and serves `fed attach` on a unix socket. `fed stop`
+    /// reads the PID to reap a host that outlives its service, and `fed
+    /// attach` reads the path to find the socket. Both are NULL for every
+    /// other service.
     async fn migrate_v9_to_v10(&self) -> Result<()> {
-        debug!("Running migration v9 -> v10: Adding variant column");
+        debug!("Running migration v9 -> v10: Adding host_pid and attach_socket columns");
 
         self.conn
             .call(|conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
@@ -592,16 +597,28 @@ impl SqliteStateTracker {
                     return Ok(());
                 }
 
-                let has_column: bool = tx
+                let has_host_pid_column: bool = tx
                     .query_row(
-                        "SELECT COUNT(*) > 0 FROM pragma_table_info('services') WHERE name = 'variant'",
+                        "SELECT COUNT(*) > 0 FROM pragma_table_info('services') WHERE name = 'host_pid'",
                         [],
                         |row| row.get(0),
                     )
                     .unwrap_or(false);
 
-                if !has_column {
-                    tx.execute("ALTER TABLE services ADD COLUMN variant TEXT", [])?;
+                if !has_host_pid_column {
+                    tx.execute("ALTER TABLE services ADD COLUMN host_pid INTEGER", [])?;
+                }
+
+                let has_socket_column: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM pragma_table_info('services') WHERE name = 'attach_socket'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+
+                if !has_socket_column {
+                    tx.execute("ALTER TABLE services ADD COLUMN attach_socket TEXT", [])?;
                 }
 
                 tx.execute(
@@ -615,6 +632,70 @@ impl SqliteStateTracker {
             .await?;
 
         info!("Migration v9 -> v10 completed successfully");
+        Ok(())
+    }
+
+    /// Migration v10 -> v11: Add the `variant` column.
+    ///
+    /// A service that declares `variants:` is started as exactly one of them,
+    /// chosen from flags that a later `fed status` in a different shell never
+    /// saw. Persisting the choice at registration is what lets status and the
+    /// TUI report the implementation that is actually running rather than the
+    /// one the config would pick today.
+    async fn migrate_v10_to_v11(&self) -> Result<()> {
+        debug!("Running migration v10 -> v11: Adding variant column");
+
+        self.conn
+            .call(|conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+                let tx = conn.transaction()?;
+
+                let already_applied: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM schema_version WHERE version = 11",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+
+                if already_applied {
+                    return Ok(());
+                }
+
+                // Pre-merge builds of the variants branch also used v10.
+                // Preserve their variant values while adding missing host metadata.
+                for (column, sql_type) in [("host_pid", "INTEGER"), ("attach_socket", "TEXT")] {
+                    let exists: bool = tx.query_row(
+                        "SELECT COUNT(*) > 0 FROM pragma_table_info('services') WHERE name = ?1",
+                        [column], |row| row.get(0),
+                    )?;
+                    if !exists {
+                        tx.execute(&format!("ALTER TABLE services ADD COLUMN {column} {sql_type}"), [])?;
+                    }
+                }
+
+                let has_column: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM pragma_table_info('services') WHERE name = 'variant'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+
+                if !has_column {
+                    tx.execute("ALTER TABLE services ADD COLUMN variant TEXT", [])?;
+                }
+
+                tx.execute(
+                    "INSERT INTO schema_version (version, applied_at) VALUES (11, datetime('now'))",
+                    [],
+                )?;
+
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+
+        info!("Migration v10 -> v11 completed successfully");
         Ok(())
     }
 
@@ -657,6 +738,8 @@ impl SqliteStateTracker {
                     native_restart_enabled INTEGER NOT NULL DEFAULT 0,
                     stale_grace_count INTEGER NOT NULL DEFAULT 0,
                     process_group_id INTEGER,
+                    host_pid INTEGER,
+                    attach_socket TEXT,
                     variant TEXT
                 );
 
@@ -859,8 +942,10 @@ mod desired_state_migration_tests {
 
         // Schema version must have advanced all the way to current — a
         // legacy v6 db run through `initialize()` now migrates straight
-        // through v7 (desired_state), v8 (native restart metadata), and v9
-        // (process group ownership), not just to v7.
+        // through v7 (desired_state), v8 (native restart metadata), v9
+        // (process group ownership), v10 (host pid and attach socket),
+        // and v11 (variant selection),
+        // not just to v7.
         let conn = rusqlite::Connection::open(fed_dir.join("lock.db")).unwrap();
         let version: i32 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
@@ -868,7 +953,7 @@ mod desired_state_migration_tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     #[tokio::test]
@@ -1088,7 +1173,7 @@ mod native_restart_migration_tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
 
         let process_group_id: Option<u32> = conn
             .query_row(
@@ -1157,6 +1242,266 @@ mod native_restart_migration_tests {
         assert!(retrieved.native_restart_enabled);
 
         let conn = rusqlite::Connection::open(temp_dir.path().join(".fed/lock.db")).unwrap();
+        let version: i32 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+}
+
+#[cfg(test)]
+mod host_state_migration_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Hand-write a `lock.db` matching the exact v9 schema (post-
+    /// `process_group_id`, pre-`host_pid`/`attach_socket`) so migrating it
+    /// forward exercises the real `ALTER TABLE` path rather than a
+    /// freshly-created (already up to date) database.
+    fn write_legacy_v9_db(fed_dir: &std::path::Path, service_id: &str) {
+        std::fs::create_dir_all(fed_dir).unwrap();
+        let db_path = fed_dir.join("lock.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+
+            CREATE TABLE lock_file (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                fed_pid INTEGER NOT NULL,
+                work_dir TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE services (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                service_type TEXT NOT NULL,
+                pid INTEGER,
+                container_id TEXT,
+                started_at TEXT NOT NULL,
+                external_repo TEXT,
+                namespace TEXT NOT NULL,
+                restart_count INTEGER NOT NULL DEFAULT 0,
+                last_restart_at TEXT,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                circuit_breaker_open_until TEXT,
+                startup_message TEXT,
+                desired_state TEXT NOT NULL DEFAULT 'running',
+                native_restart_enabled INTEGER NOT NULL DEFAULT 0,
+                stale_grace_count INTEGER NOT NULL DEFAULT 0,
+                process_group_id INTEGER
+            );
+
+            CREATE TABLE port_allocations (
+                service_id TEXT NOT NULL,
+                parameter_name TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                PRIMARY KEY (service_id, parameter_name)
+            );
+
+            CREATE TABLE allocated_ports (
+                port INTEGER PRIMARY KEY,
+                allocated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE persisted_ports (
+                param_name TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                allocated_at TEXT NOT NULL,
+                isolation_id TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (param_name, isolation_id)
+            );
+
+            CREATE TABLE restart_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id TEXT NOT NULL,
+                restarted_at TEXT NOT NULL
+            );
+
+            CREATE TABLE project_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            "#,
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (9, datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO lock_file (id, fed_pid, work_dir, started_at, updated_at) VALUES (1, 999999, 'legacy', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO services (id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, circuit_breaker_open_until, startup_message, desired_state, native_restart_enabled, stale_grace_count, process_group_id)
+             VALUES (?1, 'running', 'process', NULL, NULL, datetime('now'), NULL, 'root', 0, NULL, 0, NULL, NULL, 'running', 0, 0, NULL)",
+            rusqlite::params![service_id],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrate_both_v10_schemas_preserves_metadata_and_all_read_paths() {
+        for variant_schema in [false, true] {
+            let temp_dir = TempDir::new().unwrap();
+            let fed_dir = temp_dir.path().join(".fed");
+            write_legacy_v9_db(&fed_dir, "worker");
+            {
+                let conn = rusqlite::Connection::open(fed_dir.join("lock.db")).unwrap();
+                conn.execute_batch(if variant_schema {
+                    "ALTER TABLE services ADD COLUMN variant TEXT;
+                     UPDATE services SET variant = 'terminal';"
+                } else {
+                    "ALTER TABLE services ADD COLUMN host_pid INTEGER;
+                     ALTER TABLE services ADD COLUMN attach_socket TEXT;
+                     UPDATE services SET host_pid = 12345, attach_socket = '/tmp/worker.sock';"
+                })
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO schema_version VALUES (10, datetime('now'))",
+                    [],
+                )
+                .unwrap();
+            }
+            let mut tracker = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap();
+            tracker.initialize().await.unwrap();
+            tracker.run_migrations().await.unwrap();
+            let mut state = tracker.get_service("worker").await.unwrap();
+            assert_eq!(
+                state.variant.as_deref(),
+                variant_schema.then_some("terminal")
+            );
+            assert_eq!(state.host_pid, (!variant_schema).then_some(12345));
+            assert_eq!(
+                state.attach_socket,
+                (!variant_schema).then(|| "/tmp/worker.sock".into())
+            );
+
+            // New registrations carry both features, through every reader.
+            state.id = "combined".into();
+            state.variant = Some("terminal".into());
+            state.host_pid = Some(12345);
+            state.attach_socket = Some("/tmp/worker.sock".into());
+            tracker.register_service(state).await.unwrap();
+            let single = tracker.get_service("combined").await.unwrap();
+            let all = tracker.get_services().await;
+            let connection =
+                SqliteStateTracker::fetch_services_from_connection(&tracker.conn).await;
+            for state in [&single, &all["combined"], &connection["combined"]] {
+                assert_eq!(state.variant.as_deref(), Some("terminal"));
+                assert_eq!(state.host_pid, Some(12345));
+                assert_eq!(
+                    state.attach_socket.as_deref(),
+                    Some(std::path::Path::new("/tmp/worker.sock"))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn migrate_v9_to_v10_adds_host_columns_as_null() {
+        let temp_dir = TempDir::new().unwrap();
+        let fed_dir = temp_dir.path().join(".fed");
+        write_legacy_v9_db(&fed_dir, "legacy-process-svc");
+
+        let mut tracker = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        tracker
+            .initialize()
+            .await
+            .expect("migrating a v9 db to v10 should succeed");
+
+        // A service from before `tty:` existed never ran under a host, so
+        // both columns must read back empty rather than inventing one.
+        let state = tracker
+            .get_service("legacy-process-svc")
+            .await
+            .expect("legacy row should survive the migration");
+        assert_eq!(state.host_pid, None);
+        assert_eq!(state.attach_socket, None);
+
+        let conn = rusqlite::Connection::open(fed_dir.join("lock.db")).unwrap();
+        let version: i32 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, 11);
+    }
+
+    #[tokio::test]
+    async fn migrate_v9_to_v10_is_idempotent_on_rerun() {
+        let temp_dir = TempDir::new().unwrap();
+        let fed_dir = temp_dir.path().join(".fed");
+        write_legacy_v9_db(&fed_dir, "legacy-process-svc");
+
+        // First migration.
+        {
+            let mut tracker = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap();
+            tracker.initialize().await.unwrap();
+        }
+
+        // Re-opening (simulating a second `fed` invocation against an
+        // already-migrated db) must not error on the already-applied guard
+        // or the already-existing columns.
+        let mut tracker = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        tracker
+            .initialize()
+            .await
+            .expect("re-running migrations against an already-migrated db should be a no-op");
+
+        let state = tracker.get_service("legacy-process-svc").await.unwrap();
+        assert_eq!(state.host_pid, None);
+    }
+
+    /// A brand-new `.fed/` directory takes the `create_schema` path, not the
+    /// migration path — a new column needs both, and forgetting
+    /// `create_schema` would leave fresh projects one migration behind their
+    /// own schema version.
+    #[tokio::test]
+    async fn fresh_database_has_host_columns_without_migrating() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut tracker = SqliteStateTracker::new(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        tracker.initialize().await.unwrap();
+
+        let conn = rusqlite::Connection::open(temp_dir.path().join(".fed/lock.db")).unwrap();
+        for column in ["host_pid", "attach_socket"] {
+            let has_column: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('services') WHERE name = ?1",
+                    rusqlite::params![column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(has_column, "fresh schema is missing {column}");
+        }
+
         let version: i32 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
                 row.get(0)

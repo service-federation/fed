@@ -4,7 +4,10 @@ use fed::{Orchestrator, config::Config};
 /// Bumped only on a breaking/renaming change to the per-service JSON shape.
 const SCHEMA_VERSION: u32 = 1;
 
-/// JSON shape for a single service under `fed status --json`.
+/// JSON shape for a single service under `fed status --json`: `status`,
+/// `schema_version`, `health`, `service_type`, `pid`, `container_id`,
+/// `started_at`, `uptime_seconds`, `ports`, `startup_message`,
+/// `variant`, `attachable`, `supervised_by`, `supervisor_running`, `supervisor_pid`.
 ///
 /// Every field is always present (never omitted): an agent doing
 /// `data[svc]["pid"]` should never hit a `KeyError` depending on service
@@ -41,6 +44,9 @@ struct ServiceStatusJson {
     /// so it reflects the selection the running process was started with
     /// rather than whatever today's flags would pick.
     variant: Option<String>,
+    /// Whether `fed attach <service>` can connect right now: the service
+    /// runs under a terminal-owning host, and it is still alive.
+    attachable: bool,
     /// `"fed"` — in the supervisor's filtered health-check scope
     /// (`fed::orchestrator::supervised_service_names`); `"docker-native"` —
     /// a Docker service with `restart: always`, protected by Docker's own
@@ -194,6 +200,8 @@ pub async fn run_status(
                         .unwrap_or_default(),
                     startup_message: service_state.and_then(|s| s.startup_message.clone()),
                     variant: resolved_variant(service_state, config, &name),
+                    attachable: service_state.is_some_and(|s| s.attach_socket.is_some())
+                        && super::stop::state_status_is_active(stat),
                     supervised_by: supervised_by_bucket(config, &name, &supervised_scope),
                     supervisor_running: supervisor_pid.is_some(),
                     supervisor_pid,

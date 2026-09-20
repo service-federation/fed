@@ -138,6 +138,17 @@ pub struct Service {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart: Option<RestartPolicy>,
 
+    /// The service needs a terminal. `fed start` runs it under a
+    /// pseudo-terminal owned by a fed host process, so the service keeps
+    /// running in the background and `fed attach` can connect a terminal to
+    /// it later. Everything the program shows on its terminal goes to the
+    /// log file, including the input it echoes back. `fed start -i` runs the
+    /// service in your own terminal instead, with no host.
+    ///
+    /// Process services only, and unix only.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tty: bool,
+
     // Service exposure for external consumption
     #[serde(default, skip_serializing_if = "is_false")]
     pub expose: bool,
@@ -273,6 +284,7 @@ impl Service {
             "healthcheck",
             "depends_on",
             "restart",
+            "tty",
             "expose",
             "profiles",
             "tags",
@@ -878,6 +890,7 @@ mod merge_completeness {
             healthcheck: Some(HealthCheck::Command("true".to_string())),
             depends_on: vec![DependsOn::Simple("postgres".to_string())],
             restart: Some(RestartPolicy::Always),
+            tty: true,
             expose: true,
             profiles: vec!["full".to_string()],
             tags: vec!["backend".to_string()],
@@ -941,6 +954,7 @@ mod merge_completeness {
             healthcheck,
             depends_on,
             restart,
+            tty,
             expose,
             profiles,
             tags,
@@ -998,6 +1012,7 @@ mod merge_completeness {
             matches!(restart, Some(RestartPolicy::Always)),
             "restart must be copied"
         );
+        assert!(tty, "tty must be copied");
         assert!(expose, "expose must be copied");
         assert_eq!(profiles, vec!["full".to_string()]);
         assert_eq!(tags, vec!["backend".to_string()]);

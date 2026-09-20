@@ -254,7 +254,7 @@ impl ServiceMerger {
     ///   chosen variant over the outer service to produce the service that
     ///   every later stage sees.
     ///
-    /// `merge_service_all_fields_are_copied` in this module's tests
+    /// `merge_service_all_fields_are_copied` in `config::service` tests
     /// destructures the merged `Service`, so adding a field to the struct
     /// without adding it here fails to compile.
     pub fn merge_service(local: &mut Service, base: &Service) -> Result<()> {
@@ -329,11 +329,12 @@ impl ServiceMerger {
             local.variant = base.variant.clone();
         }
 
-        // `expose` and `compose_imported` are booleans with no "unset"
+        // `tty`, `expose`, and `compose_imported` are booleans with no "unset"
         // state, so "local wins" can only mean "local's `true` wins" —
         // inheriting `expose: true` from a template is the whole point of
         // marking a package service exposed, and `compose_imported` is an
         // internal provenance flag that must survive any merge.
+        local.tty |= base.tty;
         local.expose |= base.expose;
         local.compose_imported |= base.compose_imported;
 

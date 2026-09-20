@@ -1,6 +1,7 @@
 //! Schema-shape tests for `fed status --json`'s enriched per-service object
 //! (03-status-json.md): `schema_version`, `health`, `service_type`, `pid`,
-//! `container_id`, `started_at`, `uptime_seconds`, `ports`, `startup_message`.
+//! `container_id`, `started_at`, `uptime_seconds`, `ports`,
+//! `startup_message`, `attachable`.
 //!
 //! `pid`/`container_id`/`started_at`/`uptime_seconds` are inherently
 //! non-deterministic per test run, so these assert *shape* via
@@ -123,6 +124,9 @@ fn status_json_schema_process_oneshot_and_never_started() {
     );
     assert!(app["ports"].is_object());
     assert_eq!(app["startup_message"], "http://localhost:1234");
+    // A plain process service has no terminal-owning host, so nothing can
+    // attach to it.
+    assert_eq!(app["attachable"], false);
 
     // --- item 5: configured-but-never-started service ---
     let never = &data["never-started"];
@@ -139,6 +143,7 @@ fn status_json_schema_process_oneshot_and_never_started() {
     assert!(never["uptime_seconds"].is_null());
     assert_eq!(never["ports"], serde_json::json!({}));
     assert!(never["startup_message"].is_null());
+    assert_eq!(never["attachable"], false);
 
     // --- item 4: oneshot/Completed shape ---
     let migrate = &data["migrate"];
@@ -148,6 +153,7 @@ fn status_json_schema_process_oneshot_and_never_started() {
     assert_eq!(migrate["service_type"], "oneshot");
     assert!(migrate["pid"].is_null());
     assert!(migrate["container_id"].is_null());
+    assert_eq!(migrate["attachable"], false);
     assert!(
         migrate["started_at"].as_str().is_some(),
         "oneshot started_at should be non-null"
@@ -169,6 +175,7 @@ fn status_json_schema_process_oneshot_and_never_started() {
     assert!(app_after["container_id"].is_null());
     assert!(app_after["started_at"].is_null());
     assert!(app_after["uptime_seconds"].is_null());
+    assert_eq!(app_after["attachable"], false);
 }
 
 /// Cross-process regression test for compose `container_id` (task
