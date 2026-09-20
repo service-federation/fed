@@ -1027,6 +1027,19 @@ impl SqliteStateTracker {
 
             let is_stale = if let Some(pid) = service_state.pid {
                 let launcher_is_dead = !Self::is_process_running(pid).await;
+                #[cfg(unix)]
+                if launcher_is_dead && service_state.host_pid.is_some() {
+                    // A wedged host may be keeping the dead group leader as
+                    // a zombie. Reap the host before testing group cleanup.
+                    crate::service::hosted::reap_host(
+                        service_id.rsplit('/').next().unwrap_or(service_id),
+                        service_state.host_pid,
+                        service_state.attach_socket.as_deref(),
+                        service_state.started_at,
+                        std::path::Path::new(&self.work_dir),
+                    )
+                    .await;
+                }
                 if launcher_is_dead
                     && service_state.service_type == ServiceType::Process
                     && let Some(process_group_id) =
@@ -1060,6 +1073,17 @@ impl SqliteStateTracker {
             };
 
             if is_stale {
+                #[cfg(unix)]
+                if service_state.pid.is_none() {
+                    crate::service::hosted::reap_host(
+                        service_id.rsplit('/').next().unwrap_or(service_id),
+                        service_state.host_pid,
+                        service_state.attach_socket.as_deref(),
+                        service_state.started_at,
+                        std::path::Path::new(&self.work_dir),
+                    )
+                    .await;
+                }
                 if service_state.native_restart_enabled {
                     grace_hit.push(service_id.clone());
                 } else {

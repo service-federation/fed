@@ -25,6 +25,8 @@ mod docker;
 mod external;
 mod foreground;
 mod gradle;
+#[cfg(unix)]
+pub mod hosted;
 mod log_capture;
 mod oneshot;
 mod process;

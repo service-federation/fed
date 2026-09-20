@@ -274,6 +274,8 @@ impl Orchestrator {
         let foreground = self.foreground.as_deref() == Some(name);
         let output_mode = if foreground {
             OutputMode::Passthrough
+        } else if service.tty {
+            OutputMode::File
         } else {
             self.output_mode
         };
@@ -313,6 +315,8 @@ impl Orchestrator {
         );
         if foreground {
             Box::new(process_service.run_in_foreground())
+        } else if service.tty {
+            Box::new(process_service.run_hosted())
         } else {
             Box::new(process_service)
         }
@@ -391,6 +395,15 @@ impl Orchestrator {
                     }
                 }
 
+                if let Some(process) = manager.as_any_mut().downcast_mut::<ProcessService>() {
+                    process.restore_host(
+                        service_state.host_pid,
+                        service_state.attach_socket.clone(),
+                        service_state.pid,
+                        service_state.started_at,
+                    );
+                }
+
                 // Restore container ID for docker services
                 if let Some(container_id) = &service_state.container_id
                     && let Some(restored) =
@@ -448,6 +461,15 @@ impl Orchestrator {
             if missing {
                 match missing_handling {
                     MissingServiceHandling::Unregister => {
+                        #[cfg(unix)]
+                        crate::service::hosted::reap_host(
+                            service_name,
+                            service_state.host_pid,
+                            service_state.attach_socket.as_deref(),
+                            service_state.started_at,
+                            self.work_dir(),
+                        )
+                        .await;
                         self.unregister_stale_service(service_name).await;
                     }
                     MissingServiceHandling::Report => {
@@ -610,6 +632,30 @@ mod tests {
         Orchestrator::new(config, temp.path().to_path_buf())
             .await
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_tty_reads_file_logs_in_captured_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut orchestrator =
+            Orchestrator::new(crate::config::Config::default(), dir.path().to_path_buf())
+                .await
+                .unwrap();
+        orchestrator.set_output_mode(OutputMode::Captured);
+        let service = crate::config::Service {
+            process: Some("cat".into()),
+            tty: true,
+            ..Default::default()
+        };
+        let manager = orchestrator.create_process_service(
+            "repl",
+            &service,
+            HashMap::new(),
+            dir.path().to_string_lossy().into_owned(),
+        );
+        std::fs::write(dir.path().join(".fed/logs/repl.log"), "terminal-output\n").unwrap();
+        assert_eq!(manager.logs(None).await.unwrap(), vec!["terminal-output"]);
     }
 
     /// Regression for the supervisor-attach race where the initial stale
