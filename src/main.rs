@@ -232,6 +232,21 @@ async fn run() -> anyhow::Result<()> {
 
     // ── Tier 1: Commands that need NO config ──────────────────────────
     match &cli.command {
+        #[cfg(unix)]
+        Commands::Attach {
+            service,
+            no_stdin,
+            detach_keys,
+        } => {
+            let work_dir = resolve_work_dir(
+                cli.workdir.clone(),
+                cli.config
+                    .as_deref()
+                    .unwrap_or(std::path::Path::new("fed.yaml")),
+            )?;
+            let code = commands::run_attach(work_dir, service, *no_stdin, detach_keys).await?;
+            std::process::exit(code);
+        }
         Commands::Init { output, force } => {
             return commands::run_init(output, *force, &out);
         }
@@ -788,6 +803,8 @@ async fn run() -> anyhow::Result<()> {
         Commands::Top { interval } => {
             commands::run_top(&orchestrator, interval, &out).await?;
         }
+        #[cfg(unix)]
+        Commands::Attach { .. } => unreachable!("handled in earlier dispatch tiers"),
         // Handled in earlier tiers
         Commands::Init { .. }
         | Commands::Validate

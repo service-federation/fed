@@ -145,7 +145,8 @@ pub struct Service {
     /// log file, including the input it echoes back. `fed start -i` runs the
     /// service in your own terminal instead, with no host.
     ///
-    /// Process services only, and unix only.
+    /// See the README section "Attach to a running service" for detach keys
+    /// and output-only sessions. Process services only, and unix only.
     #[serde(default, skip_serializing_if = "is_false")]
     pub tty: bool,
 

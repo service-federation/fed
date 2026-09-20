@@ -137,6 +137,20 @@ fed starts that service's dependencies in the background as usual, hands it your
 
 When `fed start -i` doesn't receive a service, it uses the entrypoint. Just like `fed start`. That works when the entrypoint is itself a process service. An entrypoint that only groups other services (a `depends_on:` list with no `process:`) has nothing to hand the terminal to, so fed asks you to pass one of them.
 
+### Attach to a running service
+
+Give a process service `tty: true`, then run `fed start <service>` and
+`fed attach <service>`. Your input goes to the service and its output appears
+in your terminal. Press Ctrl+P, then Ctrl+Q to detach; the service keeps running.
+Use `--detach-keys ctrl-a,ctrl-d` to choose another pair.
+
+`fed attach <service> --no-stdin` follows output without forwarding input.
+Ctrl+C ends that client. Multiple clients can attach to the same service.
+An attached client exits with the service's exit code when the service stops.
+
+Terminal output, including typed input the program echoes, is saved in
+`.fed/logs/<service>.log` and available through `fed logs <service>`.
+
 ## One stack per worktree
 
 Git isolates files. fed isolates the runtime state that usually still collides.
