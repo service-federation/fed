@@ -68,7 +68,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Process management
-nix = { version = "0.29", features = ["signal", "process", "resource", "feature", "term"] }
+nix = { version = "0.29", features = ["signal", "process", "resource", "feature", "term", "ioctl"] }
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }

@@ -76,6 +76,69 @@ pub fn ensure_fed_dir(work_dir: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Longest path a `sockaddr_un` can hold on this platform, excluding the
+/// terminating NUL: 103 bytes on macOS, 107 on Linux.
+#[cfg(unix)]
+pub fn max_socket_path_len() -> usize {
+    std::mem::size_of::<nix::libc::sockaddr_un>()
+        - std::mem::offset_of!(nix::libc::sockaddr_un, sun_path)
+        - 1
+}
+
+/// Where the attach host for `service` listens.
+///
+/// `.fed/attach/<service>.sock` keeps the socket with the rest of the
+/// checkout's state, but a unix socket path has to fit in `sun_path`, and a
+/// realistic workspace path plus `.fed/attach/` often does not (measured: a
+/// 135-character workspace produces a 161-byte socket path against macOS's
+/// 103-byte limit). When it does not fit, fall back to a short path under
+/// `$TMPDIR` keyed by a hash of the work dir. `fed start` calls this once and
+/// stores the result in the service's state row, because macOS gives a
+/// different `$TMPDIR` per user and launch context, so a host and a client
+/// that each computed the path could disagree.
+#[cfg(unix)]
+pub fn attach_socket_path(work_dir: &Path, service: &str) -> PathBuf {
+    attach_socket_path_under(work_dir, service, &std::env::temp_dir())
+}
+
+#[cfg(unix)]
+fn attach_socket_path_under(work_dir: &Path, service: &str, temp_dir: &Path) -> PathBuf {
+    // Keep readable names where possible. Hash names that need escaping so
+    // distinct services such as `a/b` and `a_b` never alias by sanitization.
+    let file = if service.len() <= 24
+        && !service.is_empty()
+        && service
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        format!("{service}.sock")
+    } else {
+        format!("~{:016x}.sock", socket_name_hash(service.as_bytes()))
+    };
+    let in_checkout = fed_dir(work_dir).join("attach").join(&file);
+    if in_checkout.as_os_str().len() <= max_socket_path_len() {
+        return in_checkout;
+    }
+    let directory = format!("fed-{}", crate::service::hash_work_dir(work_dir));
+    let in_temp = temp_dir.join(&directory).join(&file);
+    if in_temp.as_os_str().len() <= max_socket_path_len() {
+        return in_temp;
+    }
+    // TMPDIR itself can be longer than sun_path. The uid keeps this last
+    // resort separate between users even for a shared workspace path.
+    let uid = unsafe { nix::libc::geteuid() };
+    PathBuf::from("/tmp")
+        .join(format!("{directory}-{uid}"))
+        .join(file)
+}
+
+#[cfg(unix)]
+fn socket_name_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +161,64 @@ mod tests {
         ensure_fed_dir(tmp.path()).unwrap();
         let content = std::fs::read_to_string(&gi).unwrap();
         assert!(content.contains("!extra.yaml"), "user edits must survive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_short_workspace_keeps_the_socket_in_the_checkout() {
+        let path = attach_socket_path(Path::new("/w"), "echo-svc");
+        assert_eq!(path, PathBuf::from("/w/.fed/attach/echo-svc.sock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_deep_workspace_moves_the_socket_under_tmpdir() {
+        let deep = PathBuf::from("/w").join("x".repeat(max_socket_path_len()));
+        let path = attach_socket_path(&deep, "echo-svc");
+        assert!(
+            path.starts_with(std::env::temp_dir()),
+            "expected a $TMPDIR fallback, got {}",
+            path.display()
+        );
+        assert!(path.as_os_str().len() <= max_socket_path_len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_file_name_cannot_escape_its_directory() {
+        let path = attach_socket_path(Path::new("/w"), "../../etc/x");
+        assert_eq!(path.parent(), Some(Path::new("/w/.fed/attach")));
+        assert_ne!(path, attach_socket_path(Path::new("/w"), "______etc_x"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_names_and_temp_directories_still_fit_and_bind() {
+        use std::os::unix::net::UnixListener;
+        let workspace = tempfile::tempdir().unwrap();
+        let long_temp = PathBuf::from("/tmp").join("x".repeat(200));
+        let deep = workspace.path().join("nested".repeat(30));
+        let path = attach_socket_path_under(&deep, &"é".repeat(200), &long_temp);
+        assert!(path.as_os_str().len() <= max_socket_path_len());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&path).expect("fallback socket should bind");
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn names_that_need_escaping_do_not_alias_safe_names() {
+        let workspace = Path::new("/w");
+        assert_ne!(
+            attach_socket_path(workspace, "a/b"),
+            attach_socket_path(workspace, "a_b")
+        );
+        assert_ne!(
+            attach_socket_path(workspace, "a.b"),
+            attach_socket_path(workspace, "a/b")
+        );
     }
 
     #[test]
