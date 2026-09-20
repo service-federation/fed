@@ -1,6 +1,5 @@
 use crate::output::UserOutput;
 use fed::{Orchestrator, StartOutcome, config::Config};
-use std::path::Path;
 
 /// Print the post-restart summary: reserve the unconditional success line for
 /// fully healthy restarts, list healthcheck timeouts otherwise (non-fatal —
@@ -30,15 +29,12 @@ pub async fn run_restart(
     orchestrator: &mut Orchestrator,
     config: &Config,
     services: Vec<String>,
-    config_path: &Path,
-    flags: super::supervise::InheritedFlags,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
-    let restarted_names: Vec<String> = if services.is_empty() {
+    if services.is_empty() {
         out.status("Restarting all services in dependency-aware order...");
         let outcome = orchestrator.restart_all().await?;
         report_restart_outcome(&outcome, true, out);
-        config.services.keys().cloned().collect()
     } else {
         // Expand tag references (e.g., @backend) into service names
         let services_to_restart = config.expand_service_selection(&services);
@@ -92,22 +88,7 @@ pub async fn run_restart(
 
         out.blank();
         report_restart_outcome(&outcome, false, out);
-        services_to_restart
     };
-
-    // `fed restart` already mutates state and runs the full `initialize()`
-    // path, so it also gets to respawn a dead/missing supervisor, same as
-    // `fed start`. `fed status` deliberately does neither, since it never
-    // mutates state and stays strictly read-only.
-    if super::supervise::any_needs_supervision(config, restarted_names.iter()) {
-        let work_dir = orchestrator.work_dir().to_path_buf();
-        if let Err(e) = super::supervise::spawn_if_needed(&work_dir, config_path, &flags) {
-            out.warning(&format!(
-                "Warning: failed to start the service supervisor: {}",
-                e
-            ));
-        }
-    }
 
     Ok(())
 }

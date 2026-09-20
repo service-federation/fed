@@ -639,12 +639,7 @@ pub async fn run_start(
         out.status("  Use 'fed stop' to stop them");
         out.status("  Use 'fed tui' for interactive mode");
 
-        // A plain, non-watch `fed start` backgrounds services and this
-        // process exits immediately — without a supervisor, a `restart:`
-        // policy would never fire again. Spawn one iff it's actually needed
-        // and not already running; `fed status` never does this, staying
-        // strictly read-only.
-        spawn_restart_supervisor(orchestrator, config, &started, config_path, &flags, out);
+        // main reattaches the daemon after dispatch, including failure paths.
     } else {
         run_watch_mode(orchestrator, config, config_path, out).await?;
     }

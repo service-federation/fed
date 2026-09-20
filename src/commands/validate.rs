@@ -114,19 +114,7 @@ pub async fn run_validate(
     let mut services: Vec<_> = config.services.iter().collect();
     services.sort_by(|a, b| a.0.cmp(b.0));
     for (name, service) in services {
-        let service_type = if service.process.is_some() {
-            "process"
-        } else if service.image.is_some() {
-            "docker"
-        } else if service.compose_file.is_some() {
-            "docker-compose"
-        } else if service.gradle_task.is_some() {
-            "gradle"
-        } else if service.install.is_some() || service.migrate.is_some() {
-            "hook-only"
-        } else {
-            "unknown"
-        };
+        let service_type = service.service_type();
         match &service.variant {
             Some(variant) => out.status(&format!(
                 "  - {} ({}, variant: {})",

@@ -41,7 +41,10 @@ pub(super) async fn collect_managed_ports(
     let mut has_live_service = false;
 
     for svc in services.values() {
-        if !matches!(svc.status, Status::Running | Status::Healthy) {
+        if !matches!(
+            svc.status,
+            Status::Running | Status::Healthy | Status::Failing
+        ) {
             continue;
         }
 

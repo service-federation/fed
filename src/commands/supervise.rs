@@ -3,10 +3,9 @@
 //! This file has two halves:
 //! - [`run_supervise`]: the daemon's own body, invoked by `main.rs` when
 //!   `cli.command` is the hidden `Commands::Supervise` variant.
-//! - [`spawn_if_needed`]: called from `fed start`'s non-watch branch and
-//!   `fed restart` to launch a detached `fed supervise` process when a
-//!   service with a `restart:` policy is running and no live supervisor
-//!   already exists for this workspace.
+//! - [`spawn_if_needed`]: called after background start/restart dispatch
+//!   (including error recovery), or for an interactive service's dependencies,
+//!   to launch a detached observer for healthchecks and restart policies.
 
 use fed::config::Config;
 use fed::orchestrator::supervisor::{live_supervisor_pid, try_acquire};
@@ -31,10 +30,14 @@ use std::time::Duration;
 /// `fed start`/`fed restart` invocations both decide to spawn one at
 /// roughly the same time).
 pub async fn run_supervise(
-    config: Config,
+    mut config: Config,
     work_dir: PathBuf,
     mut run_context: RunContext,
 ) -> anyhow::Result<()> {
+    // Serialize attach with start/restart parameter resolution and registration.
+    // A just-spawned daemon may not hold supervisor.lock yet when another
+    // command begins; it must wait for that command's committed state.
+    let attach_lock = fed::orchestrator::StartLock::acquire(&work_dir).await?;
     let lock = match try_acquire(&work_dir) {
         Ok(lock) => lock,
         Err(e) => {
@@ -52,6 +55,34 @@ pub async fn run_supervise(
         work_dir
     );
 
+    // A later start may only change one service. The persisted registration
+    // owns the implementation of every still-running (or restartable) service.
+    let tracker = fed::state::StateTracker::new_for_supervisor(work_dir.clone()).await?;
+    let mut running_names = Vec::new();
+    for name in config.services.keys() {
+        if let Some(state) = tracker.get_service(name).await
+            && state.desired_state == fed::state::DesiredState::Running
+        {
+            if let Some(variant) = state.variant {
+                run_context.variants.push(format!("{name}:{variant}"));
+            }
+            running_names.push(name.clone());
+        }
+    }
+    fed::config::variants::resolve_variants(
+        &mut config,
+        &fed::config::variants::VariantSelection::load(&run_context.variants, &work_dir)?,
+        &run_context.profiles,
+    )?;
+    for name in running_names {
+        for profile in &config.services[&name].profiles {
+            if !run_context.profiles.contains(profile) {
+                run_context.profiles.push(profile.clone());
+            }
+        }
+    }
+    drop(tracker);
+
     // supervisor_attach's own construction path (initialize_supervisor) is
     // what matters here, not output_mode — but File is the accurate label
     // for what this daemon exists to watch (backgrounded services).
@@ -65,6 +96,7 @@ pub async fn run_supervise(
         .build()
         .await?;
 
+    drop(attach_lock);
     tracing::info!("fed supervise: attached and monitoring supervised services");
 
     run_until_done(&orchestrator).await;
@@ -189,9 +221,8 @@ fn supervisor_args(
 /// Spawn a detached `fed supervise` for `work_dir`, unless one is already
 /// running.
 ///
-/// Called from `fed start`'s non-watch branch (when any started service has
-/// a `restart:` policy) and from `fed restart` — both spawn or respawn a
-/// missing supervisor after mutating state. `fed status` calls neither this
+/// Called after background start/restart dispatch, or before waiting on an
+/// interactive service. A fresh daemon attaches to the committed service state. `fed status` calls neither this
 /// nor any other respawn logic; it only reads the lock file for display,
 /// staying strictly read-only.
 ///

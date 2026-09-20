@@ -237,7 +237,7 @@ For each service, the first name in the list it offers wins; otherwise its `defa
 
 Switching variant while the service runs is a `fed stop` and a `fed start` — the ports and container names are the same, so the two implementations can't coexist. A variant that needs a *different* port is a different service, not a variant: the contract lives on the outer service by design.
 
-See [`examples/variants-example.yaml`](./examples/variants-example.yaml) for a runnable version.
+See [`examples/variants-example.yaml`](./examples/variants-example.yaml) for a minimal version, or the [variant stack walkthrough](./examples/variant-stack/) for real HTTP services, a browser page, health failure/recovery, and an attachable console.
 
 ### Shared defaults and whole-stack startup
 

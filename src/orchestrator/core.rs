@@ -705,7 +705,15 @@ impl Orchestrator {
             .initialize_for_supervisor()
             .await?;
 
+        // Attach to the existing port scope before resolving healthcheck URLs.
+        // Those listeners belong to our live services, not competing processes.
+        if self.isolation_id.is_none() {
+            self.isolation_id = Self::load_isolation_id_read_only(&self.work_dir);
+        }
+        self.collect_managed_ports().await;
         self.initialize_dry_run().await?;
+        // Newly-stale services may need to bind these ports during recovery.
+        self.release_port_listeners_once();
 
         // Restore managers, honoring desired_state (never resurrect stopped).
         // A service can die after initialize_for_supervisor's liveness sweep

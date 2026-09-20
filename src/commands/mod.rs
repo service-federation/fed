@@ -58,6 +58,7 @@ pub use status::run_status;
 pub use stop::{run_stop, run_stop_from_state};
 pub use supervise::InheritedFlags;
 pub use supervise::run_supervise;
+pub(crate) use supervise::{any_needs_supervision, spawn_if_needed as spawn_supervisor_if_needed};
 pub use top::run_top;
 pub use tui::run_tui;
 pub use validate::run_validate;
