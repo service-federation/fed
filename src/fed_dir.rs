@@ -103,18 +103,7 @@ pub fn attach_socket_path(work_dir: &Path, service: &str) -> PathBuf {
 
 #[cfg(unix)]
 fn attach_socket_path_under(work_dir: &Path, service: &str, temp_dir: &Path) -> PathBuf {
-    // Keep readable names where possible. Hash names that need escaping so
-    // distinct services such as `a/b` and `a_b` never alias by sanitization.
-    let file = if service.len() <= 24
-        && !service.is_empty()
-        && service
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-    {
-        format!("{service}.sock")
-    } else {
-        format!("~{:016x}.sock", socket_name_hash(service.as_bytes()))
-    };
+    let file = format!("{}.sock", service_file_stem(service));
     let in_checkout = fed_dir(work_dir).join("attach").join(&file);
     if in_checkout.as_os_str().len() <= max_socket_path_len() {
         return in_checkout;
@@ -130,6 +119,24 @@ fn attach_socket_path_under(work_dir: &Path, service: &str, temp_dir: &Path) -> 
     PathBuf::from("/tmp")
         .join(format!("{directory}-{uid}"))
         .join(file)
+}
+
+/// A short, stable filename component for service-owned files.
+///
+/// Names that need escaping are hashed so distinct service names cannot
+/// collide through sanitization or escape their containing directory.
+#[cfg(unix)]
+pub fn service_file_stem(service: &str) -> String {
+    if service.len() <= 24
+        && !service.is_empty()
+        && service
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        service.to_owned()
+    } else {
+        format!("~{:016x}", socket_name_hash(service.as_bytes()))
+    }
 }
 
 #[cfg(unix)]

@@ -462,3 +462,32 @@ fn stdout_exit_event_does_not_wait_for_a_descendant_holding_the_terminal() {
     );
     host.exited();
 }
+
+#[test]
+fn host_diagnostics_use_safe_bounded_service_filenames() {
+    for service in [
+        "api/repl".to_owned(),
+        "../../repl".to_owned(),
+        "r".repeat(300),
+    ] {
+        let (_dir, mut spec) = fixture("exit 0");
+        spec.service = service.clone();
+        spec.socket_path = fed::fed_dir::attach_socket_path(&spec.work_dir, &service);
+        let mut host = Host::spawn(&spec);
+        host.ready();
+        assert_eq!(host.event(), HostEvent::Exited { status: 0 });
+        host.exited();
+        let entries = std::fs::read_dir(spec.work_dir.join(".fed/logs"))
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].file_type().unwrap().is_file());
+        assert!(
+            entries[0]
+                .file_name()
+                .to_string_lossy()
+                .ends_with("-host.log")
+        );
+    }
+}

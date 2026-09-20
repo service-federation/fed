@@ -201,7 +201,10 @@ async fn run() -> anyhow::Result<()> {
     let daemon_log = match &cli.command {
         Commands::Supervise => Some("supervisor.log".to_string()),
         #[cfg(unix)]
-        Commands::Host { service } => Some(format!("{}-host.log", service)),
+        Commands::Host { service } => Some(format!(
+            "{}-host.log",
+            fed::fed_dir::service_file_stem(service)
+        )),
         _ => None,
     };
     let is_tty = std::io::stderr().is_terminal();
