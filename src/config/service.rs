@@ -138,6 +138,17 @@ pub struct Service {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart: Option<RestartPolicy>,
 
+    /// The service needs a terminal. `fed start` runs it under a
+    /// pseudo-terminal owned by a fed host process, so the service keeps
+    /// running in the background and `fed attach` can connect a terminal to
+    /// it later. Everything the program shows on its terminal goes to the
+    /// log file, including the input it echoes back. `fed start -i` runs the
+    /// service in your own terminal instead, with no host.
+    ///
+    /// Process services only, and unix only.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tty: bool,
+
     // Service exposure for external consumption
     #[serde(default, skip_serializing_if = "is_false")]
     pub expose: bool,
@@ -215,6 +226,7 @@ impl Service {
             "healthcheck",
             "depends_on",
             "restart",
+            "tty",
             "expose",
             "profiles",
             "tags",
