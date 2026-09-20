@@ -98,30 +98,45 @@ pub fn max_socket_path_len() -> usize {
 /// that each computed the path could disagree.
 #[cfg(unix)]
 pub fn attach_socket_path(work_dir: &Path, service: &str) -> PathBuf {
-    let file = format!("{}.sock", sanitize_service_name(service));
+    attach_socket_path_under(work_dir, service, &std::env::temp_dir())
+}
+
+#[cfg(unix)]
+fn attach_socket_path_under(work_dir: &Path, service: &str, temp_dir: &Path) -> PathBuf {
+    // Keep readable names where possible. Hash names that need escaping so
+    // distinct services such as `a/b` and `a_b` never alias by sanitization.
+    let file = if service.len() <= 24
+        && !service.is_empty()
+        && service
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        format!("{service}.sock")
+    } else {
+        format!("~{:016x}.sock", socket_name_hash(service.as_bytes()))
+    };
     let in_checkout = fed_dir(work_dir).join("attach").join(&file);
     if in_checkout.as_os_str().len() <= max_socket_path_len() {
         return in_checkout;
     }
-    std::env::temp_dir()
-        .join(format!("fed-{}", crate::service::hash_work_dir(work_dir)))
+    let directory = format!("fed-{}", crate::service::hash_work_dir(work_dir));
+    let in_temp = temp_dir.join(&directory).join(&file);
+    if in_temp.as_os_str().len() <= max_socket_path_len() {
+        return in_temp;
+    }
+    // TMPDIR itself can be longer than sun_path. The uid keeps this last
+    // resort separate between users even for a shared workspace path.
+    let uid = unsafe { nix::libc::geteuid() };
+    PathBuf::from("/tmp")
+        .join(format!("{directory}-{uid}"))
         .join(file)
 }
 
-/// Service names reach the filesystem here, so restrict them the same way
-/// the log file name does in `orchestrator::factory`.
 #[cfg(unix)]
-fn sanitize_service_name(service: &str) -> String {
-    service
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+fn socket_name_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
 }
 
 #[cfg(test)]
@@ -172,7 +187,38 @@ mod tests {
     #[test]
     fn a_socket_file_name_cannot_escape_its_directory() {
         let path = attach_socket_path(Path::new("/w"), "../../etc/x");
-        assert_eq!(path, PathBuf::from("/w/.fed/attach/______etc_x.sock"));
+        assert_eq!(path.parent(), Some(Path::new("/w/.fed/attach")));
+        assert_ne!(path, attach_socket_path(Path::new("/w"), "______etc_x"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_names_and_temp_directories_still_fit_and_bind() {
+        use std::os::unix::net::UnixListener;
+        let workspace = tempfile::tempdir().unwrap();
+        let long_temp = PathBuf::from("/tmp").join("x".repeat(200));
+        let deep = workspace.path().join("nested".repeat(30));
+        let path = attach_socket_path_under(&deep, &"é".repeat(200), &long_temp);
+        assert!(path.as_os_str().len() <= max_socket_path_len());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&path).expect("fallback socket should bind");
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn names_that_need_escaping_do_not_alias_safe_names() {
+        let workspace = Path::new("/w");
+        assert_ne!(
+            attach_socket_path(workspace, "a/b"),
+            attach_socket_path(workspace, "a_b")
+        );
+        assert_ne!(
+            attach_socket_path(workspace, "a.b"),
+            attach_socket_path(workspace, "a/b")
+        );
     }
 
     #[test]
