@@ -209,7 +209,9 @@ fn scan_value(value: &serde_yaml::Value, out: &mut HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, DependsOn, HealthCheck, Parameter, Script, Service};
+    use crate::config::{
+        Config, DependsOn, HealthCheck, HealthCheckTiming, Parameter, Script, Service,
+    };
 
     fn secret_param() -> Parameter {
         Parameter {
@@ -294,7 +296,7 @@ mod tests {
                 // Reference lives only in the healthcheck — must still be found.
                 healthcheck: Some(HealthCheck::HttpGet {
                     http_get: "http://localhost/health?token={{HEALTH_TOKEN}}".to_string(),
-                    timeout: None,
+                    timing: HealthCheckTiming::default(),
                 }),
                 environment: [("DB".to_string(), "{{DB_PASSWORD}}".to_string())]
                     .into_iter()

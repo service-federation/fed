@@ -23,6 +23,20 @@ pub struct Cli {
     #[arg(short, long)]
     pub profile: Vec<String>,
 
+    /// Which implementation to run for services that declare `variants:`.
+    ///
+    /// Takes an ordered preference list of variant names shared across
+    /// services (`--variant go,ts,rust`: prefer Go, then TypeScript, then
+    /// Rust, for whichever services offer them), or a `service:variant` pin
+    /// for the odd one out (`--variant catalog:java`). Repeatable; a pin
+    /// beats the list. `fed variant set` persists the same thing.
+    ///
+    /// Global, so `fed start --variant go` and `fed --variant go start` are
+    /// both accepted — unlike `--profile`, which predates this and only takes
+    /// the leading position.
+    #[arg(long, global = true, value_name = "LIST|SERVICE:VARIANT")]
+    pub variant: Vec<String>,
+
     /// Offline mode: skip network package and vault lookups; use cached values only
     #[arg(long)]
     pub offline: bool,
@@ -47,6 +61,10 @@ pub enum Commands {
     Start {
         /// Services to start (defaults to entrypoint)
         services: Vec<String>,
+
+        /// Start every service enabled by the active profiles
+        #[arg(long, conflicts_with_all = ["services", "interactive"])]
+        all: bool,
 
         /// Watch for file changes and auto-restart services (runs in foreground)
         #[arg(short, long)]
@@ -94,6 +112,9 @@ pub enum Commands {
     },
     /// Restart services
     Restart {
+        /// Restart every service enabled by the active profiles
+        #[arg(long, conflicts_with = "services")]
+        all: bool,
         /// Services to restart (defaults to all)
         services: Vec<String>,
     },
@@ -193,6 +214,12 @@ pub enum Commands {
     },
     /// Validate configuration without starting services
     Validate,
+    /// Choose which implementation runs for services that declare `variants:`
+    Variant {
+        /// Defaults to `list` when no subcommand is given
+        #[command(subcommand)]
+        cmd: Option<VariantCommands>,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -392,6 +419,45 @@ pub enum PortsCommands {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Subcommands of `fed variant`, which reads and writes `.fed/variants.yaml`.
+/// The same entries `--variant` accepts, made durable so `fed restart`,
+/// `fed status`, the TUI and the supervisor agree without repeating the flag.
+#[derive(Subcommand, Clone)]
+pub enum VariantCommands {
+    /// Show the resolved variant for each service, and what decided it
+    /// [default when no subcommand given]
+    #[command(alias = "ls")]
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Persist a preference list and/or pins
+    ///
+    /// `fed variant set go,ts,rust` sets the preference list;
+    /// `fed variant set catalog:java` adds a pin. Both forms may be combined
+    /// in one invocation. Setting a preference list replaces the previous one.
+    Set {
+        /// Preference-list names and/or `service:variant` pins
+        #[arg(value_name = "LIST|SERVICE:VARIANT", required = true)]
+        entries: Vec<String>,
+    },
+    /// Remove the pin for one or more services
+    Unset {
+        /// Service names whose pins to drop
+        #[arg(value_name = "SERVICE", required = true)]
+        services: Vec<String>,
+    },
+    /// Remove the persisted preference list and every pin
+    Clear,
+}
+
+impl Default for VariantCommands {
+    fn default() -> Self {
+        VariantCommands::List { json: false }
+    }
 }
 
 impl Default for PortsCommands {

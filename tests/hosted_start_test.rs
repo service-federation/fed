@@ -347,6 +347,38 @@ fn stale_dead_service_reaps_a_stopped_host_before_purging_state() {
 }
 
 #[test]
+fn hosted_variant_keeps_selection_and_attach_metadata_across_commands() {
+    let project = Project::new(
+        r#"
+defaults:
+  tty: true
+services:
+  repl:
+    default_variant: plain
+    variants:
+      plain:
+        process: cat
+      selected:
+        process: cat
+"#,
+    );
+    project.success(&["--variant", "selected", "start", "--all"]);
+    let (pid, host, socket) = project.row("repl");
+    assert!(alive(pid) && alive(host) && socket.exists());
+
+    // A separate command has neither the original flag nor its resolution.
+    let output = project.success(&["status", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let service = &json["repl"];
+    assert_eq!(service["variant"], "selected");
+    assert_eq!(service["attachable"], true);
+    project.success(&["stop", "repl"]);
+    gone(pid);
+    gone(host);
+    assert!(!socket.exists());
+}
+
+#[test]
 fn relative_workspace_arguments_keep_sockets_and_host_identity_absolute() {
     for explicit_workdir in [false, true] {
         let project = Project::new(CAT);

@@ -7,7 +7,7 @@ const SCHEMA_VERSION: u32 = 1;
 /// JSON shape for a single service under `fed status --json`: `status`,
 /// `schema_version`, `health`, `service_type`, `pid`, `container_id`,
 /// `started_at`, `uptime_seconds`, `ports`, `startup_message`,
-/// `attachable`, `supervised_by`, `supervisor_running`, `supervisor_pid`.
+/// `variant`, `attachable`, `supervised_by`, `supervisor_running`, `supervisor_pid`.
 ///
 /// Every field is always present (never omitted): an agent doing
 /// `data[svc]["pid"]` should never hit a `KeyError` depending on service
@@ -39,6 +39,11 @@ struct ServiceStatusJson {
     // introspection is added
     ports: std::collections::HashMap<String, u16>,
     startup_message: Option<String>,
+    /// Which of the service's `variants:` is running, or `null` for an
+    /// ordinary service. Sourced from the state DB for a registered service,
+    /// so it reflects the selection the running process was started with
+    /// rather than whatever today's flags would pick.
+    variant: Option<String>,
     /// Whether `fed attach <service>` can connect right now: the service
     /// runs under a terminal-owning host, and it is still alive.
     attachable: bool,
@@ -81,6 +86,23 @@ fn health_bucket(status: fed::Status) -> &'static str {
         // resolve, not reintroduce.
         fed::Status::Running => "unknown",
     }
+}
+
+/// The variant a service is running as.
+///
+/// Prefers the value persisted at registration over the config's current
+/// choice: the running process was started with whatever `--variant` that
+/// invocation was given, and `fed status` in another shell has no way to
+/// re-derive it. Falls back to the config for a service that is configured
+/// but not registered (e.g. stopped), where there is nothing to disagree with.
+fn resolved_variant(
+    service_state: Option<&fed::state::ServiceState>,
+    config: &Config,
+    name: &str,
+) -> Option<String> {
+    service_state
+        .and_then(|s| s.variant.clone())
+        .or_else(|| config.services.get(name).and_then(|s| s.variant.clone()))
 }
 
 /// Which supervision mechanism, if any, protects `name` — see
@@ -134,14 +156,14 @@ pub async fn run_status(
         fed::orchestrator::supervisor::live_supervisor_pid(orchestrator.work_dir());
     let supervised_scope = fed::orchestrator::supervised_service_names(config);
 
-    if json {
-        // Fetch persisted state once, not per service — this is the single
-        // read-lock acquisition and single SQLite query for the whole
-        // command. Nothing here calls `manager.get_port_mappings()`/
-        // `get_pid()`/`get_container_id()` on live managers, so this adds
-        // zero Docker calls beyond what `get_status()` already made above.
-        let service_states = orchestrator.state_tracker.read().await.get_services().await;
+    // Fetch persisted state once, not per service — this is the single
+    // read-lock acquisition and single SQLite query for the whole command.
+    // Nothing here calls `manager.get_port_mappings()`/`get_pid()`/
+    // `get_container_id()` on live managers, so this adds zero Docker calls
+    // beyond what `get_status()` already made above.
+    let service_states = orchestrator.state_tracker.read().await.get_services().await;
 
+    if json {
         let status_obj = status
             .into_iter()
             .map(|(name, stat)| {
@@ -177,6 +199,7 @@ pub async fn run_status(
                         .map(|s| s.port_allocations.clone())
                         .unwrap_or_default(),
                     startup_message: service_state.and_then(|s| s.startup_message.clone()),
+                    variant: resolved_variant(service_state, config, &name),
                     attachable: service_state.is_some_and(|s| s.attach_socket.is_some())
                         && super::stop::state_status_is_active(stat),
                     supervised_by: supervised_by_bucket(config, &name, &supervised_scope),
@@ -233,9 +256,16 @@ pub async fn run_status(
                 } else {
                     ""
                 };
+                // The variant belongs with the name, not the status: it says
+                // *what* this service is, and a dependant's `depends_on`
+                // names only the outer service either way.
+                let label = match resolved_variant(service_states.get(&name), config, &name) {
+                    Some(variant) => format!("{name} ({variant})"),
+                    None => name.clone(),
+                };
                 out.status(&format!(
                     "  {} {:<30} {}{}",
-                    status_icon, name, stat, annotation
+                    status_icon, label, stat, annotation
                 ));
             }
         }

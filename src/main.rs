@@ -2,6 +2,7 @@ mod cli;
 mod commands;
 mod output;
 
+use crate::output::UserOutput;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -226,6 +227,7 @@ async fn run() -> anyhow::Result<()> {
         is_interactive,
         output_mode: OutputMode::default(),
         profiles: cli.profile.clone(),
+        variants: cli.variant.clone(),
         required_secret_names: None,
         foreground: None,
     };
@@ -258,6 +260,19 @@ async fn run() -> anyhow::Result<()> {
             return commands::run_validate(
                 cli.config.clone(),
                 cli.workdir.clone(),
+                cli.offline,
+                &cli.variant,
+                &cli.profile,
+                &out,
+            )
+            .await;
+        }
+        Commands::Variant { cmd } => {
+            return commands::run_variant(
+                &cmd.clone().unwrap_or_default(),
+                cli.workdir.clone(),
+                cli.config.clone(),
+                &cli.variant,
                 cli.offline,
                 &out,
             )
@@ -438,11 +453,30 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let work_dir = resolve_work_dir(cli.workdir.clone(), &config_path)?;
+
     run_context.secret_cache = cli
         .secret_cache
         .or_else(|| fed::cloud::load_link(&work_dir).map(|link| link.secret_cache))
         .unwrap_or_default()
         .effective();
+
+    // The supervisor must recover each running service's actual variant/profile,
+    // rather than resolving everything from the latest caller's preferences.
+    if matches!(cli.command, Commands::Supervise) {
+        return commands::run_supervise(config, work_dir, run_context).await;
+    }
+
+    // Pick an implementation for every service that declares `variants:` and
+    // replace it with the merged result, before anything — the orchestrator,
+    // `fed status`, the dry-run preview, the supervisor it may spawn — reads
+    // `config.services`. Everything downstream sees ordinary services.
+    let mut config = config;
+    fed::config::variants::resolve_variants(
+        &mut config,
+        &fed::config::variants::VariantSelection::load(&cli.variant, &work_dir)?,
+        &cli.profile,
+    )?;
+    let config = config;
 
     // Resolved before the start lock and any orchestrator, so a rejected
     // `fed start -i` leaves the stack untouched.
@@ -463,21 +497,15 @@ async fn run() -> anyhow::Result<()> {
     // Serialize real `fed start` invocations before either phase so concurrent
     // commands cannot resolve different port sets and then split registration
     // wins between them. Dry-run is read-only and must remain non-blocking.
+    let _restart_lock = if matches!(cli.command, Commands::Restart { .. }) {
+        Some(StartLock::acquire(&work_dir).await?)
+    } else {
+        None
+    };
     let start_lock = match &cli.command {
         Commands::Start { dry_run: false, .. } => Some(StartLock::acquire(&work_dir).await?),
         _ => None,
     };
-
-    // `fed supervise` builds its orchestrator through a completely
-    // different path (`.supervisor_attach(true)` -> `initialize_supervisor`,
-    // never `.readonly()`/`.dry_run()`/plain `initialize()`) and then runs
-    // its own long-lived event loop instead of dispatching into a
-    // `commands::run_*` function — handled here, before any of the
-    // Tier-3 output-mode/readonly/isolate logic below, none of which
-    // applies to it.
-    if matches!(cli.command, Commands::Supervise) {
-        return commands::run_supervise(config, work_dir).await;
-    }
 
     // ── Tier 3: Commands that need orchestrator ─────────────────────
 
@@ -610,232 +638,277 @@ async fn run() -> anyhow::Result<()> {
     // start`/`fed restart` (`spawn_if_needed`, wired into both below).
     let is_watch_or_tui = matches!(
         &cli.command,
-        Commands::Start { watch: true, .. } | Commands::Tui { .. }
+        Commands::Start {
+            watch: true,
+            dry_run: false,
+            ..
+        } | Commands::Tui { .. }
     );
-    if is_watch_or_tui {
-        fed::orchestrator::supervisor::signal_stop_and_wait(
+    let refresh_supervisor = matches!(
+        &cli.command,
+        Commands::Start {
+            watch: false,
+            interactive: false,
+            dry_run: false,
+            ..
+        } | Commands::Restart { .. }
+    );
+    let previous_supervisor =
+        fed::orchestrator::supervisor::live_supervisor_pid(&work_dir).is_some();
+    let resume_work_dir = work_dir.clone();
+    let resume_config_path = config_path.clone();
+    let resume_flags = commands::InheritedFlags {
+        offline: cli.offline,
+        profiles: cli.profile.clone(),
+        variants: cli.variant.clone(),
+    };
+    let needs_supervision = commands::any_needs_supervision(&config, config.services.keys());
+    // Mutating starts/restarts replace managers and can change variants. Stop
+    // the old observer before that mutation, then reattach to committed state.
+    if is_watch_or_tui || refresh_supervisor {
+        let stopped = fed::orchestrator::supervisor::signal_stop_and_wait(
             &work_dir,
             std::time::Duration::from_secs(10),
         )
         .await;
+        anyhow::ensure!(
+            stopped,
+            "Could not stop the previous supervisor before changing services"
+        );
     }
 
-    // Build orchestrator with all settings applied and initialized
-    let mut orchestrator = Orchestrator::builder()
-        .config(config.clone())
-        .work_dir(work_dir)
-        .run_context(run_context)
-        .randomize_ports(randomize)
-        .replace_mode(replace)
-        .dry_run(dry_run)
-        .auto_resolve_conflicts(auto_resolve)
-        .readonly(readonly)
-        .build()
-        .await?;
-
-    match cli.command {
-        Commands::Start {
-            services,
-            watch,
-            replace,
-            output: _,
-            interactive: _,
-            dry_run,
-            isolate: _,
-            jobs,
-        } => {
-            let exit_code = commands::run_start(
-                &mut orchestrator,
-                &config,
-                services,
-                commands::StartOptions {
-                    watch,
-                    replace,
-                    dry_run,
-                    jobs: jobs as usize,
-                    config_path: &config_path,
-                    offline: cli.offline,
-                    profiles: cli.profile.clone(),
-                    start_lock,
-                },
-                &out,
-            )
+    let result = async {
+        // Build orchestrator with all settings applied and initialized
+        let mut orchestrator = Orchestrator::builder()
+            .config(config.clone())
+            .work_dir(work_dir)
+            .run_context(run_context)
+            .randomize_ports(randomize)
+            .replace_mode(replace)
+            .dry_run(dry_run)
+            .auto_resolve_conflicts(auto_resolve)
+            .readonly(readonly)
+            .build()
             .await?;
 
-            // Every state write is already committed, so exiting here
-            // only skips the remaining drops.
-            if let Some(code) = exit_code {
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-                let _ = std::io::stderr().flush();
-                std::process::exit(code);
-            }
-        }
-        Commands::Stop { services } => {
-            commands::run_stop(&mut orchestrator, &config, services, &out).await?;
-        }
-        Commands::Restart { services } => {
-            commands::run_restart(
-                &mut orchestrator,
-                &config,
+        match cli.command {
+            Commands::Start {
+                all,
                 services,
-                &config_path,
-                cli.offline,
-                cli.profile.clone(),
-                &out,
-            )
-            .await?;
-        }
-        Commands::Status { json, tag } => {
-            commands::run_status(&orchestrator, &config, json, tag, &out).await?;
-        }
-        Commands::Logs {
-            service,
-            tail,
-            follow,
-        } => {
-            commands::run_logs(&orchestrator, &service, tail, follow, &out).await?;
-        }
-        Commands::Tui { watch } => {
-            commands::run_tui(orchestrator, watch, Some(&config)).await?;
-        }
-        Commands::Run { name, args, .. } => {
-            // Strip leading "--" from args (clap captures it literally)
-            let extra_args: Vec<String> = args.into_iter().skip_while(|arg| arg == "--").collect();
-            commands::run_script(&mut orchestrator, &name, &extra_args, false, &out).await?;
-        }
-        Commands::External(args) => {
-            // Handle `fed <script>` shorthand - first arg is the script name
-            // Extra args after script name are passed to the script
-            if args.is_empty() {
-                anyhow::bail!("No script name provided");
-            }
-            let script_name = &args[0];
+                watch,
+                replace,
+                output: _,
+                interactive: _,
+                dry_run,
+                isolate: _,
+                jobs,
+            } => {
+                let exit_code = commands::run_start(
+                    &mut orchestrator,
+                    &config,
+                    services,
+                    commands::StartOptions {
+                        all,
+                        watch,
+                        replace,
+                        dry_run,
+                        jobs: jobs as usize,
+                        config_path: &config_path,
+                        flags: commands::InheritedFlags {
+                            offline: cli.offline,
+                            profiles: cli.profile.clone(),
+                            variants: cli.variant.clone(),
+                        },
+                        profiles: cli.profile.clone(),
+                        start_lock,
+                    },
+                    &out,
+                )
+                .await?;
 
-            // Extract extra arguments (everything after the script name)
-            // Skip leading "--" since clap's external_subcommand captures it literally
-            // e.g., `fed test -- -t auth` gives args = ["test", "--", "-t", "auth"]
-            let extra_args: Vec<String> = args
-                .iter()
-                .skip(1)
-                .skip_while(|arg| *arg == "--")
-                .cloned()
-                .collect();
-
-            let available_scripts = orchestrator.list_scripts();
-            if available_scripts.contains(script_name) {
-                commands::run_script(&mut orchestrator, script_name, &extra_args, false, &out)
-                    .await?;
-            } else {
-                // Suggest the closest script or built-in command for typos
-                // like `fed strat` or `fed migrte`.
-                const BUILTIN_COMMANDS: &[&str] = &[
-                    "start",
-                    "login",
-                    "logout",
-                    "whoami",
-                    "link",
-                    "secrets",
-                    "stop",
-                    "restart",
-                    "status",
-                    "logs",
-                    "tui",
-                    "run",
-                    "install",
-                    "clean",
-                    "build",
-                    "package",
-                    "ports",
-                    "init",
-                    "validate",
-                    "completions",
-                    "doctor",
-                    "top",
-                    "debug",
-                    "docker",
-                    "isolate",
-                    "workspace",
-                ];
-                let candidates = available_scripts
-                    .iter()
-                    .map(String::as_str)
-                    .chain(BUILTIN_COMMANDS.iter().copied());
-                eprintln!(
-                    "{}",
-                    commands::suggest::with_did_you_mean(
-                        &format!("Unknown command or script: '{}'.", script_name),
-                        script_name,
-                        candidates,
-                    )
-                );
-                if !available_scripts.is_empty() {
-                    eprintln!("\nAvailable scripts:");
-                    let mut names = available_scripts.clone();
-                    names.sort();
-                    for script in names {
-                        eprintln!("  - {}", script);
-                    }
+                // Every state write is already committed, so exiting here
+                // only skips the remaining drops.
+                if let Some(code) = exit_code {
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    let _ = std::io::stderr().flush();
+                    std::process::exit(code);
                 }
-                eprintln!("\nRun 'fed --help' for available commands.");
-                std::process::exit(1);
             }
-        }
-        Commands::Install { services } => {
-            commands::run_install(&orchestrator, &config, services, &out).await?;
-        }
-        Commands::Clean { services } => {
-            commands::run_clean(&orchestrator, &config, services, &out).await?;
-        }
-        Commands::Build {
-            services,
-            tag,
-            build_args,
-            json,
-        } => {
-            commands::run_build(
-                &orchestrator,
-                &config,
+            Commands::Stop { services } => {
+                commands::run_stop(&mut orchestrator, &config, services, &out).await?;
+            }
+            Commands::Restart { services, all: _ } => {
+                commands::run_restart(&mut orchestrator, &config, services, &out).await?;
+            }
+            Commands::Status { json, tag } => {
+                commands::run_status(&orchestrator, &config, json, tag, &out).await?;
+            }
+            Commands::Logs {
+                service,
+                tail,
+                follow,
+            } => {
+                commands::run_logs(&orchestrator, &service, tail, follow, &out).await?;
+            }
+            Commands::Tui { watch } => {
+                commands::run_tui(orchestrator, watch, Some(&config)).await?;
+            }
+            Commands::Run { name, args, .. } => {
+                // Strip leading "--" from args (clap captures it literally)
+                let extra_args: Vec<String> =
+                    args.into_iter().skip_while(|arg| arg == "--").collect();
+                commands::run_script(&mut orchestrator, &name, &extra_args, false, &out).await?;
+            }
+            Commands::External(args) => {
+                // Handle `fed <script>` shorthand - first arg is the script name
+                // Extra args after script name are passed to the script
+                if args.is_empty() {
+                    anyhow::bail!("No script name provided");
+                }
+                let script_name = &args[0];
+
+                // Extract extra arguments (everything after the script name)
+                // Skip leading "--" since clap's external_subcommand captures it literally
+                // e.g., `fed test -- -t auth` gives args = ["test", "--", "-t", "auth"]
+                let extra_args: Vec<String> = args
+                    .iter()
+                    .skip(1)
+                    .skip_while(|arg| *arg == "--")
+                    .cloned()
+                    .collect();
+
+                let available_scripts = orchestrator.list_scripts();
+                if available_scripts.contains(script_name) {
+                    commands::run_script(&mut orchestrator, script_name, &extra_args, false, &out)
+                        .await?;
+                } else {
+                    // Suggest the closest script or built-in command for typos
+                    // like `fed strat` or `fed migrte`.
+                    const BUILTIN_COMMANDS: &[&str] = &[
+                        "start",
+                        "login",
+                        "logout",
+                        "whoami",
+                        "link",
+                        "secrets",
+                        "stop",
+                        "restart",
+                        "status",
+                        "logs",
+                        "tui",
+                        "run",
+                        "install",
+                        "clean",
+                        "build",
+                        "package",
+                        "ports",
+                        "init",
+                        "validate",
+                        "variant",
+                        "completions",
+                        "doctor",
+                        "top",
+                        "debug",
+                        "docker",
+                        "isolate",
+                        "workspace",
+                    ];
+                    let candidates = available_scripts
+                        .iter()
+                        .map(String::as_str)
+                        .chain(BUILTIN_COMMANDS.iter().copied());
+                    eprintln!(
+                        "{}",
+                        commands::suggest::with_did_you_mean(
+                            &format!("Unknown command or script: '{}'.", script_name),
+                            script_name,
+                            candidates,
+                        )
+                    );
+                    if !available_scripts.is_empty() {
+                        eprintln!("\nAvailable scripts:");
+                        let mut names = available_scripts.clone();
+                        names.sort();
+                        for script in names {
+                            eprintln!("  - {}", script);
+                        }
+                    }
+                    eprintln!("\nRun 'fed --help' for available commands.");
+                    std::process::exit(1);
+                }
+            }
+            Commands::Install { services } => {
+                commands::run_install(&orchestrator, &config, services, &out).await?;
+            }
+            Commands::Clean { services } => {
+                commands::run_clean(&orchestrator, &config, services, &out).await?;
+            }
+            Commands::Build {
                 services,
                 tag,
                 build_args,
                 json,
-                &out,
-            )
-            .await?;
+            } => {
+                commands::run_build(
+                    &orchestrator,
+                    &config,
+                    services,
+                    tag,
+                    build_args,
+                    json,
+                    &out,
+                )
+                .await?;
+            }
+            Commands::Top { interval } => {
+                commands::run_top(&orchestrator, interval, &out).await?;
+            }
+            #[cfg(unix)]
+            Commands::Attach { .. } => unreachable!("handled in earlier dispatch tiers"),
+            // Handled in earlier tiers
+            Commands::Init { .. }
+            | Commands::Validate
+            | Commands::Variant { .. }
+            | Commands::Completions { .. }
+            | Commands::Doctor
+            | Commands::Prune { .. }
+            | Commands::Package(_)
+            | Commands::Ports { .. }
+            | Commands::Docker(_)
+            | Commands::Debug(_)
+            | Commands::Workspace(_)
+            | Commands::Isolate(_)
+            | Commands::Login { .. }
+            | Commands::Logout
+            | Commands::Whoami
+            | Commands::Link { .. }
+            | Commands::Secrets(_)
+            | Commands::Supervise => {
+                unreachable!("handled in earlier dispatch tiers");
+            }
+            #[cfg(unix)]
+            Commands::Host { .. } => {
+                unreachable!("handled in earlier dispatch tiers");
+            }
         }
-        Commands::Top { interval } => {
-            commands::run_top(&orchestrator, interval, &out).await?;
-        }
-        #[cfg(unix)]
-        Commands::Attach { .. } => unreachable!("handled in earlier dispatch tiers"),
-        // Handled in earlier tiers
-        Commands::Init { .. }
-        | Commands::Validate
-        | Commands::Completions { .. }
-        | Commands::Doctor
-        | Commands::Prune { .. }
-        | Commands::Package(_)
-        | Commands::Ports { .. }
-        | Commands::Docker(_)
-        | Commands::Debug(_)
-        | Commands::Workspace(_)
-        | Commands::Isolate(_)
-        | Commands::Login { .. }
-        | Commands::Logout
-        | Commands::Whoami
-        | Commands::Link { .. }
-        | Commands::Secrets(_)
-        | Commands::Supervise => {
-            unreachable!("handled in earlier dispatch tiers");
-        }
-        #[cfg(unix)]
-        Commands::Host { .. } => {
-            unreachable!("handled in earlier dispatch tiers");
-        }
-    }
 
-    Ok(())
+        Ok(())
+    }
+    .await;
+
+    // A failed start must not leave previously running services unsupervised.
+    if refresh_supervisor
+        && (previous_supervisor || needs_supervision)
+        && let Err(error) = commands::spawn_supervisor_if_needed(
+            &resume_work_dir,
+            &resume_config_path,
+            &resume_flags,
+        )
+    {
+        out.warning(&format!("Failed to resume the service supervisor: {error}"));
+    }
+    result
 }
 
 /// True for the subcommands that run detached from the caller's terminal,

@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 const DB_FILE_NAME: &str = "lock.db";
 const LOCK_FILE_NAME: &str = ".lock";
-const SCHEMA_VERSION: i32 = 10;
+const SCHEMA_VERSION: i32 = 11;
 
 mod isolation;
 mod migrations;
@@ -294,7 +294,7 @@ impl SqliteStateTracker {
         match conn
             .call(|conn: &mut rusqlite::Connection| {
                 let mut stmt = conn.prepare(
-                    "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled, host_pid, attach_socket FROM services"
+                    "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled, host_pid, attach_socket, variant FROM services"
                 )?;
 
                 let services_iter = stmt.query_map([], |row| {
@@ -327,6 +327,7 @@ impl SqliteStateTracker {
                             consecutive_failures: row.get(10)?,
                             port_allocations: HashMap::new(),
                             startup_message: row.get(11)?,
+                            variant: row.get(16)?,
                             desired_state: desired_state_str
                                 .parse::<DesiredState>()
                                 .unwrap_or(DesiredState::Running),
@@ -692,6 +693,7 @@ mod tests {
                 startup_message: None,
                 desired_state: DesiredState::Running,
                 native_restart_enabled: false,
+                variant: None,
                 host_pid: None,
                 attach_socket: None,
             };
@@ -719,6 +721,7 @@ mod tests {
                 startup_message: None,
                 desired_state: DesiredState::Running,
                 native_restart_enabled: false,
+                variant: None,
                 host_pid: None,
                 attach_socket: None,
             };
@@ -750,6 +753,7 @@ mod tests {
                 startup_message: None,
                 desired_state: DesiredState::Running,
                 native_restart_enabled: false,
+                variant: None,
                 host_pid: None,
                 attach_socket: None,
             }

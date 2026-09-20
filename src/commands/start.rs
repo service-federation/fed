@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::lifecycle::{graceful_docker_stop, graceful_process_kill, validate_pid_start_time};
 
 pub struct StartOptions<'a> {
+    pub all: bool,
     pub watch: bool,
     pub replace: bool,
     pub dry_run: bool,
@@ -21,8 +22,11 @@ pub struct StartOptions<'a> {
     pub jobs: usize,
     pub config_path: &'a std::path::Path,
     /// Threaded to `spawn_if_needed` so a spawned `fed supervise` sees the
-    /// same `--offline`/`--profile` session settings as this invocation.
-    pub offline: bool,
+    /// same `--offline`/`--profile`/`--variant` session settings as this
+    /// invocation.
+    pub flags: super::supervise::InheritedFlags,
+    /// Active profiles, used for service-selection error messages as well as
+    /// being replayed to the supervisor via `flags`.
     pub profiles: Vec<String>,
     /// Scope-wide guard acquired before orchestrator initialization. Kept
     /// alive through startup, then released before a watch loop can run
@@ -43,36 +47,42 @@ pub async fn run_start(
     out: &dyn UserOutput,
 ) -> anyhow::Result<Option<i32>> {
     let StartOptions {
+        all,
         watch,
         replace,
         dry_run,
         jobs,
         config_path,
-        offline,
+        flags,
         profiles,
         start_lock,
     } = opts;
     let jobs = jobs.max(1);
-    let services_to_start = if services.is_empty() {
-        // Use entrypoint
-        if let Some(ref ep) = config.entrypoint {
-            vec![ep.clone()]
-        } else if !config.entrypoints.is_empty() {
-            config.entrypoints.clone()
-        } else {
-            let mut msg = String::from(
-                "No services specified and no entrypoint configured.\n\n\
+    let services_to_start =
+        if all || (services.is_empty() && config.entrypoint.as_deref() == Some("*")) {
+            let mut names: Vec<_> = orchestrator.get_config().services.keys().cloned().collect();
+            names.sort();
+            names
+        } else if services.is_empty() {
+            // Use entrypoint
+            if let Some(ref ep) = config.entrypoint {
+                vec![ep.clone()]
+            } else if !config.entrypoints.is_empty() {
+                config.entrypoints.clone()
+            } else {
+                let mut msg = String::from(
+                    "No services specified and no entrypoint configured.\n\n\
                  Start a specific service with 'fed start <service>' or set an \
                  'entrypoint:' in your config.",
-            );
-            msg.push_str(&configured_services_list(config));
-            out.status(&msg);
-            return Ok(None);
-        }
-    } else {
-        // Expand tag references (e.g., @backend) into service names
-        config.expand_service_selection(&services)
-    };
+                );
+                msg.push_str(&configured_services_list(config));
+                out.status(&msg);
+                return Ok(None);
+            }
+        } else {
+            // Expand tag references (e.g., @backend) into service names
+            config.expand_service_selection(&services)
+        };
 
     // Handle dry run mode - show what would happen without starting services
     if dry_run {
@@ -599,15 +609,7 @@ pub async fn run_start(
     if let Some(name) = foreground.as_deref() {
         // `started` holds the dependencies only, so the foreground service
         // is never supervised.
-        spawn_restart_supervisor(
-            orchestrator,
-            config,
-            &started,
-            config_path,
-            offline,
-            &profiles,
-            out,
-        );
+        spawn_restart_supervisor(orchestrator, config, &started, config_path, &flags, out);
         warn_ignored_restart_policy(config, name, out);
 
         // Registration of the foreground service is serialized like every
@@ -637,20 +639,7 @@ pub async fn run_start(
         out.status("  Use 'fed stop' to stop them");
         out.status("  Use 'fed tui' for interactive mode");
 
-        // A plain, non-watch `fed start` backgrounds services and this
-        // process exits immediately — without a supervisor, a `restart:`
-        // policy would never fire again. Spawn one iff it's actually needed
-        // and not already running; `fed status` never does this, staying
-        // strictly read-only.
-        spawn_restart_supervisor(
-            orchestrator,
-            config,
-            &started,
-            config_path,
-            offline,
-            &profiles,
-            out,
-        );
+        // main reattaches the daemon after dispatch, including failure paths.
     } else {
         run_watch_mode(orchestrator, config, config_path, out).await?;
     }
@@ -665,17 +654,16 @@ fn spawn_restart_supervisor(
     config: &Config,
     started: &std::collections::HashSet<String>,
     config_path: &std::path::Path,
-    offline: bool,
-    profiles: &[String],
+    flags: &super::supervise::InheritedFlags,
     out: &dyn UserOutput,
 ) {
-    if !super::supervise::any_has_restart_policy(config, started.iter()) {
+    if !super::supervise::any_needs_supervision(config, started.iter()) {
         return;
     }
     let work_dir = orchestrator.work_dir().to_path_buf();
-    if let Err(e) = super::supervise::spawn_if_needed(&work_dir, config_path, offline, profiles) {
+    if let Err(e) = super::supervise::spawn_if_needed(&work_dir, config_path, flags) {
         out.warning(&format!(
-            "Warning: failed to start the restart-policy supervisor: {}",
+            "Warning: failed to start the service supervisor: {}",
             e
         ));
     }
@@ -938,6 +926,12 @@ fn named_foreground_target(config: &Config, services: &[String]) -> anyhow::Resu
 }
 
 fn entrypoint_foreground_target(config: &Config) -> anyhow::Result<String> {
+    if config.entrypoint.as_deref() == Some("*") {
+        anyhow::bail!(
+            "Entrypoint '*' selects every service. {} Pick one: fed start -i <service>",
+            ONE_AT_A_TIME
+        );
+    }
     let entrypoints = match &config.entrypoint {
         Some(ep) => std::slice::from_ref(ep),
         None => config.entrypoints.as_slice(),
@@ -1524,7 +1518,19 @@ async fn run_dry_run(
         let service_type = service_config
             .map(|s| s.service_type())
             .unwrap_or(ServiceType::Undefined);
-        out.status(&format!("  {}. {} ({:?})", i + 1, service, service_type));
+        // A service with `variants:` has already been resolved by the time
+        // dry-run runs, so naming the chosen variant here is the only way a
+        // preview tells the user *which* implementation `--variant` landed on.
+        match service_config.and_then(|s| s.variant.as_deref()) {
+            Some(variant) => out.status(&format!(
+                "  {}. {} ({:?}, variant: {})",
+                i + 1,
+                service,
+                service_type,
+                variant
+            )),
+            None => out.status(&format!("  {}. {} ({:?})", i + 1, service, service_type)),
+        }
     }
 
     // 3. Check for port conflicts using resolution tracking
@@ -1608,6 +1614,9 @@ async fn run_dry_run(
             // Show service type
             let service_type = service_config.service_type();
             out.status(&format!("    type: {:?}", service_type));
+            if let Some(ref variant) = service_config.variant {
+                out.status(&format!("    variant: {}", variant));
+            }
 
             // Show process command or image
             if let Some(ref process) = service_config.process {
@@ -1627,22 +1636,29 @@ async fn run_dry_run(
 
             // Show health check if configured
             if let Some(ref healthcheck) = service_config.healthcheck {
-                let timeout = healthcheck.get_timeout();
-                match healthcheck.get_http_url() {
-                    Some(url) => {
-                        out.status(&format!(
-                            "    healthcheck: HTTP GET {} (timeout: {:?})",
-                            url, timeout
-                        ));
-                    }
-                    None => {
-                        if let Some(cmd) = healthcheck.get_command() {
-                            out.status(&format!(
-                                "    healthcheck: command '{}' (timeout: {:?})",
-                                cmd, timeout
-                            ));
-                        }
-                    }
+                // Name the timings the way the config does, so a preview can
+                // actually be used to check them: "timeout" here used to mean
+                // the start period, which is exactly the confusion
+                // `start_period` exists to end.
+                let start_period = service_config.start_period_or_default();
+                let probe = healthcheck.get_probe_timeout(start_period);
+                let interval = healthcheck.get_interval();
+                let probe_description = match healthcheck.get_http_url() {
+                    Some(url) => format!("HTTP GET {url}"),
+                    None => match healthcheck.get_command() {
+                        Some(cmd) => format!("command '{cmd}'"),
+                        None => String::new(),
+                    },
+                };
+                if !probe_description.is_empty() {
+                    out.status(&format!("    healthcheck: {probe_description}"));
+                    out.status(&format!(
+                        "      start_period: {:?}, interval: {:?}, probe_timeout: {:?}, retries: {}",
+                        start_period,
+                        interval,
+                        probe,
+                        healthcheck.get_retries()
+                    ));
                 }
             }
 

@@ -192,6 +192,64 @@ pub struct Service {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_message: Option<String>,
 
+    /// Fallback for `healthcheck.start_period` — how long fed waits for the
+    /// first health check to pass.
+    ///
+    /// This exists so a `defaults:` block can set one start period for a whole
+    /// config without restating each service's probe. It is a plain service
+    /// key, so it also works on a service or template directly; the
+    /// healthcheck's own `start_period` (or its `timeout` alias) wins wherever
+    /// both are set.
+    ///
+    /// Canonical key: `healthcheck_start_period`. `healthcheck_timeout` is
+    /// accepted too, matching the `start_period`/`timeout` pair on the
+    /// healthcheck itself.
+    #[serde(alias = "healthcheck_timeout", skip_serializing_if = "Option::is_none")]
+    pub healthcheck_start_period: Option<String>,
+
+    // Variants: one service, several interchangeable implementations
+    /// Alternative implementations of this service, keyed by variant name.
+    ///
+    /// Each value is a partial [`Service`] carrying exactly one
+    /// type-defining field (`process`, `image`, `gradle_task`, or
+    /// `compose_file` + `compose_service`) plus whatever else differs. The
+    /// outer service holds the shared contract — ports, healthcheck,
+    /// `depends_on` — and must itself have no type-defining field.
+    ///
+    /// Exactly one variant is chosen at start time and merged over the outer
+    /// service (see [`crate::config::variants`]); the merged service replaces
+    /// this one before anything downstream runs, so no later stage ever sees
+    /// a service with `variants` still set.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub variants: HashMap<String, Service>,
+
+    /// Variant to use when nothing selects one. Required when there is more
+    /// than one variant; optional (and implied) when there is exactly one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_variant: Option<String>,
+
+    /// The variant that was selected, recorded by variant resolution so
+    /// `fed status` and the TUI can show which implementation is live.
+    /// Never parsed from YAML — it is an output of resolution, not an input.
+    #[serde(skip)]
+    pub variant: Option<String>,
+
+    /// Collection keys this definition wrote as explicitly empty in YAML
+    /// (`depends_on: []`, `environment: {}`).
+    ///
+    /// Recorded by the parser from a raw scan of the document, because serde
+    /// cannot distinguish "written as empty" from "absent" once both have
+    /// become an empty `Vec`. [`crate::package::ServiceMerger::merge_service`]
+    /// reads it to keep such a key empty instead of unioning it with the
+    /// value it would otherwise inherit — which is how a service opts out of
+    /// a `defaults:` collection.
+    ///
+    /// An inherited empty depends_on remains explicit when this layer has no
+    /// dependencies, so later defaults or variant merges cannot refill it.
+    /// Other collection markers remain local to the block.
+    #[serde(skip)]
+    pub explicit_empty: std::collections::BTreeSet<String>,
+
     /// Unknown keys captured for a non-breaking typo warning at validate/start time.
     /// fed keeps parsing permissive — an unrecognized service key is a warning (with a
     /// "did you mean?" hint), never a hard error. serde routes only genuinely-unknown keys
@@ -237,6 +295,9 @@ impl Service {
             "startup_timeout",
             "circuit_breaker",
             "startup_message",
+            "healthcheck_start_period",
+            "variants",
+            "default_variant",
         ]
     }
 }
@@ -338,7 +399,9 @@ impl std::str::FromStr for ServiceType {
 impl Service {
     /// Determine the type of service based on configured fields.
     pub fn service_type(&self) -> ServiceType {
-        if self.compose_file.is_some() && self.compose_service.is_some() {
+        if !self.variants.is_empty() {
+            ServiceType::Undefined
+        } else if self.compose_file.is_some() && self.compose_service.is_some() {
             ServiceType::DockerCompose
         } else if self.process.is_some() {
             ServiceType::Process
@@ -348,9 +411,9 @@ impl Service {
             ServiceType::External
         } else if self.gradle_task.is_some() {
             ServiceType::GradleTask
-        } else if self.install.is_some() || self.migrate.is_some() {
-            // Hook-only node: no process/image/etc, just lifecycle hooks. Runs
-            // its hooks to completion during startup and gates dependents.
+        } else if self.install.is_some() || self.migrate.is_some() || !self.depends_on.is_empty() {
+            // Hook or grouping node: dependencies and any lifecycle hooks
+            // complete before dependents proceed; there is no long-lived process.
             ServiceType::Oneshot
         } else {
             ServiceType::Undefined
@@ -393,6 +456,28 @@ impl Service {
             .as_ref()
             .and_then(|s| parse_duration_string(s))
             .unwrap_or(std::time::Duration::from_secs(10))
+    }
+
+    /// How long fed waits for this service's first health check to pass,
+    /// as explicitly configured — `None` when nothing set it.
+    ///
+    /// Resolution order, most specific first: the healthcheck's own
+    /// `start_period` (or its `timeout` alias), then the service-level
+    /// `healthcheck_start_period` that a `defaults:` block typically
+    /// supplies. Callers that need a concrete value use
+    /// [`Self::start_period_or_default`].
+    pub fn effective_start_period(&self) -> Option<std::time::Duration> {
+        self.healthcheck
+            .as_ref()
+            .and_then(|hc| hc.configured_start_period())
+            .or(self.healthcheck_start_period.as_deref())
+            .and_then(parse_duration_string)
+    }
+
+    /// [`Self::effective_start_period`], falling back to fed's 5s default.
+    pub fn start_period_or_default(&self) -> std::time::Duration {
+        self.effective_start_period()
+            .unwrap_or(std::time::Duration::from_secs(5))
     }
 
     /// Parsed per-service startup_timeout override, if any.
@@ -766,5 +851,227 @@ startup_timeout: "5m"
             ..Default::default()
         };
         assert_eq!(svc.get_startup_timeout(), None);
+    }
+}
+
+/// Exhaustive field coverage: adding a Service field requires updating its merge.
+#[cfg(test)]
+mod merge_completeness {
+    use crate::config::{
+        BuildConfig, CircuitBreakerConfig, DependsOn, DockerCommand, HealthCheck, ResourceLimits,
+        RestartPolicy, Service,
+    };
+    use crate::package::ServiceMerger;
+
+    /// A `Service` with every field set to a distinguishable non-default
+    /// value. Anything `merge_service` fails to copy shows up below as a
+    /// default where this fixture put a value.
+    fn fully_populated() -> Service {
+        Service {
+            extends: Some("pkg.base".to_string()),
+            cwd: Some("services/catalog".to_string()),
+            install: Some("npm ci".to_string()),
+            migrate: Some("npm run migrate".to_string()),
+            clean: Some("rm -rf node_modules".to_string()),
+            build: Some(BuildConfig::Command("npm run build".to_string())),
+            process: Some("npm start".to_string()),
+            image: Some("catalog:latest".to_string()),
+            command: Some(DockerCommand::List(vec!["--flag".to_string()])),
+            volumes: vec!["./data:/data".to_string()],
+            ports: vec!["8080:8080".to_string()],
+            dependency: Some("shared".to_string()),
+            service: Some("catalog".to_string()),
+            parameters: [("PORT".to_string(), "8080".to_string())].into(),
+            gradle_task: Some(":catalog:run".to_string()),
+            compose_file: Some("docker-compose.yml".to_string()),
+            compose_service: Some("catalog".to_string()),
+            compose_profiles: vec!["dev".to_string()],
+            compose_imported: true,
+            environment: [("LOG_LEVEL".to_string(), "debug".to_string())].into(),
+            healthcheck: Some(HealthCheck::Command("true".to_string())),
+            depends_on: vec![DependsOn::Simple("postgres".to_string())],
+            restart: Some(RestartPolicy::Always),
+            tty: true,
+            expose: true,
+            profiles: vec!["full".to_string()],
+            tags: vec!["backend".to_string()],
+            watch: vec!["src/**".to_string()],
+            resources: Some(ResourceLimits {
+                memory: Some("512m".to_string()),
+                memory_reservation: None,
+                memory_swap: None,
+                cpus: None,
+                cpu_shares: None,
+                pids: None,
+                nofile: None,
+                strict_limits: false,
+            }),
+            grace_period: Some("30s".to_string()),
+            startup_timeout: Some("5m".to_string()),
+            circuit_breaker: Some(CircuitBreakerConfig::default()),
+            startup_message: Some("http://localhost:8080".to_string()),
+            healthcheck_start_period: Some("10m".to_string()),
+            variants: [("go".to_string(), Service::default())].into(),
+            default_variant: Some("go".to_string()),
+            variant: Some("go".to_string()),
+            explicit_empty: ["ports".to_string()].into(),
+            unknown_fields: [(
+                "typo_key".to_string(),
+                serde_yaml::Value::String("x".to_string()),
+            )]
+            .into(),
+        }
+    }
+
+    #[test]
+    fn merge_service_all_fields_are_copied() {
+        let base = fully_populated();
+        let mut local = Service::default();
+        ServiceMerger::merge_service(&mut local, &base).unwrap();
+
+        // Exhaustive destructuring: a new `Service` field fails to compile
+        // here until it is both merged above and asserted below.
+        let Service {
+            extends,
+            cwd,
+            install,
+            migrate,
+            clean,
+            build,
+            process,
+            image,
+            command,
+            volumes,
+            ports,
+            dependency,
+            service,
+            parameters,
+            gradle_task,
+            compose_file,
+            compose_service,
+            compose_profiles,
+            compose_imported,
+            environment,
+            healthcheck,
+            depends_on,
+            restart,
+            tty,
+            expose,
+            profiles,
+            tags,
+            watch,
+            resources,
+            grace_period,
+            startup_timeout,
+            circuit_breaker,
+            startup_message,
+            healthcheck_start_period,
+            variants,
+            default_variant,
+            variant,
+            explicit_empty,
+            unknown_fields,
+        } = local;
+
+        // `extends` is the one field deliberately NOT carried over: it is the
+        // instruction that produced this merge, and leaving it set would make
+        // a second pass re-merge the same base.
+        assert_eq!(extends, None, "extends must be cleared by a merge");
+
+        assert_eq!(cwd.as_deref(), Some("services/catalog"));
+        assert_eq!(install.as_deref(), Some("npm ci"));
+        assert_eq!(migrate.as_deref(), Some("npm run migrate"));
+        assert_eq!(clean.as_deref(), Some("rm -rf node_modules"));
+        assert!(
+            matches!(build, Some(BuildConfig::Command(ref c)) if c == "npm run build"),
+            "build must be copied"
+        );
+        assert_eq!(process.as_deref(), Some("npm start"));
+        assert_eq!(image.as_deref(), Some("catalog:latest"));
+        assert_eq!(
+            command.map(|c| c.to_args().unwrap()),
+            Some(vec!["--flag".to_string()]),
+            "command must be copied"
+        );
+        assert_eq!(volumes, vec!["./data:/data".to_string()]);
+        assert_eq!(ports, vec!["8080:8080".to_string()]);
+        assert_eq!(dependency.as_deref(), Some("shared"));
+        assert_eq!(service.as_deref(), Some("catalog"));
+        assert_eq!(parameters.get("PORT").map(String::as_str), Some("8080"));
+        assert_eq!(gradle_task.as_deref(), Some(":catalog:run"));
+        assert_eq!(compose_file.as_deref(), Some("docker-compose.yml"));
+        assert_eq!(compose_service.as_deref(), Some("catalog"));
+        assert_eq!(compose_profiles, vec!["dev".to_string()]);
+        assert!(compose_imported, "compose_imported must be copied");
+        assert_eq!(
+            environment.get("LOG_LEVEL").map(String::as_str),
+            Some("debug")
+        );
+        assert!(healthcheck.is_some(), "healthcheck must be copied");
+        assert_eq!(depends_on.len(), 1, "depends_on must be copied");
+        assert!(
+            matches!(restart, Some(RestartPolicy::Always)),
+            "restart must be copied"
+        );
+        assert!(tty, "tty must be copied");
+        assert!(expose, "expose must be copied");
+        assert_eq!(profiles, vec!["full".to_string()]);
+        assert_eq!(tags, vec!["backend".to_string()]);
+        assert_eq!(watch, vec!["src/**".to_string()]);
+        assert_eq!(
+            resources.and_then(|r| r.memory).as_deref(),
+            Some("512m"),
+            "resources must be copied"
+        );
+        assert_eq!(grace_period.as_deref(), Some("30s"));
+        assert_eq!(startup_timeout.as_deref(), Some("5m"));
+        assert!(circuit_breaker.is_some(), "circuit_breaker must be copied");
+        assert_eq!(startup_message.as_deref(), Some("http://localhost:8080"));
+        assert_eq!(healthcheck_start_period.as_deref(), Some("10m"));
+        assert!(variants.contains_key("go"), "variants must be copied");
+        assert_eq!(default_variant.as_deref(), Some("go"));
+        assert_eq!(variant.as_deref(), Some("go"));
+        assert!(
+            unknown_fields.contains_key("typo_key"),
+            "unknown keys must survive so the typo warning still fires"
+        );
+        // The one field that must NOT be copied: it records what the *local*
+        // block wrote, so inheriting the base's claim would let a template
+        // silently empty a collection the service never mentioned.
+        assert!(
+            explicit_empty.is_empty(),
+            "explicit_empty is local-only and must not be inherited from the base"
+        );
+        // `ports` was explicitly empty on the base but not on the local, so
+        // the union still happened.
+        assert_eq!(ports, vec!["8080:8080".to_string()]);
+    }
+
+    /// The other half of the contract: the local service wins wherever it has
+    /// something to say. Same fixture on both sides, so any field where the
+    /// base leaks through is visible as the base's value.
+    #[test]
+    fn merge_service_local_wins_over_base() {
+        let base = fully_populated();
+        let mut local = Service {
+            process: Some("cargo run".to_string()),
+            cwd: Some("services/orders".to_string()),
+            tags: vec!["frontend".to_string()],
+            environment: [("LOG_LEVEL".to_string(), "info".to_string())].into(),
+            ..Default::default()
+        };
+        ServiceMerger::merge_service(&mut local, &base).unwrap();
+
+        assert_eq!(local.process.as_deref(), Some("cargo run"));
+        assert_eq!(local.cwd.as_deref(), Some("services/orders"));
+        assert_eq!(
+            local.environment.get("LOG_LEVEL").map(String::as_str),
+            Some("info")
+        );
+        // Collections union rather than replace, with local's entry first.
+        assert_eq!(
+            local.tags,
+            vec!["frontend".to_string(), "backend".to_string()]
+        );
     }
 }

@@ -1,0 +1,85 @@
+# Python 3.10+ standard library only. See README.md for the walkthrough.
+entrypoint: '*'
+
+parameters:
+  STORAGE_PORT:
+    type: port
+    default: 18741
+  CATALOG_PORT:
+    type: port
+    default: 18742
+  FRONTEND_PORT:
+    type: port
+    default: 18743
+
+defaults:
+  depends_on: [storage]
+  startup_timeout: 15s
+  healthcheck_start_period: 5s
+  environment:
+    PYTHONUNBUFFERED: '1'
+    DEMO_LABEL: Variant stack
+
+templates:
+  live-catalog:
+    process: python3 server.py catalog
+    environment:
+      IMPLEMENTATION: live
+      STORAGE_URL: 'http://127.0.0.1:{{STORAGE_PORT}}'
+
+services:
+  # Infrastructure is excluded from defaults, so it never depends on itself.
+  storage:
+    process: python3 server.py storage
+    environment:
+      PORT: '{{STORAGE_PORT}}'
+    healthcheck:
+      http_get: 'http://127.0.0.1:{{STORAGE_PORT}}/health'
+
+  catalog:
+    default_variant: live
+    environment:
+      PORT: '{{CATALOG_PORT}}'
+    healthcheck:
+      http_get: 'http://127.0.0.1:{{CATALOG_PORT}}/health'
+      interval: 200ms
+      probe_timeout: 500ms
+      retries: 3
+    variants:
+      live:
+        extends: live-catalog
+      fixture:
+        process: python3 server.py catalog
+        # This implementation can be started without storage.
+        depends_on: []
+        environment:
+          IMPLEMENTATION: fixture
+
+  frontend:
+    process: python3 server.py frontend
+    # Keep the frontend available to report errors while catalog is unhealthy.
+    depends_on:
+      - service: catalog
+        on_failure: ignore
+    environment:
+      PORT: '{{FRONTEND_PORT}}'
+      CATALOG_URL: 'http://127.0.0.1:{{CATALOG_PORT}}'
+    startup_message: 'Open http://127.0.0.1:{{FRONTEND_PORT}}'
+    healthcheck:
+      http_get: 'http://127.0.0.1:{{FRONTEND_PORT}}/health'
+
+  # Grouping node: no process of its own, completes after frontend is ready.
+  stack:
+    depends_on: [frontend]
+
+  # '*' and --all still respect profiles. Unix only because this uses a PTY.
+  console:
+    profiles: [console]
+    process: python3 console.py
+    tty: true
+    # Keep the console alive so it can accept the recovery command.
+    depends_on:
+      - service: catalog
+        on_failure: ignore
+    environment:
+      CATALOG_URL: 'http://127.0.0.1:{{CATALOG_PORT}}'

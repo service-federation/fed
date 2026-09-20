@@ -1,0 +1,72 @@
+# Variants: one service, several implementations
+#
+# A team rewriting a service keeps the old and the new implementation side by
+# side for months. Both listen on the same port, both satisfy the same
+# dependants, and only one may run at a time. Profiles can't express that —
+# they add services, they never replace one.
+#
+# With `variants:`, `catalog` keeps one name and one contract (its port, its
+# healthcheck, its `depends_on`, and what `frontend` depends on), and only the
+# implementation is chosen at start time:
+#
+#   fed start                        # java — the default_variant
+#   fed start --variant go           # go
+#   fed start --variant go,rust      # go here; rust in a checkout that has it
+#   fed start --variant catalog:java # pin the odd one out
+#   fed variant set go               # persist it, so later commands agree
+#
+# Both variants below are `sleep` stand-ins so this example runs anywhere.
+
+parameters:
+  CATALOG_PORT:
+    type: port
+    default: 8080
+
+  FRONTEND_PORT:
+    type: port
+    default: 3000
+
+services:
+  # The shared contract lives on the outer service: environment, healthcheck,
+  # dependencies, tags. It has no type-defining field of its own — that is
+  # what makes it a variant service rather than an ordinary one.
+  catalog:
+    environment:
+      PORT: '{{CATALOG_PORT}}'
+    healthcheck:
+      command: 'true'
+    tags: ["backend"]
+    default_variant: java
+    variants:
+      # Each variant supplies exactly one type-defining field, plus whatever
+      # else differs from the outer service. Scalars here win over the outer
+      # service; environment and other collections are merged into it.
+      java:
+        process: |
+          echo "catalog (java) on port {{CATALOG_PORT}}"
+          while true; do sleep 1; done
+        environment:
+          JAVA_OPTS: '-Xmx512m'
+      go:
+        process: |
+          echo "catalog (go) on port {{CATALOG_PORT}}"
+          while true; do sleep 1; done
+        environment:
+          GOMAXPROCS: '4'
+
+  # A dependant names the service, never the variant. This edge holds no
+  # matter which implementation is live.
+  frontend:
+    startup_message: "Demo frontend is running (sleep stand-in)"
+    process: |
+      echo "frontend on port {{FRONTEND_PORT}}"
+      while true; do sleep 1; done
+    environment:
+      PORT: '{{FRONTEND_PORT}}'
+      CATALOG_URL: 'http://localhost:{{CATALOG_PORT}}'
+    depends_on:
+      - catalog
+    healthcheck:
+      command: 'true'
+
+entrypoint: frontend

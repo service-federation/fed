@@ -85,7 +85,13 @@ scripts:
       npm test
 
 # Profiles switch services on by context: tag one with `profiles: [production]`, then
-# `fed -p production start`. See https://www.service-federation.com/docs/configuration/
+# `fed -p production start`.
+#
+# Variants keep one service name over several implementations — useful during a
+# rewrite. Give the service `variants:` instead of a `process:`, then
+# `fed start --variant go` or `fed variant set go`.
+#
+# See https://www.service-federation.com/docs/configuration/
 "#;
 
 pub fn run_init(output: &Path, force: bool, out: &dyn UserOutput) -> anyhow::Result<()> {

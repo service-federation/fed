@@ -893,6 +893,17 @@ impl ServiceManager for DockerService {
         Ok(())
     }
 
+    async fn liveness(&self) -> Result<bool> {
+        let container_id = self.container_id.read().clone();
+        let Some(id) = container_id else {
+            return Ok(false);
+        };
+        if !crate::docker::is_daemon_healthy().await {
+            return Err(crate::docker::DockerError::DaemonUnavailable.into());
+        }
+        Ok(self.client.is_running(&id, DOCKER_INSPECT_TIMEOUT).await)
+    }
+
     async fn health(&self) -> Result<bool> {
         // Serialize checks through the cache lock so concurrent callers
         // (TUI ticks, health monitor) don't each spawn a `docker exec`.
