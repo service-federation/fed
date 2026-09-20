@@ -726,17 +726,46 @@ fn test_watch_handoff_stops_background_supervisor_and_resumes_after() {
     // Start `fed start --watch` in the background — in real usage this
     // blocks in the foreground; here it's a spawned child under our
     // control so the test can observe both sides of the handoff.
-    let mut watch_child = Command::new(fed_binary())
-        .arg("-c")
-        .arg(&config_path)
-        .arg("-w")
-        .arg(workdir)
-        .args(["start", "--watch", "steady"])
-        .env("FED_NON_INTERACTIVE", "1")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("failed to spawn fed start --watch");
+    struct WatchSession<'a> {
+        child: std::process::Child,
+        config_path: &'a Path,
+        workdir: &'a Path,
+    }
+    impl Drop for WatchSession<'_> {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = run_fed(self.config_path, self.workdir, &["stop"]);
+        }
+    }
+
+    // Keep output outside the workspace so log writes cannot trigger its watcher.
+    let watch_output = tempfile::NamedTempFile::new().expect("create watch output file");
+    let mut watch = WatchSession {
+        child: Command::new(fed_binary())
+            .arg("-c")
+            .arg(&config_path)
+            .arg("-w")
+            .arg(workdir)
+            .args(["start", "--watch", "steady"])
+            .env("FED_NON_INTERACTIVE", "1")
+            .stdout(
+                watch_output
+                    .as_file()
+                    .try_clone()
+                    .expect("clone watch stdout"),
+            )
+            .stderr(
+                watch_output
+                    .as_file()
+                    .try_clone()
+                    .expect("clone watch stderr"),
+            )
+            .spawn()
+            .expect("failed to spawn fed start --watch"),
+        config_path: &config_path,
+        workdir,
+    };
 
     // The pre-flight handoff must SIGTERM the background daemon before
     // `--watch`'s own orchestrator ever starts monitoring — the exact
@@ -749,25 +778,31 @@ fn test_watch_handoff_stops_background_supervisor_and_resumes_after() {
          pre-flight handoff"
     );
     assert!(
-        matches!(watch_child.try_wait(), Ok(None)),
+        matches!(watch.child.try_wait(), Ok(None)),
         "the --watch process itself should still be running"
     );
 
-    // The pre-flight handoff (this test's own polling of the *old*
-    // supervisor's liveness) and `--watch`'s own internal build/attach
-    // (which independently waits on the same handoff via a different
-    // liveness primitive, `live_supervisor_pid`'s flock check rather than
-    // `kill -0`) are two separate observers of the same event and are not
-    // guaranteed to settle at the exact same instant. A short buffer here
-    // lets `--watch`'s own `Orchestrator::initialize()`/`create_services()`
-    // finish attaching to the still-alive 'steady' *before* this test
-    // crashes it — otherwise a crash landing in that narrow window would be
-    // absorbed by the plain `start steady` CLI argument's own "start what
-    // was named" semantics (a fresh register, not a monitoring-loop
-    // restart), which is a real but orthogonal pre-existing race (the same
-    // `mark_dead_services` staleness race Design's "Attach/self-heal
-    // reality" section discusses), not what this test exists to check.
-    std::thread::sleep(Duration::from_secs(3));
+    // Daemon exit is only the pre-flight boundary: initialization and the
+    // named service's ordinary start still follow it. Wait until watch mode
+    // announces readiness, after create_services and mark_startup_complete,
+    // so killing the service exercises monitoring instead of a fresh start.
+    let readiness_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = fs::read_to_string(watch_output.path()).expect("read watch output");
+        let status = watch.child.try_wait().expect("poll watch process");
+        assert!(
+            status.is_none(),
+            "watch exited before readiness: {status:?}\n{output}"
+        );
+        if output.contains("Watching for file changes...") {
+            break;
+        }
+        assert!(
+            Instant::now() < readiness_deadline,
+            "watch was not ready within 30s:\n{output}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
     // Prove there's exactly one live monitor, not a race window with two:
     // crash the service once and confirm exactly one restart is recorded —
@@ -793,9 +828,9 @@ fn test_watch_handoff_stops_background_supervisor_and_resumes_after() {
     // must survive (it's a real, independently-detached process the watch
     // session was only observing, not one it owns), and nothing auto-
     // respawns supervision once the session is gone.
-    let watch_child_pid = watch_child.id();
+    let watch_child_pid = watch.child.id();
     kill9(watch_child_pid);
-    let _ = watch_child.wait();
+    let _ = watch.child.wait();
 
     let service_pid_after_watch_exit = service_pid(workdir, "steady")
         .expect("'steady' should still be running after --watch exits");

@@ -366,3 +366,58 @@ fn hosted_variant_keeps_selection_and_attach_metadata_across_commands() {
     gone(host);
     assert!(!socket.exists());
 }
+
+#[test]
+fn relative_workspace_arguments_keep_sockets_and_host_identity_absolute() {
+    for explicit_workdir in [false, true] {
+        let project = Project::new(CAT);
+        let directory = project.0.path().file_name().unwrap();
+        let relative = PathBuf::from(directory);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fed"));
+        command.current_dir(project.0.path().parent().unwrap());
+        if explicit_workdir {
+            command.arg("--workdir").arg(&relative);
+        } else {
+            command.arg("--config").arg(relative.join("fed.yaml"));
+        }
+        let mut child = command
+            .args(["start", "repl"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("relative-path startup timed out");
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (pid, host, socket) = project.row("repl");
+        assert!(
+            socket.is_absolute(),
+            "persisted socket is relative: {socket:?}"
+        );
+        // This test process has a different cwd from the launching command.
+        let stream = UnixStream::connect(&socket).unwrap();
+        drop(stream);
+        // The host cannot exit on its own: stop must recognize its workspace
+        // even though startup used a relative spelling and stop an absolute one.
+        unsafe {
+            libc::kill(host as i32, libc::SIGSTOP);
+        }
+        project.success(&["stop", "repl"]);
+        gone(pid);
+        gone(host);
+        assert!(!socket.exists());
+    }
+}

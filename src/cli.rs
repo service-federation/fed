@@ -128,6 +128,18 @@ pub enum Commands {
         #[arg(long)]
         tag: Option<String>,
     },
+    /// Connect your terminal to a running tty service
+    #[cfg(unix)]
+    Attach {
+        /// Service name
+        service: String,
+        /// Follow output without forwarding input or changing terminal mode
+        #[arg(long)]
+        no_stdin: bool,
+        /// Two control keys that detach without stopping the service
+        #[arg(long, default_value = "ctrl-p,ctrl-q")]
+        detach_keys: String,
+    },
     /// Show service logs
     Logs {
         /// Service name

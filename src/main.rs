@@ -233,6 +233,25 @@ async fn run() -> anyhow::Result<()> {
 
     // ── Tier 1: Commands that need NO config ──────────────────────────
     match &cli.command {
+        #[cfg(unix)]
+        Commands::Attach {
+            service,
+            no_stdin,
+            detach_keys,
+        } => {
+            let config_path = cli.config.clone().unwrap_or_else(|| {
+                if cli.workdir.is_some() {
+                    PathBuf::from("fed.yaml")
+                } else {
+                    ConfigParser::new()
+                        .find_config_file()
+                        .unwrap_or_else(|_| PathBuf::from("fed.yaml"))
+                }
+            });
+            let work_dir = resolve_work_dir(cli.workdir.clone(), &config_path)?;
+            let code = commands::run_attach(work_dir, service, *no_stdin, detach_keys).await?;
+            std::process::exit(code);
+        }
         Commands::Init { output, force } => {
             return commands::run_init(output, *force, &out);
         }
@@ -825,6 +844,8 @@ async fn run() -> anyhow::Result<()> {
         Commands::Top { interval } => {
             commands::run_top(&orchestrator, interval, &out).await?;
         }
+        #[cfg(unix)]
+        Commands::Attach { .. } => unreachable!("handled in earlier dispatch tiers"),
         // Handled in earlier tiers
         Commands::Init { .. }
         | Commands::Validate
@@ -883,7 +904,15 @@ fn resolve_work_dir(
         if parent.as_os_str().is_empty() {
             Ok(std::env::current_dir()?)
         } else {
-            Ok(parent.to_path_buf())
+            // Detached host identity and persisted socket paths must stay
+            // stable when later commands run from a different directory.
+            std::fs::canonicalize(parent).map_err(|error| {
+                anyhow::anyhow!(
+                    "Cannot resolve working directory '{}': {}",
+                    parent.display(),
+                    error
+                )
+            })
         }
     } else {
         Ok(std::env::current_dir()?)
