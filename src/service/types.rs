@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::path::Path;
 
 /// Current lifecycle status of a service.
 ///
@@ -436,6 +437,24 @@ pub trait ServiceManager: Send + Sync {
     /// This can outlive the tracked launcher PID when a package-manager shim
     /// is killed but its server child remains alive.
     fn get_process_group_id(&self) -> Option<u32> {
+        None
+    }
+
+    /// Get the PID of the `fed host` process that owns this service's
+    /// pseudo-terminal, if it has one.
+    ///
+    /// Only a service declared `tty: true` runs under a host, so every
+    /// manager keeps this `None` until the hosted process service arrives.
+    fn get_host_pid(&self) -> Option<u32> {
+        None
+    }
+
+    /// Get the unix socket the host listens on for `fed attach`, if this
+    /// service has a host.
+    ///
+    /// Same rule as [`get_host_pid`](Self::get_host_pid): only a service
+    /// declared `tty: true` answers with a path.
+    fn attach_socket(&self) -> Option<&Path> {
         None
     }
 

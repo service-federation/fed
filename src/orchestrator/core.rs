@@ -1558,6 +1558,13 @@ impl Orchestrator {
                         .update_service_container_id(name, container_id)
                         .await?;
                 }
+                if let (Some(host_pid), Some(attach_socket)) =
+                    (manager.get_host_pid(), manager.attach_socket())
+                {
+                    tracker
+                        .update_service_host(name, host_pid, attach_socket)
+                        .await?;
+                }
                 // Store port mappings if available (for docker services)
                 let port_mappings = manager.get_port_mappings().await;
                 if !port_mappings.is_empty() {
@@ -3379,6 +3386,8 @@ mod tests {
                     startup_message: None,
                     desired_state: DesiredState::Running,
                     native_restart_enabled: false,
+                    host_pid: None,
+                    attach_socket: None,
                 })
                 .await
                 .unwrap();
@@ -3400,6 +3409,8 @@ mod tests {
                     startup_message: None,
                     desired_state: DesiredState::Stopped,
                     native_restart_enabled: false,
+                    host_pid: None,
+                    attach_socket: None,
                 })
                 .await
                 .unwrap();
@@ -3508,6 +3519,8 @@ mod tests {
                         startup_message: None,
                         desired_state,
                         native_restart_enabled: false,
+                        host_pid: None,
+                        attach_socket: None,
                     })
                     .await
                     .unwrap();
@@ -3606,6 +3619,8 @@ mod tests {
                     startup_message: None,
                     desired_state: DesiredState::Running,
                     native_restart_enabled: false,
+                    host_pid: None,
+                    attach_socket: None,
                 })
                 .await
                 .unwrap();
@@ -3627,6 +3642,8 @@ mod tests {
                     startup_message: None,
                     desired_state: DesiredState::Stopped,
                     native_restart_enabled: false,
+                    host_pid: None,
+                    attach_socket: None,
                 })
                 .await
                 .unwrap();

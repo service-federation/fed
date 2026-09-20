@@ -63,6 +63,8 @@ fn native_restart_service_state(container_id: &str) -> ServiceState {
         startup_message: None,
         desired_state: DesiredState::Running,
         native_restart_enabled: true,
+        host_pid: None,
+        attach_socket: None,
     }
 }
 

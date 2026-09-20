@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 /// Lock file format - persisted state of running services
@@ -109,6 +110,15 @@ pub struct ServiceState {
     /// everything else keeps today's one-shot staleness check.
     #[serde(default)]
     pub native_restart_enabled: bool,
+
+    /// PID of the `fed host` process that owns this service's
+    /// pseudo-terminal, for services declared `tty: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_pid: Option<u32>,
+
+    /// Path of the unix socket that the host listens on for `fed attach`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_socket: Option<PathBuf>,
 }
 
 /// Persisted intent for whether a service should be running.
@@ -174,6 +184,8 @@ impl ServiceState {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
+            host_pid: None,
+            attach_socket: None,
         }
     }
 
