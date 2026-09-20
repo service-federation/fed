@@ -274,6 +274,8 @@ impl Orchestrator {
         let foreground = self.foreground.as_deref() == Some(name);
         let output_mode = if foreground {
             OutputMode::Passthrough
+        } else if service.tty {
+            OutputMode::File
         } else {
             self.output_mode
         };
@@ -313,6 +315,8 @@ impl Orchestrator {
         );
         if foreground {
             Box::new(process_service.run_in_foreground())
+        } else if service.tty {
+            Box::new(process_service.run_hosted())
         } else {
             Box::new(process_service)
         }
@@ -391,6 +395,15 @@ impl Orchestrator {
                     }
                 }
 
+                if let Some(process) = manager.as_any_mut().downcast_mut::<ProcessService>() {
+                    process.restore_host(
+                        service_state.host_pid,
+                        service_state.attach_socket.clone(),
+                        service_state.pid,
+                        service_state.started_at,
+                    );
+                }
+
                 // Restore container ID for docker services
                 if let Some(container_id) = &service_state.container_id
                     && let Some(restored) =
@@ -448,6 +461,14 @@ impl Orchestrator {
             if missing {
                 match missing_handling {
                     MissingServiceHandling::Unregister => {
+                        #[cfg(unix)]
+                        crate::service::hosted::reap_host(
+                            service_name,
+                            service_state.host_pid,
+                            service_state.attach_socket.as_deref(),
+                            service_state.started_at,
+                        )
+                        .await;
                         self.unregister_stale_service(service_name).await;
                     }
                     MissingServiceHandling::Report => {

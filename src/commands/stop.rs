@@ -79,6 +79,8 @@ pub async fn run_stop(
             out.status(&format!("Killed {} orphaned process(es)", process_count));
         }
 
+        #[cfg(unix)]
+        fed::service::hosted::sweep_dead_sockets(orchestrator.work_dir());
         orchestrator.cleanup().await;
     } else {
         // Expand tag references (e.g., @backend) into service names
@@ -111,6 +113,32 @@ pub async fn run_stop(
         let mut failures: Vec<(String, String)> = Vec::new();
         for service in services_to_stop {
             out.progress(&format!("  Stopping {}...", service));
+            if !config.services.contains_key(&service)
+                && let Some(state) = state_services.get(&service)
+            {
+                let _ = orchestrator
+                    .state_tracker
+                    .write()
+                    .await
+                    .set_desired_state(&service, DesiredState::Stopped)
+                    .await;
+                match stop_service_by_state(&service, state).await {
+                    StopResult::Failed => {
+                        out.finish_progress(" failed");
+                        failures.push((service, "Failed to stop service from state".into()));
+                    }
+                    _ => {
+                        orchestrator
+                            .state_tracker
+                            .write()
+                            .await
+                            .unregister_service(&service)
+                            .await?;
+                        out.finish_progress(" done");
+                    }
+                }
+                continue;
+            }
             match orchestrator.stop(&service).await {
                 Ok(_) => out.finish_progress(" done"),
                 Err(e) => {
@@ -164,7 +192,7 @@ async fn stop_remaining_state_services(orchestrator: &Orchestrator, out: &dyn Us
     {
         let mut tracker = orchestrator.state_tracker.write().await;
         for (name, state) in &services {
-            if !state_status_is_active(state.status) {
+            if !state_status_is_active(state.status) && state.host_pid.is_none() {
                 continue;
             }
             let _ = tracker.set_desired_state(name, DesiredState::Stopped).await;
@@ -174,7 +202,7 @@ async fn stop_remaining_state_services(orchestrator: &Orchestrator, out: &dyn Us
     let mut stopped_names: Vec<String> = Vec::new();
 
     for (name, state) in services {
-        if !state_status_is_active(state.status) {
+        if !state_status_is_active(state.status) && state.host_pid.is_none() {
             continue;
         }
 
@@ -238,6 +266,10 @@ pub async fn run_stop_from_state(
 
     let all_services = tracker.get_services().await;
     if all_services.is_empty() {
+        #[cfg(unix)]
+        if services.is_empty() {
+            fed::service::hosted::sweep_dead_sockets(work_dir);
+        }
         out.status("No services found in state tracker.");
         return Ok(());
     }
@@ -263,7 +295,7 @@ pub async fn run_stop_from_state(
     // still let a restart-policy supervisor resurrect a service, since this
     // path never goes through `stop_service_impl`.
     for (name, state) in &services_to_stop {
-        if !state_status_is_active(state.status) {
+        if !state_status_is_active(state.status) && state.host_pid.is_none() {
             continue;
         }
         let _ = tracker.set_desired_state(name, DesiredState::Stopped).await;
@@ -273,7 +305,7 @@ pub async fn run_stop_from_state(
     for (name, state) in &services_to_stop {
         // Failing/Stopping services still have a live process or container —
         // they must be stopped here, not skipped and then erased from state.
-        if !state_status_is_active(state.status) {
+        if !state_status_is_active(state.status) && state.host_pid.is_none() {
             continue;
         }
 
@@ -325,6 +357,10 @@ pub async fn run_stop_from_state(
         );
     }
 
+    #[cfg(unix)]
+    if services.is_empty() {
+        fed::service::hosted::sweep_dead_sockets(work_dir);
+    }
     out.success("Services stopped");
 
     Ok(())

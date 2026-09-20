@@ -64,6 +64,9 @@ pub struct ProcessService {
     /// Run this service in fed's terminal, with fed waiting for it
     /// (`fed start -i`). See [`Self::run_in_foreground`].
     foreground: bool,
+    hosted: bool,
+    host_pid: Option<u32>,
+    attach_socket: Option<std::path::PathBuf>,
 }
 
 impl ProcessService {
@@ -93,6 +96,9 @@ impl ProcessService {
             grace_period,
             started_at: Arc::new(SyncMutex::new(None)),
             foreground: false,
+            hosted: false,
+            host_pid: None,
+            attach_socket: None,
         }
     }
 
@@ -105,6 +111,93 @@ impl ProcessService {
     pub fn run_in_foreground(mut self) -> Self {
         self.foreground = true;
         self
+    }
+
+    pub fn run_hosted(mut self) -> Self {
+        self.hosted = true;
+        self
+    }
+
+    pub fn restore_host(
+        &mut self,
+        host_pid: Option<u32>,
+        socket: Option<std::path::PathBuf>,
+        process_group_id: Option<u32>,
+        started_at: DateTime<Utc>,
+    ) {
+        self.host_pid = host_pid;
+        self.attach_socket = socket;
+        if host_pid.is_some() {
+            *self.started_at.lock() = Some(started_at);
+            *self.process_group_id.lock() = process_group_id;
+            if self.base.read().status == Status::Stopped {
+                self.base.write().set_status(Status::Failing);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn start_hosted(&mut self) -> Result<()> {
+        let spec =
+            {
+                let base = self.base.read();
+                let work_dir = std::path::PathBuf::from(&base.work_dir);
+                crate::attach::launch::LaunchSpec {
+                    service: self.name.clone(),
+                    command: self
+                        .config
+                        .process
+                        .clone()
+                        .ok_or_else(|| Error::Config("No process command specified".into()))?,
+                    cwd: self
+                        .config
+                        .cwd
+                        .as_ref()
+                        .map(|cwd| work_dir.join(cwd))
+                        .unwrap_or_else(|| work_dir.clone()),
+                    environment: base.environment.clone(),
+                    log_path: self.log_capture.log_file_path().cloned().ok_or_else(|| {
+                        Error::Config("Hosted service requires a log file".into())
+                    })?,
+                    socket_path: crate::fed_dir::attach_socket_path(&work_dir, &self.name),
+                    work_dir,
+                    resources: self.config.resources.clone(),
+                }
+            };
+        *self.started_at.lock() = Some(Utc::now());
+        *self.health_cache.lock().await = (None, Instant::now());
+        match super::hosted::launch(&spec).await {
+            Ok((pid, host_pid)) => {
+                *self.pid.lock() = Some(pid);
+                *self.process_group_id.lock() = Some(pid);
+                self.host_pid = Some(host_pid);
+                self.attach_socket = Some(spec.socket_path);
+                self.base.write().set_status(Status::Running);
+                Ok(())
+            }
+            Err(error) => {
+                let mut base = self.base.write();
+                base.set_error(error.to_string());
+                base.set_status(Status::Failing);
+                Err(error)
+            }
+        }
+    }
+
+    async fn reap_host(&mut self) {
+        #[cfg(unix)]
+        {
+            let started_at = self.started_at.lock().unwrap_or_else(Utc::now);
+            super::hosted::reap_host(
+                &self.name,
+                self.host_pid,
+                self.attach_socket.as_deref(),
+                started_at,
+            )
+            .await;
+        }
+        self.host_pid = None;
+        self.attach_socket = None;
     }
 
     /// Restore PID from state (used when reattaching to detached processes)
@@ -409,6 +502,11 @@ impl ServiceManager for ProcessService {
         // Note: Install command is handled by orchestrator.run_install_if_needed()
         // before calling start(). Don't duplicate that logic here.
 
+        #[cfg(unix)]
+        if self.hosted && !self.foreground {
+            return self.start_hosted().await;
+        }
+
         // Start the process
         let mut child = self.spawn_process().await?;
 
@@ -581,14 +679,15 @@ impl ServiceManager for ProcessService {
     async fn stop(&mut self) -> Result<()> {
         {
             let mut base = self.base.write();
-            if base.status == Status::Stopped {
+            if base.status == Status::Stopped && self.host_pid.is_none() {
                 return Ok(());
             }
             base.set_status(Status::Stopping);
         }
 
         // If we have a Child handle (interactive mode), use it for clean shutdown
-        let mut process = self.process.lock().await;
+        let process_handle = Arc::clone(&self.process);
+        let mut process = process_handle.lock().await;
         if let Some(child) = process.as_mut() {
             if let Some(raw_pid) = child.id() {
                 // Validate PID: rejects 0, 1, and values > i32::MAX
@@ -648,6 +747,8 @@ impl ServiceManager for ProcessService {
                     );
                     *self.pid.lock() = None;
                     *self.process_group_id.lock() = None;
+
+                    self.reap_host().await;
 
                     // Shutdown log capture tasks
                     self.log_capture.shutdown().await;
@@ -718,6 +819,7 @@ impl ServiceManager for ProcessService {
                 *self.process_group_id.lock() = None;
             }
         }
+        self.reap_host().await;
 
         // Shutdown log capture tasks
         self.log_capture.shutdown().await;
@@ -737,13 +839,19 @@ impl ServiceManager for ProcessService {
         // Immediate SIGKILL without SIGTERM first (unlike stop())
         {
             let mut base = self.base.write();
-            if base.status == Status::Stopped {
+            if base.status == Status::Stopped && self.host_pid.is_none() {
                 return Ok(());
             }
             base.set_status(Status::Stopping);
         }
 
-        let pid_opt = *self.pid.lock();
+        let mut pid_opt = *self.pid.lock();
+        if self.host_pid.is_some()
+            && let (Some(pid), Some(started_at)) = (pid_opt, *self.started_at.lock())
+            && !crate::error::validate_pid_start_time(pid, started_at)
+        {
+            pid_opt = None;
+        }
 
         if let Some(pid_val) = pid_opt {
             // Validate PID: rejects 0, 1, and values > i32::MAX
@@ -770,10 +878,13 @@ impl ServiceManager for ProcessService {
             let _ = child.wait().await;
         }
         *process = None;
+        drop(process);
 
         // Now that the process is confirmed dead, clear PID
         *self.pid.lock() = None;
         *self.process_group_id.lock() = None;
+
+        self.reap_host().await;
 
         // Shutdown log capture tasks
         self.log_capture.shutdown().await;
@@ -847,6 +958,14 @@ impl ServiceManager for ProcessService {
     fn get_pid(&self) -> Option<u32> {
         // Return stored PID (works for both detached and interactive mode)
         *self.pid.lock()
+    }
+
+    fn get_host_pid(&self) -> Option<u32> {
+        self.host_pid
+    }
+
+    fn attach_socket(&self) -> Option<&std::path::Path> {
+        self.attach_socket.as_deref()
     }
 
     async fn wait_foreground(&mut self) -> Result<std::process::ExitStatus> {

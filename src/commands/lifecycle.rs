@@ -13,7 +13,7 @@ pub enum StopResult {
 /// This encapsulates the common pattern shared by `stop_remaining_state_services`
 /// and `run_stop_from_state`: given a `ServiceState`, stop whatever is running.
 pub async fn stop_service_by_state(name: &str, state: &fed::state::ServiceState) -> StopResult {
-    if let Some(container_id) = state.container_id.as_deref() {
+    let result = if let Some(container_id) = state.container_id.as_deref() {
         if graceful_docker_stop(container_id).await {
             StopResult::Stopped
         } else {
@@ -29,7 +29,18 @@ pub async fn stop_service_by_state(name: &str, state: &fed::state::ServiceState)
         }
     } else {
         StopResult::Skipped(format!("no PID or container ID for service '{}'", name))
+    };
+    #[cfg(unix)]
+    if !matches!(result, StopResult::Failed) {
+        fed::service::hosted::reap_host(
+            name,
+            state.host_pid,
+            state.attach_socket.as_deref(),
+            state.started_at,
+        )
+        .await;
     }
+    result
 }
 
 /// Remove orphaned Docker containers for a work directory (no orchestrator needed).

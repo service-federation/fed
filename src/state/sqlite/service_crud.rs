@@ -1060,6 +1060,14 @@ impl SqliteStateTracker {
             };
 
             if is_stale {
+                #[cfg(unix)]
+                crate::service::hosted::reap_host(
+                    service_id.rsplit('/').next().unwrap_or(service_id),
+                    service_state.host_pid,
+                    service_state.attach_socket.as_deref(),
+                    service_state.started_at,
+                )
+                .await;
                 if service_state.native_restart_enabled {
                     grace_hit.push(service_id.clone());
                 } else {
