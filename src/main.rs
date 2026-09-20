@@ -238,12 +238,16 @@ async fn run() -> anyhow::Result<()> {
             no_stdin,
             detach_keys,
         } => {
-            let work_dir = resolve_work_dir(
-                cli.workdir.clone(),
-                cli.config
-                    .as_deref()
-                    .unwrap_or(std::path::Path::new("fed.yaml")),
-            )?;
+            let config_path = cli.config.clone().unwrap_or_else(|| {
+                if cli.workdir.is_some() {
+                    PathBuf::from("fed.yaml")
+                } else {
+                    ConfigParser::new()
+                        .find_config_file()
+                        .unwrap_or_else(|_| PathBuf::from("fed.yaml"))
+                }
+            });
+            let work_dir = resolve_work_dir(cli.workdir.clone(), &config_path)?;
             let code = commands::run_attach(work_dir, service, *no_stdin, detach_keys).await?;
             std::process::exit(code);
         }

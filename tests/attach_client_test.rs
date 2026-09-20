@@ -382,3 +382,192 @@ fn old_state_schema_reports_not_attachable() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("Service 'repl' is not attachable."));
 }
+
+fn flood_client(
+    listener: UnixListener,
+) -> (std::sync::mpsc::Receiver<()>, std::thread::JoinHandle<()>) {
+    let (ready, waiting) = std::sync::mpsc::channel();
+    let host = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = FrameReader::new(stream.try_clone().unwrap());
+        assert!(matches!(reader.read_frame().unwrap(), Frame::Hello { .. }));
+        stream
+            .write_all(&encode(&Frame::Scrollback(Vec::new())))
+            .unwrap();
+        let output = encode(&Frame::Output(vec![b'x'; 65536]));
+        for index in 0..1024 {
+            if stream.write_all(&output).is_err() {
+                return;
+            }
+            if index == 7 {
+                ready.send(()).unwrap();
+            }
+        }
+        panic!("all output unexpectedly fit in the unread pipe");
+    });
+    (waiting, host)
+}
+
+#[test]
+fn signal_preempts_blocked_stdout_pipe() {
+    let dir = TempDir::new().unwrap();
+    let listener = fake_host(dir.path());
+    let (ready, host) = flood_client(listener);
+    let mut child = attach(dir.path(), &["--no-stdin"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    ready.recv_timeout(Duration::from_secs(10)).unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(1));
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("SIGTERM did not interrupt blocked stdout");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    host.join().unwrap();
+}
+
+#[test]
+fn signal_restores_raw_terminal_with_blocked_stdout() {
+    let dir = TempDir::new().unwrap();
+    let listener = fake_host(dir.path());
+    let fifo = dir.path().join("output.fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _unread_pipe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .unwrap();
+    let pid_file = dir.path().join("client.pid");
+    let script = dir.path().join("blocked-output.sh");
+    std::fs::write(
+        &script,
+        format!(
+            r#"before=$(stty -a | sed -E "s/-?pendin//g")
+bash -c 'echo $$ > {}; exec {} > {}'
+result=$?
+test "$before" = "$(stty -a | sed -E "s/-?pendin//g")" && echo TERMINAL_RESTORED
+exit $result
+"#,
+            pid_file.display(),
+            pty_command(dir.path(), ""),
+            fifo.display()
+        ),
+    )
+    .unwrap();
+    let (ready, host) = flood_client(listener);
+    let mut session = rexpect::spawn(&format!("bash {}", script.display()), Some(2000)).unwrap();
+    ready.recv_timeout(Duration::from_secs(10)).unwrap();
+    let pid: i32 = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    session.exp_string("TERMINAL_RESTORED").unwrap();
+    assert_eq!(exit_code(&mut session), 1);
+    host.join().unwrap();
+}
+
+#[test]
+fn attach_finds_project_state_from_nested_directory_without_parsing_config() {
+    let dir = TempDir::new().unwrap();
+    let listener = fake_host(dir.path());
+    std::fs::write(dir.path().join("fed.yaml"), "invalid: [yaml").unwrap();
+    let nested = dir.path().join("deep/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let host = std::thread::spawn(move || {
+        let (mut stream, _, _) = hello(listener);
+        stream
+            .write_all(&encode(&Frame::Exit { status: 0 }))
+            .unwrap();
+    });
+    let output = Command::new(binary())
+        .current_dir(nested)
+        .args(["attach", "repl", "--no-stdin"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    host.join().unwrap();
+}
+
+#[test]
+fn service_exit_waits_for_all_output_to_drain() {
+    use std::io::Read;
+    let dir = TempDir::new().unwrap();
+    let listener = fake_host(dir.path());
+    let (sent, ready) = std::sync::mpsc::channel();
+    let host = std::thread::spawn(move || {
+        let (mut stream, _, _) = hello(listener);
+        stream
+            .write_all(&encode(&Frame::Scrollback(Vec::new())))
+            .unwrap();
+        stream
+            .write_all(&encode(&Frame::Output(vec![b'x'; 262144])))
+            .unwrap();
+        stream
+            .write_all(&encode(&Frame::Exit { status: 7 << 8 }))
+            .unwrap();
+        sent.send(()).unwrap();
+    });
+    let mut child = attach(dir.path(), &["--no-stdin"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    ready.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(child.try_wait().unwrap().is_none());
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut output)
+        .unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(7));
+    assert_eq!(output, vec![b'x'; 262144]);
+    host.join().unwrap();
+}
+
+#[test]
+fn hosted_service_survives_client_termination() {
+    let service = RunningService::start("cat");
+    let mut session =
+        rexpect::spawn(&pty_command(service.0.path(), "--no-stdin"), Some(10000)).unwrap();
+    session.exp_string("Attached to repl").unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(session.process.child_pid.as_raw()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    assert_eq!(exit_code(&mut session), 1);
+    let output = service.command("status").arg("--json").output().unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["repl"]["attachable"], true);
+}

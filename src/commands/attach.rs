@@ -1,8 +1,10 @@
 use std::io::{IsTerminal, Read, Write};
 use std::net::Shutdown;
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -25,14 +27,9 @@ enum Event {
     Failed(String),
 }
 
-type Writer = Arc<Mutex<UnixStream>>;
-
-fn send(writer: &Writer, frame: Frame) -> anyhow::Result<()> {
-    writer
-        .lock()
-        .map_err(|_| anyhow::anyhow!("attach writer panicked"))?
-        .write_all(&encode(&frame))?;
-    Ok(())
+enum WriteRequest {
+    Frame(Frame),
+    Detach,
 }
 
 /// Attach using persisted state without loading config or resolving secrets.
@@ -85,7 +82,9 @@ pub async fn run_attach(
     ))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let writer = Arc::new(Mutex::new(stream.try_clone()?));
+    let mut writer = stream.try_clone()?;
+    let shutdown = stream.try_clone()?;
+    let mut stdout = std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?);
     // Register handlers before changing terminal attributes.
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
@@ -110,17 +109,45 @@ pub async fn run_attach(
     }
     let terminal = TerminalGuard;
     let (cols, rows) = size().unwrap_or((80, 24));
-    send(
-        &writer,
-        Frame::Hello {
-            version: VERSION,
-            cols,
-            rows,
-            flags: if no_stdin { FLAG_NO_STDIN } else { 0 },
-        },
-    )?;
-    let (tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (output_tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let (events, mut controls) = tokio::sync::mpsc::unbounded_channel();
+    let (input, outgoing) = std::sync::mpsc::sync_channel(16);
+    let dimensions = Arc::new(AtomicU32::new((u32::from(cols) << 16) | u32::from(rows)));
+    let writer_dimensions = dimensions.clone();
+    let writer_events = events.clone();
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<()> {
+            writer.write_all(&encode(&Frame::Hello {
+                version: VERSION,
+                cols,
+                rows,
+                flags: if no_stdin { FLAG_NO_STDIN } else { 0 },
+            }))?;
+            let mut previous_size = (u32::from(cols) << 16) | u32::from(rows);
+            loop {
+                let current_size = writer_dimensions.load(Ordering::Relaxed);
+                if current_size != previous_size {
+                    writer.write_all(&encode(&Frame::Resize {
+                        cols: (current_size >> 16) as u16,
+                        rows: current_size as u16,
+                    }))?;
+                    previous_size = current_size;
+                }
+                match outgoing.recv_timeout(Duration::from_millis(50)) {
+                    Ok(WriteRequest::Frame(frame)) => writer.write_all(&encode(&frame))?,
+                    Ok(WriteRequest::Detach) => {
+                        let _ = writer_events.send(Event::Detached);
+                        return Ok(());
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                }
+            }
+        })();
+        if let Err(error) = result {
+            let _ = writer_events.send(Event::Failed(error.to_string()));
+        }
+    });
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(16);
     std::thread::spawn(move || {
         let timeout_socket = stream.try_clone().ok();
         let mut reader = FrameReader::new(stream);
@@ -144,33 +171,53 @@ pub async fn run_attach(
             }
         }
     });
+    let output_events = events.clone();
+    std::thread::spawn(move || {
+        while let Some(event) = output_rx.blocking_recv() {
+            match event {
+                Event::Frame(Frame::Output(bytes) | Frame::Scrollback(bytes)) => {
+                    if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+                        let _ = output_events.send(Event::Failed(error.to_string()));
+                        return;
+                    }
+                }
+                // Delivery acknowledges that every preceding output frame was flushed.
+                event => {
+                    let _ = output_events.send(event);
+                    return;
+                }
+            }
+        }
+        let _ = output_events.send(Event::Failed("the attach connection closed".into()));
+    });
     if !no_stdin {
-        let input_writer = writer.clone();
+        let input = input.clone();
         std::thread::spawn(move || {
             let mut detector = DetachDetector::new(keys);
             let mut buffer = [0; 4096];
             loop {
                 match std::io::stdin().read(&mut buffer) {
                     Ok(0) => {
-                        let _ = tx.send(Event::Detached);
+                        let _ = input.send(WriteRequest::Detach);
                         break;
                     }
                     Ok(count) => {
                         let scan = detector.scan(&buffer[..count]);
                         if !scan.forward.is_empty()
-                            && let Err(error) = send(&input_writer, Frame::Input(scan.forward))
+                            && input
+                                .send(WriteRequest::Frame(Frame::Input(scan.forward)))
+                                .is_err()
                         {
-                            let _ = tx.send(Event::Failed(error.to_string()));
                             break;
                         }
                         if scan.detach {
-                            let _ = tx.send(Event::Detached);
+                            let _ = input.send(WriteRequest::Detach);
                             break;
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(error) => {
-                        let _ = tx.send(Event::Failed(error.to_string()));
+                        let _ = events.send(Event::Failed(error.to_string()));
                         break;
                     }
                 }
@@ -185,19 +232,11 @@ pub async fn run_attach(
                 _ = hangup.recv() => return Ok(1),
                 _ = interrupt.recv() => return Ok(if no_stdin { 0 } else { 1 }),
                 _ = resize.recv() => {
-                    if let Ok((cols, rows)) = size() { send(&writer, Frame::Resize { cols, rows })?; }
-                }
-                Some(event) = input_rx.recv() => match event {
-                    Event::Detached => return Ok(0),
-                    Event::Failed(error) => bail!(error),
-                    Event::Frame(_) => unreachable!("input pump only sends control events"),
-                },
-                event = rx.recv() => match event {
-                    Some(Event::Frame(Frame::Output(bytes) | Frame::Scrollback(bytes))) => {
-                        let mut stdout = std::io::stdout().lock();
-                        stdout.write_all(&bytes)?;
-                        stdout.flush()?;
+                    if let Ok((cols, rows)) = size() {
+                        dimensions.store((u32::from(cols) << 16) | u32::from(rows), Ordering::Relaxed);
                     }
+                }
+                event = controls.recv() => match event {
                     Some(Event::Frame(Frame::Exit { status })) => {
                         let code = exit_code(status);
                         drop(terminal);
@@ -212,9 +251,8 @@ pub async fn run_attach(
             }
         }
     }.await;
-    if let Ok(socket) = writer.lock() {
-        let _ = socket.shutdown(Shutdown::Both);
-    }
+    let _ = shutdown.shutdown(Shutdown::Both);
+    drop(input);
     result
 }
 
