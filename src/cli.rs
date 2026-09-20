@@ -270,6 +270,21 @@ pub enum Commands {
     /// of `--help`/normal discovery.
     #[command(hide = true)]
     Supervise,
+
+    /// Internal: own the pseudo-terminal of one `tty: true` service, write
+    /// its output to the service's log file and serve its attach socket.
+    /// Started by `fed start` for such a service, which writes the launch
+    /// spec to this process's stdin — never invoke this directly. Unix
+    /// only.
+    ///
+    /// Named `host` rather than `_host` for the reason `supervise` gives
+    /// above: clap_complete's bash generator breaks on such a name.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    Host {
+        /// Service whose terminal this process owns
+        service: String,
+    },
 }
 
 #[derive(Subcommand)]

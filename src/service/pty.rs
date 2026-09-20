@@ -101,6 +101,10 @@ pub fn spawn_on_pty(spec: &PtyLaunch) -> Result<PtyChild> {
     // See: https://man7.org/linux/man-pages/man7/signal-safety.7.html
     unsafe {
         cmd.pre_exec(move || {
+            // A detached host ignores SIGHUP; its terminal child must receive it.
+            if libc::signal(libc::SIGHUP, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(io::Error::last_os_error());
+            }
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
