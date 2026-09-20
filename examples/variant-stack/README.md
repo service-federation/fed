@@ -139,4 +139,4 @@ is retained for inspection and can be deleted afterwards.
 
 Browser rendering and interactive attach/detach are manual parts of the
 walkthrough; the runner checks that the console is attachable but does not
-simulate an interactive terminal. See [QA.md](QA.md) for the recorded manual run.
+simulate an interactive terminal.
