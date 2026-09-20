@@ -26,7 +26,7 @@ nix::ioctl_write_ptr_bad!(set_winsize, libc::TIOCSWINSZ, libc::winsize);
 /// `fed start` resolves all of it and sends it to the host as a launch spec,
 /// so the host never loads config and never reads the vault.
 pub struct PtyLaunch {
-    /// The `process:` string, run as `bash -ec 'exec <command>'`.
+    /// The `process:` string, run as `bash -ec <command>`.
     pub command: String,
     /// Already resolved against the work dir.
     pub cwd: PathBuf,
@@ -48,7 +48,13 @@ pub struct PtyChild {
     pub master: OwnedFd,
 }
 
-/// Run `spec.command` through `bash -ec 'exec <command>'` on a fresh pty.
+/// Run `spec.command` through `bash -ec <command>` on a fresh pty.
+///
+/// Bash gets the command as written. A single simple command is exec'd in
+/// place, so the pid is the program itself; a compound command or script
+/// keeps bash as the session leader with the program as its child, and the
+/// session is what `fed stop` signals. An explicit `exec` prefix would run
+/// only the first command of `a && b`.
 ///
 /// The child becomes a session leader with the pty slave as its controlling
 /// terminal, so programs that check `isatty()` or want job control see a
@@ -71,7 +77,7 @@ pub fn spawn_on_pty(spec: &PtyLaunch) -> Result<PtyChild> {
     let slave_raw: RawFd = pty.slave.as_raw_fd();
 
     let mut cmd = Command::new("/bin/bash");
-    cmd.arg("-ec").arg(format!("exec {}", spec.command));
+    cmd.arg("-ec").arg(&spec.command);
     cmd.current_dir(&spec.cwd);
     cmd.envs(&spec.environment)
         // Markers for the recursion check in main.rs. Service name is
@@ -287,6 +293,19 @@ mod tests {
             "the last bytes must arrive before the hangup, got {:?}",
             String::from_utf8_lossy(&output)
         );
+    }
+
+    // Requires a pty. With an `exec` prefix bash would replace itself with
+    // `true` and the echo would never run.
+    #[test]
+    fn a_compound_command_runs_past_its_first_command() {
+        let mut spawned =
+            spawn_on_pty(&launch("true && echo marker-9", std::env::temp_dir())).unwrap();
+        let output = String::from_utf8_lossy(&read_master_to_eof(spawned.master)).into_owned();
+        let status = spawned.child.wait().unwrap();
+
+        assert!(status.success());
+        assert!(output.contains("marker-9"), "got {:?}", output);
     }
 
     // Requires a pty.
