@@ -592,18 +592,90 @@ fn input_backlog_disconnects_instead_of_blocking_terminal_control() {
             .unwrap();
         released.recv_timeout(Duration::from_secs(10)).unwrap();
     });
-    let mut session = rexpect::spawn(&pty_command(dir.path(), ""), Some(5000)).unwrap();
-    session.exp_string("HOST_READY").unwrap();
-    let mut writer = session.writer.get_ref().try_clone().unwrap();
-    let flood = std::thread::spawn(move || {
-        let _ = writer.write_all(&vec![b'x'; 4 * 1024 * 1024]);
-    });
-    session.exp_string("attach input backlog is full").unwrap();
-    assert_eq!(exit_code(&mut session), 1);
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let slave = std::fs::File::from(pty.slave);
+    let mut attributes = nix::sys::termios::tcgetattr(&slave).unwrap();
+    attributes
+        .local_flags
+        .remove(nix::sys::termios::LocalFlags::ECHO);
+    nix::sys::termios::tcsetattr(&slave, nix::sys::termios::SetArg::TCSANOW, &attributes).unwrap();
+    let mut master = std::fs::File::from(pty.master);
+    // Only the master is nonblocking; the child's stdin remains a normal terminal.
+    unsafe {
+        let flags = nix::libc::fcntl(master.as_raw_fd(), nix::libc::F_GETFL);
+        assert!(flags >= 0);
+        assert_eq!(
+            nix::libc::fcntl(
+                master.as_raw_fd(),
+                nix::libc::F_SETFL,
+                flags | nix::libc::O_NONBLOCK
+            ),
+            0
+        );
+    }
+    let mut command = attach(dir.path(), &[]);
+    command
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave);
+    // SAFETY: after fork these are async-signal-safe operations on stdin's pty.
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() == -1 || nix::libc::ioctl(0, nix::libc::TIOCSCTTY as _, 0) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    drop(command);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut output = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        match master.read(&mut buffer) {
+            Ok(count) => output.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.raw_os_error() == Some(nix::libc::EIO) => {}
+            Err(error) => panic!("reading client output: {error}"),
+        }
+        if output
+            .windows(b"HOST_READY".len())
+            .any(|bytes| bytes == b"HOST_READY")
+            && !String::from_utf8_lossy(&output).contains("attach input backlog is full")
+        {
+            match master.write(&[b'x'; 4096]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) if error.raw_os_error() == Some(nix::libc::EIO) => {}
+                Err(error) => panic!("writing client input: {error}"),
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(1));
+            while let Ok(count) = master.read(&mut buffer) {
+                if count == 0 {
+                    break;
+                }
+                output.extend_from_slice(&buffer[..count]);
+            }
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            drop(master);
+            let _ = child.wait();
+            panic!("input backlog did not disconnect the client");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(String::from_utf8_lossy(&output).contains("attach input backlog is full"));
     release.send(()).unwrap();
     host.join().unwrap();
-    drop(session);
-    flood.join().unwrap();
 }
 
 #[test]
