@@ -633,6 +633,30 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_tty_reads_file_logs_in_captured_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut orchestrator =
+            Orchestrator::new(crate::config::Config::default(), dir.path().to_path_buf())
+                .await
+                .unwrap();
+        orchestrator.set_output_mode(OutputMode::Captured);
+        let service = crate::config::Service {
+            process: Some("cat".into()),
+            tty: true,
+            ..Default::default()
+        };
+        let manager = orchestrator.create_process_service(
+            "repl",
+            &service,
+            HashMap::new(),
+            dir.path().to_string_lossy().into_owned(),
+        );
+        std::fs::write(dir.path().join(".fed/logs/repl.log"), "terminal-output\n").unwrap();
+        assert_eq!(manager.logs(None).await.unwrap(), vec!["terminal-output"]);
+    }
+
     /// Regression for the supervisor-attach race where the initial stale
     /// sweep sees a live process, but it exits before manager restoration
     /// validates the persisted PID. Ordinary initialization unregisters

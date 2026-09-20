@@ -213,3 +213,60 @@ fn tty_dependency_is_hosted() {
     let (pid, host, socket) = project.row("repl");
     assert!(alive(pid) && alive(host) && socket.exists());
 }
+
+#[test]
+fn foreground_tty_does_not_spawn_a_host() {
+    let project =
+        Project::new("services:\n  repl:\n    process: echo foreground-output\n    tty: true\n");
+    let output = project.success(&["start", "-i", "repl"]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("foreground-output"));
+    assert!(!fed::fed_dir::attach_socket_path(project.0.path(), "repl").exists());
+}
+
+#[test]
+fn cancellation_during_startup_reaps_service_and_host() {
+    let project = Project::new(
+        "services:\n  repl:\n    process: 'echo $$ > service.pid; cat'\n    tty: true\n",
+    );
+    let mut start = project.command(&["start", "repl"]).spawn().unwrap();
+    let marker = project.0.path().join("service.pid");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&marker)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            break pid;
+        }
+        if Instant::now() >= deadline {
+            let _ = start.kill();
+            let output = start.wait_with_output().unwrap();
+            panic!(
+                "service did not start: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "ppid="])
+        .output()
+        .unwrap();
+    let host: u32 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    unsafe {
+        libc::kill(start.id() as i32, libc::SIGINT);
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while start.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = start.kill();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = start.wait();
+    gone(pid);
+    gone(host);
+}

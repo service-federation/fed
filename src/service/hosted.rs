@@ -11,28 +11,71 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 struct PendingHost {
-    child: Child,
+    child: Option<Child>,
     service_pid: Option<u32>,
+    socket: std::path::PathBuf,
     armed: bool,
 }
 
-impl Drop for PendingHost {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
+/// Owns a child only while it is being terminated. If the runtime cancels
+/// the cleanup future, dropping this owner still sends SIGKILL.
+struct HostCleanup {
+    child: Child,
+    socket: std::path::PathBuf,
+}
+
+impl HostCleanup {
+    async fn finish(mut self) {
+        if tokio::time::timeout(Duration::from_secs(2), self.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = self.child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
         }
+        remove_dead_socket(&self.socket);
+    }
+}
+
+impl Drop for HostCleanup {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
+impl PendingHost {
+    fn begin_cleanup(&mut self) -> Option<HostCleanup> {
         if let Some(pid) = self
             .service_pid
+            .take()
             .and_then(|pid| validate_pid(pid, "hosted service").ok())
         {
             let _ = killpg(pid, Signal::SIGKILL);
         }
-        if let Some(pid) = self
-            .child
-            .id()
-            .and_then(|pid| validate_pid(pid, "host").ok())
-        {
+        let child = self.child.take()?;
+        if let Some(pid) = child.id().and_then(|pid| validate_pid(pid, "host").ok()) {
             let _ = kill(pid, Signal::SIGTERM);
+        }
+        Some(HostCleanup {
+            child,
+            socket: self.socket.clone(),
+        })
+    }
+
+    async fn cleanup(&mut self) {
+        if let Some(cleanup) = self.begin_cleanup() {
+            cleanup.finish().await;
+        }
+    }
+}
+
+impl Drop for PendingHost {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(cleanup) = self.begin_cleanup()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(cleanup.finish());
         }
     }
 }
@@ -59,16 +102,62 @@ pub async fn launch(spec: &LaunchSpec) -> Result<(u32, u32)> {
         });
     }
     let mut pending = PendingHost {
-        child: command.spawn().map_err(|e| failure(e.to_string()))?,
+        child: Some(command.spawn().map_err(|e| failure(e.to_string()))?),
         service_pid: None,
+        socket: spec.socket_path.clone(),
         armed: true,
     };
-    let host_pid = pending
-        .child
+    let result = handshake(&mut pending, spec).await;
+    match result {
+        Ok(Startup::Ready { pid, host_pid }) => {
+            pending.armed = false;
+            Ok((pid, host_pid))
+        }
+        Ok(Startup::Exited { status }) => {
+            pending.cleanup().await;
+            let log = tokio::fs::read_to_string(&spec.log_path)
+                .await
+                .unwrap_or_default();
+            let preview = log
+                .lines()
+                .rev()
+                .take(15)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(failure(format!(
+                "Service '{}' exited with code {} right after starting.\n\n{}",
+                spec.service,
+                status,
+                if preview.is_empty() {
+                    "Log file is empty."
+                } else {
+                    &preview
+                }
+            )))
+        }
+        Err(error) => {
+            pending.cleanup().await;
+            Err(error)
+        }
+    }
+}
+
+enum Startup {
+    Ready { pid: u32, host_pid: u32 },
+    Exited { status: i32 },
+}
+
+async fn handshake(pending: &mut PendingHost, spec: &LaunchSpec) -> Result<Startup> {
+    let failure = |message: String| Error::ServiceStartFailed(spec.service.clone(), message);
+    let child = pending.child.as_mut().unwrap();
+    let host_pid = child
         .id()
         .ok_or_else(|| failure("Host has no PID".into()))?;
-    let stdin = pending.child.stdin.take().unwrap();
-    let stdout = pending.child.stdout.take().unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
     let mut reader = BufReader::new(stdout);
     let line = spec.to_line()?;
     let handshake = async {
@@ -104,28 +193,7 @@ pub async fn launch(spec: &LaunchSpec) -> Result<(u32, u32)> {
             } else {
                 128 + libc::WTERMSIG(status)
             };
-            let log = tokio::fs::read_to_string(&spec.log_path)
-                .await
-                .unwrap_or_default();
-            let preview = log
-                .lines()
-                .rev()
-                .take(15)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(failure(format!(
-                "Service '{}' exited with code {} right after starting.\n\n{}",
-                spec.service,
-                status,
-                if preview.is_empty() {
-                    "Log file is empty."
-                } else {
-                    &preview
-                }
-            )));
+            return Ok(Startup::Exited { status });
         }
         Ok(Ok(_)) => return Err(failure("Unexpected terminal host startup event".into())),
         Ok(Err(e)) => {
@@ -142,8 +210,7 @@ pub async fn launch(spec: &LaunchSpec) -> Result<(u32, u32)> {
             }
         }
     }
-    pending.armed = false;
-    Ok((pid, host_pid))
+    Ok(Startup::Ready { pid, host_pid })
 }
 
 async fn read_event(reader: &mut BufReader<tokio::process::ChildStdout>) -> Result<HostEvent> {
