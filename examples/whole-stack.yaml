@@ -11,7 +11,7 @@ entrypoint: '*'
 defaults:
   depends_on: [storage]
   startup_timeout: 15s
-  healthcheck_timeout: 5s
+  healthcheck_start_period: 5s
   environment:
     DEMO_MODE: local
 
@@ -25,7 +25,8 @@ services:
   # Services named in defaults.depends_on are excluded from all defaults.
   storage:
     process: sleep 300
-    healthcheck: { command: 'true' }
+    healthcheck:
+      command: 'true'
 
   catalog:
     default_variant: java
@@ -38,7 +39,8 @@ services:
     variants:
       java:
         process: sleep 300
-        environment: { DEMO_IMPLEMENTATION: java }
+        environment:
+          DEMO_IMPLEMENTATION: java
       go:
         extends: go-worker
         cwd: .

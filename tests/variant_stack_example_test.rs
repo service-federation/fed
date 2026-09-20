@@ -28,7 +28,11 @@ fn variant_stack_walkthrough() {
 async fn supervisor_releases_port_reservations_for_recovering_services() {
     let temp_dir = tempfile::tempdir().unwrap();
     let config = support::parse_checked(
-        "parameters:\n  RECOVERY_LISTENER_PORT: { type: port }\nservices: {}\n",
+        r#"
+parameters:
+  RECOVERY_LISTENER_PORT: { type: port }
+services: {}
+"#,
     );
     let orchestrator = fed::Orchestrator::builder()
         .config(config)

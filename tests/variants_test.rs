@@ -999,22 +999,42 @@ services:
 #[cfg(unix)]
 fn terminal_setting_is_inherited_by_process_variants() {
     let config = resolve(
-        "services:\n  worker:\n    tty: true\n    variants:\n      terminal:\n        process: sleep 30\n",
+        r#"
+services:
+  worker:
+    tty: true
+    variants:
+      terminal:
+        process: sleep 30
+"#,
         &[],
-    ).unwrap();
+    )
+    .unwrap();
     assert!(config.services["worker"].tty);
 }
 
 #[test]
 fn terminal_constraints_are_checked_on_every_merged_variant() {
-    for fields in [
-        "image: alpine",
-        "process: sleep 30\n        restart: always",
+    for yaml in [
+        r#"
+services:
+  worker:
+    tty: true
+    variants:
+      terminal:
+        image: alpine
+"#,
+        r#"
+services:
+  worker:
+    tty: true
+    variants:
+      terminal:
+        process: sleep 30
+        restart: always
+"#,
     ] {
-        let yaml = format!(
-            "services:\n  worker:\n    tty: true\n    variants:\n      terminal:\n        {fields}\n"
-        );
-        let config = parse(&yaml);
+        let config = parse(yaml);
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("tty: true"), "{error}");
         assert!(error.contains("worker:terminal"), "{error}");

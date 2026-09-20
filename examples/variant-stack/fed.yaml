@@ -2,9 +2,15 @@
 entrypoint: '*'
 
 parameters:
-  STORAGE_PORT: { type: port, default: 18741 }
-  CATALOG_PORT: { type: port, default: 18742 }
-  FRONTEND_PORT: { type: port, default: 18743 }
+  STORAGE_PORT:
+    type: port
+    default: 18741
+  CATALOG_PORT:
+    type: port
+    default: 18742
+  FRONTEND_PORT:
+    type: port
+    default: 18743
 
 defaults:
   depends_on: [storage]
@@ -25,12 +31,15 @@ services:
   # Infrastructure is excluded from defaults, so it never depends on itself.
   storage:
     process: python3 server.py storage
-    environment: { PORT: '{{STORAGE_PORT}}' }
-    healthcheck: { http_get: 'http://127.0.0.1:{{STORAGE_PORT}}/health' }
+    environment:
+      PORT: '{{STORAGE_PORT}}'
+    healthcheck:
+      http_get: 'http://127.0.0.1:{{STORAGE_PORT}}/health'
 
   catalog:
     default_variant: live
-    environment: { PORT: '{{CATALOG_PORT}}' }
+    environment:
+      PORT: '{{CATALOG_PORT}}'
     healthcheck:
       http_get: 'http://127.0.0.1:{{CATALOG_PORT}}/health'
       interval: 200ms
@@ -43,17 +52,21 @@ services:
         process: python3 server.py catalog
         # This implementation can be started without storage.
         depends_on: []
-        environment: { IMPLEMENTATION: fixture }
+        environment:
+          IMPLEMENTATION: fixture
 
   frontend:
     process: python3 server.py frontend
-    # Keep serving errors / keep the recovery console alive during the demo.
-    depends_on: [{ service: catalog, on_failure: ignore }]
+    # Keep the frontend available to report errors while catalog is unhealthy.
+    depends_on:
+      - service: catalog
+        on_failure: ignore
     environment:
       PORT: '{{FRONTEND_PORT}}'
       CATALOG_URL: 'http://127.0.0.1:{{CATALOG_PORT}}'
     startup_message: 'Open http://127.0.0.1:{{FRONTEND_PORT}}'
-    healthcheck: { http_get: 'http://127.0.0.1:{{FRONTEND_PORT}}/health' }
+    healthcheck:
+      http_get: 'http://127.0.0.1:{{FRONTEND_PORT}}/health'
 
   # Grouping node: no process of its own, completes after frontend is ready.
   stack:
@@ -64,7 +77,9 @@ services:
     profiles: [console]
     process: python3 console.py
     tty: true
-    # Keep serving errors / keep the recovery console alive during the demo.
-    depends_on: [{ service: catalog, on_failure: ignore }]
+    # Keep the console alive so it can accept the recovery command.
+    depends_on:
+      - service: catalog
+        on_failure: ignore
     environment:
       CATALOG_URL: 'http://127.0.0.1:{{CATALOG_PORT}}'

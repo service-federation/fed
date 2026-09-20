@@ -349,7 +349,18 @@ fn stale_dead_service_reaps_a_stopped_host_before_purging_state() {
 #[test]
 fn hosted_variant_keeps_selection_and_attach_metadata_across_commands() {
     let project = Project::new(
-        "defaults:\n  tty: true\nservices:\n  repl:\n    default_variant: plain\n    variants:\n      plain:\n        process: cat\n      selected:\n        process: cat\n",
+        r#"
+defaults:
+  tty: true
+services:
+  repl:
+    default_variant: plain
+    variants:
+      plain:
+        process: cat
+      selected:
+        process: cat
+"#,
     );
     project.success(&["--variant", "selected", "start", "--all"]);
     let (pid, host, socket) = project.row("repl");

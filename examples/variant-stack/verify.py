@@ -1,160 +1,236 @@
-#!/usr/bin/env python3
-"""Exercise the example in a disposable copy and retain commands and responses."""
+"""Run the variant-stack walkthrough in a disposable copy."""
 
 import argparse
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import time
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
-parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--fed", default=os.environ.get("FED", "fed"), help="fed binary to test")
-args = parser.parse_args()
-source = Path(__file__).resolve().parent
-executable = shutil.which(args.fed)
-if not executable:
-    parser.error(f"Cannot find fed: {args.fed}. Build with cargo build and pass --fed ../../target/debug/fed.")
-root = Path(tempfile.mkdtemp(prefix="fed-variant-stack-"))
-work = root / "project"
-shutil.copytree(source, work, ignore=shutil.ignore_patterns(".fed", "__pycache__"))
-# Freeze the executable: rebuilding the repo during a run must not replace it.
-binary = root / "fed"
-shutil.copy2(executable, binary)
-evidence = []
-print(f"Evidence and scratch project: {root}", flush=True)
+
+class Project:
+    """A scratch project with a stable binary and a transcript of each request."""
+
+    def __init__(self, executable):
+        self.root = Path(tempfile.mkdtemp(prefix="fed-variant-stack-"))
+        self.work_dir = self.root / "project"
+        self.binary = self.root / "fed"
+        self.evidence = []
+
+        shutil.copytree(
+            Path(__file__).resolve().parent,
+            self.work_dir,
+            ignore=shutil.ignore_patterns(".fed", "__pycache__"),
+        )
+        # A concurrent repo rebuild must not replace a running daemon's binary.
+        shutil.copy2(executable, self.binary)
+        print(f"Scratch project and transcript: {self.root}", flush=True)
+
+    def record(self, entry):
+        self.evidence.append(entry)
+        transcript = json.dumps(self.evidence, indent=2)
+        (self.root / "evidence.json").write_text(transcript, encoding="utf-8")
+
+    def run(self, *arguments, success=True):
+        result = subprocess.run(
+            [str(self.binary), *arguments],
+            cwd=self.work_dir,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=45,
+        )
+        self.record(
+            {
+                "command": list(arguments),
+                "code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+        )
+        if success:
+            assert result.returncode == 0, (arguments, result.stdout, result.stderr)
+        else:
+            assert result.returncode != 0, f"Unexpected success: {arguments}"
+        return result.stdout
+
+    def status(self):
+        return json.loads(self.run("status", "--json"))
+
+    def ports(self):
+        return json.loads(self.run("ports", "list", "--json"))
+
+    def get(self, port, path="/catalog", expected_status=200):
+        url = f"http://127.0.0.1:{port}{path}"
+        try:
+            response = urlopen(url, timeout=3)
+        except HTTPError as error:
+            response = error
+
+        with response:
+            body = response.read().decode("utf-8")
+            self.record({"url": url, "status": response.status, "body": body})
+            assert response.status == expected_status, body
+        return body
+
+    def wait_for_status(self, service, expected):
+        deadline = time.monotonic() + 12
+        while True:
+            observed = self.status()[service]["status"]
+            if observed == expected:
+                return
+            assert time.monotonic() < deadline, (service, expected, observed)
+            time.sleep(0.1)
 
 
-def record(entry):
-    evidence.append(entry)
-    (root / "evidence.json").write_text(json.dumps(evidence, indent=2))
+def passed(scenario):
+    print(f"PASS {scenario}", flush=True)
 
 
-def run(*arguments, success=True):
-    result = subprocess.run([str(binary), *arguments], cwd=work, text=True,
-                            capture_output=True, timeout=45)
-    record({"command": list(arguments), "code": result.returncode,
-            "stdout": result.stdout, "stderr": result.stderr})
-    if success:
-        assert result.returncode == 0, (arguments, result.stdout, result.stderr)
-    else:
-        assert result.returncode != 0, f"Unexpected success: {arguments}"
-    return result.stdout
-
-
-def status():
-    return json.loads(run("status", "--json"))
-
-
-def get(port, path="/catalog", expected_status=200):
-    url = f"http://127.0.0.1:{port}{path}"
-    try:
-        response = urlopen(url, timeout=3)
-    except HTTPError as error:
-        response = error
-    with response:
-        body = response.read().decode()
-        record({"url": url, "status": response.status, "body": body})
-        assert response.status == expected_status, body
-    return body
-
-
-def wait_for(check, label):
-    deadline = time.monotonic() + 12
-    while True:
-        if check():
-            print(f"PASS {label}", flush=True)
-            return
-        assert time.monotonic() < deadline, label
-        time.sleep(0.1)
-
-
-try:
-    summary = run("validate")
+def verify_startup(project):
+    summary = project.run("validate")
     assert "stack (oneshot)" in summary, summary
-    run("start")  # wildcard entrypoint
-    initial = status()
-    assert "console" not in initial or initial["console"]["pid"] is None
-    assert initial["stack"]["service_type"] == "oneshot"
-    assert initial["catalog"]["variant"] == "live"
-    assert all(initial[name]["status"] == "healthy" for name in ("storage", "catalog", "frontend"))
-    ports = json.loads(run("ports", "list", "--json"))
-    frontend_port = ports["FRONTEND_PORT"]
-    catalog_port = ports["CATALOG_PORT"]
-    data = json.loads(get(frontend_port))
-    assert data["implementation"] == "live" and data["items"][0]["name"] == "Notebook"
-    assert "Active implementation: <strong>live</strong>" in get(frontend_port, "/")
-    print("PASS wildcard start, defaults, template, grouping, profile exclusion, real HTTP chain", flush=True)
+    project.run("start")  # Uses the wildcard entrypoint.
 
-    # An invalid persisted choice must fail without changing the saved file.
-    run("variant", "set", "fixture")
-    saved = (work / ".fed/variants.yaml").read_text()
-    run("variant", "set", "catalog:missing", success=False)
-    assert (work / ".fed/variants.yaml").read_text() == saved
-    assert status()["catalog"]["variant"] == "live"  # running state, not future choice
-    assert json.loads(run("variant", "list", "--json"))["catalog"]["variant"] == "fixture"
-    run("restart", "--all")
-    switched = status()
-    assert switched["catalog"]["variant"] == "fixture"
-    assert json.loads(run("ports", "list", "--json"))["FRONTEND_PORT"] == frontend_port
-    data = json.loads(get(frontend_port))
-    assert data["implementation"] == "fixture" and data["items"][1]["stock"] == 0
-    assert "Active implementation: <strong>fixture</strong>" in get(frontend_port, "/")
-    print("PASS persisted preference, rejected pin, truthful running status, restart --all, same URL", flush=True)
+    services = project.status()
+    assert services["console"]["pid"] is None
+    assert services["stack"]["service_type"] == "oneshot"
+    assert services["stack"]["status"] == "completed"
+    assert services["catalog"]["variant"] == "live"
+    for name in ("storage", "catalog", "frontend"):
+        assert services[name]["status"] == "healthy", services[name]
 
-    # The error path must restore monitoring of the already-running stack.
-    run("start", "missing-service", success=False)
+    frontend_port = project.ports()["FRONTEND_PORT"]
+    catalog = json.loads(project.get(frontend_port))
+    assert catalog["implementation"] == "live"
+    assert catalog["items"][0] == {"name": "Notebook", "stock": 12}
 
-    # Failed readiness must not mean process death or trigger a restart.
-    catalog_pid = switched["catalog"]["pid"]
-    marker = work / ".fed/catalog-unhealthy"
+    page = project.get(frontend_port, "/")
+    assert "<strong>live</strong>" in page
+    assert 'href="/styles.css"' in page
+    assert "font-family:" in project.get(frontend_port, "/styles.css")
+    project.get(frontend_port, "/missing", expected_status=404)
+    passed("wildcard startup, shared defaults, template, grouping, and HTTP chain")
+
+
+def verify_saved_selection(project):
+    frontend_port = project.ports()["FRONTEND_PORT"]
+    project.run("variant", "set", "fixture")
+
+    # Rejected pins must leave the existing selection file untouched.
+    selections = project.work_dir / ".fed/variants.yaml"
+    saved = selections.read_text()
+    project.run("variant", "set", "catalog:missing", success=False)
+    assert selections.read_text() == saved
+
+    # The saved selection describes the next start, not the running process.
+    assert project.status()["catalog"]["variant"] == "live"
+    selection = json.loads(project.run("variant", "list", "--json"))
+    assert selection["catalog"]["variant"] == "fixture"
+
+    project.run("restart", "--all")
+    assert project.status()["catalog"]["variant"] == "fixture"
+    assert project.ports()["FRONTEND_PORT"] == frontend_port
+    catalog = json.loads(project.get(frontend_port))
+    assert catalog["implementation"] == "fixture"
+    assert catalog["items"][1] == {"name": "Sample pencil", "stock": 0}
+    assert "<strong>fixture</strong>" in project.get(frontend_port, "/")
+    passed("saved preference, rejected pin, running status, and whole-stack restart")
+
+
+def verify_health_recovery(project):
+    original_pid = project.status()["catalog"]["pid"]
+    catalog_port = project.ports()["CATALOG_PORT"]
+    marker = project.work_dir / ".fed/catalog-unhealthy"
+
     marker.touch()
-    get(catalog_port, "/health", expected_status=503)
-    wait_for(lambda: status()["catalog"]["status"] == "failing", "health turns failing")
-    assert status()["catalog"]["pid"] == catalog_pid
-    marker.unlink()
-    wait_for(lambda: status()["catalog"]["status"] == "healthy", "health recovers without restart")
-    assert status()["catalog"]["pid"] == catalog_pid
+    try:
+        project.get(catalog_port, "/health", expected_status=503)
+        project.wait_for_status("catalog", "failing")
+        assert project.status()["catalog"]["pid"] == original_pid
+    finally:
+        marker.unlink(missing_ok=True)
 
-    # A per-command pin beats the saved preference. The next status has no flag.
-    run("--variant", "catalog:live", "restart", "catalog")
-    assert status()["catalog"]["variant"] == "live"
-    assert json.loads(get(frontend_port))["implementation"] == "live"
-    run("start", "storage")  # unrelated start, without the original CLI pin
-    assert status()["catalog"]["variant"] == "live"
-    marker.touch()
-    wait_for(lambda: status()["catalog"]["status"] == "failing", "unrelated start preserves supervision")
-    marker.unlink()
-    wait_for(lambda: status()["catalog"]["status"] == "healthy", "running CLI-pinned variant recovers")
-    run("stop")
+    project.wait_for_status("catalog", "healthy")
+    assert project.status()["catalog"]["pid"] == original_pid
 
-    # An explicit empty dependency list really permits standalone operation.
-    run("start", "catalog")
-    standalone = status()
-    assert standalone["catalog"]["variant"] == "fixture"
-    assert not standalone.get("storage", {}).get("pid")
-    assert json.loads(get(json.loads(run("ports", "list", "--json"))["CATALOG_PORT"]))["implementation"] == "fixture"
-    run("stop")
-    print("PASS CLI pin precedence and fixture starts without storage", flush=True)
 
-    run("variant", "clear")
-    run("start", "--all")
-    assert status()["catalog"]["variant"] == "live"
+def verify_supervisor_handoff(project):
+    # Even a failed start must restore monitoring of the existing stack.
+    project.run("start", "missing-service", success=False)
+    verify_health_recovery(project)
+    passed("health monitoring resumes after a failed start")
+
+    # A CLI pin wins over the saved preference and survives an unrelated start.
+    project.run("--variant", "catalog:live", "restart", "catalog")
+    project.run("start", "storage")
+    assert project.status()["catalog"]["variant"] == "live"
+    catalog = json.loads(project.get(project.ports()["FRONTEND_PORT"]))
+    assert catalog["implementation"] == "live"
+    verify_health_recovery(project)
+    passed("CLI pin and health monitoring survive an unrelated start")
+
+
+def verify_standalone_fixture(project):
+    project.run("stop")
+    project.run("start", "catalog")
+
+    services = project.status()
+    assert services["catalog"]["variant"] == "fixture"
+    assert services["storage"]["pid"] is None
+    catalog = json.loads(project.get(project.ports()["CATALOG_PORT"]))
+    assert catalog["implementation"] == "fixture"
+
+    project.run("stop")
+    passed("fixture starts without storage")
+
+
+def verify_optional_console(project):
+    project.run("variant", "clear")
+    project.run("start", "--all")
+    assert project.status()["catalog"]["variant"] == "live"
+
     if os.name == "posix":
-        run("--profile", "console", "start", "--all")
-        assert json.loads(run("--profile", "console", "status", "--json"))["console"]["attachable"]
-        print("PASS optional console is hosted and attachable", flush=True)
-finally:
-    # Preserve the original failure, while always attempting the real stop path.
-    result = subprocess.run([str(binary), "stop"], cwd=work, text=True, capture_output=True, timeout=45)
-    record({"command": ["stop (cleanup)"], "code": result.returncode,
-            "stdout": result.stdout, "stderr": result.stderr})
-    assert result.returncode == 0, result.stderr
+        project.run("--profile", "console", "start", "--all")
+        services = json.loads(project.run("--profile", "console", "status", "--json"))
+        assert services["console"]["attachable"]
+        passed("optional console is hosted and attachable")
 
-assert all(service["pid"] is None for service in status().values())
-assert not any((work / ".fed").rglob("*.sock")), "Attach socket survived stop"
-print("PASS cleanup; all scenarios passed", flush=True)
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--fed",
+        default=os.environ.get("FED", "fed"),
+        help="path to the fed binary (defaults to $FED or fed on PATH)",
+    )
+    args = parser.parse_args()
+    executable = shutil.which(args.fed)
+    if not executable:
+        parser.error(
+            f"Cannot find fed: {args.fed}. From the repository root, run "
+            "cargo build and pass --fed target/debug/fed."
+        )
+
+    project = Project(executable)
+    try:
+        project.run("isolate", "enable")
+        verify_startup(project)
+        verify_saved_selection(project)
+        verify_supervisor_handoff(project)
+        verify_standalone_fixture(project)
+        verify_optional_console(project)
+    finally:
+        project.run("stop")
+
+    assert all(service["pid"] is None for service in project.status().values())
+    assert not any((project.work_dir / ".fed").rglob("*.sock"))
+    passed("cleanup; all scenarios passed")
+
+
+if __name__ == "__main__":
+    main()

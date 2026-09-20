@@ -78,7 +78,12 @@ fn defaults_templates_variants_and_explicit_empty_have_consistent_precedence() {
 #[test]
 fn unknown_variant_template_names_the_location() {
     let dir = tempfile::tempdir().unwrap();
-    let yaml = "services:\n  catalog:\n    variants:\n      go: {extends: absent}\n";
+    let yaml = r#"
+services:
+  catalog:
+    variants:
+      go: {extends: absent}
+"#;
     support::parse_checked(yaml);
     let path = dir.path().join("fed.yaml");
     std::fs::write(&path, yaml).unwrap();
@@ -158,7 +163,17 @@ fn all_rejects_ambiguous_selection_and_wildcard_foreground() {
 fn health_timing_alias_and_invalid_settings() {
     for field in ["timeout", "start_period"] {
         let config = load(&format!(
-            "services:\n  amber:\n    process: sleep 30\n    healthcheck: {{ command: 'true', {field}: 2s, interval: 20ms, probe_timeout: 10ms, retries: 2 }}\n"
+            r#"
+services:
+  amber:
+    process: sleep 30
+    healthcheck:
+      command: 'true'
+      {field}: 2s
+      interval: 20ms
+      probe_timeout: 10ms
+      retries: 2
+"#
         ));
         config.validate().unwrap();
         let health = config.services["amber"].healthcheck.as_ref().unwrap();
@@ -177,7 +192,12 @@ fn health_timing_alias_and_invalid_settings() {
         "retries: 0",
     ] {
         let config = load(&format!(
-            "services:\n  amber:\n    process: sleep 30\n    healthcheck: {{ command: 'true', {timing} }}\n"
+            r#"
+services:
+  amber:
+    process: sleep 30
+    healthcheck: {{ command: 'true', {timing} }}
+"#
         ));
         assert!(config.validate().is_err(), "{timing}");
     }
@@ -190,7 +210,11 @@ async fn grouping_nodes_start_dependencies_and_probe_timeouts_are_nonfatal() {
 services:
   amber:
     process: sleep 30
-    healthcheck: { command: 'exec sleep 2', start_period: 100ms, probe_timeout: 20ms, interval: 10ms }
+    healthcheck:
+      command: 'exec sleep 2'
+      start_period: 100ms
+      probe_timeout: 20ms
+      interval: 10ms
   bundle: { depends_on: [amber] }
 "#,
     );
@@ -343,7 +367,12 @@ async fn http_preflight_still_rejects_an_existing_listener() {
         }
     });
     let config = load(&format!(
-        "services:\n  amber:\n    process: sleep 30\n    healthcheck: {{ http_get: 'http://127.0.0.1:{port}/health' }}\n"
+        r#"
+services:
+  amber:
+    process: sleep 30
+    healthcheck: {{ http_get: 'http://127.0.0.1:{port}/health' }}
+"#
     ));
     let dir = tempfile::tempdir().unwrap();
     let orch = Orchestrator::builder()

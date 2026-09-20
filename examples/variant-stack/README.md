@@ -8,9 +8,9 @@ sample instead. Both use the same catalog URL and response shape.
 The optional terminal console needs macOS or Linux. All HTTP listeners bind to
 `127.0.0.1`. The storage service holds a fixed in-memory dataset, not a database.
 
-## Start and look at the result
+## Start the stack
 
-From this directory, with the PR's fed binary on your `PATH`:
+From this directory, with `fed` on your `PATH`:
 
 ```sh
 fed validate
@@ -120,7 +120,18 @@ Stop works without the profile flag and cleans up the console, its terminal
 host/socket, and the supervisor as well as the HTTP services. The failure
 marker deliberately persists across restarts until removed.
 
-## Repeat the checks in a disposable copy
+## Project files
+
+| File | Purpose |
+| --- | --- |
+| `fed.yaml` | Services, variants, shared defaults, and the optional console profile |
+| `server.py` | Storage, catalog, and frontend HTTP handlers |
+| `web/index.html`, `web/item.html` | Catalog page and table-row templates |
+| `web/styles.css` | Page layout and styling |
+| `console.py` | Interactive catalog and health controls |
+| `verify.py` | Repeatable checks against a disposable copy of the stack |
+
+## Verify the example
 
 From the repository root:
 
@@ -129,8 +140,8 @@ cargo build
 python3 examples/variant-stack/verify.py --fed target/debug/fed
 ```
 
-The runner copies this example and the binary into a temporary directory. It
-checks real requests, wildcard startup, profiles, variant precedence, a rejected
+The runner copies this example and the binary into a temporary directory and
+enables isolated ports, so it can run alongside your own stack. It checks real requests, wildcard startup, profiles, variant precedence, a rejected
 pin, running-versus-selected status, full restart, dependency opt-out, health
 failure/recovery without process restart, and cleanup. Commands, stdout/stderr,
 and HTTP responses are retained in the printed `evidence.json`, including a
