@@ -264,7 +264,7 @@ fn test_process_with_embedded_single_quote_starts_healthy() {
     let config = r#"
 services:
   quoted-service:
-    process: "sh -c 'sleep 5'"
+    process: "sh -c 'sleep 300'"
 "#;
     let (temp_dir, config_path) = create_test_config(config);
     let workdir = temp_dir.path().to_str().unwrap();
@@ -272,9 +272,9 @@ services:
     let output = fed_start(&config_path, workdir, "quoted-service");
     assert_start_success(&output);
 
-    std::thread::sleep(Duration::from_secs(1));
-
+    // Keep the fixture alive across slow CLI calls; its lifetime is controlled by stop.
     let status = fed_status(&config_path, workdir);
+    fed_stop(&config_path, workdir);
     assert!(
         status.contains("running") || status.contains("healthy"),
         "Service with an embedded single quote should start and stay \
@@ -286,8 +286,6 @@ services:
         "Service should not report Failing (the mangled-wrapper symptom). Got:\n{}",
         status
     );
-
-    fed_stop(&config_path, workdir);
 }
 
 #[test]

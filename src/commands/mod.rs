@@ -1,3 +1,7 @@
+#[cfg(unix)]
+mod attach;
+#[cfg(unix)]
+pub use attach::run_attach;
 mod auth;
 mod build;
 mod clean;
