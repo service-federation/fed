@@ -467,6 +467,7 @@ impl Orchestrator {
                             service_state.host_pid,
                             service_state.attach_socket.as_deref(),
                             service_state.started_at,
+                            self.work_dir(),
                         )
                         .await;
                         self.unregister_stale_service(service_name).await;

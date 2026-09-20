@@ -361,6 +361,13 @@ pub async fn run_start(
         }
     }
 
+    if startup_abort.load(Ordering::SeqCst) {
+        out.status("\n\nStartup aborted. Cleaning up...");
+        orchestrator.cleanup_failed_start().await;
+        out.status("Cleanup complete");
+        return Ok(None);
+    }
+
     // The unconditional success line is reserved for fully healthy starts.
     // Unverified healthchecks (timed out, or invalid and never run) are
     // non-fatal (processes are up, dependents proceeded), so `fed start`

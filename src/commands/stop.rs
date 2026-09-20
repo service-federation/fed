@@ -122,7 +122,7 @@ pub async fn run_stop(
                     .await
                     .set_desired_state(&service, DesiredState::Stopped)
                     .await;
-                match stop_service_by_state(&service, state).await {
+                match stop_service_by_state(&service, state, orchestrator.work_dir()).await {
                     StopResult::Failed => {
                         out.finish_progress(" failed");
                         failures.push((service, "Failed to stop service from state".into()));
@@ -210,7 +210,7 @@ async fn stop_remaining_state_services(orchestrator: &Orchestrator, out: &dyn Us
         // Stop by state (PID/container) and unregister regardless of config.
         out.progress(&format!("  Stopping {} (from state)...", name));
 
-        match stop_service_by_state(&name, &state).await {
+        match stop_service_by_state(&name, &state, orchestrator.work_dir()).await {
             StopResult::Stopped => {
                 out.finish_progress(" done");
                 stopped_names.push(name);
@@ -311,7 +311,7 @@ pub async fn run_stop_from_state(
 
         out.progress(&format!("  Stopping {}...", name));
 
-        match stop_service_by_state(name, state).await {
+        match stop_service_by_state(name, state, work_dir).await {
             StopResult::Stopped => {
                 out.finish_progress(" done");
             }

@@ -12,8 +12,12 @@ pub enum StopResult {
 ///
 /// This encapsulates the common pattern shared by `stop_remaining_state_services`
 /// and `run_stop_from_state`: given a `ServiceState`, stop whatever is running.
-pub async fn stop_service_by_state(name: &str, state: &fed::state::ServiceState) -> StopResult {
-    let result = if let Some(container_id) = state.container_id.as_deref() {
+pub async fn stop_service_by_state(
+    name: &str,
+    state: &fed::state::ServiceState,
+    work_dir: &std::path::Path,
+) -> StopResult {
+    let mut result = if let Some(container_id) = state.container_id.as_deref() {
         if graceful_docker_stop(container_id).await {
             StopResult::Stopped
         } else {
@@ -22,7 +26,7 @@ pub async fn stop_service_by_state(name: &str, state: &fed::state::ServiceState)
     } else if let Some(pid) = state.pid {
         if !validate_pid_start_time(pid, state.started_at) {
             StopResult::Skipped(format!("PID {} was reused by another process", pid))
-        } else if graceful_process_kill(pid).await {
+        } else if graceful_process_kill_impl(pid, state.host_pid.is_some()).await {
             StopResult::Stopped
         } else {
             StopResult::Failed
@@ -31,14 +35,22 @@ pub async fn stop_service_by_state(name: &str, state: &fed::state::ServiceState)
         StopResult::Skipped(format!("no PID or container ID for service '{}'", name))
     };
     #[cfg(unix)]
-    if !matches!(result, StopResult::Failed) {
+    {
         fed::service::hosted::reap_host(
             name,
             state.host_pid,
             state.attach_socket.as_deref(),
             state.started_at,
+            work_dir,
         )
         .await;
+        if matches!(result, StopResult::Failed)
+            && state.host_pid.is_some()
+            && let Some(pid) = state.pid
+            && graceful_process_kill_impl(pid, true).await
+        {
+            result = StopResult::Stopped;
+        }
     }
     result
 }
@@ -100,6 +112,10 @@ pub use fed::error::validate_pid_start_time;
 /// signaling if the PGID lookup fails. Sends SIGTERM first, waits up to
 /// 5 seconds, then sends SIGKILL.
 pub async fn graceful_process_kill(pid: u32) -> bool {
+    graceful_process_kill_impl(pid, false).await
+}
+
+async fn graceful_process_kill_impl(pid: u32, hosted: bool) -> bool {
     use std::time::Duration;
 
     #[cfg(unix)]
@@ -107,10 +123,17 @@ pub async fn graceful_process_kill(pid: u32) -> bool {
         use nix::sys::signal::{self, Signal};
         use nix::unistd::{Pid, getpgid};
 
+        if hosted && fed::error::validate_pid(pid, "hosted service").is_err() {
+            return false;
+        }
         let nix_pid = Pid::from_raw(pid as i32);
 
-        // Check if process exists first
-        if signal::kill(nix_pid, None).is_err() {
+        // A hosted service owns its process group even after its leader exits.
+        if if hosted {
+            signal::killpg(nix_pid, None).is_err()
+        } else {
+            signal::kill(nix_pid, None).is_err()
+        } {
             // Process already dead
             return true;
         }
@@ -118,9 +141,20 @@ pub async fn graceful_process_kill(pid: u32) -> bool {
         // Look up the process group ID so we kill child processes too.
         // The tracked PID may be a bash wrapper whose children (pnpm, next dev,
         // etc.) would otherwise survive as orphans reparented to init.
-        let pgid = getpgid(Some(nix_pid))
-            .ok()
-            .filter(|&pg| pg != Pid::from_raw(1));
+        let pgid = if hosted {
+            Some(nix_pid)
+        } else {
+            getpgid(Some(nix_pid))
+                .ok()
+                .filter(|&pg| pg != Pid::from_raw(1))
+        };
+        let still_running = || {
+            if hosted {
+                signal::killpg(nix_pid, None).is_ok()
+            } else {
+                signal::kill(nix_pid, None).is_ok()
+            }
+        };
 
         // Send SIGTERM — prefer process group, fall back to individual PID
         let term_ok = if let Some(pg) = pgid {
@@ -138,7 +172,7 @@ pub async fn graceful_process_kill(pid: u32) -> bool {
         // Wait for process to exit (up to 5 seconds)
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            if signal::kill(nix_pid, None).is_err() {
+            if !still_running() {
                 return true;
             }
         }
@@ -154,13 +188,13 @@ pub async fn graceful_process_kill(pid: u32) -> bool {
         // Wait a bit more for SIGKILL to take effect
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        signal::kill(nix_pid, None).is_err()
+        !still_running()
     }
 
     #[cfg(not(unix))]
     {
         // Non-unix fallback: shell out to taskkill or similar
-        let _ = pid;
+        let _ = (pid, hosted);
         false
     }
 }

@@ -188,11 +188,13 @@ impl ProcessService {
         #[cfg(unix)]
         {
             let started_at = self.started_at.lock().unwrap_or_else(Utc::now);
+            let work_dir = std::path::PathBuf::from(&self.base.read().work_dir);
             super::hosted::reap_host(
                 &self.name,
                 self.host_pid,
                 self.attach_socket.as_deref(),
                 started_at,
+                &work_dir,
             )
             .await;
         }
@@ -785,19 +787,27 @@ impl ServiceManager for ProcessService {
                 };
 
                 if signal_result.is_ok() {
+                    let hosted = self.host_pid.is_some();
+                    let still_running = || {
+                        if hosted {
+                            killpg(pgid, None).is_ok()
+                        } else {
+                            signal::kill(pid, None).is_ok()
+                        }
+                    };
                     // Poll for process exit using configured grace period
                     let poll_interval = Duration::from_millis(100);
                     let poll_count =
                         (self.grace_period.as_millis() / poll_interval.as_millis()).max(1) as u64;
                     for _ in 0..poll_count {
                         tokio::time::sleep(poll_interval).await;
-                        if signal::kill(pid, None).is_err() {
+                        if !still_running() {
                             break;
                         }
                     }
 
                     // If still running, send SIGKILL to process group
-                    if signal::kill(pid, None).is_ok() {
+                    if still_running() {
                         tracing::warn!(
                             "Process {} did not exit after SIGTERM (grace period: {:?}), sending SIGKILL",
                             self.name,

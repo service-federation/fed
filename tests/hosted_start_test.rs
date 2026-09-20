@@ -270,3 +270,78 @@ fn cancellation_during_startup_reaps_service_and_host() {
     gone(pid);
     gone(host);
 }
+
+#[test]
+fn stop_kills_terminal_descendants_after_the_leader_exits() {
+    for invalid_config in [false, true] {
+        let project = Project::new(
+            r#"services:
+  repl:
+    tty: true
+    grace_period: 1s
+    process: |
+      bash -c 'trap "" TERM HUP; echo $$ > descendant.pid; while :; do sleep 1; done' &
+      wait
+"#,
+        );
+        project.success(&["start", "repl"]);
+        let descendant: u32 = std::fs::read_to_string(project.0.path().join("descendant.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let (pid, host, socket) = project.row("repl");
+        if invalid_config {
+            std::fs::write(project.0.path().join("fed.yaml"), "invalid: [").unwrap();
+        }
+        project.success(&["stop"]);
+        gone(pid);
+        gone(host);
+        gone(descendant);
+        assert!(!socket.exists());
+    }
+}
+
+#[test]
+fn host_pid_from_another_workspace_is_not_signalled() {
+    let first = Project::new(CAT);
+    let second = Project::new(CAT);
+    first.success(&["start", "repl"]);
+    second.success(&["start", "repl"]);
+    let (first_pid, first_host, _) = first.row("repl");
+    let (other_pid, other_host, other_socket) = second.row("repl");
+    let db = rusqlite::Connection::open(first.0.path().join(".fed/lock.db")).unwrap();
+    db.execute(
+        "UPDATE services SET host_pid = ?1 WHERE id = 'repl'",
+        [other_host],
+    )
+    .unwrap();
+    first.success(&["stop"]);
+    gone(first_pid);
+    gone(first_host);
+    assert!(alive(other_pid) && alive(other_host) && other_socket.exists());
+}
+
+#[test]
+fn stale_dead_service_reaps_a_stopped_host_before_purging_state() {
+    for invalid_config in [false, true] {
+        let project = Project::new(CAT);
+        project.success(&["start", "repl"]);
+        let (pid, host, socket) = project.row("repl");
+        unsafe {
+            libc::kill(host as i32, libc::SIGSTOP);
+        }
+        if invalid_config {
+            std::fs::write(project.0.path().join("fed.yaml"), "invalid: [").unwrap();
+        } else {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        project.success(&["stop"]);
+        gone(pid);
+        gone(host);
+        assert!(!socket.exists());
+    }
+}

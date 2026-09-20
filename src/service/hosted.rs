@@ -17,16 +17,19 @@ struct PendingHost {
     armed: bool,
 }
 
-/// Owns a child only while it is being terminated. If the runtime cancels
-/// the cleanup future, dropping this owner still sends SIGKILL.
+/// Owns a child while it is being terminated. Once the service's group
+/// has been killed, runtime cancellation may safely kill the host too.
 struct HostCleanup {
     child: Child,
     socket: std::path::PathBuf,
+    service_group_killed: bool,
 }
 
 impl HostCleanup {
     async fn finish(mut self) {
-        if tokio::time::timeout(Duration::from_secs(2), self.child.wait())
+        // The host needs two seconds to escalate its child group when
+        // cancellation arrives before the Ready event supplies its PID.
+        if tokio::time::timeout(Duration::from_secs(5), self.child.wait())
             .await
             .is_err()
         {
@@ -39,12 +42,17 @@ impl HostCleanup {
 
 impl Drop for HostCleanup {
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
+        if self.service_group_killed {
+            let _ = self.child.start_kill();
+        }
+        // Before Ready the host alone knows the child PID. It has already
+        // received SIGTERM and must remain alive to kill that child group.
     }
 }
 
 impl PendingHost {
     fn begin_cleanup(&mut self) -> Option<HostCleanup> {
+        let service_group_killed = self.service_pid.is_some();
         if let Some(pid) = self
             .service_pid
             .take()
@@ -59,6 +67,7 @@ impl PendingHost {
         Some(HostCleanup {
             child,
             socket: self.socket.clone(),
+            service_group_killed,
         })
     }
 
@@ -228,7 +237,7 @@ fn alive(pid: u32) -> bool {
     validate_pid(pid, "host").is_ok_and(|pid| kill(pid, None).is_ok())
 }
 
-async fn is_host(pid: u32, service: &str, started_at: DateTime<Utc>) -> bool {
+async fn is_host(pid: u32, service: &str, started_at: DateTime<Utc>, work_dir: &Path) -> bool {
     if !alive(pid) || !crate::error::validate_pid_start_time(pid, started_at) {
         return false;
     }
@@ -241,13 +250,13 @@ async fn is_host(pid: u32, service: &str, started_at: DateTime<Utc>) -> bool {
     };
     let command = String::from_utf8_lossy(&output.stdout);
     let command = command.trim();
-    let Some((executable, _)) = command.split_once(" --workdir ") else {
+    let Some((executable, arguments)) = command.split_once(" --workdir ") else {
         return false;
     };
     Path::new(executable)
         .file_name()
         .is_some_and(|name| name == "fed")
-        && command.ends_with(&format!(" host {service}"))
+        && arguments == format!("{} host {service}", work_dir.display())
 }
 
 /// Reap a host only when the recorded PID still identifies a fed host.
@@ -256,6 +265,7 @@ pub async fn reap_host(
     host_pid: Option<u32>,
     socket: Option<&Path>,
     started_at: DateTime<Utc>,
+    work_dir: &Path,
 ) {
     if let Some(pid) = host_pid {
         for _ in 0..20 {
@@ -264,7 +274,7 @@ pub async fn reap_host(
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if is_host(pid, service, started_at).await {
+        if is_host(pid, service, started_at, work_dir).await {
             let _ = kill(validate_pid(pid, "host").unwrap(), Signal::SIGTERM);
             for _ in 0..20 {
                 if !alive(pid) {
@@ -272,7 +282,7 @@ pub async fn reap_host(
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            if is_host(pid, service, started_at).await {
+            if is_host(pid, service, started_at, work_dir).await {
                 let _ = kill(validate_pid(pid, "host").unwrap(), Signal::SIGKILL);
                 for _ in 0..10 {
                     if !alive(pid) {
