@@ -24,6 +24,7 @@ impl Drop for TerminalGuard {
 enum Event {
     Frame(Frame),
     Detached,
+    Detaching,
     Failed(String),
 }
 
@@ -193,25 +194,37 @@ pub async fn run_attach(
     if !no_stdin {
         let input = input.clone();
         std::thread::spawn(move || {
+            let enqueue = |request| {
+                input.try_send(request).map_err(|error| {
+                    let message = match error {
+                        std::sync::mpsc::TrySendError::Full(_) =>
+                            "attach input backlog is full; disconnected because the host is not keeping up",
+                        std::sync::mpsc::TrySendError::Disconnected(_) => "the attach writer closed",
+                    };
+                    let _ = events.send(Event::Failed(message.into()));
+                })
+            };
             let mut detector = DetachDetector::new(keys);
             let mut buffer = [0; 4096];
             loop {
                 match std::io::stdin().read(&mut buffer) {
                     Ok(0) => {
-                        let _ = input.send(WriteRequest::Detach);
+                        let _ = events.send(Event::Detaching);
+                        let _ = enqueue(WriteRequest::Detach);
                         break;
                     }
                     Ok(count) => {
                         let scan = detector.scan(&buffer[..count]);
+                        if scan.detach {
+                            let _ = events.send(Event::Detaching);
+                        }
                         if !scan.forward.is_empty()
-                            && input
-                                .send(WriteRequest::Frame(Frame::Input(scan.forward)))
-                                .is_err()
+                            && enqueue(WriteRequest::Frame(Frame::Input(scan.forward))).is_err()
                         {
                             break;
                         }
                         if scan.detach {
-                            let _ = input.send(WriteRequest::Detach);
+                            let _ = enqueue(WriteRequest::Detach);
                             break;
                         }
                     }
@@ -225,12 +238,15 @@ pub async fn run_attach(
         });
     }
     let result = async {
+        let mut detach_deadline = None;
         loop {
             tokio::select! {
                 biased;
                 _ = terminate.recv() => return Ok(1),
                 _ = hangup.recv() => return Ok(1),
                 _ = interrupt.recv() => return Ok(if no_stdin { 0 } else { 1 }),
+                _ = tokio::time::sleep_until(detach_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                    if detach_deadline.is_some() => return Ok(0),
                 _ = resize.recv() => {
                     if let Ok((cols, rows)) = size() {
                         dimensions.store((u32::from(cols) << 16) | u32::from(rows), Ordering::Relaxed);
@@ -238,13 +254,19 @@ pub async fn run_attach(
                 }
                 event = controls.recv() => match event {
                     Some(Event::Frame(Frame::Exit { status })) => {
-                        let code = exit_code(status);
+                        let code = if detach_deadline.is_some() { 0 } else { exit_code(status) };
                         drop(terminal);
                         eprintln!("{service} exited (code {code})");
                         return Ok(code);
                     }
                     Some(Event::Detached) => return Ok(0),
-                    Some(Event::Failed(error) | Event::Frame(Frame::Error(error))) => bail!(error),
+                    Some(Event::Detaching) => {
+                        detach_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(100));
+                    }
+                    Some(Event::Failed(error) | Event::Frame(Frame::Error(error))) => {
+                        if detach_deadline.is_some() { return Ok(0); }
+                        bail!(error);
+                    }
                     Some(Event::Frame(_)) => bail!("unexpected frame from attach host"),
                     None => bail!("the attach connection closed"),
                 }

@@ -390,7 +390,7 @@ fn flood_client(
     let host = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
+            .set_write_timeout(Some(Duration::from_millis(200)))
             .unwrap();
         let mut reader = FrameReader::new(stream.try_clone().unwrap());
         assert!(matches!(reader.read_frame().unwrap(), Frame::Hello { .. }));
@@ -398,12 +398,20 @@ fn flood_client(
             .write_all(&encode(&Frame::Scrollback(Vec::new())))
             .unwrap();
         let output = encode(&Frame::Output(vec![b'x'; 65536]));
-        for index in 0..1024 {
-            if stream.write_all(&output).is_err() {
-                return;
-            }
-            if index == 7 {
-                ready.send(()).unwrap();
+        for _ in 0..1024 {
+            match stream.write_all(&output) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // A full client output queue has propagated backpressure to the socket.
+                    ready.send(()).unwrap();
+                    return;
+                }
+                Err(error) => panic!("client disconnected before backpressure: {error}"),
             }
         }
         panic!("all output unexpectedly fit in the unread pipe");
@@ -570,4 +578,65 @@ fn hosted_service_survives_client_termination() {
     let output = service.command("status").arg("--json").output().unwrap();
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["repl"]["attachable"], true);
+}
+
+#[test]
+fn input_backlog_disconnects_instead_of_blocking_terminal_control() {
+    let dir = TempDir::new().unwrap();
+    let listener = fake_host(dir.path());
+    let (release, released) = std::sync::mpsc::channel();
+    let host = std::thread::spawn(move || {
+        let (mut stream, _reader, _) = hello(listener);
+        stream
+            .write_all(&encode(&Frame::Scrollback(b"HOST_READY\r\n".to_vec())))
+            .unwrap();
+        released.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    let mut session = rexpect::spawn(&pty_command(dir.path(), ""), Some(5000)).unwrap();
+    session.exp_string("HOST_READY").unwrap();
+    let mut writer = session.writer.get_ref().try_clone().unwrap();
+    let flood = std::thread::spawn(move || {
+        let _ = writer.write_all(&vec![b'x'; 4 * 1024 * 1024]);
+    });
+    session.exp_string("attach input backlog is full").unwrap();
+    assert_eq!(exit_code(&mut session), 1);
+    release.send(()).unwrap();
+    host.join().unwrap();
+    drop(session);
+    flood.join().unwrap();
+}
+
+#[test]
+fn detach_exits_successfully_when_host_does_not_read_input() {
+    let dir = TempDir::new().unwrap();
+    let listener = fake_host(dir.path());
+    let (release, released) = std::sync::mpsc::channel();
+    let host = std::thread::spawn(move || {
+        let (mut stream, _reader, _) = hello(listener);
+        stream
+            .write_all(&encode(&Frame::Scrollback(b"HOST_READY\r\n".to_vec())))
+            .unwrap();
+        released.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    let mut session = rexpect::spawn(&pty_command(dir.path(), ""), Some(2000)).unwrap();
+    session.exp_string("HOST_READY").unwrap();
+    let mut input = vec![b'x'; 128];
+    input.extend_from_slice(&[0x10, 0x11]);
+    session.writer.write_all(&input).unwrap();
+    session.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(rexpect::process::wait::WaitStatus::Exited(_, code)) = session.process.status()
+        {
+            assert_eq!(code, 0);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detach waited for the host to read input"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    release.send(()).unwrap();
+    host.join().unwrap();
 }
