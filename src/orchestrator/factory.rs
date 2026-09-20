@@ -665,6 +665,8 @@ mod tests {
                     startup_message: None,
                     desired_state: DesiredState::Running,
                     native_restart_enabled: false,
+                    host_pid: None,
+                    attach_socket: None,
                 })
                 .await
                 .unwrap();

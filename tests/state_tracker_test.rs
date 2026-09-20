@@ -595,3 +595,81 @@ async fn test_regression_unregister_requires_plain_name() {
     tracker.unregister_service("temp-service").await.unwrap();
     assert!(!tracker.is_service_registered("temp-service").await);
 }
+
+/// A `tty: true` service is registered with the host that owns its terminal
+/// already set, and `fed stop` clears both columns when the host is gone.
+#[tokio::test]
+async fn test_host_pid_and_attach_socket_round_trip() {
+    let temp_dir = create_test_dir();
+    let mut tracker = StateTracker::new(temp_dir.path().to_path_buf())
+        .await
+        .unwrap();
+    tracker.initialize().await.expect("Init failed");
+
+    let socket = temp_dir.path().join(".fed/attach/repl.sock");
+    let mut service_state = ServiceState::new(
+        "repl".to_string(),
+        ServiceType::Process,
+        "default".to_string(),
+    );
+    service_state.host_pid = Some(4242);
+    service_state.attach_socket = Some(socket.clone());
+    tracker.register_service(service_state).await.unwrap();
+
+    let registered = tracker.get_service("repl").await.unwrap();
+    assert_eq!(registered.host_pid, Some(4242));
+    assert_eq!(registered.attach_socket, Some(socket.clone()));
+
+    let new_socket = temp_dir.path().join(".fed/attach/repl-2.sock");
+    tracker
+        .update_service_host("repl", 5353, &new_socket)
+        .await
+        .unwrap();
+
+    let updated = tracker.get_service("repl").await.unwrap();
+    assert_eq!(updated.host_pid, Some(5353));
+    assert_eq!(updated.attach_socket, Some(new_socket));
+
+    tracker.clear_service_host("repl").await.unwrap();
+
+    let cleared = tracker.get_service("repl").await.unwrap();
+    assert_eq!(cleared.host_pid, None);
+    assert_eq!(cleared.attach_socket, None);
+}
+
+/// PID 0 and 1 are never a host: signalling them would hit the whole
+/// process group or init.
+#[tokio::test]
+async fn test_update_service_host_rejects_an_unsafe_pid() {
+    let temp_dir = create_test_dir();
+    let mut tracker = StateTracker::new(temp_dir.path().to_path_buf())
+        .await
+        .unwrap();
+    tracker.initialize().await.expect("Init failed");
+
+    let service_state = ServiceState::new(
+        "repl".to_string(),
+        ServiceType::Process,
+        "default".to_string(),
+    );
+    tracker.register_service(service_state).await.unwrap();
+
+    let socket = temp_dir.path().join(".fed/attach/repl.sock");
+    assert!(
+        tracker
+            .update_service_host("repl", 1, &socket)
+            .await
+            .is_err(),
+        "PID 1 must be rejected"
+    );
+    assert!(
+        tracker
+            .update_service_host("repl", 0, &socket)
+            .await
+            .is_err(),
+        "PID 0 must be rejected"
+    );
+
+    let state = tracker.get_service("repl").await.unwrap();
+    assert_eq!(state.host_pid, None);
+}
