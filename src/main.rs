@@ -866,7 +866,15 @@ fn resolve_work_dir(
         if parent.as_os_str().is_empty() {
             Ok(std::env::current_dir()?)
         } else {
-            Ok(parent.to_path_buf())
+            // Detached host identity and persisted socket paths must stay
+            // stable when later commands run from a different directory.
+            std::fs::canonicalize(parent).map_err(|error| {
+                anyhow::anyhow!(
+                    "Cannot resolve working directory '{}': {}",
+                    parent.display(),
+                    error
+                )
+            })
         }
     } else {
         Ok(std::env::current_dir()?)
