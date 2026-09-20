@@ -3,6 +3,107 @@ use crate::error::{Error, Result};
 use std::collections::HashSet;
 
 impl Config {
+    /// Validate a service that declares `variants:`.
+    ///
+    /// The outer service is the shared contract — ports, healthcheck,
+    /// `depends_on`, everything a dependant relies on — so it must carry no
+    /// type-defining field of its own. Each variant supplies exactly one,
+    /// checked against the *merged* service so a contradiction between the
+    /// two halves surfaces here rather than at start time.
+    fn validate_variants(name: &str, service: &super::Service) -> Result<()> {
+        let outer_type_fields = type_defining_fields(service);
+        if !outer_type_fields.is_empty() {
+            return Err(Error::Validation(format!(
+                "Service '{}' has both `variants` and its own type-defining field(s): {}. \
+                 Move them into a variant — the outer service holds only the shared contract \
+                 (ports, healthcheck, depends_on).",
+                name,
+                outer_type_fields.join(", ")
+            )));
+        }
+
+        let mut variant_names: Vec<&String> = service.variants.keys().collect();
+        variant_names.sort();
+
+        for variant_name in &variant_names {
+            if variant_name.is_empty() {
+                return Err(Error::Validation(format!(
+                    "Service '{name}' has a variant with an empty name."
+                )));
+            }
+            // `service:variant` is the pin syntax for `--variant` and
+            // `fed variant set`, so a colon in a variant name would make
+            // that pin unparseable.
+            if variant_name.contains([':', ',']) || variant_name.trim() != variant_name.as_str() {
+                return Err(Error::Validation(format!(
+                    "Service '{name}' has variant '{variant_name}': a variant name cannot contain ':' or ',' or surrounding whitespace \
+                     — that character separates service from variant in `--variant {name}:<variant>`."
+                )));
+            }
+
+            let variant = &service.variants[*variant_name];
+            if !variant.variants.is_empty() {
+                return Err(Error::Validation(format!(
+                    "Variant '{variant_name}' of service '{name}' declares its own `variants`. \
+                     Variants cannot nest."
+                )));
+            }
+
+            // Check the *merged* service, not the variant alone: an outer
+            // `image:` plus a variant `process:` is a contradiction that only
+            // shows up once the two are combined. `merge_service` copies the
+            // outer `variants`/`default_variant` across, which would make the
+            // merged service look like a variant service itself — clear them.
+            let mut merged = variant.clone();
+            crate::package::ServiceMerger::merge_service(&mut merged, service)?;
+            merged.variants.clear();
+            merged.default_variant = None;
+            if type_defining_fields(&merged).is_empty() && variant.extends.is_none() {
+                return Err(Error::Validation(format!(
+                    "Variant '{variant_name}' of service '{name}' has no type defined. A variant must define exactly one service type"
+                )));
+            }
+            check_service_fields(&format!("{name}:{variant_name}"), &merged)?;
+            check_single_type(
+                &format!("Variant '{variant_name}' of service '{name}'"),
+                &merged,
+                variant.extends.as_deref().or(service.extends.as_deref()),
+            )?;
+        }
+
+        match &service.default_variant {
+            Some(default) if !service.variants.contains_key(default) => {
+                return Err(Error::Validation(format!(
+                    "Service '{}' sets default_variant: '{}', which is not one of its variants. Available: {}",
+                    name,
+                    default,
+                    variant_names
+                        .iter()
+                        .map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            Some(_) => {}
+            None if service.variants.len() > 1 => {
+                return Err(Error::Validation(format!(
+                    "Service '{}' has {} variants ({}) but no `default_variant`. Name the one to use when nothing selects a variant.",
+                    name,
+                    service.variants.len(),
+                    variant_names
+                        .iter()
+                        .map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            // Exactly one variant (or none): the single variant is implied.
+            None => {}
+        }
+
+        Ok(())
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> Result<()> {
         // `FED_PROJECT_ID` is a built-in template variable (a stable, cookie-safe
@@ -28,6 +129,7 @@ impl Config {
 
         // Validate entrypoint references
         if let Some(ref ep) = self.entrypoint
+            && ep != "*"
             && !self.services.contains_key(ep)
         {
             return Err(Error::Validation(format!(
@@ -71,34 +173,24 @@ impl Config {
 
         // Validate each service has exactly one type
         for (name, service) in &self.services {
-            if service.service_type() == ServiceType::Undefined {
+            if service.explicit_empty.contains("variants") {
                 return Err(Error::Validation(format!(
-                    "Service '{}' has no type defined. Add one of: process, image, gradle_task, compose_file + compose_service, or make it a hook-only node with install and/or migrate.",
-                    name
+                    "Service '{name}' declares an empty variants map"
                 )));
             }
-
-            // Reject ambiguous configs with multiple type-defining fields
-            let type_fields: Vec<&str> = [
-                service.process.as_ref().map(|_| "process"),
-                service.image.as_ref().map(|_| "image"),
-                service.gradle_task.as_ref().map(|_| "gradle_task"),
-                service
-                    .compose_file
-                    .as_ref()
-                    .and(service.compose_service.as_ref())
-                    .map(|_| "compose_file + compose_service"),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-
-            if type_fields.len() > 1 {
+            if service.variants.is_empty() && service.default_variant.is_some() {
                 return Err(Error::Validation(format!(
-                    "Service '{}' has multiple type-defining fields: {}. Remove all but one.",
-                    name,
-                    type_fields.join(", ")
+                    "Service '{name}' declares default_variant but has no variants"
                 )));
+            }
+            if service.variants.is_empty() {
+                check_single_type(
+                    &format!("Service '{name}'"),
+                    service,
+                    service.extends.as_deref(),
+                )?;
+            } else {
+                Self::validate_variants(name, service)?;
             }
 
             // A hook-only node completes to signal readiness, so a healthcheck
@@ -121,39 +213,8 @@ impl Config {
             }
         }
 
-        // Validate duration strings
         for (name, service) in &self.services {
-            if let Some(ref gp) = service.grace_period
-                && parse_duration_string(gp).is_none()
-            {
-                return Err(Error::Validation(format!(
-                    "Service '{}' has invalid grace_period '{}'. Use formats like '5s', '30s', '1m', '500ms'",
-                    name, gp
-                )));
-            }
-            if let Some(ref st) = service.startup_timeout
-                && parse_duration_string(st).is_none()
-            {
-                return Err(Error::Validation(format!(
-                    "Service '{}' has invalid startup_timeout '{}'. Use formats like '60s', '5m', '500ms'",
-                    name, st
-                )));
-            }
-            if let Some(ref hc) = service.healthcheck {
-                let timeout_str = match hc {
-                    HealthCheck::HttpGet { timeout, .. } => timeout.as_deref(),
-                    HealthCheck::CommandMap { timeout, .. } => timeout.as_deref(),
-                    HealthCheck::Command(_) => None,
-                };
-                if let Some(t) = timeout_str
-                    && parse_duration_string(t).is_none()
-                {
-                    return Err(Error::Validation(format!(
-                        "Service '{}' has invalid healthcheck timeout '{}'. Use formats like '5s', '30s', '1m', '500ms'",
-                        name, t
-                    )));
-                }
-            }
+            check_service_fields(name, service)?;
         }
 
         for (name, script) in &self.scripts {
@@ -341,26 +402,6 @@ impl Config {
                         script_name, dep, border, hint_text, border, script_name, dep
                     )));
                 }
-            }
-        }
-
-        // Validate resource limits for all services
-        for (service_name, service) in &self.services {
-            if let Some(ref resources) = service.resources {
-                validate_resource_limits(service_name, resources)?;
-            }
-        }
-
-        // Validate environment variables for all services
-        for (service_name, service) in &self.services {
-            if !service.environment.is_empty() {
-                crate::config::env_loader::validate_and_sanitize_env(&service.environment)
-                    .map_err(|e| {
-                        Error::Config(format!(
-                            "Service '{}' has invalid environment variable: {}",
-                            service_name, e
-                        ))
-                    })?;
             }
         }
 
@@ -597,7 +638,161 @@ impl Config {
     }
 }
 
-/// Validate parameter value against constraints
+/// Validate fields shared by ordinary services and merged variants.
+fn check_service_fields(name: &str, service: &super::Service) -> Result<()> {
+    if let Some(ref gp) = service.grace_period
+        && parse_duration_string(gp).is_none()
+    {
+        return Err(Error::Validation(format!(
+            "Service '{}' has invalid grace_period '{}'. Use formats like '5s', '30s', '1m', '500ms'",
+            name, gp
+        )));
+    }
+    if let Some(ref st) = service.startup_timeout
+        && parse_duration_string(st).is_none()
+    {
+        return Err(Error::Validation(format!(
+            "Service '{}' has invalid startup_timeout '{}'. Use formats like '60s', '5m', '500ms'",
+            name, st
+        )));
+    }
+    if let Some(ref hc) = service.healthcheck {
+        check_healthcheck_timing(name, hc)?;
+    }
+    if let Some(ref sp) = service.healthcheck_start_period
+        && parse_duration_string(sp).is_none()
+    {
+        return Err(Error::Validation(format!(
+            "Service '{}' has invalid healthcheck_start_period '{}'. Use formats like '30s', '5m', '10m'",
+            name, sp
+        )));
+    }
+    warn_on_start_period_over_startup_timeout(name, service);
+    if let Some(resources) = &service.resources {
+        validate_resource_limits(name, resources)?;
+    }
+    crate::config::env_loader::validate_and_sanitize_env(&service.environment).map_err(|e| {
+        Error::Config(format!(
+            "Service '{name}' has invalid environment variable: {e}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn check_healthcheck_timing(name: &str, hc: &HealthCheck) -> Result<()> {
+    if let Some((start_period, timeout)) = hc.both_start_period_spellings() {
+        return Err(Error::Validation(format!(
+            "Service '{name}' sets both `start_period: {start_period}` and `timeout: {timeout}` on its healthcheck. \
+             They are the same setting — `timeout` is the older name for `start_period`. Keep one."
+        )));
+    }
+
+    let timing = hc.timing();
+    if timing.retries == Some(0) {
+        return Err(Error::Validation(format!(
+            "Service '{name}' healthcheck retries must be at least 1"
+        )));
+    }
+    for (field, value) in [
+        ("start_period", timing.start_period.as_deref()),
+        ("timeout", timing.timeout.as_deref()),
+        ("interval", timing.interval.as_deref()),
+        ("probe_timeout", timing.probe_timeout.as_deref()),
+    ] {
+        if let Some(value) = value
+            && parse_duration_string(value).is_none_or(|d| field == "interval" && d.is_zero())
+        {
+            return Err(Error::Validation(format!(
+                "Service '{name}' has invalid healthcheck {field} '{value}'. Use formats like '5s', '30s', '1m', '500ms'"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Warn when a service would give up on the whole start attempt before its
+/// healthcheck has been given its full start period.
+///
+/// Not an error: the start attempt still does something useful, and a hard
+/// failure here would reject configs that work. But the start period is then
+/// a number that can never be reached, which is worth saying out loud.
+fn warn_on_start_period_over_startup_timeout(name: &str, service: &super::Service) {
+    let (Some(start_period), Some(startup_timeout)) = (
+        service.effective_start_period(),
+        service.get_startup_timeout(),
+    ) else {
+        return;
+    };
+    if start_period > startup_timeout {
+        eprintln!(
+            "Warning: service '{name}' has a healthcheck start_period of {start_period:?} but a \
+             startup_timeout of {startup_timeout:?}. The start attempt gives up first, so the \
+             last {:?} of the start period can never be reached.",
+            start_period - startup_timeout
+        );
+    }
+}
+
+/// The type-defining fields a service declares, in canonical spelling.
+///
+/// Exactly one must be present for a service to be startable. A service with
+/// `variants:` declares none here — its variants each declare their own.
+fn type_defining_fields(service: &super::Service) -> Vec<&'static str> {
+    [
+        service.process.as_ref().map(|_| "process"),
+        service.image.as_ref().map(|_| "image"),
+        service.gradle_task.as_ref().map(|_| "gradle_task"),
+        service
+            .compose_file
+            .as_ref()
+            .and(service.compose_service.as_ref())
+            .map(|_| "compose_file + compose_service"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// A service must resolve to exactly one type. `label` names it the way the
+/// user wrote it — `"Service 'api'"` for a top-level service, `"Variant 'rust'
+/// of service 'api'"` for a variant, which is checked *after* being merged
+/// over its outer service so that an outer `image:` plus a variant `process:`
+/// is caught here rather than surfacing as a mystery at start time.
+fn check_single_type(
+    label: &str,
+    service: &super::Service,
+    unresolved_extends: Option<&str>,
+) -> Result<()> {
+    if service.service_type() == ServiceType::Undefined {
+        // An unresolved `extends:` is the one cause worth naming: the type is
+        // presumably in the template, and "has no type defined" would send the
+        // reader looking in the wrong file. Passed in rather than read off
+        // `service`, because a variant is checked *after* being merged over
+        // its outer service and `merge_service` clears `extends` as it goes.
+        if let Some(extends) = unresolved_extends {
+            return Err(Error::Validation(format!(
+                "{label} has no type defined, and its `extends: {extends}` was never resolved. \
+                 A dotted reference needs the package declared under `packages:`; an undotted one \
+                 needs a matching entry under `templates:`."
+            )));
+        }
+        return Err(Error::Validation(format!(
+            "{label} has no type defined. Add one of: process, image, gradle_task, compose_file + compose_service, or make it a hook-only node with install and/or migrate."
+        )));
+    }
+
+    let type_fields = type_defining_fields(service);
+    if type_fields.len() > 1 {
+        return Err(Error::Validation(format!(
+            "{label} has multiple type-defining fields: {}. Remove all but one.",
+            type_fields.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
 pub fn validate_parameter_value(
     param_name: &str,
     value: &str,
@@ -820,6 +1015,7 @@ fn validate_cpus_string(cpus: &str) -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HealthCheckTiming;
     use crate::config::{Parameter, Service};
 
     #[test]
@@ -832,7 +1028,7 @@ mod tests {
                 startup_message: Some("http://localhost:4321".to_string()),
                 healthcheck: Some(HealthCheck::HttpGet {
                     http_get: "http://localhost:4321/login".to_string(),
-                    timeout: None,
+                    timing: HealthCheckTiming::default(),
                 }),
                 ..Default::default()
             },
@@ -906,7 +1102,7 @@ mod tests {
                 startup_message: Some("http://localhost:{{APP_PORT}}".to_string()),
                 healthcheck: Some(HealthCheck::HttpGet {
                     http_get: "http://localhost:{{APP_PORT}}/login".to_string(),
-                    timeout: None,
+                    timing: HealthCheckTiming::default(),
                 }),
                 environment: [(
                     "DATABASE_URL".to_string(),
@@ -1628,7 +1824,10 @@ mod tests {
                 process: Some("echo hello".to_string()),
                 healthcheck: Some(HealthCheck::HttpGet {
                     http_get: "http://localhost:8080/health".to_string(),
-                    timeout: Some("not-a-duration".to_string()),
+                    timing: HealthCheckTiming {
+                        timeout: Some("not-a-duration".to_string()),
+                        ..Default::default()
+                    },
                 }),
                 ..Default::default()
             },
@@ -1651,7 +1850,10 @@ mod tests {
                 process: Some("echo hello".to_string()),
                 healthcheck: Some(HealthCheck::HttpGet {
                     http_get: "http://localhost:8080/health".to_string(),
-                    timeout: Some("5s".to_string()),
+                    timing: HealthCheckTiming {
+                        timeout: Some("5s".to_string()),
+                        ..Default::default()
+                    },
                 }),
                 ..Default::default()
             },
@@ -1688,7 +1890,10 @@ mod tests {
                 process: Some("echo hello".to_string()),
                 healthcheck: Some(HealthCheck::CommandMap {
                     command: "curl localhost".to_string(),
-                    timeout: Some("bogus".to_string()),
+                    timing: HealthCheckTiming {
+                        timeout: Some("bogus".to_string()),
+                        ..Default::default()
+                    },
                 }),
                 ..Default::default()
             },

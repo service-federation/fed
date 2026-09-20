@@ -387,6 +387,13 @@ pub trait ServiceManager: Send + Sync {
     /// The specific check depends on the service configuration (HTTP, command, etc.).
     async fn health(&self) -> Result<bool>;
 
+    /// Whether the process/container is alive, independent of configured
+    /// readiness probes. An error is an unknown result, not proof of death.
+    /// Backends whose health method includes probes override this distinction.
+    async fn liveness(&self) -> Result<bool> {
+        self.health().await
+    }
+
     /// Get the current lifecycle status.
     fn status(&self) -> Status;
 

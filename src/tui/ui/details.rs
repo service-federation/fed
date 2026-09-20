@@ -98,6 +98,13 @@ fn draw_service_info(f: &mut Frame, app: &App, service_name: &str, area: Rect) {
                 Span::styled(&service.service_type, Style::default().fg(Color::White)),
             ]),
             Line::from(vec![
+                Span::styled("  Variant:    ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    service.variant.as_deref().unwrap_or("N/A"),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
                 Span::styled("  Namespace:  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(&service.namespace, Style::default().fg(Color::White)),
             ]),

@@ -42,24 +42,99 @@ const DEFAULT_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum HealthCheck {
-    /// HTTP GET health check with optional timeout.
+    /// HTTP GET health check.
     /// Canonical key: `http_get`. `httpGet` is a legacy spelling, still accepted.
     HttpGet {
         #[serde(alias = "httpGet")]
         http_get: String,
-        /// Timeout duration (e.g., "5s", "30s", "1m")
-        #[serde(skip_serializing_if = "Option::is_none")]
-        timeout: Option<String>,
+        #[serde(flatten)]
+        timing: HealthCheckTiming,
     },
-    /// Command health check with explicit field and optional timeout
+    /// Command health check with explicit field.
     CommandMap {
         command: String,
-        /// Timeout duration (e.g., "5s", "30s", "1m")
-        #[serde(skip_serializing_if = "Option::is_none")]
-        timeout: Option<String>,
+        #[serde(flatten)]
+        timing: HealthCheckTiming,
     },
-    /// Simple command string health check (no timeout config, uses default)
+    /// Simple command string health check (no timing config, uses defaults)
     Command(String),
+}
+
+/// Default interval between health-check probes.
+///
+/// 500ms, matching the poll loops in `orchestrator/health.rs` that this
+/// replaced — not a new choice, the existing one made configurable.
+const DEFAULT_HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Default number of consecutive failures before a *healthy* service is
+/// marked unhealthy.
+///
+/// 3, matching Docker Compose. There is no older fed behaviour to preserve
+/// here: before `retries` existed the monitoring loop never re-ran the
+/// configured probe at all, so a live process with a failing health endpoint
+/// stayed `Healthy` forever. Now that it is polled, 1 would restart a
+/// service on a single blip, which is a worse default than waiting for the
+/// failure to look real.
+const DEFAULT_HEALTH_CHECK_RETRIES: u32 = 3;
+
+/// The four timing knobs shared by both configurable health-check forms.
+///
+/// Flattened into the enum variants, so they are written as sibling keys of
+/// `http_get`/`command` rather than nested.
+///
+/// The names follow Docker Compose, because the concepts are the same and a
+/// second vocabulary for them would be a cost with no benefit:
+///
+/// | key | means |
+/// |---|---|
+/// | `start_period` | total time fed waits for the **first** pass before giving up |
+/// | `interval` | time between probes |
+/// | `probe_timeout` | how long a **single** probe may take |
+/// | `retries` | consecutive failures that mark a healthy service unhealthy |
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HealthCheckTiming {
+    /// Total wait for the first successful check (e.g. "30s", "10m").
+    ///
+    /// Mutually exclusive with [`Self::timeout`], which is the older spelling
+    /// of exactly this field. Kept as two fields rather than a serde alias so
+    /// that writing both can be rejected instead of silently picking one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_period: Option<String>,
+
+    /// Former name for [`Self::start_period`]. Still honoured, and still the
+    /// spelling in most existing configs, so it cannot simply be renamed —
+    /// but it reads like a per-probe timeout and is not one, which is why
+    /// `start_period` exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+
+    /// Time between probes (default 500ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval: Option<String>,
+
+    /// How long one probe may take before it counts as failed.
+    ///
+    /// Defaults to the start period, which is what fed did when `timeout`
+    /// was the only knob — a single value served as both. Set it explicitly
+    /// on any service with a long start period, or one hung probe will sit
+    /// there for the whole of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_timeout: Option<String>,
+
+    /// Consecutive failed probes before a service that had become healthy is
+    /// marked unhealthy (default 3).
+    ///
+    /// Applies only after the service has started: during startup the start
+    /// period is already the tolerance for "not up yet".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retries: Option<u32>,
+}
+
+impl HealthCheckTiming {
+    /// The configured start period, under either spelling.
+    fn configured_start_period(&self) -> Option<&str> {
+        self.start_period.as_deref().or(self.timeout.as_deref())
+    }
 }
 
 impl HealthCheck {
@@ -88,20 +163,84 @@ impl HealthCheck {
         }
     }
 
-    /// Get the configured timeout, or the default (5 seconds).
-    ///
-    /// Parses duration strings like "5s", "30s", "1m", "500ms".
-    /// Returns the default timeout if no timeout is configured or if parsing fails.
-    pub fn get_timeout(&self) -> Duration {
-        let timeout_str = match self {
-            HealthCheck::HttpGet { timeout, .. } => timeout.as_deref(),
-            HealthCheck::CommandMap { timeout, .. } => timeout.as_deref(),
-            HealthCheck::Command(_) => None,
-        };
+    /// The timing block, or an empty one for the bare-string form.
+    pub fn timing(&self) -> HealthCheckTiming {
+        match self {
+            HealthCheck::HttpGet { timing, .. } | HealthCheck::CommandMap { timing, .. } => {
+                timing.clone()
+            }
+            HealthCheck::Command(_) => HealthCheckTiming::default(),
+        }
+    }
 
-        timeout_str
+    /// The configured start period as written, under either spelling.
+    ///
+    /// `None` means "not configured here" — the caller falls back to the
+    /// service's `healthcheck_start_period` and then to the 5s default. See
+    /// [`crate::config::Service::effective_start_period`].
+    pub fn configured_start_period(&self) -> Option<&str> {
+        match self {
+            HealthCheck::HttpGet { timing, .. } | HealthCheck::CommandMap { timing, .. } => {
+                timing.configured_start_period()
+            }
+            HealthCheck::Command(_) => None,
+        }
+    }
+
+    /// Both spellings of the start period, for the "don't write both" check.
+    pub fn both_start_period_spellings(&self) -> Option<(&str, &str)> {
+        let timing = match self {
+            HealthCheck::HttpGet { timing, .. } | HealthCheck::CommandMap { timing, .. } => timing,
+            HealthCheck::Command(_) => return None,
+        };
+        match (&timing.start_period, &timing.timeout) {
+            (Some(start_period), Some(timeout)) => Some((start_period, timeout)),
+            _ => None,
+        }
+    }
+
+    /// Total wait for the first successful check, defaulting to 5 seconds.
+    ///
+    /// Prefer [`crate::config::Service::effective_start_period`], which also
+    /// consults the service-level `healthcheck_start_period` that a
+    /// `defaults:` block sets.
+    pub fn get_start_period(&self) -> Duration {
+        self.configured_start_period()
             .and_then(parse_duration_string)
             .unwrap_or(DEFAULT_HEALTH_CHECK_TIMEOUT)
+    }
+
+    /// Time between probes, defaulting to 500ms.
+    pub fn get_interval(&self) -> Duration {
+        self.timing()
+            .interval
+            .as_deref()
+            .and_then(parse_duration_string)
+            .unwrap_or(DEFAULT_HEALTH_CHECK_INTERVAL)
+    }
+
+    /// How long a single probe may take.
+    ///
+    /// Defaults to `start_period`: before this field existed, one `timeout`
+    /// value served as both the total wait and the per-probe cap, and
+    /// silently shortening it here would turn a slow-but-working healthcheck
+    /// into one that never passes.
+    pub fn get_probe_timeout(&self, start_period: Duration) -> Duration {
+        self.timing()
+            .probe_timeout
+            .as_deref()
+            .and_then(parse_duration_string)
+            .unwrap_or(start_period)
+    }
+
+    /// Consecutive failures that mark a healthy service unhealthy.
+    ///
+    /// Validation rejects zero; clamp defensively for programmatic callers.
+    pub fn get_retries(&self) -> u32 {
+        self.timing()
+            .retries
+            .unwrap_or(DEFAULT_HEALTH_CHECK_RETRIES)
+            .max(1)
     }
 }
 
@@ -218,7 +357,7 @@ timeout: "30s"
 
         assert_eq!(health.health_check_type(), HealthCheckType::Http);
         assert_eq!(health.get_http_url(), Some("http://localhost:8080/health"));
-        assert_eq!(health.get_timeout(), Duration::from_secs(30));
+        assert_eq!(health.get_start_period(), Duration::from_secs(30));
     }
 
     #[test]
@@ -229,7 +368,7 @@ http_get: "http://localhost:8080/health"
         let health: HealthCheck = serde_yaml::from_str(yaml).unwrap();
 
         assert_eq!(health.health_check_type(), HealthCheckType::Http);
-        assert_eq!(health.get_timeout(), Duration::from_secs(5)); // Default
+        assert_eq!(health.get_start_period(), Duration::from_secs(5)); // Default
     }
 
     // The legacy camelCase spelling must keep working through the untagged
@@ -245,7 +384,7 @@ timeout: "30s"
 
         assert_eq!(health.health_check_type(), HealthCheckType::Http);
         assert_eq!(health.get_http_url(), Some("http://localhost:8080/health"));
-        assert_eq!(health.get_timeout(), Duration::from_secs(30));
+        assert_eq!(health.get_start_period(), Duration::from_secs(30));
     }
 
     #[test]
@@ -258,7 +397,7 @@ timeout: "10s"
 
         assert_eq!(health.health_check_type(), HealthCheckType::Command);
         assert_eq!(health.get_command(), Some("curl -f http://localhost:3000"));
-        assert_eq!(health.get_timeout(), Duration::from_secs(10));
+        assert_eq!(health.get_start_period(), Duration::from_secs(10));
     }
 
     #[test]
@@ -269,7 +408,7 @@ command: "curl -f http://localhost:3000"
         let health: HealthCheck = serde_yaml::from_str(yaml).unwrap();
 
         assert_eq!(health.health_check_type(), HealthCheckType::Command);
-        assert_eq!(health.get_timeout(), Duration::from_secs(5)); // Default
+        assert_eq!(health.get_start_period(), Duration::from_secs(5)); // Default
     }
 
     #[test]
@@ -280,7 +419,7 @@ command: "curl -f http://localhost:3000"
 
         assert_eq!(health.health_check_type(), HealthCheckType::Command);
         assert_eq!(health.get_command(), Some("curl -f http://localhost:3000"));
-        assert_eq!(health.get_timeout(), Duration::from_secs(5)); // Default
+        assert_eq!(health.get_start_period(), Duration::from_secs(5)); // Default
     }
 
     #[test]
@@ -290,7 +429,7 @@ http_get: "http://localhost:8080/health"
 timeout: "2m"
 "#;
         let health: HealthCheck = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(health.get_timeout(), Duration::from_secs(120));
+        assert_eq!(health.get_start_period(), Duration::from_secs(120));
     }
 
     #[test]
@@ -300,7 +439,7 @@ http_get: "http://localhost:8080/health"
 timeout: "500ms"
 "#;
         let health: HealthCheck = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(health.get_timeout(), Duration::from_millis(500));
+        assert_eq!(health.get_start_period(), Duration::from_millis(500));
     }
 
     #[test]
@@ -311,14 +450,14 @@ timeout: "invalid"
 "#;
         let health: HealthCheck = serde_yaml::from_str(yaml).unwrap();
         // Invalid timeout should fall back to default
-        assert_eq!(health.get_timeout(), Duration::from_secs(5));
+        assert_eq!(health.get_start_period(), Duration::from_secs(5));
     }
 
     #[test]
     fn test_http_healthcheck_serialization_without_timeout() {
         let health = HealthCheck::HttpGet {
             http_get: "http://localhost:8080/health".to_string(),
-            timeout: None,
+            timing: HealthCheckTiming::default(),
         };
         let yaml = serde_yaml::to_string(&health).unwrap();
         // timeout should be skipped when None
@@ -365,7 +504,10 @@ timeout: "invalid"
     fn test_http_healthcheck_serialization_with_timeout() {
         let health = HealthCheck::HttpGet {
             http_get: "http://localhost:8080/health".to_string(),
-            timeout: Some("30s".to_string()),
+            timing: HealthCheckTiming {
+                timeout: Some("30s".to_string()),
+                ..Default::default()
+            },
         };
         let yaml = serde_yaml::to_string(&health).unwrap();
         assert!(yaml.contains("timeout"));

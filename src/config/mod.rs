@@ -14,11 +14,14 @@
 //! - `parameter` - Variables/parameters (`Parameter`)
 //! - `script` - Script configuration (`Script`)
 //! - `parser` - YAML config parsing
+//! - `defaults` - The top-level `defaults:` block
 //! - `validation` - Config validation
+//! - `variants` - Per-service implementation variants
 
 pub mod discovery;
 pub mod env_loader;
 
+pub mod defaults;
 mod dependency;
 mod duration;
 mod health;
@@ -29,6 +32,7 @@ mod script;
 mod service;
 mod types;
 mod validation;
+pub mod variants;
 
 // Re-export all types for backward compatibility
 pub use dependency::*;

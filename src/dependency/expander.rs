@@ -294,15 +294,15 @@ impl<'a> ExternalServiceExpander<'a> {
         parameter_mapping: &HashMap<String, String>,
     ) -> Result<HealthCheck> {
         Ok(match healthcheck {
-            HealthCheck::HttpGet { http_get, timeout } => HealthCheck::HttpGet {
+            HealthCheck::HttpGet { http_get, timing } => HealthCheck::HttpGet {
                 http_get: self
                     .resolver
                     .resolve_template(http_get, parameter_mapping)?,
-                timeout: timeout.clone(),
+                timing: timing.clone(),
             },
-            HealthCheck::CommandMap { command, timeout } => HealthCheck::CommandMap {
+            HealthCheck::CommandMap { command, timing } => HealthCheck::CommandMap {
                 command: self.resolver.resolve_template(command, parameter_mapping)?,
-                timeout: timeout.clone(),
+                timing: timing.clone(),
             },
             HealthCheck::Command(cmd) => {
                 HealthCheck::Command(self.resolver.resolve_template(cmd, parameter_mapping)?)

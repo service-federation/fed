@@ -23,6 +23,7 @@ mod supervise;
 mod top;
 mod tui;
 mod validate;
+mod variant;
 mod workspace;
 
 pub(crate) mod suggest;
@@ -47,10 +48,12 @@ pub use secrets_cmd::run_secrets;
 pub use start::{StartOptions, resolve_foreground_target, run_start};
 pub use status::run_status;
 pub use stop::{run_stop, run_stop_from_state};
+pub use supervise::InheritedFlags;
 pub use supervise::run_supervise;
 pub use top::run_top;
 pub use tui::run_tui;
 pub use validate::run_validate;
+pub use variant::run_variant;
 pub use workspace::run_workspace;
 
 /// Emit non-breaking warnings for unknown (typo'd) config keys — used by `fed validate`

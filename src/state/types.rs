@@ -109,6 +109,16 @@ pub struct ServiceState {
     /// everything else keeps today's one-shot staleness check.
     #[serde(default)]
     pub native_restart_enabled: bool,
+
+    /// The variant this service was started as, for services that declare
+    /// `variants:` — `None` for ordinary services.
+    ///
+    /// Persisted rather than re-derived from config because the choice can
+    /// come from a `--variant` flag that a later `fed status` in another
+    /// shell was never given. Captured at registration, like
+    /// `startup_message` and `native_restart_enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
 }
 
 /// Persisted intent for whether a service should be running.
@@ -174,6 +184,7 @@ impl ServiceState {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
+            variant: None,
         }
     }
 

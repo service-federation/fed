@@ -46,10 +46,35 @@ enum ServiceAction {
     Restart,
 }
 
+/// The persisted facts about one service that the dashboard shows alongside
+/// its live status. Named rather than a positional tuple: five same-shaped
+/// fields (two `String`s among them) are too easy to transpose silently.
+#[derive(Debug, Clone)]
+struct PersistedFacts {
+    namespace: String,
+    service_type: String,
+    /// Which of the service's `variants:` is running, if any.
+    variant: Option<String>,
+    port: Option<u16>,
+    started_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Default for PersistedFacts {
+    fn default() -> Self {
+        Self {
+            namespace: "root".to_string(),
+            service_type: "Unknown".to_string(),
+            variant: None,
+            port: None,
+            started_at: chrono::Utc::now(),
+        }
+    }
+}
+
 /// Snapshot of orchestrator state gathered off the UI loop.
 pub struct RefreshData {
     status_map: HashMap<String, Status>,
-    service_states: HashMap<String, (String, String, Option<u16>, chrono::DateTime<chrono::Utc>)>,
+    service_states: HashMap<String, PersistedFacts>,
     logs: Option<(String, Vec<String>)>,
 }
 
@@ -71,12 +96,13 @@ pub async fn gather_refresh_data(
             if let Some(state) = state_tracker.get_service(name).await {
                 service_states.insert(
                     name.clone(),
-                    (
-                        state.namespace.clone(),
-                        state.service_type.to_string(),
-                        state.port_allocations.values().next().copied(),
-                        state.started_at,
-                    ),
+                    PersistedFacts {
+                        namespace: state.namespace.clone(),
+                        service_type: state.service_type.to_string(),
+                        variant: state.variant.clone(),
+                        port: state.port_allocations.values().next().copied(),
+                        started_at: state.started_at,
+                    },
                 );
             }
         }
@@ -233,6 +259,9 @@ pub struct ServiceInfo {
     pub namespace: String,
     pub status: Status,
     pub service_type: String,
+    /// Which of the service's `variants:` is running, or `None` for an
+    /// ordinary service.
+    pub variant: Option<String>,
     pub port: Option<u16>,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub health_error: Option<String>,
@@ -983,21 +1012,16 @@ impl App {
                 // Update previous status
                 self.previous_status.insert(name.clone(), status);
 
-                let (namespace, service_type, port, started_at) =
-                    service_states.get(&name).cloned().unwrap_or((
-                        "root".to_string(),
-                        "Unknown".to_string(),
-                        None,
-                        chrono::Utc::now(),
-                    ));
+                let facts = service_states.get(&name).cloned().unwrap_or_default();
 
                 ServiceInfo {
                     name: name.clone(),
-                    namespace,
+                    namespace: facts.namespace,
                     status,
-                    service_type,
-                    port,
-                    started_at: Some(started_at),
+                    service_type: facts.service_type,
+                    variant: facts.variant,
+                    port: facts.port,
+                    started_at: Some(facts.started_at),
                     health_error: None,
                 }
             })

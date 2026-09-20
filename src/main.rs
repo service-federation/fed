@@ -222,6 +222,7 @@ async fn run() -> anyhow::Result<()> {
         is_interactive,
         output_mode: OutputMode::default(),
         profiles: cli.profile.clone(),
+        variants: cli.variant.clone(),
         required_secret_names: None,
         foreground: None,
     };
@@ -235,6 +236,19 @@ async fn run() -> anyhow::Result<()> {
             return commands::run_validate(
                 cli.config.clone(),
                 cli.workdir.clone(),
+                cli.offline,
+                &cli.variant,
+                &cli.profile,
+                &out,
+            )
+            .await;
+        }
+        Commands::Variant { cmd } => {
+            return commands::run_variant(
+                &cmd.clone().unwrap_or_default(),
+                cli.workdir.clone(),
+                cli.config.clone(),
+                &cli.variant,
                 cli.offline,
                 &out,
             )
@@ -406,6 +420,19 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let work_dir = resolve_work_dir(cli.workdir.clone(), &config_path)?;
+
+    // Pick an implementation for every service that declares `variants:` and
+    // replace it with the merged result, before anything — the orchestrator,
+    // `fed status`, the dry-run preview, the supervisor it may spawn — reads
+    // `config.services`. Everything downstream sees ordinary services.
+    let mut config = config;
+    fed::config::variants::resolve_variants(
+        &mut config,
+        &fed::config::variants::VariantSelection::load(&cli.variant, &work_dir)?,
+        &cli.profile,
+    )?;
+    let config = config;
+
     run_context.secret_cache = cli
         .secret_cache
         .or_else(|| fed::cloud::load_link(&work_dir).map(|link| link.secret_cache))
@@ -444,7 +471,7 @@ async fn run() -> anyhow::Result<()> {
     // Tier-3 output-mode/readonly/isolate logic below, none of which
     // applies to it.
     if matches!(cli.command, Commands::Supervise) {
-        return commands::run_supervise(config, work_dir).await;
+        return commands::run_supervise(config, work_dir, run_context).await;
     }
 
     // ── Tier 3: Commands that need orchestrator ─────────────────────
@@ -603,6 +630,7 @@ async fn run() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Start {
+            all,
             services,
             watch,
             replace,
@@ -617,12 +645,17 @@ async fn run() -> anyhow::Result<()> {
                 &config,
                 services,
                 commands::StartOptions {
+                    all,
                     watch,
                     replace,
                     dry_run,
                     jobs: jobs as usize,
                     config_path: &config_path,
-                    offline: cli.offline,
+                    flags: commands::InheritedFlags {
+                        offline: cli.offline,
+                        profiles: cli.profile.clone(),
+                        variants: cli.variant.clone(),
+                    },
                     profiles: cli.profile.clone(),
                     start_lock,
                 },
@@ -642,14 +675,17 @@ async fn run() -> anyhow::Result<()> {
         Commands::Stop { services } => {
             commands::run_stop(&mut orchestrator, &config, services, &out).await?;
         }
-        Commands::Restart { services } => {
+        Commands::Restart { services, all: _ } => {
             commands::run_restart(
                 &mut orchestrator,
                 &config,
                 services,
                 &config_path,
-                cli.offline,
-                cli.profile.clone(),
+                commands::InheritedFlags {
+                    offline: cli.offline,
+                    profiles: cli.profile.clone(),
+                    variants: cli.variant.clone(),
+                },
                 &out,
             )
             .await?;
@@ -717,6 +753,7 @@ async fn run() -> anyhow::Result<()> {
                     "ports",
                     "init",
                     "validate",
+                    "variant",
                     "completions",
                     "doctor",
                     "top",
@@ -778,6 +815,7 @@ async fn run() -> anyhow::Result<()> {
         // Handled in earlier tiers
         Commands::Init { .. }
         | Commands::Validate
+        | Commands::Variant { .. }
         | Commands::Completions { .. }
         | Commands::Doctor
         | Commands::Prune { .. }

@@ -187,6 +187,117 @@ fed starts missing dependencies, polls their configured health checks, runs the 
 
 See [Scripts and tests](https://www.service-federation.com/docs/scripts/) for lifecycle rules, argument passing, output modes, and isolation limits.
 
+## One service, several implementations
+
+A rewrite keeps the old and the new implementation side by side for months. Both listen on the same port, both satisfy the same dependants, and only one may run at a time. Profiles can't express that — they add services, they never replace one.
+
+`variants:` keeps one service name and one contract, and moves only the implementation:
+
+```yaml
+services:
+  catalog:
+    depends_on: [storage]
+    healthcheck: { http_get: 'http://localhost:{{CATALOG_PORT}}/health' }
+    default_variant: java
+    variants:
+      java:
+        gradle_task: ':catalog:run'
+      go:
+        process: go run ./cmd/catalog
+        cwd: services/catalog-go
+```
+
+The outer service holds the shared contract — ports, healthcheck, `depends_on`, tags — and carries no type-defining field of its own. Each variant supplies exactly one, plus whatever else differs. The chosen variant is merged over the outer service before anything else runs, so dependants, `fed status` and the dependency graph see an ordinary service; `frontend`'s `depends_on: [catalog]` holds whichever implementation is live.
+
+Variant names are a vocabulary shared across services, so the main control is an ordered preference list rather than a per-service flag:
+
+```bash
+fed start --variant go,ts,rust    # first name each service actually has
+fed start --variant catalog:java  # pin the odd one out
+fed variant set go,ts,rust        # persist it; fed variant list shows the result
+```
+
+For each service, the first name in the list it offers wins; otherwise its `default_variant`. A name no service has produces a warning, so one list can serve several checkouts. Precedence, highest first: a `--variant` pin, the `--variant` list, `.fed/variants.yaml` (written by `fed variant set`), then `default_variant`. Persisting matters because `fed restart`, `fed status`, the TUI and the background supervisor all have to agree without the flag being repeated.
+
+Switching variant while the service runs is a `fed stop` and a `fed start` — the ports and container names are the same, so the two implementations can't coexist. A variant that needs a *different* port is a different service, not a variant: the contract lives on the outer service by design.
+
+See [`examples/variants-example.yaml`](./examples/variants-example.yaml) for a runnable version.
+
+### Shared defaults and whole-stack startup
+
+Use `defaults:` for common service fields. A service or template's own values
+win; collections are combined. An explicit `depends_on: []` opts out of
+inherited dependencies, including through a template or variant. Services
+named in `defaults.depends_on` are excluded from all defaults to avoid cycles;
+`fed validate` reports that exclusion once.
+
+```yaml
+defaults:
+  depends_on: [storage]
+  healthcheck_timeout: 30s
+  startup_timeout: 1m
+
+templates:
+  go-worker:
+    process: go run ./cmd/worker
+
+services:
+  storage: { process: sleep 300 }
+  catalog:
+    variants:
+      java: { process: sleep 300 }
+      go: { extends: go-worker, cwd: workers/catalog }
+    default_variant: java
+  standalone: { process: sleep 300, depends_on: [] }
+
+entrypoint: '*'
+```
+
+Variants can extend local templates or exposed package services, using the
+same `extends:` rules as ordinary services. Templates cannot extend templates.
+Defaults fill fields left unset after extension resolution; the chosen variant
+then overrides the outer service. `healthcheck_timeout` (also accepted as
+`healthcheck_start_period`) supplies a startup health wait without defining a
+probe. An explicit `healthcheck.start_period` or legacy `timeout` wins over it.
+
+`fed start --all` starts every service enabled by the active profiles.
+`entrypoint: '*'` makes that the default for plain `fed start`.
+`fed restart --all` explicitly requests the existing restart-everything behavior.
+A service with only `depends_on` is a grouping node: it completes after its
+dependencies start. Interactive startup still requires a single process service;
+use `fed start -i <service>` with a wildcard or grouping entrypoint.
+
+See [examples/whole-stack.yaml](./examples/whole-stack.yaml) for a runnable
+example with defaults, variant templates, grouping, and optional profiles.
+
+### Healthcheck timing
+
+start_period is how long fed waits for the first pass. It is separate from the
+time limit for an individual probe.
+
+| Field | Meaning | Default |
+| --- | --- | --- |
+| `start_period` | Startup wait for the first successful probe | 5s |
+| `interval` | Delay between probes | 500ms |
+| `probe_timeout` | Time limit for one probe | The effective start period, preserving legacy behavior |
+| `retries` | Consecutive failed probes before unhealthy | 3 |
+
+These fields work alongside either `http_get` or `command`. A bare command
+string uses the defaults. `timeout` remains the legacy alias for `start_period`;
+setting both is an error. `interval` must be positive and `retries` at least 1.
+`startup_timeout` still caps the entire start attempt; validation warns when
+it is shorter than the health wait.
+
+A probe timeout counts as one failed probe. Startup continues polling until the
+start period expires; expiry while the process is alive produces a health
+warning, not a failed start. A probe already in flight at the deadline may
+finish. After startup, the supervisor (or watch/TUI monitor) runs the configured
+probes, preserves health through fewer than `retries` failures, and records
+unhealthy at the threshold. A success resets the streak and restores healthy
+status. Process death bypasses probe retries. Healthchecks alone enable
+supervision; restarting still requires a restart policy.
+
+
 ## Existing Docker Compose projects
 
 You do not need to translate every container into fed. Include the Compose file once and fed expands its services and dependency edges into the same graph as native services:
@@ -237,7 +348,7 @@ If your team needs to share development credentials, an optional hosted vault ca
 - [Scripts and tests](https://www.service-federation.com/docs/scripts/)
 - [Command reference](https://www.service-federation.com/docs/commands/)
 
-Example configs include [Rails with Sidekiq](./examples/rails-sidekiq.yaml), [FastAPI with Celery](./examples/python-fastapi.yaml), [Go microservices](./examples/go-microservices.yaml), [Node services](./examples/nodejs-microservices.yaml), and [an existing Docker Compose project](./examples/docker-compose-example/).
+Example configs include [Rails with Sidekiq](./examples/rails-sidekiq.yaml), [FastAPI with Celery](./examples/python-fastapi.yaml), [Go microservices](./examples/go-microservices.yaml), [Node services](./examples/nodejs-microservices.yaml), [service variants](./examples/variants-example.yaml), and [an existing Docker Compose project](./examples/docker-compose-example/).
 
 `fed --help` is the command-line source of truth for the installed version.
 

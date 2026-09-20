@@ -33,6 +33,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use super::Orchestrator;
+use super::health::{HealthCheckerEntry, SharedHealthCheckerRegistry};
 
 /// Type alias for a single service manager entry
 type ServiceEntry = Arc<Mutex<Box<dyn ServiceManager>>>;
@@ -43,11 +44,36 @@ type ServicesMap = Arc<RwLock<HashMap<String, ServiceEntry>>>;
 /// Type alias for the state tracker
 type StateTrackerRef = Arc<RwLock<StateTracker>>;
 
+/// What the service's *configured* healthcheck said this cycle.
+///
+/// Kept apart from liveness because the two failures mean different things
+/// and get different tolerances: a dead process is dead now, while a live
+/// process whose health endpoint returned 503 once may well be fine on the
+/// next probe. Only the latter is subject to `retries`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProbeOutcome {
+    /// No healthcheck is configured, or its checker failed to construct.
+    NotConfigured,
+    /// The next scheduled probe is not due yet.
+    NotDue,
+    /// The configured healthcheck passed.
+    Passed,
+    /// The configured healthcheck failed or errored.
+    Failed,
+}
+
 /// Result of a health check for a single service
 struct HealthCheckResult {
     name: String,
     manager: Arc<Mutex<Box<dyn ServiceManager>>>,
-    is_healthy: bool,
+    /// The manager's own liveness answer (process/container still there).
+    alive: bool,
+    /// The configured healthcheck's answer, if there is one.
+    probe: ProbeOutcome,
+    /// Liveness and probe folded together, after `retries` has been applied.
+    /// Filled in by [`apply_probe_retries`]; never set by the concurrent
+    /// probing pass, which has no access to the cross-cycle counters.
+    is_healthy: Option<bool>,
 }
 
 /// Calculate backoff delay for restart attempts with jitter
@@ -123,6 +149,8 @@ pub(super) fn calculate_backoff_delay(consecutive_failures: u32) -> Duration {
 async fn check_all_services(
     services: &ServicesMap,
     scope: Option<&HashSet<String>>,
+    health_checkers: &SharedHealthCheckerRegistry,
+    next_probes: &mut HashMap<String, tokio::time::Instant>,
 ) -> Vec<HealthCheckResult> {
     // Acquire read lock once and collect all service entries
     #[allow(clippy::type_complexity)]
@@ -134,6 +162,8 @@ async fn check_all_services(
     }; // Read lock dropped here
 
     let mut health_check_tasks = Vec::new();
+    let mut scheduled = Vec::new();
+    let mut monitored = HashSet::new();
 
     for (service_name, manager_arc) in service_entries {
         // Out-of-scope services are skipped entirely — not even a liveness
@@ -156,23 +186,149 @@ async fn check_all_services(
             continue;
         }
 
+        monitored.insert(service_name.clone());
+        let probe_due = next_probes
+            .get(&service_name)
+            .is_none_or(|due| *due <= tokio::time::Instant::now());
+
+        // The configured probe, cloned out of the registry so the read lock
+        // is not held across the await. `Invalid` entries (a checker that
+        // could not be constructed, e.g. a malformed URL) deliberately
+        // behave as "not configured": the start path already warned about
+        // them, and flipping a live service to Failing over a config typo
+        // would be a worse answer than leaving it on liveness alone.
+        let probe = {
+            let checkers = health_checkers.read().await;
+            match checkers.get(&service_name) {
+                Some(HealthCheckerEntry::Ready {
+                    checker, interval, ..
+                }) if probe_due => {
+                    scheduled.push((service_name.clone(), *interval));
+                    Some(Arc::clone(checker))
+                }
+                Some(HealthCheckerEntry::Ready { .. }) => None,
+                Some(HealthCheckerEntry::Invalid { .. }) | None => None,
+            }
+        };
+
         // Create concurrent health check task
         let manager_arc_clone = Arc::clone(&manager_arc);
         health_check_tasks.push(async move {
-            let is_healthy = {
-                let manager = manager_arc_clone.lock().await;
-                manager.health().await.unwrap_or(false)
+            let liveness = manager_arc_clone.lock().await.liveness().await;
+            let (alive, probe_due) = match liveness {
+                Ok(alive) => (alive, probe_due),
+                Err(error) => {
+                    // A daemon outage must not count as a failed container
+                    // probe or cause every container to be restarted.
+                    tracing::debug!("Liveness unknown for '{}': {}", service_name, error);
+                    (true, false)
+                }
+            };
+            // A dead service is not probed: the probe could only confirm what
+            // liveness already said, and running it would charge a probe
+            // timeout per cycle against a service nobody can reach.
+            let probe = match (alive, probe) {
+                (false, _) => ProbeOutcome::NotConfigured,
+                (true, _) if !probe_due => ProbeOutcome::NotDue,
+                (_, None) => ProbeOutcome::NotConfigured,
+                (true, Some(checker)) => match checker.check().await {
+                    Ok(true) => ProbeOutcome::Passed,
+                    Ok(false) | Err(_) => ProbeOutcome::Failed,
+                },
             };
             HealthCheckResult {
                 name: service_name,
                 manager: manager_arc,
-                is_healthy,
+                alive,
+                probe,
+                // Decided in `apply_probe_retries`, which runs sequentially
+                // and can therefore touch the cross-cycle failure counters.
+                is_healthy: None,
             }
         });
     }
 
     // Run all health checks concurrently
-    futures::future::join_all(health_check_tasks).await
+    let results = futures::future::join_all(health_check_tasks).await;
+    for (name, interval) in scheduled {
+        next_probes.insert(name, tokio::time::Instant::now() + interval);
+    }
+    next_probes.retain(|name, _| monitored.contains(name));
+    results
+}
+
+/// Record one probe result against `counters` and say whether the service
+/// has now failed enough consecutive probes to be called unhealthy.
+///
+/// Pure apart from `counters`, so the retry arithmetic is unit-testable
+/// without a running service. `retries` is clamped to at least 1: zero would
+/// mean "never unhealthy", which is what deleting the healthcheck says.
+pub(super) fn probe_failure_demotes(
+    service: &str,
+    passed: bool,
+    retries: u32,
+    counters: &mut HashMap<String, u32>,
+) -> bool {
+    if passed {
+        counters.remove(service);
+        return false;
+    }
+    let count = counters.entry(service.to_string()).or_insert(0);
+    *count = count.saturating_add(1);
+    *count >= retries.max(1)
+}
+
+/// Fold each service's liveness and configured-probe answers into the single
+/// `is_healthy` verdict the rest of the cycle acts on, applying `retries`.
+///
+/// Runs sequentially, after the concurrent probing pass, because it is the
+/// only part that needs the counters that persist across cycles.
+///
+/// The three cases, deliberately not symmetric:
+///
+/// - not alive → unhealthy immediately, counters cleared. A restart is about
+///   to re-run the startup healthcheck anyway, so carrying a probe streak
+///   across it would double-count.
+/// - alive, no probe (or its checker was invalid) → healthy, exactly as
+///   before configured probes were polled here at all.
+/// - alive, probe failed → unhealthy only once `retries` consecutive probes
+///   have failed.
+fn apply_probe_retries(
+    results: &mut [HealthCheckResult],
+    config: &Config,
+    counters: &mut HashMap<String, u32>,
+) {
+    for result in results.iter_mut() {
+        if !result.alive {
+            counters.remove(&result.name);
+            result.is_healthy = Some(false);
+            continue;
+        }
+        result.is_healthy = match result.probe {
+            ProbeOutcome::NotDue => None,
+            ProbeOutcome::NotConfigured | ProbeOutcome::Passed => {
+                counters.remove(&result.name);
+                Some(true)
+            }
+            ProbeOutcome::Failed => {
+                let retries = config
+                    .services
+                    .get(&result.name)
+                    .and_then(|s| s.healthcheck.as_ref())
+                    .map(|h| h.get_retries())
+                    .unwrap_or(1);
+                // An inconclusive failure must not promote an unverified
+                // Running service to Healthy or erase restart accounting.
+                probe_failure_demotes(&result.name, false, retries, counters).then_some(false)
+            }
+        };
+    }
+
+    // Services that vanished from this cycle (stopped, filtered out of
+    // scope) must not keep a stale streak that would demote them one probe
+    // after they come back.
+    let seen: HashSet<&str> = results.iter().map(|r| r.name.as_str()).collect();
+    counters.retain(|name, _| seen.contains(name.as_str()));
 }
 
 /// Compute the supervisor's health-check scope: the union of every service
@@ -191,7 +347,7 @@ async fn check_all_services(
 /// nothing downstream would ever be told about it.
 ///
 /// ```text
-/// scope = { s : s.restart != No }
+/// scope = { s : s.restart != No or s.healthcheck is configured }
 ///       ∪ { d : d is a depends_on target of some s where either
 ///               s.restart != No, or
 ///               s's failure_policy for that dependency is not Ignore }
@@ -224,7 +380,7 @@ pub fn supervised_service_names(config: &Config) -> HashSet<String> {
             service.restart.clone().unwrap_or(RestartPolicy::No),
             RestartPolicy::No
         );
-        if restart_enabled {
+        if restart_enabled || service.healthcheck.is_some() {
             scope.insert(name.clone());
         }
 
@@ -252,9 +408,9 @@ fn classify_health_results(
     let mut unhealthy = Vec::new();
 
     for result in results {
-        if result.is_healthy {
+        if result.is_healthy == Some(true) {
             healthy_names.push(result.name);
-        } else {
+        } else if result.is_healthy == Some(false) {
             tracing::warn!("Service '{}' failed health check", result.name);
             unhealthy.push((result.name, result.manager));
         }
@@ -415,15 +571,51 @@ async fn restart_single_service(
 ///
 /// `scope` is forwarded verbatim to [`check_all_services`] — see that
 /// function's doc comment for the `None`-means-unfiltered contract.
+#[allow(clippy::too_many_arguments)]
 async fn execute_health_check_cycle(
     services: &ServicesMap,
     state_tracker: &StateTrackerRef,
     config: &Config,
     cancel_token: &CancellationToken,
     scope: Option<&HashSet<String>>,
+    health_checkers: &SharedHealthCheckerRegistry,
+    probe_failures: &mut HashMap<String, u32>,
+    next_probes: &mut HashMap<String, tokio::time::Instant>,
 ) {
     // Check all services concurrently
-    let health_results = check_all_services(services, scope).await;
+    let mut health_results =
+        check_all_services(services, scope, health_checkers, next_probes).await;
+
+    // Fold in the configured probes, applying `retries`
+    apply_probe_retries(&mut health_results, config, probe_failures);
+
+    // Persist configured-probe verdicts independently of manager liveness.
+    // Status readers overlay these only while the manager is still alive.
+    for result in &health_results {
+        if matches!(result.probe, ProbeOutcome::Passed | ProbeOutcome::Failed)
+            && let Some(healthy) = result.is_healthy
+        {
+            let mut tracker = state_tracker.write().await;
+            if tracker.is_desired_running(&result.name).await {
+                let status = if healthy {
+                    Status::Healthy
+                } else {
+                    Status::Failing
+                };
+                if let Err(error) = tracker
+                    .try_transition_service_status(
+                        &result.name,
+                        &[Status::Running, Status::Healthy, Status::Failing],
+                        crate::state::DesiredState::Running,
+                        status,
+                    )
+                    .await
+                {
+                    tracing::warn!("Could not persist health for '{}': {}", result.name, error);
+                }
+            }
+        }
+    }
 
     // Classify results
     let (healthy_names, unhealthy) = classify_health_results(health_results);
@@ -596,9 +788,11 @@ async fn execute_health_check_cycle(
             )
             .await
             {
+                probe_failures.remove(&service_name);
+                next_probes.remove(&service_name);
                 successful_restarts.push(service_name);
             }
-        } else {
+        } else if !matches!(restart_policy, RestartPolicy::No) {
             tracing::warn!(
                 "Service '{}' exceeded restart limit (failures: {})",
                 service_name,
@@ -815,6 +1009,7 @@ async fn apply_health_check_jitter() {
 /// if `config` were ever live-reloaded (not yet implemented — but this keeps
 /// the loop shaped so that adding it later doesn't require touching this
 /// function again).
+#[allow(clippy::too_many_arguments)]
 async fn run_monitoring_loop(
     services: ServicesMap,
     state_tracker: StateTrackerRef,
@@ -822,13 +1017,33 @@ async fn run_monitoring_loop(
     cancel_token: CancellationToken,
     startup_complete: Arc<std::sync::atomic::AtomicBool>,
     filter_scope: bool,
+    health_checkers: SharedHealthCheckerRegistry,
 ) {
     use futures::FutureExt;
     use std::panic::AssertUnwindSafe;
 
-    // Health checks run every 5 seconds. Combined with up to ±500ms jitter,
-    // cancellation may take up to ~5.5s to take effect (worst case: check just started).
-    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    // Consecutive configured-probe failures per service. Owned by the loop
+    // rather than the state DB: it is a property of this supervisor's view
+    // of the last few seconds, and a restarted supervisor should start
+    // counting again from a clean slate rather than inherit a streak whose
+    // probes it never ran.
+    let mut probe_failures: HashMap<String, u32> = HashMap::new();
+    let mut next_probes = HashMap::new();
+
+    // Wake often enough for the shortest configured interval. Per-service
+    // deadlines prevent longer-interval probes from running on every tick;
+    // projects without probes retain the existing five-second liveness poll.
+    let tick = config
+        .services
+        .values()
+        .filter_map(|s| s.healthcheck.as_ref())
+        .map(|h| h.get_interval())
+        .min()
+        .unwrap_or(Duration::from_secs(5))
+        .min(Duration::from_secs(5))
+        .max(Duration::from_millis(1));
+    let mut interval = tokio::time::interval(tick);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -837,7 +1052,7 @@ async fn run_monitoring_loop(
                 break;
             }
             _ = interval.tick() => {
-                apply_health_check_jitter().await;
+                if tick >= Duration::from_secs(5) { apply_health_check_jitter().await; }
 
                 // Skip all monitoring during startup to prevent race conditions
                 if !startup_complete.load(Ordering::SeqCst) {
@@ -858,18 +1073,25 @@ async fn run_monitoring_loop(
                 };
 
                 let cancel_token_clone = cancel_token.clone();
-                let health_check_result = AssertUnwindSafe(async {
+                let health_checkers_clone = Arc::clone(&health_checkers);
+                let cycle = AssertUnwindSafe(async {
                     execute_health_check_cycle(
                         &services_clone,
                         &state_tracker_clone,
                         &config_clone,
                         &cancel_token_clone,
                         scope.as_ref(),
+                        &health_checkers_clone,
+                        &mut probe_failures,
+                        &mut next_probes,
                     )
                     .await;
                 })
-                .catch_unwind()
-                .await;
+                .catch_unwind();
+                let health_check_result = tokio::select! {
+                    _ = cancel_token.cancelled() => break,
+                    result = cycle => result,
+                };
 
                 // Log any panics but continue monitoring
                 if let Err(panic_info) = health_check_result {
@@ -919,7 +1141,9 @@ impl Orchestrator {
         let checker = {
             let checkers = self.health_checkers.read().await;
             match checkers.get(service_name) {
-                Some(super::health::HealthCheckerEntry::Ready(c)) => Some(Arc::clone(c)),
+                Some(super::health::HealthCheckerEntry::Ready { checker, .. }) => {
+                    Some(Arc::clone(checker))
+                }
                 Some(super::health::HealthCheckerEntry::Invalid { .. }) | None => None,
             }
         };
@@ -977,6 +1201,7 @@ impl Orchestrator {
             cancel_token,
             startup_complete,
             filter_scope,
+            Arc::clone(&self.health_checkers),
         ));
 
         // Store the handle so we can await it during cleanup
@@ -1260,7 +1485,13 @@ mod tests {
             ("b".to_string(), fake_entry(Status::Running, false)),
         ])));
 
-        let results = check_all_services(&services, None).await;
+        let results = check_all_services(
+            &services,
+            None,
+            &Arc::new(RwLock::new(HashMap::new())),
+            &mut HashMap::new(),
+        )
+        .await;
         let names: HashSet<String> = results.iter().map(|r| r.name.clone()).collect();
         assert_eq!(names, HashSet::from(["a".to_string(), "b".to_string()]));
     }
@@ -1278,7 +1509,13 @@ mod tests {
         ])));
 
         let scope: HashSet<String> = HashSet::from(["supervised".to_string()]);
-        let results = check_all_services(&services, Some(&scope)).await;
+        let results = check_all_services(
+            &services,
+            Some(&scope),
+            &Arc::new(RwLock::new(HashMap::new())),
+            &mut HashMap::new(),
+        )
+        .await;
 
         assert_eq!(
             results.len(),
@@ -1299,7 +1536,13 @@ mod tests {
         )])));
 
         let scope: HashSet<String> = HashSet::from(["stopped-but-in-scope".to_string()]);
-        let results = check_all_services(&services, Some(&scope)).await;
+        let results = check_all_services(
+            &services,
+            Some(&scope),
+            &Arc::new(RwLock::new(HashMap::new())),
+            &mut HashMap::new(),
+        )
+        .await;
 
         assert!(
             results.is_empty(),
@@ -1319,8 +1562,145 @@ mod tests {
         )])));
 
         let scope: HashSet<String> = HashSet::new();
-        let results = check_all_services(&services, Some(&scope)).await;
+        let results = check_all_services(
+            &services,
+            Some(&scope),
+            &Arc::new(RwLock::new(HashMap::new())),
+            &mut HashMap::new(),
+        )
+        .await;
 
         assert!(results.is_empty());
+    }
+    struct SwitchProbe(std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl crate::healthcheck::HealthChecker for SwitchProbe {
+        async fn check(&self) -> Result<bool> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+        fn timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_probes_persist_retry_threshold_and_recovery() {
+        let services: ServicesMap = Arc::new(RwLock::new(HashMap::from([(
+            "amber".into(),
+            fake_entry(Status::Running, true),
+        )])));
+        let mut config = Config::default();
+        config.services.insert(
+            "amber".into(),
+            crate::config::Service {
+                process: Some("sleep 30".into()),
+                healthcheck: Some(crate::config::HealthCheck::CommandMap {
+                    command: "true".into(),
+                    timing: crate::config::HealthCheckTiming {
+                        retries: Some(3),
+                        ..Default::default()
+                    },
+                }),
+                ..Default::default()
+            },
+        );
+        let mut tracker = StateTracker::new_ephemeral().await.unwrap();
+        tracker.initialize().await.unwrap();
+        let mut state = crate::state::ServiceState::new(
+            "amber".into(),
+            crate::config::ServiceType::Process,
+            "".into(),
+        );
+        state.status = Status::Running;
+        tracker.register_service(state).await.unwrap();
+        let tracker = Arc::new(RwLock::new(tracker));
+        let probe = Arc::new(SwitchProbe(std::sync::atomic::AtomicBool::new(false)));
+        let registry = Arc::new(RwLock::new(HashMap::from([(
+            "amber".into(),
+            HealthCheckerEntry::Ready {
+                checker: probe.clone(),
+                start_period: Duration::from_secs(1),
+                interval: Duration::from_secs(60),
+            },
+        )])));
+        let token = CancellationToken::new();
+        let mut failures = HashMap::new();
+        let mut next = HashMap::new();
+        // A failed probe before the threshold must not invent a first pass.
+        execute_health_check_cycle(
+            &services,
+            &tracker,
+            &config,
+            &token,
+            None,
+            &registry,
+            &mut failures,
+            &mut next,
+        )
+        .await;
+        assert_eq!(
+            tracker
+                .read()
+                .await
+                .get_service("amber")
+                .await
+                .unwrap()
+                .status,
+            Status::Running
+        );
+        // Not-due cycles neither run the probe nor increment the streak.
+        execute_health_check_cycle(
+            &services,
+            &tracker,
+            &config,
+            &token,
+            None,
+            &registry,
+            &mut failures,
+            &mut next,
+        )
+        .await;
+        assert_eq!(failures["amber"], 1);
+        for (passed, expected) in [
+            (true, Status::Healthy),
+            (false, Status::Healthy),
+            (false, Status::Healthy),
+            (false, Status::Failing),
+            (true, Status::Healthy),
+        ] {
+            probe.0.store(passed, Ordering::SeqCst);
+            next.clear();
+            execute_health_check_cycle(
+                &services,
+                &tracker,
+                &config,
+                &token,
+                None,
+                &registry,
+                &mut failures,
+                &mut next,
+            )
+            .await;
+            assert_eq!(
+                tracker
+                    .read()
+                    .await
+                    .get_service("amber")
+                    .await
+                    .unwrap()
+                    .status,
+                expected
+            );
+        }
+        assert!(failures.is_empty());
+        // A dead process is unhealthy immediately, independent of retries.
+        services
+            .write()
+            .await
+            .insert("amber".into(), fake_entry(Status::Running, false));
+        let mut results = check_all_services(&services, None, &registry, &mut next).await;
+        apply_probe_retries(&mut results, &config, &mut failures);
+        assert_eq!(results[0].is_healthy, Some(false));
     }
 }

@@ -749,7 +749,7 @@ impl Resolver {
             // Resolve health check
             if let Some(ref healthcheck) = service.healthcheck {
                 match healthcheck {
-                    crate::config::HealthCheck::HttpGet { http_get, timeout } => {
+                    crate::config::HealthCheck::HttpGet { http_get, timing } => {
                         let resolved_url =
                             self.resolve_template(http_get, &parameters).map_err(|e| {
                                 Error::TemplateResolution(format!(
@@ -759,10 +759,10 @@ impl Resolver {
                             })?;
                         service.healthcheck = Some(crate::config::HealthCheck::HttpGet {
                             http_get: resolved_url,
-                            timeout: timeout.clone(),
+                            timing: timing.clone(),
                         });
                     }
-                    crate::config::HealthCheck::CommandMap { command, timeout } => {
+                    crate::config::HealthCheck::CommandMap { command, timing } => {
                         let resolved_cmd =
                             self.resolve_template(command, &parameters).map_err(|e| {
                                 Error::TemplateResolution(format!(
@@ -772,7 +772,7 @@ impl Resolver {
                             })?;
                         service.healthcheck = Some(crate::config::HealthCheck::CommandMap {
                             command: resolved_cmd,
-                            timeout: timeout.clone(),
+                            timing: timing.clone(),
                         });
                     }
                     crate::config::HealthCheck::Command(cmd) => {

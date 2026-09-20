@@ -100,6 +100,7 @@ pub struct Orchestrator {
     /// Output mode for process services.
     pub(super) output_mode: OutputMode,
     active_profiles: Vec<String>,
+    variant_flags: Vec<String>,
     pub(super) monitoring_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pub(super) startup_complete: Arc<AtomicBool>,
     /// Track if port listeners have been released (to prevent TOCTOU races)
@@ -183,6 +184,7 @@ impl Orchestrator {
             output_mode: OutputMode::default(),
 
             active_profiles: Vec::new(),
+            variant_flags: Vec::new(),
             monitoring_task: Arc::new(tokio::sync::Mutex::new(None)),
             startup_complete: Arc::new(AtomicBool::new(false)),
             port_listeners_released: AtomicBool::new(false),
@@ -219,6 +221,7 @@ impl Orchestrator {
             namespace: "root".to_string(),
             output_mode: OutputMode::default(),
             active_profiles: Vec::new(),
+            variant_flags: Vec::new(),
             monitoring_task: Arc::new(tokio::sync::Mutex::new(None)),
             startup_complete: Arc::new(AtomicBool::new(false)),
             port_listeners_released: AtomicBool::new(false),
@@ -257,6 +260,7 @@ impl Orchestrator {
             output_mode: OutputMode::default(),
 
             active_profiles: Vec::new(),
+            variant_flags: Vec::new(),
             monitoring_task: Arc::new(tokio::sync::Mutex::new(None)),
             startup_complete: Arc::new(AtomicBool::new(false)),
             port_listeners_released: AtomicBool::new(false),
@@ -428,6 +432,7 @@ impl Orchestrator {
         self.set_is_interactive(ctx.is_interactive);
         self.set_output_mode(ctx.output_mode);
         self.active_profiles = ctx.profiles.clone();
+        self.variant_flags = ctx.variants.clone();
         self.foreground = ctx.foreground.clone();
     }
 
@@ -445,6 +450,7 @@ impl Orchestrator {
             is_interactive: self.resolver.get_is_interactive(),
             output_mode: self.output_mode,
             profiles: self.active_profiles.clone(),
+            variants: self.variant_flags.clone(),
             required_secret_names: self.get_required_secret_names(),
             foreground: self.foreground.clone(),
         }
@@ -699,7 +705,7 @@ impl Orchestrator {
             .initialize_for_supervisor()
             .await?;
 
-        self.build_dependency_graph()?;
+        self.initialize_dry_run().await?;
 
         // Restore managers, honoring desired_state (never resurrect stopped).
         // A service can die after initialize_for_supervisor's liveness sweep
@@ -707,6 +713,7 @@ impl Orchestrator {
         // newly stale too; unregistering it here would leave a Stopped manager
         // that the monitoring loop permanently skips.
         newly_stale.extend(self.create_services_for_supervisor().await?);
+        self.create_health_checkers().await;
         newly_stale.sort();
         newly_stale.dedup();
 
@@ -1453,6 +1460,10 @@ impl Orchestrator {
             // `mark_dead_services` to decide whether this service's
             // container-liveness check gets a stale-grace period.
             service_state.native_restart_enabled = service_config.docker_native_restart_enabled();
+            // Which of the service's `variants:` this run picked, so a later
+            // `fed status` from a shell that never saw `--variant` still
+            // reports the implementation that is actually up.
+            service_state.variant = service_config.variant.clone();
         }
 
         let Some(registration) =
@@ -1789,6 +1800,7 @@ impl Orchestrator {
             state.status = Status::Completed;
             if let Some(cfg) = self.config.services.get(name) {
                 state.startup_message = cfg.startup_message.clone();
+                state.variant = cfg.variant.clone();
             }
             tracker.register_service(state).await?;
             tracker.save().await?;
@@ -2204,17 +2216,43 @@ impl Orchestrator {
             // The health check is cached (500ms TTL) so this is inexpensive
             if status == Status::Running || status == Status::Healthy {
                 // Health check updates status internally if process has died
-                let _ = manager.health().await;
+                if matches!(manager.liveness().await, Ok(false)) {
+                    let observed = manager.status();
+                    return (
+                        name,
+                        if matches!(observed, Status::Running | Status::Healthy) {
+                            Status::Failing
+                        } else {
+                            observed
+                        },
+                    );
+                }
             }
 
             // Get status again after potential health check update
             (name, manager.status())
         });
 
-        futures::future::join_all(checks)
+        let mut statuses: HashMap<_, _> = futures::future::join_all(checks)
             .await
             .into_iter()
-            .collect()
+            .collect();
+        let persisted = self.state_tracker.read().await.get_services().await;
+        for (name, status) in &mut statuses {
+            if matches!(*status, Status::Running | Status::Healthy)
+                && self
+                    .config
+                    .services
+                    .get(name)
+                    .is_some_and(|s| s.healthcheck.is_some())
+                && let Some(state) = persisted.get(name)
+                && state.desired_state == DesiredState::Running
+                && matches!(state.status, Status::Healthy | Status::Failing)
+            {
+                *status = state.status;
+            }
+        }
+        statuses
     }
 
     /// Get a service manager
@@ -3292,6 +3330,7 @@ mod tests {
             is_interactive: true,
             output_mode: OutputMode::Passthrough,
             profiles: vec!["a".to_string(), "b".to_string()],
+            variants: vec!["go,rust".to_string()],
             required_secret_names: Some(required_secret_names),
             foreground: Some("svc".to_string()),
         };
@@ -3304,6 +3343,7 @@ mod tests {
         assert_eq!(round_tripped.is_interactive, ctx.is_interactive);
         assert_eq!(round_tripped.output_mode, ctx.output_mode);
         assert_eq!(round_tripped.profiles, ctx.profiles);
+        assert_eq!(round_tripped.variants, ctx.variants);
         assert_eq!(
             round_tripped.required_secret_names,
             ctx.required_secret_names
@@ -3379,6 +3419,7 @@ mod tests {
                     startup_message: None,
                     desired_state: DesiredState::Running,
                     native_restart_enabled: false,
+                    variant: None,
                 })
                 .await
                 .unwrap();
@@ -3400,6 +3441,7 @@ mod tests {
                     startup_message: None,
                     desired_state: DesiredState::Stopped,
                     native_restart_enabled: false,
+                    variant: None,
                 })
                 .await
                 .unwrap();
@@ -3508,6 +3550,7 @@ mod tests {
                         startup_message: None,
                         desired_state,
                         native_restart_enabled: false,
+                        variant: None,
                     })
                     .await
                     .unwrap();
@@ -3606,6 +3649,7 @@ mod tests {
                     startup_message: None,
                     desired_state: DesiredState::Running,
                     native_restart_enabled: false,
+                    variant: None,
                 })
                 .await
                 .unwrap();
@@ -3627,6 +3671,7 @@ mod tests {
                     startup_message: None,
                     desired_state: DesiredState::Stopped,
                     native_restart_enabled: false,
+                    variant: None,
                 })
                 .await
                 .unwrap();

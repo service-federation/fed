@@ -1,37 +1,90 @@
 use crate::config::{Config, Service};
 use crate::error::{Error, Result};
 use crate::package::types::Package;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+
+/// Where an `extends:` reference was written.
+///
+/// A variant is a partial [`Service`], so `extends:` is valid in two places:
+/// on a service, and on one of its variants. Both resolve through the same
+/// code; this carries which one so the target can be reached for mutation and
+/// named in an error message ("referenced in variant 'go' of service
+/// 'catalog'").
+///
+/// Ordered by `(service, variant)` with the service itself before its
+/// variants, so resolution order is deterministic — see
+/// [`ServiceMerger::extends_sites`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ExtendsSite {
+    service: String,
+    /// `None` for the service itself.
+    variant: Option<String>,
+}
+
+impl ExtendsSite {
+    fn service(name: &str) -> Self {
+        Self {
+            service: name.to_string(),
+            variant: None,
+        }
+    }
+
+    fn variant(service: &str, variant: &str) -> Self {
+        Self {
+            service: service.to_string(),
+            variant: Some(variant.to_string()),
+        }
+    }
+
+    /// How this site is named in an error message.
+    fn describe(&self) -> String {
+        match &self.variant {
+            Some(variant) => format!("variant '{}' of service '{}'", variant, self.service),
+            None => format!("service '{}'", self.service),
+        }
+    }
+
+    /// The `Service` this site refers to, for merging into.
+    ///
+    /// `None` means the service (or variant) named here is gone — which can
+    /// only happen if the config were mutated between collecting the sites
+    /// and using them. Callers turn it into a `ServiceNotFound`.
+    fn get_mut<'a>(&self, config: &'a mut Config) -> Option<&'a mut Service> {
+        let service = config.services.get_mut(&self.service)?;
+        match &self.variant {
+            None => Some(service),
+            Some(variant) => service.variants.get_mut(variant),
+        }
+    }
+}
 
 /// Service merger for merging package services into main config
 pub struct ServiceMerger;
 
 impl ServiceMerger {
-    /// Merge local templates into services
-    /// This applies service extension by resolving `extends` references to local templates
+    /// Merge local templates into services and into service variants.
+    ///
+    /// Resolves every `extends:` reference that names a local template (no dot
+    /// — a dotted reference is a package reference, handled by
+    /// [`Self::merge_packages`]). A variant is a partial `Service`, so it may
+    /// carry its own `extends:` and is resolved here alongside the services:
+    /// that is what lets a Go rewrite pull a shared `go-worker` template
+    /// while the service above it keeps holding the contract.
     pub fn merge_local_templates(config: &mut Config) -> Result<()> {
-        // Collect services that extend local templates (no dot in extends reference)
-        let mut local_extends: Vec<(String, String)> = Vec::new();
-
-        for (service_name, service) in &config.services {
-            if let Some(ref extend_ref) = service.extends {
-                // If no dot, it's a local template reference
-                if !extend_ref.contains('.') {
-                    local_extends.push((service_name.clone(), extend_ref.clone()));
-                }
-            }
-        }
-
-        // Process each local template extension
-        for (service_name, template_name) in local_extends {
-            // Get template
+        // Resolve outer services first, then discover any variant references
+        // inherited from those templates as well as explicitly declared ones.
+        while let Some((site, template_name)) = Self::extends_sites(config)
+            .into_iter()
+            .find(|(_, extend_ref)| !extend_ref.contains('.'))
+        {
             let template = config
                 .templates
                 .get(&template_name)
                 .ok_or_else(|| {
                     Error::Validation(format!(
-                        "Template '{}' not found (referenced in service '{}')",
-                        template_name, service_name
+                        "Template '{}' not found (referenced in {})",
+                        template_name,
+                        site.describe()
                     ))
                 })?
                 .clone();
@@ -44,14 +97,11 @@ impl ServiceMerger {
                 )));
             }
 
-            // Get local service definition
-            let local_service = config
-                .services
-                .get_mut(&service_name)
-                .ok_or_else(|| Error::ServiceNotFound(service_name.clone()))?;
+            let target = site
+                .get_mut(config)
+                .ok_or_else(|| Error::ServiceNotFound(site.service.clone()))?;
 
-            // Merge template into local
-            Self::merge_service(local_service, &template)?;
+            Self::merge_service(target, &template)?;
         }
 
         Ok(())
@@ -63,18 +113,23 @@ impl ServiceMerger {
         main_config: &mut Config,
         packages: &HashMap<String, Package>,
     ) -> Result<()> {
-        // Collect all services that extend packages
-        let extends_map = Self::build_extends_map(main_config)?;
+        // Collect every `extends:` that names a package (dotted reference);
+        // local-template references were already resolved by
+        // `merge_local_templates` and are skipped here.
+        let package_extends: Vec<(ExtendsSite, String)> = Self::extends_sites(main_config)
+            .into_iter()
+            .filter(|(_, extend_ref)| extend_ref.contains('.'))
+            .collect();
 
-        // Process each service with extends
-        for (service_name, extend_ref) in extends_map {
+        for (site, extend_ref) in package_extends {
             let (package_alias, package_service_name) = Self::parse_extend_ref(&extend_ref)?;
 
             // Find the package
             let package = packages.get(&package_alias).ok_or_else(|| {
                 Error::Package(format!(
-                    "Package alias '{}' not found (referenced in service '{}')",
-                    package_alias, service_name
+                    "Package alias '{}' not found (referenced in {})",
+                    package_alias,
+                    site.describe()
                 ))
             })?;
 
@@ -85,8 +140,10 @@ impl ServiceMerger {
                 .get(&package_service_name)
                 .ok_or_else(|| {
                     Error::Package(format!(
-                        "Service '{}' not found in package '{}' (referenced in service '{}')",
-                        package_service_name, package_alias, service_name
+                        "Service '{}' not found in package '{}' (referenced in {})",
+                        package_service_name,
+                        package_alias,
+                        site.describe()
                     ))
                 })?;
 
@@ -96,8 +153,10 @@ impl ServiceMerger {
             // `dependency/expander.rs`.
             if !base_service.expose {
                 return Err(Error::Package(format!(
-                    "Service '{}' in package '{}' is not marked expose: true. Mark it exposed in the package's fed.yaml before extending it from '{}'",
-                    package_service_name, package_alias, service_name
+                    "Service '{}' in package '{}' is not marked expose: true. Mark it exposed in the package's fed.yaml before extending it from {}",
+                    package_service_name,
+                    package_alias,
+                    site.describe()
                 )));
             }
 
@@ -106,14 +165,14 @@ impl ServiceMerger {
                 return Err(Error::CircularPackageDependency);
             }
 
-            // Get local service definition
-            let local_service = main_config
-                .services
-                .get_mut(&service_name)
-                .ok_or_else(|| Error::ServiceNotFound(service_name.clone()))?;
+            // `base_service` borrows `packages`, not `main_config`, so the
+            // mutable borrow below is free to descend into the site.
+            let base_service = base_service.clone();
+            let target = site
+                .get_mut(main_config)
+                .ok_or_else(|| Error::ServiceNotFound(site.service.clone()))?;
 
-            // Merge base into local
-            Self::merge_service(local_service, base_service)?;
+            Self::merge_service(target, &base_service)?;
         }
 
         // Package configs are parsed with the same legacy-spelling scan as the
@@ -137,24 +196,29 @@ impl ServiceMerger {
         Ok(())
     }
 
-    /// Build map of service names to their extends references.
+    /// Every `extends:` reference in the config, with the site that wrote it.
     ///
-    /// Uses a `BTreeMap` (rather than `HashMap`) so `merge_packages` iterates
-    /// services in deterministic (sorted-by-name) order. This matters because
-    /// `merge_packages`'s loop body uses `?` to bail out on the first error —
-    /// with a `HashMap`'s randomized iteration order, *which* service's error
-    /// surfaces first (and which not-yet-processed entries get abandoned)
-    /// would vary from run to run given the same input.
-    fn build_extends_map(config: &Config) -> Result<BTreeMap<String, String>> {
-        let mut map = BTreeMap::new();
+    /// Returned in deterministic (sorted) order. This matters because
+    /// [`Self::merge_packages`]'s loop uses `?` to bail out on the first
+    /// error — with a `HashMap`'s randomized iteration order, *which*
+    /// service's error surfaces first (and which not-yet-processed entries
+    /// get abandoned) would vary from run to run given the same input.
+    fn extends_sites(config: &Config) -> Vec<(ExtendsSite, String)> {
+        let mut sites: Vec<(ExtendsSite, String)> = Vec::new();
 
         for (name, service) in &config.services {
             if let Some(ref extend_ref) = service.extends {
-                map.insert(name.clone(), extend_ref.clone());
+                sites.push((ExtendsSite::service(name), extend_ref.clone()));
+            }
+            for (variant_name, variant) in &service.variants {
+                if let Some(ref extend_ref) = variant.extends {
+                    sites.push((ExtendsSite::variant(name, variant_name), extend_ref.clone()));
+                }
             }
         }
 
-        Ok(map)
+        sites.sort_by(|a, b| a.0.cmp(&b.0));
+        sites
     }
 
     /// Parse extends reference (format: "package-alias.service-name")
@@ -177,21 +241,47 @@ impl ServiceMerger {
         Ok((parts[0].to_string(), parts[1].to_string()))
     }
 
-    /// Merge base service into local service
-    /// Strategy: local overrides base, but preserve base defaults
-    fn merge_service(local: &mut Service, base: &Service) -> Result<()> {
-        // 1. Copy base scalar fields if local doesn't have them
+    /// Merge `base` into `local`: `local` wins on every scalar it defines,
+    /// collections are unioned with `local`'s entries taking precedence.
+    ///
+    /// Two callers depend on this being *complete* — every field of
+    /// [`Service`] must be carried over:
+    ///
+    /// - `extends:` (package and local templates), where a missing field
+    ///   silently drops the template's value (this is the historical
+    ///   "`tags:` from a template never arrived" bug).
+    /// - variant resolution ([`crate::config::variants`]), which merges the
+    ///   chosen variant over the outer service to produce the service that
+    ///   every later stage sees.
+    ///
+    /// `merge_service_all_fields_are_copied` in this module's tests
+    /// destructures the merged `Service`, so adding a field to the struct
+    /// without adding it here fails to compile.
+    pub fn merge_service(local: &mut Service, base: &Service) -> Result<()> {
+        // 1. Scalars: keep local's value, fall back to base's.
         if local.cwd.is_none() {
             local.cwd = base.cwd.clone();
         }
         if local.install.is_none() {
             local.install = base.install.clone();
         }
+        if local.migrate.is_none() {
+            local.migrate = base.migrate.clone();
+        }
+        if local.clean.is_none() {
+            local.clean = base.clean.clone();
+        }
+        if local.build.is_none() {
+            local.build = base.build.clone();
+        }
         if local.process.is_none() {
             local.process = base.process.clone();
         }
         if local.image.is_none() {
             local.image = base.image.clone();
+        }
+        if local.command.is_none() {
+            local.command = base.command.clone();
         }
         if local.dependency.is_none() {
             local.dependency = base.dependency.clone();
@@ -214,18 +304,111 @@ impl ServiceMerger {
         if local.restart.is_none() {
             local.restart = base.restart.clone();
         }
+        if local.resources.is_none() {
+            local.resources = base.resources.clone();
+        }
+        if local.grace_period.is_none() {
+            local.grace_period = base.grace_period.clone();
+        }
+        if local.startup_timeout.is_none() {
+            local.startup_timeout = base.startup_timeout.clone();
+        }
+        if local.circuit_breaker.is_none() {
+            local.circuit_breaker = base.circuit_breaker.clone();
+        }
+        if local.startup_message.is_none() {
+            local.startup_message = base.startup_message.clone();
+        }
+        if local.healthcheck_start_period.is_none() {
+            local.healthcheck_start_period = base.healthcheck_start_period.clone();
+        }
+        if local.default_variant.is_none() {
+            local.default_variant = base.default_variant.clone();
+        }
+        if local.variant.is_none() {
+            local.variant = base.variant.clone();
+        }
 
-        // 2. Merge collections (environment, volumes, ports, etc.)
-        Self::merge_environment(&mut local.environment, &base.environment);
-        Self::merge_volumes(&mut local.volumes, &base.volumes);
-        Self::merge_ports(&mut local.ports, &base.ports);
-        Self::merge_parameters(&mut local.parameters, &base.parameters);
-        Self::merge_depends_on(&mut local.depends_on, &base.depends_on);
+        // `expose` and `compose_imported` are booleans with no "unset"
+        // state, so "local wins" can only mean "local's `true` wins" —
+        // inheriting `expose: true` from a template is the whole point of
+        // marking a package service exposed, and `compose_imported` is an
+        // internal provenance flag that must survive any merge.
+        local.expose |= base.expose;
+        local.compose_imported |= base.compose_imported;
+
+        // 2. Collections: union, local's entries win on conflicts — unless
+        // `local` wrote the key as explicitly empty, which means "none" and
+        // is how a service opts out of an inherited list.
+        if local.depends_on.is_empty() && base.explicit_empty.contains("depends_on") {
+            local.explicit_empty.insert("depends_on".into());
+        }
+        let kept_empty = |key: &str| local.explicit_empty.contains(key);
+        if !kept_empty("environment") {
+            Self::merge_environment(&mut local.environment, &base.environment);
+        }
+        if !kept_empty("volumes") {
+            Self::merge_volumes(&mut local.volumes, &base.volumes);
+        }
+        if !kept_empty("ports") {
+            Self::merge_ports(&mut local.ports, &base.ports);
+        }
+        if !kept_empty("parameters") {
+            Self::merge_parameters(&mut local.parameters, &base.parameters);
+        }
+        if !kept_empty("depends_on") {
+            Self::merge_depends_on(&mut local.depends_on, &base.depends_on);
+        }
+        if !kept_empty("compose_profiles") {
+            Self::merge_string_list(&mut local.compose_profiles, &base.compose_profiles);
+        }
+        if !kept_empty("profiles") {
+            Self::merge_string_list(&mut local.profiles, &base.profiles);
+        }
+        if !kept_empty("tags") {
+            Self::merge_string_list(&mut local.tags, &base.tags);
+        }
+        if !kept_empty("watch") {
+            Self::merge_string_list(&mut local.watch, &base.watch);
+        }
+
+        // Variant definitions merge by name — a local variant of the same
+        // name shadows the base's outright rather than merging field-wise,
+        // since the two are alternative implementations, not layers.
+        for (name, variant) in &base.variants {
+            local
+                .variants
+                .entry(name.clone())
+                .or_insert_with(|| variant.clone());
+        }
+
+        // Empty depends_on is inherited above when local has no dependency
+        // list. Other collection-presence markers remain local to this layer.
+
+        // Unknown (typo'd) keys carry over so the "did you mean?" warning
+        // still fires for a typo that lives in the template rather than in
+        // the service that extends it.
+        for (key, value) in &base.unknown_fields {
+            local
+                .unknown_fields
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
 
         // Clear the extends field after merging to avoid confusion
         local.extends = None;
 
         Ok(())
+    }
+
+    /// Union two plain string lists, preserving local order first and
+    /// skipping duplicates.
+    fn merge_string_list(local: &mut Vec<String>, base: &[String]) {
+        for item in base {
+            if !local.contains(item) {
+                local.push(item.clone());
+            }
+        }
     }
 
     /// Merge environment variables (local overrides base for same keys)
@@ -251,8 +434,9 @@ impl ServiceMerger {
                 if !local_targets.contains(&target) {
                     local.push(base_vol.clone());
                 }
-            } else {
-                // Named volume or bind mount without explicit target - add it
+            } else if !local.contains(base_vol) {
+                // Anonymous-volume paths are set entries too: defaults and a
+                // template can both contribute the same container path.
                 local.push(base_vol.clone());
             }
         }
@@ -306,7 +490,16 @@ impl ServiceMerger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HealthCheck, RestartPolicy};
+    use crate::config::{HealthCheck, HealthCheckTiming, RestartPolicy};
+
+    #[test]
+    fn repeated_volume_defaults_do_not_duplicate_anonymous_paths() {
+        let mut local = vec!["/cache".into(), "local:/data".into()];
+        let base = vec!["/cache".into(), "base:/data".into(), "/scratch".into()];
+        ServiceMerger::merge_volumes(&mut local, &base);
+        ServiceMerger::merge_volumes(&mut local, &base);
+        assert_eq!(local, vec!["/cache", "local:/data", "/scratch"]);
+    }
 
     #[test]
     fn test_parse_extend_ref_valid() {
@@ -510,27 +703,70 @@ mod tests {
     }
 
     #[test]
-    fn test_build_extends_map() {
+    fn test_extends_sites_finds_services_and_variants() {
         let mut config = Config::default();
 
-        let service1 = Service {
-            extends: Some("pkg1.base".to_string()),
-            ..Default::default()
-        };
+        config.services.insert(
+            "svc1".to_string(),
+            Service {
+                extends: Some("pkg1.base".to_string()),
+                ..Default::default()
+            },
+        );
+        config.services.insert(
+            "svc2".to_string(),
+            Service {
+                image: Some("test".to_string()),
+                ..Default::default()
+            },
+        );
+        // A variant carrying its own `extends:` is a site in its own right.
+        config.services.insert(
+            "svc3".to_string(),
+            Service {
+                variants: [
+                    (
+                        "go".to_string(),
+                        Service {
+                            extends: Some("go-worker".to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "java".to_string(),
+                        Service {
+                            gradle_task: Some(":svc3:run".to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                ]
+                .into(),
+                ..Default::default()
+            },
+        );
 
-        let service2 = Service {
-            image: Some("test".to_string()),
-            ..Default::default()
-        };
+        let sites = ServiceMerger::extends_sites(&config);
 
-        config.services.insert("svc1".to_string(), service1);
-        config.services.insert("svc2".to_string(), service2);
+        assert_eq!(
+            sites,
+            vec![
+                (ExtendsSite::service("svc1"), "pkg1.base".to_string()),
+                (ExtendsSite::variant("svc3", "go"), "go-worker".to_string()),
+            ],
+            "only sites that actually wrote `extends:`, in sorted order"
+        );
+    }
 
-        let map = ServiceMerger::build_extends_map(&config).unwrap();
-
-        assert_eq!(map.len(), 1);
-        assert_eq!(map.get("svc1").unwrap(), "pkg1.base");
-        assert!(!map.contains_key("svc2"));
+    #[test]
+    fn test_extends_site_describes_where_it_was_written() {
+        assert_eq!(
+            ExtendsSite::service("catalog").describe(),
+            "service 'catalog'"
+        );
+        assert_eq!(
+            ExtendsSite::variant("catalog", "go").describe(),
+            "variant 'go' of service 'catalog'"
+        );
     }
 
     #[test]
@@ -546,7 +782,7 @@ mod tests {
             environment: template_env,
             healthcheck: Some(HealthCheck::HttpGet {
                 http_get: "http://localhost:8080/health".to_string(),
-                timeout: None,
+                timing: HealthCheckTiming::default(),
             }),
             restart: Some(RestartPolicy::Always),
             ..Default::default()

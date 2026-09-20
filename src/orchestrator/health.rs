@@ -130,9 +130,22 @@ impl StartOutcome {
 /// registry consumer must handle it explicitly — silently treating it as
 /// absent is exactly the gap this type closes.
 pub(super) enum HealthCheckerEntry {
-    /// A constructed checker, ready to poll. `Arc` so it can be cloned out
-    /// without holding the registry read lock.
-    Ready(Arc<dyn HealthChecker>),
+    /// A constructed checker, ready to poll, with the schedule to poll it on.
+    ///
+    /// The probe and the schedule are separate on purpose. Before
+    /// `start_period`/`probe_timeout` were distinct settings, one `timeout`
+    /// value was both the deadline for the whole wait and the cap on a single
+    /// probe, so the checker's own `timeout()` could stand in for both. It
+    /// can't any more: `timeout()` is the per-probe cap, and the deadline and
+    /// interval live here.
+    Ready {
+        /// `Arc` so it can be cloned out without holding the registry read lock.
+        checker: Arc<dyn HealthChecker>,
+        /// Total wait for the first pass.
+        start_period: Duration,
+        /// Delay between probes.
+        interval: Duration,
+    },
     /// The healthcheck is configured but could not be constructed.
     Invalid {
         /// Why construction failed, surfaced to the user at start time.
@@ -162,8 +175,18 @@ impl<'a> HealthCheckRunner<'a> {
     pub async fn create_health_checkers(&self) {
         for (name, service) in &self.orchestrator.config.services {
             if let Some(ref healthcheck) = service.healthcheck {
-                // Use configured timeout or default (5 seconds)
-                let timeout = healthcheck.get_timeout();
+                // `start_period` is the total wait for the first pass and
+                // comes from the service (so a `defaults:`-supplied
+                // `healthcheck_start_period` counts); `probe_timeout` caps a
+                // single probe and is what the checker itself is built with.
+                let start_period = service.start_period_or_default();
+                let interval = healthcheck.get_interval();
+                let timeout = healthcheck.get_probe_timeout(start_period);
+                let ready = |checker: Arc<dyn HealthChecker>| HealthCheckerEntry::Ready {
+                    checker,
+                    start_period,
+                    interval,
+                };
 
                 let entry: HealthCheckerEntry = match healthcheck.health_check_type() {
                     HealthCheckType::Http => {
@@ -171,7 +194,7 @@ impl<'a> HealthCheckRunner<'a> {
                             // Use shared HTTP client to prevent file descriptor exhaustion
                             // when running many services with HTTP health checks
                             match HttpChecker::with_shared_client(url.to_string(), timeout) {
-                                Ok(checker) => HealthCheckerEntry::Ready(Arc::new(checker)),
+                                Ok(checker) => ready(Arc::new(checker)),
                                 Err(e) => {
                                     tracing::warn!(
                                         "Invalid healthcheck URL for service '{}': {}",
@@ -202,14 +225,14 @@ impl<'a> HealthCheckRunner<'a> {
                                     session_id.as_deref(),
                                     &self.orchestrator.work_dir,
                                 );
-                                HealthCheckerEntry::Ready(Arc::new(DockerCommandChecker::new(
+                                ready(Arc::new(DockerCommandChecker::new(
                                     container_name,
                                     cmd.to_string(),
                                     timeout,
                                 )))
                             } else {
                                 // Process/Gradle service - run on host
-                                HealthCheckerEntry::Ready(Arc::new(CommandChecker::new(
+                                ready(Arc::new(CommandChecker::new(
                                     "bash".to_string(),
                                     vec!["-c".to_string(), cmd.to_string()],
                                     timeout,
@@ -238,13 +261,24 @@ impl<'a> HealthCheckRunner<'a> {
     /// while the actual service crashes (e.g. dev servers that refuse to
     /// start because "another server is already running").
     ///
-    /// Docker command healthchecks run inside the not-yet-created container,
-    /// so they can only error here — that is treated as "nothing listening".
+    /// Only HTTP probes identify a listener. A command may check local state
+    /// or intentionally be `true`; passing it does not prove a foreign process.
     pub async fn preflight_foreign_listener(&self, name: &str) -> Result<()> {
+        if self
+            .orchestrator
+            .config
+            .services
+            .get(name)
+            .and_then(|s| s.healthcheck.as_ref())
+            .and_then(|h| h.get_http_url())
+            .is_none()
+        {
+            return Ok(());
+        }
         let checker = {
             let health_checkers = self.orchestrator.health_checkers.read().await;
             match health_checkers.get(name) {
-                Some(HealthCheckerEntry::Ready(c)) => Arc::clone(c),
+                Some(HealthCheckerEntry::Ready { checker, .. }) => Arc::clone(checker),
                 // An invalid checker can't probe anything; the start path
                 // surfaces it as a warning, so don't block the start here.
                 Some(HealthCheckerEntry::Invalid { .. }) | None => return Ok(()),
@@ -295,10 +329,16 @@ impl<'a> HealthCheckRunner<'a> {
     /// Wait for a service to become healthy (used by script dependencies).
     /// Returns Ok(()) when healthy, or Err after timeout.
     pub async fn wait_for_healthy(&self, service_name: &str, timeout: Duration) -> Result<()> {
-        let checker = {
+        // The caller's own deadline wins here — a script waiting on a
+        // dependency decides how long it is prepared to wait, independent of
+        // that service's configured start period. Only the poll interval
+        // comes from the service's configuration.
+        let (checker, check_interval) = {
             let health_checkers = self.orchestrator.health_checkers.read().await;
             match health_checkers.get(service_name) {
-                Some(HealthCheckerEntry::Ready(c)) => Arc::clone(c),
+                Some(HealthCheckerEntry::Ready {
+                    checker, interval, ..
+                }) => (Arc::clone(checker), *interval),
                 // A script explicitly waiting on this service's health can
                 // never succeed with an unconstructable checker — fail with
                 // the reason rather than pretending the wait passed.
@@ -317,7 +357,6 @@ impl<'a> HealthCheckRunner<'a> {
         };
 
         let start = std::time::Instant::now();
-        let check_interval = Duration::from_millis(500);
 
         // Same visibility rule as await_healthcheck: without a pending
         // progress line (script deps run without one), this wait would
@@ -383,10 +422,14 @@ impl<'a> HealthCheckRunner<'a> {
         manager_arc: &Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>>,
     ) -> Result<StartHealth> {
         // Clone the Arc and drop the read lock immediately
-        let checker = {
+        let (checker, timeout, check_interval) = {
             let health_checkers = self.orchestrator.health_checkers.read().await;
             match health_checkers.get(name) {
-                Some(HealthCheckerEntry::Ready(c)) => Arc::clone(c),
+                Some(HealthCheckerEntry::Ready {
+                    checker,
+                    start_period,
+                    interval,
+                }) => (Arc::clone(checker), *start_period, *interval),
                 // Configured but unconstructable: non-fatal (matches the
                 // long-standing behavior of starting anyway), but reported
                 // as a warning, not as a silent Unchecked.
@@ -400,9 +443,7 @@ impl<'a> HealthCheckRunner<'a> {
             }
         };
 
-        let timeout = checker.timeout();
         let start = std::time::Instant::now();
-        let check_interval = Duration::from_millis(500);
 
         // Callers with an in-place progress line (fed start) get live detail
         // attached to it; everyone else (restart, script deps, non-TTY) keeps
@@ -636,6 +677,16 @@ mod tests {
     #![allow(clippy::disallowed_methods)]
 
     use super::*;
+
+    /// A registry entry for a test checker, on a deliberately short schedule
+    /// so a test that waits out the start period finishes in milliseconds.
+    fn test_ready(checker: Arc<dyn HealthChecker>) -> HealthCheckerEntry {
+        HealthCheckerEntry::Ready {
+            checker,
+            start_period: Duration::from_millis(200),
+            interval: Duration::from_millis(20),
+        }
+    }
     use crate::config::Config;
     use async_trait::async_trait;
 
@@ -696,7 +747,7 @@ mod tests {
                 .unwrap();
         orchestrator.health_checkers.write().await.insert(
             "service".to_string(),
-            HealthCheckerEntry::Ready(Arc::new(AlwaysUnhealthy {
+            test_ready(Arc::new(AlwaysUnhealthy {
                 timeout: Duration::from_millis(1),
             })),
         );
@@ -729,11 +780,19 @@ mod tests {
             state.status = Status::Running;
             tracker.register_service(state).await.unwrap();
         }
+        // A zero start period expires on the first check, so this exercises
+        // the timeout path without waiting. The reported duration comes from
+        // the registered start period — that is the deadline the wait
+        // actually used — not from the probe's own timeout.
         orchestrator.health_checkers.write().await.insert(
             "service".to_string(),
-            HealthCheckerEntry::Ready(Arc::new(AlwaysUnhealthy {
-                timeout: Duration::ZERO,
-            })),
+            HealthCheckerEntry::Ready {
+                checker: Arc::new(AlwaysUnhealthy {
+                    timeout: Duration::ZERO,
+                }),
+                start_period: Duration::ZERO,
+                interval: Duration::from_millis(20),
+            },
         );
         let manager: Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>> =
             Arc::new(tokio::sync::Mutex::new(Box::new(LiveManager)));
@@ -821,7 +880,7 @@ mod tests {
         }
         orchestrator.health_checkers.write().await.insert(
             "service".to_string(),
-            HealthCheckerEntry::Ready(Arc::new(AlwaysUnhealthy {
+            test_ready(Arc::new(AlwaysUnhealthy {
                 timeout: Duration::ZERO,
             })),
         );
@@ -1005,7 +1064,7 @@ mod tests {
         }
         orchestrator.health_checkers.write().await.insert(
             "service".to_string(),
-            HealthCheckerEntry::Ready(Arc::new(AlwaysHealthyChecker)),
+            test_ready(Arc::new(AlwaysHealthyChecker)),
         );
         let manager: Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>> =
             Arc::new(tokio::sync::Mutex::new(Box::new(LiveManager)));
@@ -1061,7 +1120,7 @@ mod tests {
         // run anywhere near this deadline.
         orchestrator.health_checkers.write().await.insert(
             "service".to_string(),
-            HealthCheckerEntry::Ready(Arc::new(AlwaysUnhealthy {
+            test_ready(Arc::new(AlwaysUnhealthy {
                 timeout: Duration::from_secs(30),
             })),
         );

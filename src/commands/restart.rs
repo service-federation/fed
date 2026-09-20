@@ -31,8 +31,7 @@ pub async fn run_restart(
     config: &Config,
     services: Vec<String>,
     config_path: &Path,
-    offline: bool,
-    profiles: Vec<String>,
+    flags: super::supervise::InheritedFlags,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
     let restarted_names: Vec<String> = if services.is_empty() {
@@ -100,13 +99,11 @@ pub async fn run_restart(
     // path, so it also gets to respawn a dead/missing supervisor, same as
     // `fed start`. `fed status` deliberately does neither, since it never
     // mutates state and stays strictly read-only.
-    if super::supervise::any_has_restart_policy(config, restarted_names.iter()) {
+    if super::supervise::any_needs_supervision(config, restarted_names.iter()) {
         let work_dir = orchestrator.work_dir().to_path_buf();
-        if let Err(e) =
-            super::supervise::spawn_if_needed(&work_dir, config_path, offline, &profiles)
-        {
+        if let Err(e) = super::supervise::spawn_if_needed(&work_dir, config_path, &flags) {
             out.warning(&format!(
-                "Warning: failed to start the restart-policy supervisor: {}",
+                "Warning: failed to start the service supervisor: {}",
                 e
             ));
         }

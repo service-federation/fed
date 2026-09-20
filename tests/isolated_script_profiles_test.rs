@@ -29,6 +29,7 @@ scripts:
     let temp = tempfile::tempdir().unwrap();
 
     let ctx = RunContext {
+        variants: vec![],
         offline: true,
         secret_cache: fed::SecretCacheMode::File,
         is_interactive: false,

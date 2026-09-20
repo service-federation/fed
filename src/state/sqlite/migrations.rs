@@ -72,6 +72,11 @@ impl SqliteStateTracker {
             self.migrate_v8_to_v9().await?;
         }
 
+        // Migration from v9 to v10: Record which variant a service started as.
+        if current_version < 10 {
+            self.migrate_v9_to_v10().await?;
+        }
+
         Ok(())
     }
 
@@ -561,6 +566,58 @@ impl SqliteStateTracker {
         Ok(())
     }
 
+    /// Migration v9 -> v10: Add the `variant` column.
+    ///
+    /// A service that declares `variants:` is started as exactly one of them,
+    /// chosen from flags that a later `fed status` in a different shell never
+    /// saw. Persisting the choice at registration is what lets status and the
+    /// TUI report the implementation that is actually running rather than the
+    /// one the config would pick today.
+    async fn migrate_v9_to_v10(&self) -> Result<()> {
+        debug!("Running migration v9 -> v10: Adding variant column");
+
+        self.conn
+            .call(|conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+                let tx = conn.transaction()?;
+
+                let already_applied: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM schema_version WHERE version = 10",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+
+                if already_applied {
+                    return Ok(());
+                }
+
+                let has_column: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM pragma_table_info('services') WHERE name = 'variant'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+
+                if !has_column {
+                    tx.execute("ALTER TABLE services ADD COLUMN variant TEXT", [])?;
+                }
+
+                tx.execute(
+                    "INSERT INTO schema_version (version, applied_at) VALUES (10, datetime('now'))",
+                    [],
+                )?;
+
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+
+        info!("Migration v9 -> v10 completed successfully");
+        Ok(())
+    }
+
     /// Create database schema
     pub(super) async fn create_schema(&self) -> Result<()> {
         self.conn.call(|conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
@@ -599,7 +656,8 @@ impl SqliteStateTracker {
                     desired_state TEXT NOT NULL DEFAULT 'running',
                     native_restart_enabled INTEGER NOT NULL DEFAULT 0,
                     stale_grace_count INTEGER NOT NULL DEFAULT 0,
-                    process_group_id INTEGER
+                    process_group_id INTEGER,
+                    variant TEXT
                 );
 
                 -- Indexes for services
@@ -810,7 +868,7 @@ mod desired_state_migration_tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     #[tokio::test]
@@ -1030,7 +1088,7 @@ mod native_restart_migration_tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
 
         let process_group_id: Option<u32> = conn
             .query_row(

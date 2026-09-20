@@ -108,6 +108,7 @@ impl SqliteStateTracker {
         let startup_message = service_state.startup_message.clone();
         let desired_state = service_state.desired_state.to_string();
         let native_restart_enabled = service_state.native_restart_enabled;
+        let variant = service_state.variant.clone();
 
         self.conn
             .call(move |conn: &mut rusqlite::Connection| {
@@ -139,8 +140,8 @@ impl SqliteStateTracker {
                 // startup_message, since an already-registered row is left
                 // untouched above.
                 tx.execute(
-                    "INSERT INTO services (id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    "INSERT INTO services (id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled, variant)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     rusqlite::params![
                         &id,
                         &status,
@@ -156,6 +157,7 @@ impl SqliteStateTracker {
                         startup_message.as_deref(),
                         &desired_state,
                         native_restart_enabled,
+                        variant.as_deref(),
                     ],
                 )?;
 
@@ -727,7 +729,7 @@ impl SqliteStateTracker {
     pub async fn get_services(&self) -> HashMap<String, ServiceState> {
         match self.conn.call(|conn: &mut rusqlite::Connection| {
             let mut stmt = conn.prepare(
-                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled FROM services"
+                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled, variant FROM services"
             )?;
 
             let services_iter = stmt.query_map([], |row| {
@@ -758,6 +760,7 @@ impl SqliteStateTracker {
                         consecutive_failures: row.get(10)?,
                         port_allocations: HashMap::new(), // Will be populated below
                         startup_message: row.get(11)?,
+                        variant: row.get(14)?,
                         desired_state: desired_state_str.parse::<DesiredState>().unwrap_or(DesiredState::Running),
                         native_restart_enabled,
                     },
@@ -830,7 +833,7 @@ impl SqliteStateTracker {
 
         self.conn.call(move |conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<ServiceState>> {
             let service = match conn.query_row(
-                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled FROM services WHERE id = ?1",
+                "SELECT id, status, service_type, pid, container_id, started_at, external_repo, namespace, restart_count, last_restart_at, consecutive_failures, startup_message, desired_state, native_restart_enabled, variant FROM services WHERE id = ?1",
                 rusqlite::params![&service_id],
                 |row| {
                     let id: String = row.get(0)?;
@@ -855,6 +858,7 @@ impl SqliteStateTracker {
                         consecutive_failures: row.get(10)?,
                         port_allocations: HashMap::new(),
                         startup_message: row.get(11)?,
+                        variant: row.get(14)?,
                         desired_state: desired_state_str.parse::<DesiredState>().unwrap_or(DesiredState::Running),
                         native_restart_enabled,
                     })
@@ -1485,6 +1489,7 @@ mod tests {
             startup_message: Some("Running on port 8080".to_string()),
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
+            variant: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1607,6 +1612,7 @@ mod tests {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
+            variant: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1694,6 +1700,7 @@ mod tests {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
+            variant: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1729,6 +1736,7 @@ mod tests {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
+            variant: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1769,6 +1777,7 @@ mod tests {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
+            variant: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1807,6 +1816,7 @@ mod tests {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
+            variant: None,
         };
         tracker.register_service(dead).await.unwrap();
         register_stopped_service(&mut tracker, "stopped-one").await;
@@ -1851,6 +1861,7 @@ mod tests {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
+            variant: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1890,6 +1901,7 @@ mod tests {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
+            variant: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -1948,6 +1960,7 @@ mod tests {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
+            variant: None,
         }
     }
 
@@ -2132,6 +2145,7 @@ mod tests {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: true,
+            variant: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -2186,6 +2200,7 @@ mod tests {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: true,
+            variant: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -2249,6 +2264,7 @@ mod tests {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
+            variant: None,
         };
         tracker.register_service(state).await.unwrap();
 
@@ -2269,6 +2285,7 @@ mod tests {
             startup_message: None,
             desired_state: DesiredState::Running,
             native_restart_enabled: false,
+            variant: None,
         };
         let outcome = tracker.register_service(new_state).await.unwrap();
         assert_eq!(
