@@ -36,6 +36,7 @@ services:
     healthcheck:
       http_get: 'http://127.0.0.1:{{STORAGE_PORT}}/health'
       start_period: 15s
+      probe_timeout: 1s
 
   catalog:
     default_variant: live
@@ -68,6 +69,7 @@ services:
     startup_message: 'Open http://127.0.0.1:{{FRONTEND_PORT}}'
     healthcheck:
       http_get: 'http://127.0.0.1:{{FRONTEND_PORT}}/health'
+      probe_timeout: 1s
 
   # Grouping node: no process of its own, completes after frontend is ready.
   stack:

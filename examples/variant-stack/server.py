@@ -4,6 +4,7 @@ import argparse
 import html
 import json
 import os
+import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from string import Template
@@ -112,6 +113,12 @@ class DemoServer(ThreadingHTTPServer):
     def __init__(self, role, port):
         self.role = role
         super().__init__(("127.0.0.1", port), Handler)
+
+    def server_bind(self):
+        # HTTPServer.server_bind also does a reverse DNS lookup of the host,
+        # which can stall for a long time on some machines before listening.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def main():
