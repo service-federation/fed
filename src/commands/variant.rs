@@ -202,3 +202,32 @@ async fn load_config(
 
     Ok(config)
 }
+
+/// `service:variant` pins for every service that is running, or meant to be
+/// running, with a variant recorded in state.
+///
+/// Commands that look at or stop what is running use these, so a service
+/// started with `--variant` resolves to what actually runs. Without them,
+/// `fed status` checks the default variant's process or container and
+/// reports a running service as stopped. A recorded variant that fed.yaml
+/// no longer declares is skipped, so it cannot turn into an error.
+pub async fn registered_variants(config: &fed::Config, work_dir: &Path) -> Vec<String> {
+    if !fed::fed_dir::fed_dir(work_dir).join("lock.db").exists() {
+        return Vec::new();
+    }
+    let Ok(tracker) = fed::state::StateTracker::new_for_supervisor(work_dir.to_path_buf()).await
+    else {
+        return Vec::new();
+    };
+    let mut pins = Vec::new();
+    for (name, service) in &config.services {
+        if let Some(state) = tracker.get_service(name).await
+            && state.desired_state == fed::state::DesiredState::Running
+            && let Some(variant) = state.variant
+            && service.variants.contains_key(&variant)
+        {
+            pins.push(format!("{name}:{variant}"));
+        }
+    }
+    pins
+}

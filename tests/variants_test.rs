@@ -1156,3 +1156,53 @@ services:
         assert!(error.contains("worker:terminal"), "{error}");
     }
 }
+
+/// A service started with `--variant` must show as running in a later
+/// `fed status` without the flag. When the variants have different types,
+/// resolving the default would check a process that was never started.
+// Requires Docker
+#[test]
+#[ignore]
+fn status_without_the_flag_sees_the_variant_that_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("fed.yaml");
+    std::fs::write(
+        &config_path,
+        r#"
+services:
+  svc:
+    default_variant: source
+    variants:
+      source:
+        process: sleep 301
+      image:
+        image: alpine:3
+        command: sleep 302
+"#,
+    )
+    .unwrap();
+    let fed = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_fed"))
+            .arg("--workdir")
+            .arg(tmp.path())
+            .arg("--config")
+            .arg(&config_path)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let start = fed(&["--variant", "svc:image", "start", "svc"]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    let status = fed(&["status", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let svc = &json.get("services").unwrap_or(&json)["svc"];
+    let stop = fed(&["stop"]);
+    assert_eq!(svc["status"], "running", "{svc}");
+    assert_eq!(svc["service_type"], "docker", "{svc}");
+    assert!(stop.status.success());
+}

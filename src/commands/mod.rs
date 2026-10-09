@@ -62,7 +62,7 @@ pub(crate) use supervise::{any_needs_supervision, spawn_if_needed as spawn_super
 pub use top::run_top;
 pub use tui::run_tui;
 pub use validate::run_validate;
-pub use variant::run_variant;
+pub use variant::{registered_variants, run_variant};
 pub use workspace::run_workspace;
 
 /// Emit non-breaking warnings for unknown (typo'd) config keys — used by `fed validate`
