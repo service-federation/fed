@@ -456,6 +456,48 @@ fn test_supervisor_survives_sighup_and_keeps_restarting() {
     let _ = run_fed(&config_path, workdir, &["stop"]);
 }
 
+/// A crashed service that boots slower than `retries` failed probes take
+/// must be restarted once. Without a start period after the restart, the
+/// supervisor counts the boot as failed probes and kills it again.
+#[test]
+fn test_slow_booting_service_is_restarted_once_after_a_crash() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let workdir = temp_dir.path();
+    let ready = workdir.join("ready");
+    let config = format!(
+        r#"
+services:
+  slow:
+    process: sh -c 'rm -f {ready}; sleep 3; touch {ready}; exec sleep 304'
+    restart: always
+    healthcheck:
+      command: test -f {ready}
+      timeout: 20s
+"#,
+        ready = ready.display()
+    );
+    let config_path = create_test_config(&temp_dir, &config);
+
+    let start = run_fed(&config_path, workdir, &["start", "slow"]);
+    assert!(start.status.success(), "start failed: {}", combined(&start));
+    wait_for_live_supervisor(workdir, Duration::from_secs(10));
+
+    let crashed = service_pid(workdir, "slow").expect("slow should have a tracked pid");
+    kill9(crashed);
+    wait_for_restart_count_above(workdir, "slow", 0, Duration::from_secs(20));
+
+    // Long enough to boot, and for three failed probes and a second restart.
+    std::thread::sleep(Duration::from_secs(8));
+    assert_eq!(
+        restart_count(workdir, "slow"),
+        1,
+        "slow was restarted again"
+    );
+
+    let stop = run_fed(&config_path, workdir, &["stop"]);
+    assert!(stop.status.success(), "stop failed: {}", combined(&stop));
+}
+
 /// Single-instance enforcement (hole #4's locking half, daemon side):
 /// spawning several `fed supervise` processes concurrently against the
 /// same workspace must leave exactly one alive, holding

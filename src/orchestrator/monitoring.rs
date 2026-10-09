@@ -292,15 +292,20 @@ pub(super) fn probe_failure_demotes(
 /// - alive, no probe (or its checker was invalid) → healthy, exactly as
 ///   before configured probes were polled here at all.
 /// - alive, probe failed → unhealthy only once `retries` consecutive probes
-///   have failed.
+///   have failed. During a restarted service's start period (`start_grace`),
+///   a failure does not count at all, as in Docker.
 fn apply_probe_retries(
     results: &mut [HealthCheckResult],
     config: &Config,
     counters: &mut HashMap<String, u32>,
+    start_grace: &mut HashMap<String, tokio::time::Instant>,
 ) {
+    let now = tokio::time::Instant::now();
+    start_grace.retain(|_, until| *until > now);
     for result in results.iter_mut() {
         if !result.alive {
             counters.remove(&result.name);
+            start_grace.remove(&result.name);
             result.is_healthy = Some(false);
             continue;
         }
@@ -308,8 +313,10 @@ fn apply_probe_retries(
             ProbeOutcome::NotDue => None,
             ProbeOutcome::NotConfigured | ProbeOutcome::Passed => {
                 counters.remove(&result.name);
+                start_grace.remove(&result.name);
                 Some(true)
             }
+            ProbeOutcome::Failed if start_grace.contains_key(&result.name) => None,
             ProbeOutcome::Failed => {
                 let retries = config
                     .services
@@ -589,13 +596,14 @@ async fn execute_health_check_cycle(
     health_checkers: &SharedHealthCheckerRegistry,
     probe_failures: &mut HashMap<String, u32>,
     next_probes: &mut HashMap<String, tokio::time::Instant>,
+    start_grace: &mut HashMap<String, tokio::time::Instant>,
 ) {
     // Check all services concurrently
     let mut health_results =
         check_all_services(services, scope, health_checkers, next_probes).await;
 
     // Fold in the configured probes, applying `retries`
-    apply_probe_retries(&mut health_results, config, probe_failures);
+    apply_probe_retries(&mut health_results, config, probe_failures, start_grace);
 
     // Persist configured-probe verdicts independently of manager liveness.
     // Status readers overlay these only while the manager is still alive.
@@ -798,6 +806,15 @@ async fn execute_health_check_cycle(
             {
                 probe_failures.remove(&service_name);
                 next_probes.remove(&service_name);
+                let start_period = config
+                    .services
+                    .get(&service_name)
+                    .map(|s| s.start_period_or_default())
+                    .unwrap_or(Duration::from_secs(5));
+                start_grace.insert(
+                    service_name.clone(),
+                    tokio::time::Instant::now() + start_period,
+                );
                 successful_restarts.push(service_name);
             }
         } else if !matches!(restart_policy, RestartPolicy::No) {
@@ -1037,6 +1054,13 @@ async fn run_monitoring_loop(
     // probes it never ran.
     let mut probe_failures: HashMap<String, u32> = HashMap::new();
     let mut next_probes = HashMap::new();
+    // Services still inside their start period, when a failed probe means
+    // "still booting" rather than "unhealthy". Filled after each restart,
+    // and once on the first cycle for services that have not passed a probe
+    // yet: a supervisor attaching may have just restarted them, or
+    // `fed start` may have handed them over before their healthcheck passed.
+    let mut start_grace: HashMap<String, tokio::time::Instant> = HashMap::new();
+    let mut start_grace_seeded = false;
 
     // Wake often enough for the shortest configured interval. Per-service
     // deadlines prevent longer-interval probes from running on every tick;
@@ -1067,6 +1091,24 @@ async fn run_monitoring_loop(
                     continue;
                 }
 
+                if !start_grace_seeded {
+                    start_grace_seeded = true;
+                    let now = tokio::time::Instant::now();
+                    for (name, manager) in services.read().await.iter() {
+                        let Some(service) = config.services.get(name) else {
+                            continue;
+                        };
+                        if service.healthcheck.is_some()
+                            && manager.lock().await.status() == Status::Running
+                        {
+                            start_grace.insert(
+                                name.clone(),
+                                now + service.start_period_or_default(),
+                            );
+                        }
+                    }
+                }
+
                 // Clone references for the panic-safe closure
                 let services_clone = Arc::clone(&services);
                 let state_tracker_clone = Arc::clone(&state_tracker);
@@ -1092,6 +1134,7 @@ async fn run_monitoring_loop(
                         &health_checkers_clone,
                         &mut probe_failures,
                         &mut next_probes,
+                        &mut start_grace,
                     )
                     .await;
                 })
@@ -1592,6 +1635,53 @@ mod tests {
         }
     }
 
+    /// After a restart, a slow-booting service must get its start period
+    /// before failed probes count, or the supervisor kills it mid-boot.
+    #[test]
+    fn failed_probes_do_not_count_during_the_start_period_after_a_restart() {
+        let mut config = Config::default();
+        config.services.insert(
+            "amber".into(),
+            crate::config::Service {
+                process: Some("sleep 30".into()),
+                healthcheck: Some(crate::config::HealthCheck::Command("true".into())),
+                ..Default::default()
+            },
+        );
+        let probe = |outcome| {
+            vec![HealthCheckResult {
+                name: "amber".into(),
+                manager: fake_entry(Status::Running, true),
+                alive: true,
+                probe: outcome,
+                is_healthy: None,
+            }]
+        };
+        let mut failures = HashMap::new();
+        let now = tokio::time::Instant::now();
+        let mut grace = HashMap::from([("amber".to_string(), now + Duration::from_secs(60))]);
+
+        for _ in 0..5 {
+            let mut results = probe(ProbeOutcome::Failed);
+            apply_probe_retries(&mut results, &config, &mut failures, &mut grace);
+            assert_eq!(results[0].is_healthy, None);
+        }
+        assert!(failures.is_empty());
+
+        // A pass ends the start period early.
+        let mut results = probe(ProbeOutcome::Passed);
+        apply_probe_retries(&mut results, &config, &mut failures, &mut grace);
+        assert_eq!(results[0].is_healthy, Some(true));
+        assert!(grace.is_empty());
+
+        // Once it has expired, failures count again.
+        grace.insert("amber".into(), now - Duration::from_secs(1));
+        let mut results = probe(ProbeOutcome::Failed);
+        apply_probe_retries(&mut results, &config, &mut failures, &mut grace);
+        assert_eq!(failures["amber"], 1);
+        assert!(grace.is_empty());
+    }
+
     #[tokio::test]
     async fn configured_probes_persist_retry_threshold_and_recovery() {
         let services: ServicesMap = Arc::new(RwLock::new(HashMap::from([(
@@ -1645,6 +1735,7 @@ mod tests {
             &registry,
             &mut failures,
             &mut next,
+            &mut HashMap::new(),
         )
         .await;
         assert_eq!(
@@ -1667,6 +1758,7 @@ mod tests {
             &registry,
             &mut failures,
             &mut next,
+            &mut HashMap::new(),
         )
         .await;
         assert_eq!(failures["amber"], 1);
@@ -1688,6 +1780,7 @@ mod tests {
                 &registry,
                 &mut failures,
                 &mut next,
+                &mut HashMap::new(),
             )
             .await;
             assert_eq!(
@@ -1708,7 +1801,7 @@ mod tests {
             .await
             .insert("amber".into(), fake_entry(Status::Running, false));
         let mut results = check_all_services(&services, None, &registry, &mut next).await;
-        apply_probe_retries(&mut results, &config, &mut failures);
+        apply_probe_retries(&mut results, &config, &mut failures, &mut HashMap::new());
         assert_eq!(results[0].is_healthy, Some(false));
     }
 }
