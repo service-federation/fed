@@ -395,7 +395,6 @@ Before you add a token:
 - **ECR passwords expire after 12 hours.** For ECR, keep using `aws ecr get-login-password | docker login`.
 
 `registry_auth` covers `image:` services and the image pull before `fed start`. Compose services and the base images of Dockerfile `build:` services still pull with your own Docker credentials.
-||||||| parent of aabf7cd (Harden the vault client against redirects, plain HTTP and silent cache fallback)
 
 ## Documentation and examples
 
