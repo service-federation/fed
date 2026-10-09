@@ -233,7 +233,13 @@ impl VariantSelection {
         }
 
         if let Some(pinned) = self.file_pin.get(name) {
-            return Ok((resolve_pin(name, service, pinned)?, VariantSource::FilePin));
+            match resolve_pin(name, service, pinned) {
+                Ok(variant) => return Ok((variant, VariantSource::FilePin)),
+                // The variant was removed from fed.yaml after it was saved.
+                Err(e) => tracing::warn!(
+                    "{e} Ignoring its pin in {VARIANTS_FILE_REL}. Remove it with `fed variant unset {name}`."
+                ),
+            }
         }
 
         if let Some(hit) = first_match(&self.file_prefer, service) {
@@ -370,23 +376,25 @@ pub fn resolve_variants(
     {
         return Ok(());
     }
-    // Pins name a specific service, so a pin that matches nothing is a
-    // mistake worth stopping for — unlike a preference-list name, which is
-    // deliberately allowed to miss (see below).
+    // A `--variant` pin names a specific service, so a pin that matches
+    // nothing is a mistake worth stopping for — unlike a preference-list
+    // name, which is deliberately allowed to miss (see below). A saved pin
+    // only warns: it outlives edits to fed.yaml, and failing on it would
+    // also block `fed stop` and `fed status`.
     for name in selection.pinned_services() {
-        match config.services.get(name) {
-            None => {
-                return Err(Error::Validation(format!(
-                    "Cannot pin a variant for '{name}': no such service in this config."
-                )));
-            }
+        let problem = match config.services.get(name) {
+            None => format!("Cannot pin a variant for '{name}': no such service in this config."),
             Some(service) if service.variants.is_empty() && service.variant.is_none() => {
-                return Err(Error::Validation(format!(
-                    "Service '{name}' has no variants."
-                )));
+                format!("Service '{name}' has no variants.")
             }
-            Some(_) => {}
+            Some(_) => continue,
+        };
+        if selection.cli_pin.contains_key(name) {
+            return Err(Error::Validation(problem));
         }
+        tracing::warn!(
+            "{problem} Ignoring its pin in {VARIANTS_FILE_REL}. Remove it with `fed variant unset {name}`."
+        );
     }
 
     // A preference-list name no service offers is deliberately not an error:

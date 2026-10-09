@@ -49,6 +49,13 @@ fn set(
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
     let (prefer, pin) = fed::config::variants::split_entries(entries)?;
+    // Saved pins only warn when they go stale, so check the new entries as
+    // `--variant` pins, which fail on a typo.
+    fed::config::variants::resolve_variants(
+        &mut config.clone(),
+        &VariantSelection::from_cli(entries)?,
+        &[],
+    )?;
     let mut persisted = PersistedVariants::load(work_dir)?;
 
     if !prefer.is_empty() {

@@ -471,6 +471,97 @@ fn pinning_an_unknown_service_is_an_error() {
     assert!(err.contains("no such service"), "unexpected error: {err}");
 }
 
+/// Resolve `yaml` against a persisted `.fed/variants.yaml` holding `pins`.
+fn resolve_with_saved_pins(yaml: &str, pins: &[(&str, &str)]) -> fed::error::Result<Config> {
+    let mut config = parse(yaml);
+    config.validate()?;
+    let tmp = tempfile::tempdir().unwrap();
+    PersistedVariants {
+        prefer: Vec::new(),
+        pin: pins
+            .iter()
+            .map(|(s, v)| (s.to_string(), v.to_string()))
+            .collect(),
+    }
+    .save(tmp.path())?;
+    let selection = VariantSelection::load(&[], tmp.path())?;
+    resolve_variants(&mut config, &selection, &[])?;
+    Ok(config)
+}
+
+/// A saved pin outlives edits to fed.yaml. When its service is removed,
+/// every command must still work, or `fed stop` cannot stop what is running.
+#[test]
+fn a_saved_pin_for_a_removed_service_is_ignored() {
+    let config = resolve_with_saved_pins(TWO_SERVICES, &[("removed", "go")])
+        .expect("a stale saved pin must not block resolution");
+    assert_eq!(config.services["catalog"].variant.as_deref(), Some("java"));
+}
+
+#[test]
+fn a_saved_pin_for_a_service_without_variants_is_ignored() {
+    let config = resolve_with_saved_pins(TWO_SERVICES, &[("storage", "go")])
+        .expect("a stale saved pin must not block resolution");
+    assert!(config.services["storage"].variant.is_none());
+}
+
+#[test]
+fn a_saved_pin_for_a_removed_variant_falls_back_to_the_default() {
+    let config = resolve_with_saved_pins(TWO_SERVICES, &[("catalog", "go")])
+        .expect("a stale saved pin must not block resolution");
+    assert_eq!(config.services["catalog"].variant.as_deref(), Some("java"));
+}
+
+#[test]
+fn fed_stop_works_after_a_pinned_service_is_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("fed.yaml");
+    std::fs::write(&config_path, TWO_SERVICES).unwrap();
+    let fed = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_fed"))
+            .arg("--workdir")
+            .arg(tmp.path())
+            .arg("--config")
+            .arg(&config_path)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(fed(&["variant", "set", "catalog:rust"]).status.success());
+    std::fs::write(
+        &config_path,
+        "services:\n  storage:\n    process: sleep 300\n",
+    )
+    .unwrap();
+
+    for command in [&["status"][..], &["stop"][..]] {
+        let output = fed(command);
+        assert!(
+            output.status.success(),
+            "fed {command:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn fed_variant_set_rejects_a_pin_for_an_unknown_service() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("fed.yaml");
+    std::fs::write(&config_path, TWO_SERVICES).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fed"))
+        .arg("--workdir")
+        .arg(tmp.path())
+        .arg("--config")
+        .arg(&config_path)
+        .args(["variant", "set", "nosuch:go"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no such service"));
+    assert!(!tmp.path().join(".fed/variants.yaml").exists());
+}
+
 /// A preference-list name nothing offers is deliberately tolerated: one
 /// list is meant to serve several checkouts, most of which know only some
 /// of the names in it.
