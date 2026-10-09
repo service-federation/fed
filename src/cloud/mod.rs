@@ -380,6 +380,9 @@ pub fn vault_ttl() -> Duration {
 /// Clients ≤ 7.2.0 predate this header; the server must treat its absence as
 /// "too old to say".
 pub const VERSION_HEADER: &str = "x-fed-version";
+/// The cloud API contract is independent of the CLI's release version.
+pub const API_VERSION_HEADER: &str = "x-fed-api-version";
+pub const API_VERSION: &str = "2";
 
 /// Builder with everything both cloud clients share: the version header (so
 /// the server can enforce a minimum CLI version) and a matching user agent.
@@ -391,9 +394,46 @@ fn client_builder() -> reqwest::ClientBuilder {
         VERSION_HEADER,
         reqwest::header::HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
     );
+    headers.insert(
+        API_VERSION_HEADER,
+        reqwest::header::HeaderValue::from_static(API_VERSION),
+    );
     reqwest::Client::builder()
         .user_agent(concat!("fed/", env!("CARGO_PKG_VERSION")))
         .default_headers(headers)
+        // Neither bearer tokens nor single-use login codes may be replayed to
+        // a destination chosen by a redirect response.
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+/// Validate the configured origin before building any cloud request. Supplying
+/// a loopback HTTP URL is an explicit local development choice; all remote
+/// origins must use HTTPS.
+pub fn cloud_base_url(raw: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw)
+        .map_err(|_| Error::Validation("cloud: invalid vault URL".into()))?;
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    let local_http = url.scheme() == "http" && loopback;
+    if !(url.scheme() == "https" || local_http)
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err(Error::Validation(
+            "cloud: vault URL must be an HTTPS origin or an explicit local loopback HTTP origin"
+                .into(),
+        ));
+    }
+    Ok(url)
+}
+
+fn api_url(base: &str, path: &str) -> Result<reqwest::Url> {
+    let mut url = cloud_base_url(base)?;
+    url.set_path(path);
+    Ok(url)
 }
 
 fn client() -> &'static reqwest::Client {
@@ -448,7 +488,7 @@ pub struct MeOrg {
 
 pub async fn whoami(creds: &Credentials) -> Result<Me> {
     let res = client()
-        .get(format!("{}/api/v1/me", creds.url))
+        .get(api_url(&creds.url, "/api/v1/me")?)
         .bearer_auth(&creds.token)
         .send()
         .await
@@ -483,6 +523,7 @@ pub async fn whoami(creds: &Credentials) -> Result<Me> {
 pub struct AuthRequest {
     pub request: String,
     pub poll_secret: String,
+    pub pairing_code: String,
 }
 
 /// Redacting Debug: the poll secret must never reach a log line or panic
@@ -492,6 +533,7 @@ impl std::fmt::Debug for AuthRequest {
         f.debug_struct("AuthRequest")
             .field("request", &"<redacted>")
             .field("poll_secret", &"<redacted>")
+            .field("pairing_code", &self.pairing_code)
             .finish()
     }
 }
@@ -506,19 +548,31 @@ struct AuthRequestBody<'a> {
 struct AuthRequestResponse {
     request: String,
     poll_secret: String,
+    pairing_code: String,
 }
 
 /// Create a server-side poll-mode authorization request. The device label
 /// travels only in this POST body over HTTPS — never in a URL.
 pub async fn create_auth_request(base_url: &str, label: &str) -> Result<AuthRequest> {
     let res = client()
-        .post(format!("{}/api/v1/cli/authorize-request", base_url))
+        .post(api_url(base_url, "/api/v1/cli/authorize-request")?)
         .json(&AuthRequestBody { poll: true, label })
         .send()
         .await
         .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", base_url, e)))?;
     if !res.status().is_success() {
         return Err(api_error(res.status(), "starting login"));
+    }
+    if res
+        .headers()
+        .get(API_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some(API_VERSION)
+    {
+        return Err(Error::Validation(
+            "cloud: server did not confirm API protocol version 2; update the server or use a compatible fed build"
+                .into(),
+        ));
     }
     let body: AuthRequestResponse = res
         .json()
@@ -527,6 +581,7 @@ pub async fn create_auth_request(base_url: &str, label: &str) -> Result<AuthRequ
     Ok(AuthRequest {
         request: body.request,
         poll_secret: body.poll_secret,
+        pairing_code: body.pairing_code,
     })
 }
 
@@ -569,7 +624,7 @@ struct PollResponse {
 /// the exchange code when it has. The code never appears in any error.
 pub async fn poll_auth_request(base_url: &str, auth: &AuthRequest) -> Result<PollOutcome> {
     let res = client()
-        .post(format!("{}/api/v1/cli/poll", base_url))
+        .post(api_url(base_url, "/api/v1/cli/poll")?)
         .json(&PollBody {
             request: &auth.request,
             secret: &auth.poll_secret,
@@ -615,7 +670,7 @@ struct ExchangeCodeResponse {
 /// maps to one fixed, friendly message here.
 pub async fn exchange_code(base_url: &str, code: &str) -> Result<String> {
     let res = client()
-        .post(format!("{}/api/v1/cli/token", base_url))
+        .post(api_url(base_url, "/api/v1/cli/token")?)
         .json(&ExchangeCodeBody { code })
         .send()
         .await
@@ -664,13 +719,17 @@ struct ActivateResponse {
 /// is a failure, not a success. A stranded provisional token simply
 /// self-expires — no orphaned one-year credential is ever left behind.
 pub async fn activate_token(creds: &Credentials) -> Activation {
+    let url = match api_url(&creds.url, "/api/v1/cli/activate") {
+        Ok(url) => url,
+        Err(e) => return Activation::Failed(e.to_string()),
+    };
     let mut last = String::new();
     for attempt in 0..3u32 {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(250 * u64::from(attempt))).await;
         }
         let res = client()
-            .post(format!("{}/api/v1/cli/activate", creds.url))
+            .post(url.clone())
             .bearer_auth(&creds.token)
             .json(&serde_json::json!({}))
             .send()
@@ -712,7 +771,10 @@ pub struct ProjectEntry {
 
 pub async fn list_projects(creds: &Credentials, org: &str) -> Result<Vec<ProjectEntry>> {
     let res = client()
-        .get(format!("{}/api/v1/orgs/{}/projects", creds.url, org))
+        .get(api_url(
+            &creds.url,
+            &format!("/api/v1/orgs/{org}/projects"),
+        )?)
         .bearer_auth(&creds.token)
         .send()
         .await
@@ -741,10 +803,13 @@ pub struct SecretEntry {
 
 pub async fn list_secrets(creds: &Credentials, link: &CloudLink) -> Result<Vec<SecretEntry>> {
     let res = client()
-        .get(format!(
-            "{}/api/v1/orgs/{}/projects/{}/secrets",
-            creds.url, link.org, link.project
-        ))
+        .get(api_url(
+            &creds.url,
+            &format!(
+                "/api/v1/orgs/{}/projects/{}/secrets",
+                link.org, link.project
+            ),
+        )?)
         .bearer_auth(&creds.token)
         .send()
         .await
@@ -759,6 +824,152 @@ pub async fn list_secrets(creds: &Credentials, link: &CloudLink) -> Result<Vec<S
     Ok(body.secrets)
 }
 
+/// Secret names the vault accepts. Checked before a request so that a name
+/// can never change the request path.
+pub fn valid_secret_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && name.len() <= 128
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+pub const INVALID_SECRET_NAME: &str =
+    "invalid secret name: use up to 128 letters, digits and _, not starting with a digit";
+
+fn secret_url(creds: &Credentials, link: &CloudLink, name: &str) -> Result<reqwest::Url> {
+    if !valid_secret_name(name) {
+        // The name is not echoed: `NAME=value` typed by mistake would put the
+        // value in the error.
+        return Err(Error::Validation(INVALID_SECRET_NAME.into()));
+    }
+    api_url(
+        &creds.url,
+        &format!(
+            "/api/v1/orgs/{}/projects/{}/secrets/{}",
+            link.org, link.project, name
+        ),
+    )
+}
+
+/// Which secret write a refused response belongs to.
+#[derive(Clone, Copy)]
+enum SecretWrite {
+    Set,
+    Remove,
+}
+
+/// The message for a refused secret write. Built from the status, the server's
+/// `{"error": code}` and the name only: the value never reaches this function.
+fn secret_write_error(
+    status: reqwest::StatusCode,
+    code: Option<&str>,
+    write: SecretWrite,
+    name: &str,
+    link: &CloudLink,
+) -> Error {
+    let verb = match write {
+        SecretWrite::Set => "set",
+        SecretWrite::Remove => "remove",
+    };
+    let project = format!("{}/{}", link.org, link.project);
+    let message = match (status.as_u16(), code) {
+        (401, _) => {
+            "cloud: your login is missing, expired or revoked — run `fed login`".to_string()
+        }
+        (403, Some("session_only")) => format!(
+            "cloud: this vault does not accept secret changes from the CLI yet — {verb} {name} in the dashboard"
+        ),
+        (403, _) => format!("cloud: only org admins can {verb} secrets in {project}"),
+        (404, _) => format!(
+            "cloud: project {project} not found, or you are not a member — check `fed link`"
+        ),
+        (400, Some("value")) => {
+            "cloud: the vault rejected the value — it must be 1 to 65536 characters".to_string()
+        }
+        (400, Some("name")) => format!("cloud: the vault rejected the secret name `{name}`"),
+        (413, _) => "cloud: the value is too large for the vault".to_string(),
+        (429, _) => "cloud: rate limited — try again in a minute".to_string(),
+        _ => return api_error(status, &format!("trying to {verb} {name}")),
+    };
+    Error::Validation(message)
+}
+
+#[derive(Deserialize)]
+struct ErrorBody {
+    error: String,
+}
+
+/// A non-2xx answer to a secret write: the status and the server's error code.
+struct Refused {
+    status: reqwest::StatusCode,
+    code: Option<String>,
+}
+
+impl Refused {
+    fn into_error(self, write: SecretWrite, name: &str, link: &CloudLink) -> Error {
+        secret_write_error(self.status, self.code.as_deref(), write, name, link)
+    }
+}
+
+/// Send a secret write. The outer error is a transport failure; the inner one
+/// is the server's refusal, left to the caller to word.
+async fn send_secret_write(
+    req: reqwest::RequestBuilder,
+    creds: &Credentials,
+) -> Result<std::result::Result<(), Refused>> {
+    let res = req
+        .bearer_auth(&creds.token)
+        .send()
+        .await
+        .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", creds.url, e)))?;
+    let status = res.status();
+    if status.is_success() {
+        return Ok(Ok(()));
+    }
+    let code = res.json::<ErrorBody>().await.ok().map(|b| b.error);
+    Ok(Err(Refused { status, code }))
+}
+
+/// Create or replace one secret in the linked project:
+/// `PUT /api/v1/orgs/{org}/projects/{project}/secrets/{name}` with
+/// `{"value": ...}`. The body has no `env`, so the server uses its default
+/// environment, the same one `fetch_values` and `list_secrets` read.
+pub async fn put_secret(
+    creds: &Credentials,
+    link: &CloudLink,
+    name: &str,
+    value: &str,
+) -> Result<()> {
+    let url = secret_url(creds, link, name)?;
+    let req = client()
+        .put(url)
+        .json(&serde_json::json!({ "value": value }));
+    send_secret_write(req, creds)
+        .await?
+        .map_err(|r| r.into_error(SecretWrite::Set, name, link))
+}
+
+/// What `delete_secret` found on the server.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Deletion {
+    Removed,
+    /// The vault answered 404 `secret`: the name was not set in the project.
+    NotSet,
+}
+
+/// Delete one secret from the linked project:
+/// `DELETE /api/v1/orgs/{org}/projects/{project}/secrets/{name}`.
+pub async fn delete_secret(creds: &Credentials, link: &CloudLink, name: &str) -> Result<Deletion> {
+    let url = secret_url(creds, link, name)?;
+    match send_secret_write(client().delete(url), creds).await? {
+        Ok(()) => Ok(Deletion::Removed),
+        Err(r) if r.status.as_u16() == 404 && r.code.as_deref() == Some("secret") => {
+            Ok(Deletion::NotSet)
+        }
+        Err(r) => Err(r.into_error(SecretWrite::Remove, name, link)),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct SecretValues {
     pub values: HashMap<String, String>,
@@ -771,20 +982,23 @@ pub struct SecretValues {
 /// probe confirms which fires:
 ///
 /// - `Unreachable`: `is_connect()` / DNS — nothing is listening, or we're
-///   offline. Waiting is pointless; fall back to cache immediately.
-/// - `Failed`: a timeout (the backend is alive but booting) or an HTTP/parse
-///   error. The value could not be had this attempt.
+///   offline. Waiting is pointless; a recent cache may be used.
+/// - `Failed`: a timeout or server/rate-limit error. A recent cache may be used.
+/// - `Denied`: a refusal (401/403), another 4xx, a redirect, an unreadable
+///   response or an invalid vault URL. The cache must not answer this online
+///   request. The message opens with which of these it was.
 #[derive(Debug, Clone)]
 pub enum VaultFailure {
     Unreachable(String),
     Failed(String),
+    Denied(String),
 }
 
 impl VaultFailure {
     /// Human-readable reason, for warnings and the missing-secret error.
     pub fn message(&self) -> &str {
         match self {
-            VaultFailure::Unreachable(m) | VaultFailure::Failed(m) => m,
+            VaultFailure::Unreachable(m) | VaultFailure::Failed(m) | VaultFailure::Denied(m) => m,
         }
     }
 
@@ -814,27 +1028,46 @@ async fn fetch_values_inner(
     link: &CloudLink,
     names: &[String],
 ) -> VaultResult {
+    let mut url = api_url(
+        &creds.url,
+        &format!(
+            "/api/v1/orgs/{}/projects/{}/secrets/values",
+            link.org, link.project
+        ),
+    )
+    // The validation error already says what is wrong with the URL; drop
+    // its "Invalid configuration: cloud:" framing so it reads once.
+    .map_err(|e| {
+        let reason = match e {
+            Error::Validation(message) => message,
+            other => other.to_string(),
+        };
+        VaultFailure::Denied(reason.trim_start_matches("cloud: ").to_string())
+    })?;
+    url.query_pairs_mut().append_pair("names", &names.join(","));
     let res = client()
-        .get(format!(
-            "{}/api/v1/orgs/{}/projects/{}/secrets/values?names={}",
-            creds.url,
-            link.org,
-            link.project,
-            names.join(",")
-        ))
+        .get(url)
         .bearer_auth(&creds.token)
         .send()
         .await
         .map_err(|e| classify_send_error(&creds.url, &e))?;
     if !res.status().is_success() {
-        return Err(VaultFailure::Failed(
-            api_error(res.status(), "fetching secret values").to_string(),
-        ));
+        let status = res.status();
+        let message = api_error(status, "fetching secret values").to_string();
+        return Err(match status.as_u16() {
+            401 | 403 => VaultFailure::Denied(format!("team vault denied the request: {message}")),
+            429 => VaultFailure::Failed(message),
+            _ if status.is_redirection() || status.is_client_error() => {
+                VaultFailure::Denied(format!("the team vault rejected the request ({message})"))
+            }
+            _ => VaultFailure::Failed(message),
+        });
     }
-    let body: SecretValues = res
-        .json()
-        .await
-        .map_err(|e| VaultFailure::Failed(format!("cloud: bad values response: {}", e)))?;
+    let body: SecretValues = res.json().await.map_err(|e| {
+        VaultFailure::Denied(format!(
+            "the team vault sent a response fed cannot read: {e}"
+        ))
+    })?;
     Ok(body.values)
 }
 
@@ -942,16 +1175,15 @@ pub enum Revocation {
 /// so a booting backend is not worth the vault budget here — a modest ~10s cap,
 /// and connect failures (`is_connect`) fail fast rather than waiting it out.
 pub async fn revoke_current_token(creds: &Credentials) -> Revocation {
+    let url = match api_url(&creds.url, "/api/v1/cli/session") {
+        Ok(url) => url,
+        Err(e) => return Revocation::Failed(e.to_string()),
+    };
     let client = match client_builder().timeout(Duration::from_secs(10)).build() {
         Ok(client) => client,
         Err(e) => return Revocation::Failed(format!("cloud client: {}", e)),
     };
-    let res = match client
-        .delete(format!("{}/api/v1/cli/session", creds.url))
-        .bearer_auth(&creds.token)
-        .send()
-        .await
-    {
+    let res = match client.delete(url).bearer_auth(&creds.token).send().await {
         Ok(res) => res,
         // Reuse the classified send-error handling: connect/DNS fails fast,
         // timeouts and other transport errors are likewise a failed revoke.
@@ -1139,6 +1371,14 @@ mod tests {
     /// (e.g. "200 OK") and `body`, then closes. Returns the base URL. Used to
     /// exercise the logout revocation status classification against real HTTP.
     fn spawn_one_shot(status_line: &'static str, body: &'static str) -> String {
+        spawn_one_shot_with_headers(status_line, body, "")
+    }
+
+    fn spawn_one_shot_with_headers(
+        status_line: &'static str,
+        body: &'static str,
+        headers: &'static str,
+    ) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -1147,8 +1387,9 @@ mod tests {
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf);
                 let resp = format!(
-                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     status_line,
+                    headers,
                     body.len(),
                     body
                 );
@@ -1162,6 +1403,63 @@ mod tests {
         Credentials {
             url,
             token: "super-secret-token".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn vault_fetch_distinguishes_denial_from_transient_failure() {
+        let link = CloudLink {
+            org: "acme".into(),
+            project: "web".into(),
+            secret_cache: crate::orchestrator::SecretCacheMode::Memory,
+        };
+        let names = vec!["API_KEY".to_string()];
+        for (status, opening) in [
+            ("401 Unauthorized", "team vault denied the request: "),
+            ("403 Forbidden", "team vault denied the request: "),
+            ("404 Not Found", "the team vault rejected the request ("),
+            (
+                "426 Upgrade Required",
+                "the team vault rejected the request (",
+            ),
+            (
+                "307 Temporary Redirect",
+                "the team vault rejected the request (",
+            ),
+        ] {
+            let creds = creds_at(spawn_one_shot(status, "{}"));
+            match fetch_values_inner(&creds, &link, &names).await {
+                Err(VaultFailure::Denied(m)) => {
+                    assert!(m.starts_with(opening), "{status}: {m}");
+                    let code = status.split(' ').next().unwrap();
+                    assert!(m.contains(code), "{status}: detail kept: {m}");
+                }
+                other => panic!("{status}: expected Denied, got {other:?}"),
+            }
+        }
+        let creds = creds_at(spawn_one_shot("200 OK", "not json"));
+        match fetch_values_inner(&creds, &link, &names).await {
+            Err(VaultFailure::Denied(m)) => assert!(
+                m.starts_with("the team vault sent a response fed cannot read: "),
+                "{m}"
+            ),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        let creds = creds_at("http://vault.example.com".into());
+        match fetch_values_inner(&creds, &link, &names).await {
+            Err(VaultFailure::Denied(m)) => assert!(
+                m.starts_with("vault URL must be an HTTPS origin")
+                    && !m.contains("Invalid configuration"),
+                "{m}"
+            ),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        for status in ["429 Too Many Requests", "503 Service Unavailable"] {
+            let creds = creds_at(spawn_one_shot(status, "{}"));
+            assert!(matches!(
+                fetch_values_inner(&creds, &link, &names).await,
+                Err(VaultFailure::Failed(_))
+            ));
         }
     }
 
@@ -1229,6 +1527,7 @@ mod tests {
             expected,
             request
         );
+        assert!(request.contains("x-fed-api-version: 2\r\n"));
         assert!(
             request.contains(concat!("fed/", env!("CARGO_PKG_VERSION"))),
             "user agent should also name fed and its version:\n{}",
@@ -1254,6 +1553,7 @@ mod tests {
             expected,
             request
         );
+        assert!(request.contains("x-fed-api-version: 2\r\n"));
     }
 
     /// A 426 on revoke is a failed revoke that names the version problem.
@@ -1499,20 +1799,102 @@ mod tests {
     /// id and the poll secret.
     #[tokio::test]
     async fn create_auth_request_returns_id_and_poll_secret() {
-        let url = spawn_one_shot(
+        let url = spawn_one_shot_with_headers(
             "201 Created",
-            "{\"request\":\"fedar_stub-request-id\",\"poll_secret\":\"fedps_stub-poll-secret\",\"expires_in\":300}",
+            "{\"request\":\"fedar_stub-request-id\",\"poll_secret\":\"fedps_stub-poll-secret\",\"pairing_code\":\"12345678\",\"expires_in\":300}",
+            "X-Fed-Api-Version: 2\r\n",
         );
         let auth = create_auth_request(&url, "dev-box").await.unwrap();
         assert_eq!(auth.request, "fedar_stub-request-id");
         assert_eq!(auth.poll_secret, "fedps_stub-poll-secret");
+        assert_eq!(auth.pairing_code, "12345678");
+    }
+
+    #[tokio::test]
+    async fn login_rejects_missing_or_mismatched_api_version_before_parsing_body() {
+        for headers in ["", "X-Fed-Api-Version: 1\r\n", "X-Fed-Api-Version: 3\r\n"] {
+            let url = spawn_one_shot_with_headers("201 Created", "{}", headers);
+            let err = create_auth_request(&url, "dev-box").await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("server did not confirm API protocol version 2"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     fn stub_auth() -> AuthRequest {
         AuthRequest {
             request: "fedar_stub-request-id".to_string(),
             poll_secret: "fedps_stub-poll-secret".to_string(),
+            pairing_code: "12345678".to_string(),
         }
+    }
+
+    #[test]
+    fn cloud_origin_rejects_insecure_or_ambiguous_urls() {
+        for raw in [
+            "http://vault.example.com",
+            "http://localhost.evil.example",
+            "https://user@vault.example.com",
+            "https://vault.example.com/other",
+            "https://vault.example.com?next=http://evil.example",
+            "https://vault.example.com#fragment",
+            "file:///tmp/vault",
+        ] {
+            assert!(cloud_base_url(raw).is_err(), "accepted {raw}");
+        }
+        assert!(cloud_base_url("https://vault.example.com").is_ok());
+        assert!(cloud_base_url("http://127.0.0.1:1234").is_ok());
+        assert!(cloud_base_url("http://[::1]:1234").is_ok());
+    }
+
+    /// `fed login` stores the origin form, so a typed trailing slash does not
+    /// end up as `//cli/authorize` in the printed sign-in URL.
+    #[test]
+    fn cloud_origin_serializes_without_trailing_slash() {
+        for (raw, origin) in [
+            ("https://vault.example.com/", "https://vault.example.com"),
+            (
+                "https://vault.example.com:8443",
+                "https://vault.example.com:8443",
+            ),
+            ("http://[::1]:1234/", "http://[::1]:1234"),
+        ] {
+            let url = cloud_base_url(raw).unwrap();
+            assert_eq!(url.origin().ascii_serialization(), origin);
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_code_never_sends_its_body_to_a_redirect_target() {
+        let destination = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let destination_url = format!("http://{}", destination.local_addr().unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {destination_url}/capture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let err = match exchange_code(&url, "single-use-secret").await {
+            Ok(_) => panic!("redirect must not complete a token exchange"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("307"),
+            "redirect must surface as an error: {err}"
+        );
+        assert!(matches!(
+            destination.accept(),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     /// The poll answers map onto their outcomes; 410 and 429 are outcomes,
@@ -1673,5 +2055,221 @@ mod tests {
 
         // Unset falls back too.
         assert_eq!(duration_or_default(None, default), default);
+    }
+}
+
+#[cfg(test)]
+mod secret_write_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const VALUE: &str = "s3cr3t-value-must-not-leak";
+
+    /// One-shot server that answers `status_line` with `body` and hands back the
+    /// whole request, headers and body, so a test can check what was sent.
+    fn spawn_answering(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+        (format!("http://127.0.0.1:{port}"), rx)
+    }
+
+    fn creds(url: String) -> Credentials {
+        Credentials {
+            url,
+            token: "fed_test-token".into(),
+        }
+    }
+
+    fn link() -> CloudLink {
+        CloudLink {
+            org: "acme".into(),
+            project: "web".into(),
+            secret_cache: crate::orchestrator::SecretCacheMode::Memory,
+        }
+    }
+
+    #[tokio::test]
+    async fn put_secret_sends_the_value_only_in_the_json_body() {
+        let (url, rx) = spawn_answering("201 Created", "{\"ok\":true}");
+        put_secret(&creds(url), &link(), "API_KEY", VALUE)
+            .await
+            .unwrap();
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        assert!(
+            head.starts_with("PUT /api/v1/orgs/acme/projects/web/secrets/API_KEY HTTP/1.1\r\n"),
+            "{head}"
+        );
+        let head = head.to_ascii_lowercase();
+        assert!(head.contains("authorization: bearer fed_test-token\r\n"));
+        assert!(head.contains("x-fed-api-version: 2\r\n"));
+        assert!(head.contains("content-type: application/json\r\n"));
+        assert!(!head.contains(VALUE));
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json, serde_json::json!({ "value": VALUE }));
+    }
+
+    #[tokio::test]
+    async fn delete_secret_sends_a_bodyless_delete() {
+        let (url, rx) = spawn_answering("200 OK", "{\"ok\":true}");
+        delete_secret(&creds(url), &link(), "API_KEY")
+            .await
+            .unwrap();
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            request
+                .starts_with("DELETE /api/v1/orgs/acme/projects/web/secrets/API_KEY HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-fed-api-version: 2\r\n")
+        );
+        assert!(request.ends_with("\r\n\r\n"), "no body: {request}");
+    }
+
+    #[tokio::test]
+    async fn secret_writes_map_refusals_to_clear_messages_without_the_value() {
+        let cases: [(&'static str, &'static str, &str); 9] = [
+            (
+                "401 Unauthorized",
+                "{\"error\":\"unauthenticated\"}",
+                "run `fed login`",
+            ),
+            (
+                "403 Forbidden",
+                "{\"error\":\"admin_only\"}",
+                "only org admins can set secrets in acme/web",
+            ),
+            (
+                "403 Forbidden",
+                "{\"error\":\"session_only\"}",
+                "does not accept secret changes from the CLI yet",
+            ),
+            (
+                "404 Not Found",
+                "{\"error\":\"project\"}",
+                "project acme/web not found",
+            ),
+            (
+                "404 Not Found",
+                "{\"error\":\"org\"}",
+                "project acme/web not found",
+            ),
+            (
+                "429 Too Many Requests",
+                "{\"error\":\"rate_limited\"}",
+                "rate limited",
+            ),
+            (
+                "400 Bad Request",
+                "{\"error\":\"value\"}",
+                "rejected the value",
+            ),
+            (
+                "426 Upgrade Required",
+                "{\"error\":\"unsupported_api_version\"}",
+                "too old",
+            ),
+            ("500 Internal Server Error", "", "500"),
+        ];
+        for (status, body, expected) in cases {
+            let (url, _rx) = spawn_answering(status, body);
+            let err = put_secret(&creds(url), &link(), "API_KEY", VALUE)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{status}: {err}");
+            assert!(!err.contains(VALUE), "{status} leaked the value: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_secret_reports_a_missing_secret() {
+        let (url, _rx) = spawn_answering("404 Not Found", "{\"error\":\"secret\"}");
+        let found = delete_secret(&creds(url), &link(), "API_KEY")
+            .await
+            .unwrap();
+        assert_eq!(found, Deletion::NotSet);
+        let (url, _rx) = spawn_answering("404 Not Found", "{\"error\":\"project\"}");
+        let err = delete_secret(&creds(url), &link(), "API_KEY")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("project acme/web not found"), "{err}");
+        let (url, _rx) = spawn_answering("403 Forbidden", "{\"error\":\"admin_only\"}");
+        let err = delete_secret(&creds(url), &link(), "API_KEY")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only org admins can remove secrets"), "{err}");
+    }
+
+    /// A redirect is a refusal: the token and the value must not follow it.
+    #[tokio::test]
+    async fn put_secret_does_not_follow_a_redirect() {
+        let (url, _rx) = spawn_answering("307 Temporary Redirect", "");
+        let err = put_secret(&creds(url), &link(), "API_KEY", VALUE)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("307"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn secret_writes_refuse_bad_names_and_insecure_urls_before_sending() {
+        let remote_http = creds("http://vault.example.com".into());
+        assert!(
+            put_secret(&remote_http, &link(), "API_KEY", VALUE)
+                .await
+                .is_err()
+        );
+        let local = creds("http://127.0.0.1:9".into());
+        for name in ["", "1KEY", "A/B", "../x", "KEY=value", &"A".repeat(129)] {
+            let err = put_secret(&local, &link(), name, VALUE)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("invalid secret name"), "{name}: {err}");
+            assert!(!err.contains("value"), "the name is not echoed: {err}");
+        }
+        assert!(valid_secret_name("_A1"));
+        assert!(valid_secret_name(&"A".repeat(128)));
     }
 }

@@ -10,9 +10,12 @@ enum VaultOutcome {
     /// Grace expired but the cache covers every queried name freshly. Proceed on
     /// the cache; the abandoned request is left to warm the backend.
     CacheFresh,
-    /// The vault could not be reached or used. Fall back to the cache regardless
-    /// of age (with a warning); the reason names the cloud in any missing error.
+    /// A transient lookup failure. Only recently fetched cached values may be
+    /// used automatically; an explicit offline run may use older values.
     Failed(String),
+    /// The server refused access or the CLI cannot safely speak its protocol.
+    /// The message opens with which (see `cloud::VaultFailure::Denied`).
+    Denied(String),
     /// Not logged in / checkout not linked — ordinary local mode.
     Local,
 }
@@ -42,10 +45,19 @@ pub(crate) fn cache_covers_fresh(
 ) -> bool {
     names.iter().all(|name| {
         cache_values.contains_key(name)
-            && cache_stamps
-                .get(name)
-                .is_some_and(|stamped| *stamped <= now && now - *stamped < max_age_secs)
+            && cache_entry_is_fresh(name, cache_stamps, now, max_age_secs)
     })
+}
+
+fn cache_entry_is_fresh(
+    name: &str,
+    cache_stamps: &HashMap<String, u64>,
+    now: u64,
+    max_age_secs: u64,
+) -> bool {
+    cache_stamps
+        .get(name)
+        .is_some_and(|stamped| *stamped <= now && now - *stamped < max_age_secs)
 }
 
 impl Resolver {
@@ -59,6 +71,11 @@ impl Resolver {
     #[cfg(test)]
     pub(crate) fn set_test_vault_failure(&mut self, message: &str) {
         self.test_vault_failure = Some(message.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_vault_denied(&mut self, message: &str) {
+        self.test_vault_denied = Some(message.to_string());
     }
 
     /// Whether a manual-secret name is in scope for this run. Names outside the
@@ -163,6 +180,9 @@ impl Resolver {
         analysis: &crate::parameter::secret::SecretAnalysis,
     ) -> VaultOutcome {
         // Test seams bypass the timing machinery with a fixed outcome.
+        if let Some(msg) = &self.test_vault_denied {
+            return VaultOutcome::Denied(msg.clone());
+        }
         if let Some(msg) = &self.test_vault_failure {
             return VaultOutcome::Failed(msg.clone());
         }
@@ -182,9 +202,12 @@ impl Resolver {
             match join {
                 crate::cloud::VaultJoin::Answered(Ok(values)) => Some(VaultOutcome::Values(values)),
                 crate::cloud::VaultJoin::Answered(Err(f)) => {
-                    // Both unreachable and reached-but-failed fall back to the
-                    // cache; carry a message that names the cloud.
-                    Some(VaultOutcome::Failed(format!("{} ({})", f.message(), url)))
+                    let reason = format!("{} ({})", f.message(), url);
+                    Some(if matches!(f, crate::cloud::VaultFailure::Denied(_)) {
+                        VaultOutcome::Denied(reason)
+                    } else {
+                        VaultOutcome::Failed(reason)
+                    })
                 }
                 crate::cloud::VaultJoin::Pending => None,
             }
@@ -411,13 +434,23 @@ impl Resolver {
                         );
                     }
                     VaultOutcome::Local => {} // not logged in / not linked — local mode
+                    VaultOutcome::Denied(reason) => {
+                        return Err(Error::Validation(format!(
+                            "{}. Cached values were not used; run with --offline only if you intentionally need a local copy",
+                            reason
+                        )));
+                    }
                     VaultOutcome::Failed(reason) => {
-                        // Reached-but-unusable or unreachable: fall back to the
-                        // cache regardless of age (offline work must keep working),
-                        // and remember the reason so a missing-secret failure names
-                        // the cloud instead of the user's env_file.
+                        let queried: HashSet<&str> =
+                            queried_names.iter().map(String::as_str).collect();
+                        let now = unix_now();
+                        let max_age = crate::cloud::vault_max_age().as_secs();
+                        analysis.cache_values.retain(|name, _| {
+                            !queried.contains(name.as_str())
+                                || cache_entry_is_fresh(name, &analysis.cache_stamps, now, max_age)
+                        });
                         tracing::warn!(
-                            "team vault unavailable ({}); proceeding on cached secret values where available",
+                            "team vault unavailable ({}); using recent cached secret values where available (use --offline to opt in to older values)",
                             reason
                         );
                         vault_failure = Some(reason);
@@ -539,7 +572,7 @@ impl Resolver {
                 )));
             }
             return Err(Error::Validation(format!(
-                "Missing secret values — add them to your env_file ({}), or put them in your team vault (fed login, fed link, then set them in the dashboard):\n{}\n\nThese secrets have source: manual, so fed won't generate them.",
+                "Missing secret values — add them to your env_file ({}), or put them in your team vault (fed login, fed link, then fed secrets set NAME or the dashboard):\n{}\n\nThese secrets have source: manual, so fed won't generate them.",
                 env_files_hint,
                 details.join("\n")
             )));
@@ -1229,17 +1262,13 @@ mod tests {
     }
 
     #[test]
-    fn vault_failure_proceeds_on_cached_value_regardless_of_age() {
-        // 02 done-when (airplane mode + cached values): when the vault is
-        // unreachable, a required secret already in the cache resolves from it
-        // regardless of the entry's age — offline work must keep working.
+    fn stale_cache_requires_explicit_offline_mode() {
         use crate::config::{Config, Parameter};
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
         crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
-        // Ancient, unstamped cache entry (would be "too old" for a refresh
-        // decision) — but with the vault down we proceed on it anyway.
+        // An unstamped cache entry cannot silently answer an online run.
         std::fs::write(
             temp_dir.path().join(".fed/secrets.cache.env"),
             "API_KEY=cached_old\n",
@@ -1261,9 +1290,12 @@ mod tests {
             },
         );
 
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        assert!(err.to_string().contains("team vault could not be reached"));
+        resolver.set_offline(true);
         resolver
             .resolve_parameters(&mut config)
-            .expect("cached value must satisfy the run when the vault is down");
+            .expect("explicit offline mode may use the old cache");
         assert_eq!(
             resolver.get_resolved_parameters().get("API_KEY").unwrap(),
             "cached_old"
@@ -1272,6 +1304,97 @@ mod tests {
         let cache =
             std::fs::read_to_string(temp_dir.path().join(".fed/secrets.cache.env")).unwrap();
         assert!(cache.contains("API_KEY=cached_old"));
+    }
+
+    #[test]
+    fn authorization_denial_never_uses_cached_secret() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+        std::fs::write(
+            temp_dir.path().join(".fed/secrets.cache.env"),
+            format!(
+                "# fetched-at API_KEY {}\nAPI_KEY=cached\n",
+                unix_now() - 600
+            ),
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
+        resolver.set_test_vault_denied(
+            "team vault denied the request: cloud: fetching secret values failed (403)",
+        );
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        let err = resolver.resolve_parameters(&mut config).unwrap_err();
+        assert!(err.to_string().contains("denied the request"));
+        assert!(resolver.get_resolved_parameters().get("API_KEY").is_none());
+    }
+
+    #[test]
+    fn recent_cache_covers_transient_vault_failure() {
+        use crate::config::{Config, Parameter};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        crate::fed_dir::ensure_fed_dir(temp_dir.path()).unwrap();
+        std::fs::write(
+            temp_dir.path().join(".fed/secrets.cache.env"),
+            format!(
+                "# fetched-at API_KEY {}\nAPI_KEY=cached\nOLD_OPTIONAL=stale\n",
+                unix_now() - 600
+            ),
+        )
+        .unwrap();
+
+        let mut resolver = Resolver::new();
+        resolver.set_work_dir(temp_dir.path());
+        resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
+        resolver.set_test_vault_failure("cloud: timed out");
+
+        let mut config = Config::default();
+        config.parameters.insert(
+            "API_KEY".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        config.parameters.insert(
+            "OLD_OPTIONAL".to_string(),
+            Parameter {
+                param_type: Some("secret".to_string()),
+                source: Some("manual".to_string()),
+                optional: Some(true),
+                ..Default::default()
+            },
+        );
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(
+            resolver.get_resolved_parameters().get("API_KEY").unwrap(),
+            "cached"
+        );
+        assert_eq!(
+            resolver
+                .get_resolved_parameters()
+                .get("OLD_OPTIONAL")
+                .unwrap(),
+            ""
+        );
     }
 
     // ── FED_VAULT_TTL pre-network skip ─────────────────────────────────────
@@ -1963,15 +2086,9 @@ mod tests {
             !msg.contains("team vault could not be reached"),
             "no vault failure means no unreachable-cloud message: {msg}"
         );
-        // Writes are dashboard-only since fed 7.0 — the hint points there and
-        // must never mention the removed `fed secrets set` command.
         assert!(
-            msg.contains("set them in the dashboard"),
-            "hint should direct writes to the dashboard: {msg}"
-        );
-        assert!(
-            !msg.contains("fed secrets set"),
-            "the removed `fed secrets set` command must not appear: {msg}"
+            msg.contains("fed secrets set NAME or the dashboard"),
+            "hint should say how to put a value in the vault: {msg}"
         );
     }
 
