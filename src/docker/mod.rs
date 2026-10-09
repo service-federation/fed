@@ -5,6 +5,7 @@
 
 pub mod client;
 pub mod error;
+pub mod registry_auth;
 pub mod runtime;
 pub mod stderr;
 

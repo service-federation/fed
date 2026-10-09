@@ -356,6 +356,34 @@ Compose files with hardcoded host ports work as they are. One checkout starts ex
 
 If your team needs to share development credentials, an optional hosted vault can fill `source: manual` values during `fed start`. Everything above this line works without it. It handles development credentials, not production secrets, and removing someone's access does not erase values already cached on their machine, so rotate after offboarding. [Team secrets](https://www.service-federation.com/docs/secrets/) covers how it works, what it costs, and how to turn the local cache off. For the local-only path, see [Generated secrets](https://www.service-federation.com/docs/generated-secrets/).
 
+### Private registry images
+
+When your `image:` services come from a private registry, the team can share one pull token through the vault instead of everyone running `docker login`:
+
+```yaml
+parameters:
+  REGISTRY_TOKEN:
+    type: secret
+    source: manual
+    optional: true
+    description: Read-only token for pulling team images from ghcr.io
+registry_auth:
+  ghcr.io:
+    username: acme-bot          # literal or a {{PARAM}} template
+    password: '{{REGISTRY_TOKEN}}'
+```
+
+Each key is a registry host. An image without a host, such as `postgres:16`, comes from `docker.io`. The password must reference a `type: secret` parameter, so `fed validate` rejects a literal password.
+
+When `REGISTRY_TOKEN` has a value, fed pulls that registry's images with a temporary Docker config that holds this one login. The config is private to your user and is deleted after the pull. fed never runs `docker login` and never writes to `~/.docker`. When the token has no value, fed pulls with your own Docker credentials, as it does without `registry_auth`. If the registry refuses the token, fed prints one warning and retries with your own credentials.
+
+Before you add a token:
+
+- **Use a read-only, pull-only bot token.** Everyone with access to the project can read it.
+- **ECR passwords expire after 12 hours.** For ECR, keep using `aws ecr get-login-password | docker login`.
+
+`registry_auth` covers `image:` services and the image pull before `fed start`. Compose services and the base images of Dockerfile `build:` services still pull with your own Docker credentials.
+
 ## Documentation and examples
 
 - [Quickstart](https://www.service-federation.com/docs/)

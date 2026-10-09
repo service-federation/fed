@@ -7,6 +7,7 @@
 //! runtimes is a change in one module rather than here.
 
 use super::DockerError;
+use super::registry_auth::{self, RegistryCredential, RuntimeFlavor, TempAuthDir};
 use super::runtime::{self, COMPOSE_V1_BINARY};
 use super::stderr::{
     stderr_indicates_missing_container, stderr_indicates_not_running, stderr_indicates_pull_noop,
@@ -69,6 +70,16 @@ impl DockerClient {
 
     /// Run a docker command with a timeout, returning raw Output.
     async fn run(&self, args: &[&str], timeout: Duration) -> Result<Output, DockerError> {
+        self.run_with_env(args, &[], timeout).await
+    }
+
+    /// Run a docker command with extra environment for that one child.
+    async fn run_with_env(
+        &self,
+        args: &[&str],
+        env: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<Output, DockerError> {
         // kill_on_drop: when the timeout wins the race and drops the output
         // future, the docker process must die with it — otherwise every
         // timeout against a hung daemon leaks a subprocess.
@@ -76,6 +87,7 @@ impl DockerClient {
             timeout,
             tokio::process::Command::new(runtime::binary())
                 .args(args)
+                .envs(env.iter().map(|(k, v)| (k, v)))
                 .kill_on_drop(true)
                 .output(),
         )
@@ -199,9 +211,65 @@ impl DockerClient {
         self.run(&arg_refs, timeout).await
     }
 
-    /// Pull a Docker image.
+    /// Pull a Docker image with the environment's own credentials.
     pub async fn pull(&self, image: &str, timeout: Duration) -> Result<(), DockerError> {
         let output = self.run(&["pull", image], timeout).await?;
+        Self::pull_outcome(output)
+    }
+
+    /// Pull an image, using a team credential from `registry_auth` when one
+    /// is supplied for the image's registry.
+    ///
+    /// Without a credential this is [`Self::pull`]. With one, the pull runs
+    /// against a throwaway auth file ([`TempAuthDir`]) that is deleted when
+    /// this returns or is cancelled. If the registry refuses the credential,
+    /// fed warns once and retries with the environment's own credentials.
+    pub async fn pull_with_credential(
+        &self,
+        image: &str,
+        credential: Option<&RegistryCredential>,
+        timeout: Duration,
+    ) -> Result<(), DockerError> {
+        let Some(credential) = credential else {
+            return self.pull(image, timeout).await;
+        };
+        let flavor = RuntimeFlavor::of_binary(runtime::binary());
+        let user_dir = registry_auth::user_docker_config_dir();
+        let auth_dir = match TempAuthDir::create(credential, flavor, user_dir.as_deref()) {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::warn!(
+                    "Could not prepare the registry credential for {} ({}). Pulling with your own Docker credentials instead.",
+                    credential.registry(),
+                    e
+                );
+                return self.pull(image, timeout).await;
+            }
+        };
+
+        let mut args: Vec<String> = vec!["pull".to_string()];
+        args.extend(auth_dir.pull_args());
+        args.push(image.to_string());
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = self
+            .run_with_env(&arg_refs, &auth_dir.pull_env(), timeout)
+            .await
+            .and_then(Self::pull_outcome);
+        drop(auth_dir);
+
+        match result {
+            Err(DockerError::CommandFailed { ref stderr, .. })
+                if registry_auth::stderr_indicates_auth_failure(stderr) =>
+            {
+                registry_auth::warn_auth_failure_once(credential);
+                self.pull(image, timeout).await
+            }
+            other => other,
+        }
+    }
+
+    /// Map a finished `pull` to success or a [`DockerError`].
+    fn pull_outcome(output: Output) -> Result<(), DockerError> {
         if output.status.success() {
             return Ok(());
         }

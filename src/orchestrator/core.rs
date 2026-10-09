@@ -2864,6 +2864,14 @@ impl Orchestrator {
         }
     }
 
+    /// Team logins from `registry_auth` whose secret has a value this run.
+    pub(super) fn registry_credentials(&self) -> crate::docker::registry_auth::RegistryCredentials {
+        crate::docker::registry_auth::RegistryCredentials::resolve(
+            &self.config,
+            self.resolver.get_resolved_parameters(),
+        )
+    }
+
     /// Pre-pull Docker images needed by the given services.
     ///
     /// Checks which images are missing locally and pulls them in parallel.
@@ -2887,6 +2895,7 @@ impl Orchestrator {
         }
 
         let client = DockerClient::new();
+        let credentials = self.registry_credentials();
 
         // Check which images exist locally (parallel)
         let exist_checks: Vec<_> = images
@@ -2920,8 +2929,12 @@ impl Orchestrator {
             .map(|img| {
                 let client = client.clone();
                 let img = img.clone();
+                let credential = credentials.for_image(&img).cloned();
                 async move {
-                    let outcome = match client.pull(&img, pull_timeout).await {
+                    let outcome = match client
+                        .pull_with_credential(&img, credential.as_ref(), pull_timeout)
+                        .await
+                    {
                         Ok(()) => Ok(()),
                         Err(e) => Err(e.to_string()),
                     };

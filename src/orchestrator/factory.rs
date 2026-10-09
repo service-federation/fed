@@ -332,13 +332,15 @@ impl Orchestrator {
     ) -> Box<dyn ServiceManager> {
         let session_id = self.isolation_id.clone();
 
-        Box::new(DockerService::new(
-            name.to_string(),
-            service.clone(),
-            env,
-            work_dir,
-            session_id,
-        ))
+        let credential = service
+            .image
+            .as_deref()
+            .and_then(|image| self.registry_credentials().for_image(image).cloned());
+
+        Box::new(
+            DockerService::new(name.to_string(), service.clone(), env, work_dir, session_id)
+                .with_registry_credential(credential),
+        )
     }
 
     /// Create an external service manager

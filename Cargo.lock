@@ -552,6 +552,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "async-trait",
+ "base64",
  "chrono",
  "clap",
  "clap_complete",

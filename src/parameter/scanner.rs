@@ -83,6 +83,18 @@ pub fn required_parameter_names(config: &Config, script_name: &str) -> HashSet<S
         }
     }
 
+    // A docker service in scope is pulled with the `registry_auth` login for
+    // its registry, so that entry's secret is needed too.
+    for name in &visited_services {
+        if let Some(image) = config.services.get(name).and_then(|s| s.image.as_deref())
+            && let Some(auth) = config
+                .registry_auth
+                .get(crate::docker::registry_auth::registry_host(image))
+        {
+            scan_serializable(auth, &mut referenced);
+        }
+    }
+
     // Close over parameter-to-parameter references. A referenced parameter can
     // pull in another via ANY of its interpolating fields, not just `generate`:
     //   - `generate: "derive --from {{SECRET}}"`
@@ -461,6 +473,53 @@ mod tests {
         assert!(names.contains("A"), "{names:?}");
         assert!(names.contains("B"), "{names:?}");
         assert!(names.contains("C"), "chained ref must reach C: {names:?}");
+    }
+
+    #[test]
+    fn includes_registry_auth_for_images_in_scope() {
+        let mut config = Config::default();
+        config
+            .parameters
+            .insert("REGISTRY_TOKEN".to_string(), secret_param());
+        config.registry_auth.insert(
+            "ghcr.io".to_string(),
+            crate::config::RegistryAuth {
+                username: "acme-bot".to_string(),
+                password: "{{REGISTRY_TOKEN}}".to_string(),
+            },
+        );
+        config.services.insert(
+            "api".to_string(),
+            Service {
+                image: Some("ghcr.io/acme/api:1".to_string()),
+                ..Default::default()
+            },
+        );
+        config.services.insert(
+            "db".to_string(),
+            Service {
+                image: Some("postgres:16".to_string()),
+                ..Default::default()
+            },
+        );
+        config.scripts.insert(
+            "uses-api".to_string(),
+            Script {
+                script: "true".to_string(),
+                depends_on: vec!["api".to_string()],
+                ..Default::default()
+            },
+        );
+        config.scripts.insert(
+            "uses-db".to_string(),
+            Script {
+                script: "true".to_string(),
+                depends_on: vec!["db".to_string()],
+                ..Default::default()
+            },
+        );
+        assert!(required_parameter_names(&config, "uses-api").contains("REGISTRY_TOKEN"));
+        assert!(!required_parameter_names(&config, "uses-db").contains("REGISTRY_TOKEN"));
     }
 
     #[test]

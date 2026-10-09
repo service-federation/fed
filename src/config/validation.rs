@@ -168,6 +168,8 @@ impl Config {
             }
         }
 
+        self.validate_registry_auth()?;
+
         self.warn_on_literal_local_ports();
         self.warn_on_compose_restart();
 
@@ -419,6 +421,68 @@ impl Config {
             }
         }
 
+        Ok(())
+    }
+
+    /// Check each `registry_auth` entry: the key is a registry host, and the
+    /// password is a `{{PARAM}}` reference to a `type: secret` parameter.
+    ///
+    /// Errors never quote the password field. When it is a literal, quoting it
+    /// would print the secret.
+    fn validate_registry_auth(&self) -> Result<()> {
+        use crate::docker::registry_auth::{looks_like_registry_host, password_parameter};
+        let params = self.get_effective_parameters();
+        for (registry, auth) in &self.registry_auth {
+            if !looks_like_registry_host(registry) {
+                return Err(Error::Validation(format!(
+                    "registry_auth key '{registry}' is not a registry host. \
+                     Use the host from the image name, for example 'ghcr.io', \
+                     'registry.example.com:5000' or 'docker.io' for Docker Hub."
+                )));
+            }
+            let declare_hint = |name: &str| {
+                format!(
+                    "Declare the secret and reference it:\n\n  \
+                     parameters:\n    {name}:\n      type: secret\n      source: manual\n      optional: true\n  \
+                     registry_auth:\n    {registry}:\n      username: {username}\n      password: '{{{{{name}}}}}'",
+                    username = auth.username,
+                )
+            };
+            let Some(param_name) = password_parameter(&auth.password) else {
+                return Err(Error::Validation(format!(
+                    "registry_auth for '{registry}': the password must be a reference to a secret \
+                     parameter, such as '{{{{REGISTRY_TOKEN}}}}'. A literal password would be \
+                     committed with fed.yaml. {}",
+                    declare_hint("REGISTRY_TOKEN")
+                )));
+            };
+            match params.get(param_name) {
+                Some(p) if p.is_secret_type() => {}
+                Some(_) => {
+                    return Err(Error::Validation(format!(
+                        "registry_auth for '{registry}': the password parameter '{param_name}' \
+                         must have 'type: secret', so its value stays out of fed.yaml and is redacted. {}",
+                        declare_hint(param_name)
+                    )));
+                }
+                None => {
+                    return Err(Error::Validation(format!(
+                        "registry_auth for '{registry}': the password references '{param_name}', \
+                         which is not declared under parameters. {}",
+                        declare_hint(param_name)
+                    )));
+                }
+            }
+            for cap in crate::parameter::get_template_regex().captures_iter(&auth.username) {
+                let name = cap[1].trim();
+                if name != "FED_PROJECT_ID" && !params.contains_key(name) {
+                    return Err(Error::Validation(format!(
+                        "registry_auth for '{registry}': the username references '{name}', \
+                         which is not declared under parameters."
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2071,6 +2135,76 @@ mod tests {
     // ========================================================================
     // Secret parameter validation
     // ========================================================================
+
+    // ========================================================================
+    // registry_auth validation
+    // ========================================================================
+
+    fn registry_auth_config(password: &str, param_type: Option<&str>) -> Config {
+        let mut config = Config::default();
+        if let Some(t) = param_type {
+            config.parameters.insert(
+                "REGISTRY_TOKEN".to_string(),
+                Parameter {
+                    param_type: Some(t.to_string()),
+                    source: (t == "secret").then(|| "manual".to_string()),
+                    optional: Some(true),
+                    ..Default::default()
+                },
+            );
+        }
+        config.registry_auth.insert(
+            "ghcr.io".to_string(),
+            crate::config::RegistryAuth {
+                username: "acme-bot".to_string(),
+                password: password.to_string(),
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn registry_auth_with_secret_reference_is_valid() {
+        let config = registry_auth_config("{{REGISTRY_TOKEN}}", Some("secret"));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn registry_auth_literal_password_is_rejected_without_echoing_it() {
+        let config = registry_auth_config("hunter2-literal", Some("secret"));
+        let msg = config.validate().unwrap_err().to_string();
+        assert!(msg.contains("ghcr.io"), "{msg}");
+        assert!(msg.contains("literal password"), "{msg}");
+        assert!(msg.contains("type: secret"), "{msg}");
+        assert!(
+            !msg.contains("hunter2-literal"),
+            "error leaked the password: {msg}"
+        );
+    }
+
+    #[test]
+    fn registry_auth_non_secret_parameter_is_rejected() {
+        let config = registry_auth_config("{{REGISTRY_TOKEN}}", Some("string"));
+        let msg = config.validate().unwrap_err().to_string();
+        assert!(msg.contains("must have 'type: secret'"), "{msg}");
+    }
+
+    #[test]
+    fn registry_auth_undeclared_parameter_is_rejected() {
+        let config = registry_auth_config("{{REGISTRY_TOKEN}}", None);
+        let msg = config.validate().unwrap_err().to_string();
+        assert!(msg.contains("not declared"), "{msg}");
+        assert!(msg.contains("REGISTRY_TOKEN:"), "{msg}");
+    }
+
+    #[test]
+    fn registry_auth_key_must_be_a_host() {
+        let mut config = registry_auth_config("{{REGISTRY_TOKEN}}", Some("secret"));
+        let auth = config.registry_auth.remove("ghcr.io").unwrap();
+        config.registry_auth.insert("ghcr".to_string(), auth);
+        let msg = config.validate().unwrap_err().to_string();
+        assert!(msg.contains("not a registry host"), "{msg}");
+    }
 
     #[test]
     fn secret_with_default_is_rejected() {
