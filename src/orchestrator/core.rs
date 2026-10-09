@@ -2879,14 +2879,17 @@ impl Orchestrator {
     pub async fn pre_pull_images(&self, services: &[String]) -> Vec<ImagePullResult> {
         use crate::docker::DockerClient;
 
-        // Collect unique images from Docker-type services
+        // Collect unique images from Docker-type services, with the platform
+        // each one is pulled for
         let mut images: Vec<String> = Vec::new();
+        let mut platforms: HashMap<String, Option<String>> = HashMap::new();
         for name in services {
             if let Some(svc) = self.config.services.get(name)
                 && let Some(ref image) = svc.image
                 && !images.contains(image)
             {
                 images.push(image.clone());
+                platforms.insert(image.clone(), svc.platform.clone());
             }
         }
 
@@ -2930,9 +2933,15 @@ impl Orchestrator {
                 let client = client.clone();
                 let img = img.clone();
                 let credential = credentials.for_image(&img).cloned();
+                let platform = platforms.get(&img).cloned().flatten();
                 async move {
                     let outcome = match client
-                        .pull_with_credential(&img, credential.as_ref(), pull_timeout)
+                        .pull_with_credential(
+                            &img,
+                            platform.as_deref(),
+                            credential.as_ref(),
+                            pull_timeout,
+                        )
                         .await
                     {
                         Ok(()) => Ok(()),

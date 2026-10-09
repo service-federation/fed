@@ -81,6 +81,11 @@ pub struct Service {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
 
+    /// Platform to pull and run the image for, such as `linux/amd64`, for an
+    /// image that has no build for this machine's architecture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+
     /// Override the Docker CMD for image-based services.
     /// Accepts a string (split on whitespace) or an array of strings.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -271,6 +276,7 @@ impl Service {
             "build",
             "process",
             "image",
+            "platform",
             "command",
             "volumes",
             "ports",
@@ -876,6 +882,7 @@ mod merge_completeness {
             build: Some(BuildConfig::Command("npm run build".to_string())),
             process: Some("npm start".to_string()),
             image: Some("catalog:latest".to_string()),
+            platform: Some("linux/amd64".to_string()),
             command: Some(DockerCommand::List(vec!["--flag".to_string()])),
             volumes: vec!["./data:/data".to_string()],
             ports: vec!["8080:8080".to_string()],
@@ -940,6 +947,7 @@ mod merge_completeness {
             build,
             process,
             image,
+            platform,
             command,
             volumes,
             ports,
@@ -988,6 +996,7 @@ mod merge_completeness {
         );
         assert_eq!(process.as_deref(), Some("npm start"));
         assert_eq!(image.as_deref(), Some("catalog:latest"));
+        assert_eq!(platform.as_deref(), Some("linux/amd64"));
         assert_eq!(
             command.map(|c| c.to_args().unwrap()),
             Some(vec!["--flag".to_string()]),

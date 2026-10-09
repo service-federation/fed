@@ -154,7 +154,7 @@ async fn pulls_from_a_private_registry_with_the_team_credential() {
 
     // Without the team credential the registry refuses the pull.
     let err = client
-        .pull(&image, TIMEOUT)
+        .pull(&image, None, TIMEOUT)
         .await
         .expect_err("anonymous pull must be refused");
     assert!(!err.to_string().contains(PASSWORD));
@@ -163,7 +163,7 @@ async fn pulls_from_a_private_registry_with_the_team_credential() {
     // credentials, and still fails. The password stays out of the error.
     let wrong = RegistryCredential::new(&registry, USER, "wrong-password", "REGISTRY_TOKEN");
     let err = client
-        .pull_with_credential(&image, Some(&wrong), TIMEOUT)
+        .pull_with_credential(&image, None, Some(&wrong), TIMEOUT)
         .await
         .expect_err("wrong credential and no ambient login must fail");
     assert!(!err.to_string().contains("wrong-password"));
@@ -172,7 +172,7 @@ async fn pulls_from_a_private_registry_with_the_team_credential() {
     // The right team credential pulls the image.
     let right = RegistryCredential::new(&registry, USER, PASSWORD, "REGISTRY_TOKEN");
     client
-        .pull_with_credential(&image, Some(&right), TIMEOUT)
+        .pull_with_credential(&image, None, Some(&right), TIMEOUT)
         .await
         .expect("pull with the team credential");
     assert!(client.image_exists(&image).await);

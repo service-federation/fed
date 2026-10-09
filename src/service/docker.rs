@@ -532,6 +532,10 @@ impl ServiceManager for DockerService {
         // NOTE: Not using --rm flag to avoid race conditions with manual stop/cleanup
         // We'll manually remove containers in stop() to ensure proper state tracking
         let mut args = vec!["run".to_string(), "-d".to_string()];
+        if let Some(ref platform) = self.config.platform {
+            args.push("--platform".to_string());
+            args.push(platform.clone());
+        }
 
         // Native restart mapping: `restart: always` also gets Docker's own
         // `--restart unless-stopped` as an *additional* reboot-survival
@@ -716,6 +720,7 @@ impl ServiceManager for DockerService {
                 .client
                 .pull_with_credential(
                     image,
+                    self.config.platform.as_deref(),
                     self.registry_credential.as_ref(),
                     DOCKER_PULL_TIMEOUT,
                 )

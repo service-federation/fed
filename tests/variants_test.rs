@@ -435,6 +435,31 @@ fn resolution_is_idempotent() {
     );
 }
 
+/// An image built for another architecture needs its platform, and the
+/// variant that names the image is where that belongs.
+#[test]
+fn a_variant_carries_the_image_platform() {
+    let config = resolve(
+        r#"
+services:
+  api:
+    default_variant: source
+    variants:
+      source:
+        process: cargo run
+      image:
+        image: rg.example/api:latest
+        platform: linux/amd64
+"#,
+        &["image"],
+    )
+    .unwrap();
+    assert_eq!(
+        config.services["api"].platform.as_deref(),
+        Some("linux/amd64")
+    );
+}
+
 // ── Selection errors ──────────────────────────────────────────────────────
 
 #[test]

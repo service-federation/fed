@@ -53,6 +53,18 @@ pub struct BuildOptions {
 #[derive(Debug, Clone)]
 pub struct DockerClient;
 
+/// `pull [extra...] [--platform P] IMAGE`.
+fn pull_args(extra: &[String], image: &str, platform: Option<&str>) -> Vec<String> {
+    let mut args = vec!["pull".to_string()];
+    args.extend(extra.iter().cloned());
+    if let Some(platform) = platform {
+        args.push("--platform".to_string());
+        args.push(platform.to_string());
+    }
+    args.push(image.to_string());
+    args
+}
+
 impl DockerClient {
     pub fn new() -> Self {
         DockerClient
@@ -212,8 +224,15 @@ impl DockerClient {
     }
 
     /// Pull a Docker image with the environment's own credentials.
-    pub async fn pull(&self, image: &str, timeout: Duration) -> Result<(), DockerError> {
-        let output = self.run(&["pull", image], timeout).await?;
+    pub async fn pull(
+        &self,
+        image: &str,
+        platform: Option<&str>,
+        timeout: Duration,
+    ) -> Result<(), DockerError> {
+        let args = pull_args(&[], image, platform);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = self.run(&arg_refs, timeout).await?;
         Self::pull_outcome(output)
     }
 
@@ -227,11 +246,12 @@ impl DockerClient {
     pub async fn pull_with_credential(
         &self,
         image: &str,
+        platform: Option<&str>,
         credential: Option<&RegistryCredential>,
         timeout: Duration,
     ) -> Result<(), DockerError> {
         let Some(credential) = credential else {
-            return self.pull(image, timeout).await;
+            return self.pull(image, platform, timeout).await;
         };
         let flavor = RuntimeFlavor::of_binary(runtime::binary());
         let user_dir = registry_auth::user_docker_config_dir();
@@ -243,13 +263,11 @@ impl DockerClient {
                     credential.registry(),
                     e
                 );
-                return self.pull(image, timeout).await;
+                return self.pull(image, platform, timeout).await;
             }
         };
 
-        let mut args: Vec<String> = vec!["pull".to_string()];
-        args.extend(auth_dir.pull_args());
-        args.push(image.to_string());
+        let args = pull_args(&auth_dir.pull_args(), image, platform);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let result = self
             .run_with_env(&arg_refs, &auth_dir.pull_env(), timeout)
@@ -262,7 +280,7 @@ impl DockerClient {
                 if registry_auth::stderr_indicates_auth_failure(stderr) =>
             {
                 registry_auth::warn_auth_failure_once(credential);
-                self.pull(image, timeout).await
+                self.pull(image, platform, timeout).await
             }
             other => other,
         }
@@ -753,5 +771,26 @@ impl DockerClient {
 impl Default for DockerClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod pull_args_tests {
+    use super::pull_args;
+
+    #[test]
+    fn a_platform_goes_before_the_image() {
+        assert_eq!(
+            pull_args(&[], "rg.example/app:latest", Some("linux/amd64")),
+            ["pull", "--platform", "linux/amd64", "rg.example/app:latest"]
+        );
+    }
+
+    #[test]
+    fn without_a_platform_the_pull_is_unchanged() {
+        assert_eq!(
+            pull_args(&["--authfile".into(), "/tmp/a".into()], "app", None),
+            ["pull", "--authfile", "/tmp/a", "app"]
+        );
     }
 }
