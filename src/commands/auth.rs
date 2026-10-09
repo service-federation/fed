@@ -160,6 +160,11 @@ async fn login_flow(
         out.status("Open this URL on any machine, sign in, and approve the request:");
     }
     out.status(&format!("  {}", authorize));
+    out.status(&format!(
+        "Verify the code shown in your browser matches {} {}. Only then approve.",
+        &auth.pairing_code[..4],
+        &auth.pairing_code[4..]
+    ));
     out.status("Waiting for approval… (times out after 5 minutes)");
     let code = poll_for_code(base_url, &auth).await?;
 
@@ -329,6 +334,10 @@ async fn checked_auth_request(base_url: &str, label: &str) -> Result<cloud::Auth
     if !valid_prefixed_id(&auth.poll_secret, "fedps_") {
         bail!("cloud: malformed poll secret from server — run `fed login` again");
     }
+    if auth.pairing_code.len() != 8 || !auth.pairing_code.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        bail!("cloud: malformed pairing code from server — run `fed login` again");
+    }
     Ok(auth)
 }
 
@@ -340,9 +349,14 @@ pub async fn run_login(
     url_override: Option<String>,
     out: &dyn UserOutput,
 ) -> Result<()> {
-    let base_url = url_override.unwrap_or_else(|| {
+    let raw_url = url_override.unwrap_or_else(|| {
         std::env::var("FED_CLOUD_URL").unwrap_or_else(|_| cloud::DEFAULT_URL.to_string())
     });
+    // The origin form has no trailing slash, so the printed sign-in URL and
+    // the stored credential URL never contain `//`.
+    let base_url = cloud::cloud_base_url(&raw_url)?
+        .origin()
+        .ascii_serialization();
     let Some(files) = cloud::CredentialFiles::default_paths() else {
         bail!("cannot determine home directory");
     };
@@ -692,7 +706,7 @@ mod tests {
 
     fn respond_json(mut stream: &TcpStream, status_line: &str, body: &str) {
         let resp = format!(
-            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {}\r\nX-Fed-Api-Version: 2\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             status_line,
             body.len(),
             body
@@ -779,7 +793,7 @@ mod tests {
                             &stream,
                             "201 Created",
                             &format!(
-                                "{{\"request\":\"{}\",\"poll_secret\":\"{}\",\"expires_in\":300}}",
+                                "{{\"request\":\"{}\",\"poll_secret\":\"{}\",\"pairing_code\":\"12345678\",\"expires_in\":300}}",
                                 STUB_REQUEST, STUB_POLL_SECRET
                             ),
                         );
@@ -935,6 +949,7 @@ mod tests {
         // …and neither the token nor the poll secret got near the terminal.
         let text = out.combined();
         assert_no_secrets(&text);
+        assert!(text.contains("1234 5678"));
 
         // The full server-side sequence, in order: register → poll → exchange
         // → ACTIVATE (authenticated, before any success output can be built)

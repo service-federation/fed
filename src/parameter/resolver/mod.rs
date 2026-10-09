@@ -143,9 +143,11 @@ pub struct Resolver {
     /// Test seam: when set, used instead of the real cloud vault lookup.
     test_vault_values: Option<HashMap<String, String>>,
     /// Test seam: when set, the vault lookup is simulated as failing with this
-    /// message (an unreachable cloud / revoked token). Takes precedence over
+    /// message (an unreachable cloud). Takes precedence over
     /// `test_vault_values`.
     test_vault_failure: Option<String>,
+    /// Test seam for an explicit authorization denial.
+    test_vault_denied: Option<String>,
     /// Active isolation session id, if any. Scopes the built-in
     /// `FED_PROJECT_ID` so parallel isolated stacks get distinct identifiers.
     isolation_id: Option<String>,
@@ -188,6 +190,7 @@ impl Resolver {
             secret_cache: crate::orchestrator::SecretCacheMode::default(),
             test_vault_values: None,
             test_vault_failure: None,
+            test_vault_denied: None,
             required_names: None,
             isolation_id: None,
             deferred_params: HashSet::new(),
