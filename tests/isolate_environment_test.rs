@@ -36,6 +36,7 @@ services:
     let temp = tempfile::tempdir().unwrap();
 
     let ctx = RunContext {
+        variants: vec![],
         offline: true,
         secret_cache: fed::SecretCacheMode::Memory,
         is_interactive: false,

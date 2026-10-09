@@ -106,6 +106,8 @@ pub struct RunContext {
     /// profile-gated `depends_on` service survives the child's own
     /// filtering pass — see `apply_run_context`'s doc comment.
     pub profiles: Vec<String>,
+    /// Variant preferences and pins inherited by isolated script children.
+    pub variants: Vec<String>,
     /// Scope the vault query to the manual-secret names the target script
     /// transitively references. `None` fetches every missing manual secret
     /// (the safe default for interactive `fed`/`fed start`/unknown

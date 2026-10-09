@@ -36,7 +36,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let text = vec![
         Line::from(vec![
             Span::styled("Service Federation ", Style::default().fg(Color::Cyan)),
-            Span::styled("v0.2.0", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                concat!("v", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]),
         Line::from(vec![
             Span::styled("🚀 Running: ", Style::default().fg(Color::Green)),
@@ -84,7 +87,16 @@ fn draw_services_list(f: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(status_color),
                 ),
                 Span::styled(
-                    format!("{:<30}", service.name),
+                    // The variant rides with the name rather than getting a
+                    // column of its own: most stacks have none, and an empty
+                    // column would cost 10 characters on every row.
+                    format!(
+                        "{:<30}",
+                        match &service.variant {
+                            Some(variant) => format!("{} ({})", service.name, variant),
+                            None => service.name.clone(),
+                        }
+                    ),
                     Style::default().fg(Color::White),
                 ),
                 Span::styled(

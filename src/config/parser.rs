@@ -42,8 +42,26 @@ impl Parser {
         )))
     }
 
-    /// Load config from file path
+    /// Load config from file path.
+    ///
+    /// Resolves local templates and applies `defaults:`. Package extensions
+    /// need the async packages-aware loader
+    /// ([`Self::load_config_with_packages_offline`]); this path is for
+    /// package-free configs and for callers that only need the local view.
     pub fn load_config<P: AsRef<Path>>(&self, path: P) -> Result<Config> {
+        let mut config = self.load_config_pre_packages(path)?;
+        crate::config::defaults::apply(&mut config)?;
+        Ok(config)
+    }
+
+    /// Everything [`Self::load_config`] does except applying `defaults:`.
+    ///
+    /// `defaults:` has to run *after* every `extends:` has been resolved,
+    /// including package ones: a template's value is more specific than a
+    /// global default, so it must reach the service first or the default
+    /// will already be occupying the field. That ordering is the whole reason
+    /// this split exists.
+    fn load_config_pre_packages<P: AsRef<Path>>(&self, path: P) -> Result<Config> {
         let content = fs::read_to_string(path.as_ref()).map_err(|e| {
             Error::Config(format!(
                 "Failed to read config file '{}': {}",
@@ -55,7 +73,6 @@ impl Parser {
         let mut config = self.parse_config(&content)?;
         // Resolve local template extensions here so every loader — including
         // the synchronous one behind `fed validate` — sees merged services.
-        // Package extensions still require the async packages-aware loader.
         crate::package::ServiceMerger::merge_local_templates(&mut config)?;
         Ok(config)
     }
@@ -73,11 +90,13 @@ impl Parser {
         path: P,
         offline: bool,
     ) -> Result<Config> {
-        // Load the base config (local template extensions resolve in load_config)
-        let mut config = self.load_config(path.as_ref())?;
+        // Local template extensions resolve here; `defaults:` is deliberately
+        // held back until after package merging below.
+        let mut config = self.load_config_pre_packages(path.as_ref())?;
 
-        // If there are no packages, return config after template resolution
+        // If there are no packages, there is nothing further to resolve.
         if config.packages.is_empty() {
+            crate::config::defaults::apply(&mut config)?;
             return Ok(config);
         }
 
@@ -93,6 +112,10 @@ impl Parser {
         // Apply service extensions from packages
         crate::package::ServiceMerger::merge_packages(&mut config, &packages)?;
 
+        // Every `extends:` is resolved now, so the defaults can fill what is
+        // still unset without displacing a more specific package value.
+        crate::config::defaults::apply(&mut config)?;
+
         Ok(config)
     }
 
@@ -101,14 +124,82 @@ impl Parser {
         let mut config: Config = serde_yaml::from_str(content)
             .map_err(|e| Error::Parse(format!("Failed to parse YAML config: {}", e)))?;
 
-        // Second lightweight parse to a raw Value: serde aliases consume the
-        // legacy-cased keys (httpGet, gradleTask, ...) without a trace, so the
-        // soft deprecation notice has to come from the raw document.
+        // Second lightweight parse to a raw Value. Two things are only
+        // visible in the raw document: serde aliases consume the legacy-cased
+        // keys (httpGet, gradleTask, ...) without a trace, and an explicitly
+        // empty collection (`depends_on: []`) is indistinguishable from an
+        // absent one once serde has turned both into an empty `Vec`.
         if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(content) {
             config.legacy_key_usages = scan_legacy_spellings(&doc);
+            record_explicit_empty(&doc, &mut config);
         }
 
         Ok(config)
+    }
+}
+
+/// Record, for every service/template/variant/defaults block, which keys were
+/// written with an explicitly empty collection value.
+///
+/// `depends_on: []` and an omitted `depends_on:` both deserialize to an empty
+/// `Vec`, but they mean opposite things once a `defaults:` block is in play:
+/// the first is "this service has no dependencies", the second is "this
+/// service didn't say". Only the raw document can tell them apart.
+fn record_explicit_empty(doc: &serde_yaml::Value, config: &mut Config) {
+    fn empty_keys(fields: &serde_yaml::Mapping) -> std::collections::BTreeSet<String> {
+        fields
+            .iter()
+            .filter_map(|(key, value)| {
+                let key = key.as_str()?;
+                let is_empty_collection = match value {
+                    serde_yaml::Value::Sequence(seq) => seq.is_empty(),
+                    serde_yaml::Value::Mapping(map) => map.is_empty(),
+                    _ => false,
+                };
+                is_empty_collection.then(|| key.to_string())
+            })
+            .collect()
+    }
+
+    if let Some(fields) = doc.get("defaults").and_then(serde_yaml::Value::as_mapping)
+        && let Some(defaults) = config.defaults.as_mut()
+    {
+        defaults.explicit_empty = empty_keys(fields);
+    }
+
+    for section in ["services", "templates"] {
+        let Some(map) = doc.get(section).and_then(serde_yaml::Value::as_mapping) else {
+            continue;
+        };
+        for (name, raw) in map {
+            let (Some(name), Some(fields)) = (name.as_str(), raw.as_mapping()) else {
+                continue;
+            };
+            let target = match section {
+                "services" => config.services.get_mut(name),
+                _ => config.templates.get_mut(name),
+            };
+            let Some(target) = target else { continue };
+            target.explicit_empty = empty_keys(fields);
+
+            // Variants are partial services and opt out the same way.
+            let Some(variants) = fields
+                .get("variants")
+                .and_then(serde_yaml::Value::as_mapping)
+            else {
+                continue;
+            };
+            for (variant_name, raw_variant) in variants {
+                let (Some(variant_name), Some(variant_fields)) =
+                    (variant_name.as_str(), raw_variant.as_mapping())
+                else {
+                    continue;
+                };
+                if let Some(variant) = target.variants.get_mut(variant_name) {
+                    variant.explicit_empty = empty_keys(variant_fields);
+                }
+            }
+        }
     }
 }
 

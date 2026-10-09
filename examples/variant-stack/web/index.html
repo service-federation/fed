@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Variant stack · Catalog</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">$label</p>
+        <h1>One catalog.<br>Two implementations.</h1>
+        <p class="badge">
+          Active implementation: <strong>$implementation</strong>
+        </p>
+      </header>
+
+      <table>
+        <caption>Current catalog</caption>
+        <thead>
+          <tr>
+            <th scope="col">Item</th>
+            <th scope="col">In stock</th>
+          </tr>
+        </thead>
+        <tbody>
+$rows
+        </tbody>
+      </table>
+
+      <p>
+        The frontend calls the same catalog URL for either implementation.
+        Switch the variant, then reload this page to see the result.
+      </p>
+      <nav aria-label="Catalog actions">
+        <a href="/catalog">View catalog JSON</a>
+        <a href="/">Reload catalog</a>
+      </nav>
+    </main>
+  </body>
+</html>

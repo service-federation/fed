@@ -228,6 +228,20 @@ impl OrchestratorBuilder {
         // lock-then-immediately-drop, which would otherwise be a brief but
         // real acquisition.
         let work_dir = self.work_dir.unwrap_or_else(|| PathBuf::from("."));
+
+        // Resolve before any initialization mode filters profiles or creates
+        // managers. CLI callers may already supply a resolved config; isolated
+        // children inherit the same flags through RunContext.
+        let mut config = config;
+        crate::config::variants::resolve_variants(
+            &mut config,
+            &crate::config::variants::VariantSelection::load(
+                &self.run_context.variants,
+                &work_dir,
+            )?,
+            &self.run_context.profiles,
+        )?;
+
         #[allow(clippy::disallowed_methods)]
         let mut orchestrator = if self.dry_run || self.supervisor_attach {
             Orchestrator::new_ephemeral(config, work_dir).await?

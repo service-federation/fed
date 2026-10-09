@@ -1,12 +1,11 @@
-//! `fed supervise` — the restart-policy supervisor daemon.
+//! `fed supervise` — the service supervisor daemon.
 //!
 //! This file has two halves:
 //! - [`run_supervise`]: the daemon's own body, invoked by `main.rs` when
 //!   `cli.command` is the hidden `Commands::Supervise` variant.
-//! - [`spawn_if_needed`]: called from `fed start`'s non-watch branch and
-//!   `fed restart` to launch a detached `fed supervise` process when a
-//!   service with a `restart:` policy is running and no live supervisor
-//!   already exists for this workspace.
+//! - [`spawn_if_needed`]: called after background start/restart dispatch
+//!   (including error recovery), or for an interactive service's dependencies,
+//!   to launch a detached observer for healthchecks and restart policies.
 
 use fed::config::Config;
 use fed::orchestrator::supervisor::{live_supervisor_pid, try_acquire};
@@ -30,7 +29,15 @@ use std::time::Duration;
 /// supervisor is not an error, just a no-op exit (this happens whenever two
 /// `fed start`/`fed restart` invocations both decide to spawn one at
 /// roughly the same time).
-pub async fn run_supervise(config: Config, work_dir: PathBuf) -> anyhow::Result<()> {
+pub async fn run_supervise(
+    mut config: Config,
+    work_dir: PathBuf,
+    mut run_context: RunContext,
+) -> anyhow::Result<()> {
+    // Serialize attach with start/restart parameter resolution and registration.
+    // A just-spawned daemon may not hold supervisor.lock yet when another
+    // command begins; it must wait for that command's committed state.
+    let attach_lock = fed::orchestrator::StartLock::acquire(&work_dir).await?;
     let lock = match try_acquire(&work_dir) {
         Ok(lock) => lock,
         Err(e) => {
@@ -48,13 +55,38 @@ pub async fn run_supervise(config: Config, work_dir: PathBuf) -> anyhow::Result<
         work_dir
     );
 
+    // A later start may only change one service. The persisted registration
+    // owns the implementation of every still-running (or restartable) service.
+    let tracker = fed::state::StateTracker::new_for_supervisor(work_dir.clone()).await?;
+    let mut running_names = Vec::new();
+    for name in config.services.keys() {
+        if let Some(state) = tracker.get_service(name).await
+            && state.desired_state == fed::state::DesiredState::Running
+        {
+            if let Some(variant) = state.variant {
+                run_context.variants.push(format!("{name}:{variant}"));
+            }
+            running_names.push(name.clone());
+        }
+    }
+    fed::config::variants::resolve_variants(
+        &mut config,
+        &fed::config::variants::VariantSelection::load(&run_context.variants, &work_dir)?,
+        &run_context.profiles,
+    )?;
+    for name in running_names {
+        for profile in &config.services[&name].profiles {
+            if !run_context.profiles.contains(profile) {
+                run_context.profiles.push(profile.clone());
+            }
+        }
+    }
+    drop(tracker);
+
     // supervisor_attach's own construction path (initialize_supervisor) is
     // what matters here, not output_mode — but File is the accurate label
     // for what this daemon exists to watch (backgrounded services).
-    let run_context = RunContext {
-        output_mode: OutputMode::File,
-        ..Default::default()
-    };
+    run_context.output_mode = OutputMode::File;
 
     let orchestrator = Orchestrator::builder()
         .config(config)
@@ -64,6 +96,7 @@ pub async fn run_supervise(config: Config, work_dir: PathBuf) -> anyhow::Result<
         .build()
         .await?;
 
+    drop(attach_lock);
     tracing::info!("fed supervise: attached and monitoring supervised services");
 
     run_until_done(&orchestrator).await;
@@ -131,12 +164,65 @@ async fn run_until_done(_orchestrator: &Orchestrator) {
     // there, but is kept total.
 }
 
+/// The session-scoped flags a spawned `fed supervise` must inherit verbatim.
+///
+/// The daemon is a fresh process that re-reads `fed.yaml` from scratch, so
+/// anything that changed how *this* invocation interpreted the config has to
+/// be replayed on its command line or it will supervise a different stack
+/// than the one that was started. Named fields rather than a row of
+/// positional `&[String]`s, since `profiles` and `variants` are otherwise
+/// indistinguishable at the call site.
+#[derive(Debug, Clone, Default)]
+pub struct InheritedFlags {
+    /// From `--offline`.
+    pub offline: bool,
+    /// From `--profile`.
+    pub profiles: Vec<String>,
+    /// From `--variant`.
+    pub variants: Vec<String>,
+}
+
+/// The full argument list for a `fed supervise` child, as a pure function of
+/// the parent's own settings.
+///
+/// Split out from [`spawn_if_needed`] so the forwarding can be asserted
+/// directly — spawning a real daemon to read its `/proc/<pid>/cmdline` would
+/// be a slow and flaky way to test a list of strings.
+fn supervisor_args(
+    work_dir: &Path,
+    config_path: &Path,
+    flags: &InheritedFlags,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--workdir".into(),
+        work_dir.into(),
+        "--config".into(),
+        config_path.into(),
+    ];
+    if flags.offline {
+        args.push("--offline".into());
+    }
+    for profile in &flags.profiles {
+        args.push("--profile".into());
+        args.push(profile.into());
+    }
+    // The daemon re-reads fed.yaml in a fresh process, so it must be told the
+    // same variant selection — otherwise it would resolve a service's variants
+    // from `.fed/variants.yaml`/`default_variant` alone and could end up
+    // supervising a different implementation than the one actually running.
+    for variant in &flags.variants {
+        args.push("--variant".into());
+        args.push(variant.into());
+    }
+    args.push("supervise".into());
+    args
+}
+
 /// Spawn a detached `fed supervise` for `work_dir`, unless one is already
 /// running.
 ///
-/// Called from `fed start`'s non-watch branch (when any started service has
-/// a `restart:` policy) and from `fed restart` — both spawn or respawn a
-/// missing supervisor after mutating state. `fed status` calls neither this
+/// Called after background start/restart dispatch, or before waiting on an
+/// interactive service. A fresh daemon attaches to the committed service state. `fed status` calls neither this
 /// nor any other respawn logic; it only reads the lock file for display,
 /// staying strictly read-only.
 ///
@@ -152,8 +238,7 @@ async fn run_until_done(_orchestrator: &Orchestrator) {
 pub fn spawn_if_needed(
     work_dir: &Path,
     config_path: &Path,
-    offline: bool,
-    profiles: &[String],
+    flags: &InheritedFlags,
 ) -> anyhow::Result<()> {
     if let Some(pid) = live_supervisor_pid(work_dir) {
         tracing::debug!(
@@ -172,15 +257,7 @@ pub fn spawn_if_needed(
     })?;
 
     let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("--workdir").arg(work_dir);
-    cmd.arg("--config").arg(config_path);
-    if offline {
-        cmd.arg("--offline");
-    }
-    for profile in profiles {
-        cmd.arg("--profile").arg(profile);
-    }
-    cmd.arg("supervise");
+    cmd.args(supervisor_args(work_dir, config_path, flags));
 
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -197,20 +274,81 @@ pub fn spawn_if_needed(
     }
 }
 
-/// True if any of `service_names` has a `restart:` policy other than `No`
-/// in `config`. Used by both `fed start` (services just started) and `fed
-/// restart` (services just restarted) to decide whether spawning a
-/// supervisor is worth doing at all.
-pub fn any_has_restart_policy(
+/// Whether any started service needs health monitoring or restart/dependency
+/// supervision. Uses the same scope as the daemon itself.
+pub fn any_needs_supervision(
     config: &Config,
     service_names: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> bool {
-    service_names.into_iter().any(|name| {
-        config
-            .services
-            .get(name.as_ref())
-            .and_then(|s| s.restart.clone())
-            .map(|policy| !matches!(policy, fed::RestartPolicy::No))
-            .unwrap_or(false)
-    })
+    let scope = fed::orchestrator::supervised_service_names(config);
+    service_names
+        .into_iter()
+        .any(|name| scope.contains(name.as_ref()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_of(flags: &InheritedFlags) -> Vec<String> {
+        supervisor_args(Path::new("/w"), Path::new("/w/fed.yaml"), flags)
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn supervisor_inherits_no_flags_when_none_were_given() {
+        assert_eq!(
+            args_of(&InheritedFlags::default()),
+            vec!["--workdir", "/w", "--config", "/w/fed.yaml", "supervise"]
+        );
+    }
+
+    /// `--variant` must reach the daemon verbatim, entry by entry: it
+    /// re-resolves every service's variants from scratch, so a dropped flag
+    /// means it supervises a different implementation than the one `fed
+    /// start` launched.
+    #[test]
+    fn supervisor_inherits_profiles_and_variants_verbatim() {
+        let args = args_of(&InheritedFlags {
+            offline: true,
+            profiles: vec!["full".to_string()],
+            variants: vec!["go,ts".to_string(), "catalog:java".to_string()],
+        });
+        assert_eq!(
+            args,
+            vec![
+                "--workdir",
+                "/w",
+                "--config",
+                "/w/fed.yaml",
+                "--offline",
+                "--profile",
+                "full",
+                "--variant",
+                "go,ts",
+                "--variant",
+                "catalog:java",
+                "supervise",
+            ]
+        );
+    }
+
+    /// The comma list is passed through as one argument rather than split
+    /// here: `--variant` parsing lives in one place (`config::variants`), and
+    /// splitting in both would be two implementations to keep in agreement.
+    #[test]
+    fn supervisor_does_not_split_a_comma_list() {
+        let args = args_of(&InheritedFlags {
+            variants: vec!["go,ts,rust".to_string()],
+            ..Default::default()
+        });
+        assert!(args.contains(&"go,ts,rust".to_string()));
+        assert_eq!(
+            args.iter().filter(|a| *a == "--variant").count(),
+            1,
+            "one entry must stay one argument"
+        );
+    }
 }

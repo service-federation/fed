@@ -1,0 +1,60 @@
+# Runnable without Docker, Java, or Go: implementations are sleep stand-ins.
+# Copy to a scratch directory as fed.yaml, then:
+#   fed validate
+#   fed start --variant go
+#   fed status
+#   fed restart --all
+#   fed stop
+# Remove entrypoint to select the full graph explicitly with fed start --all.
+entrypoint: '*'
+
+defaults:
+  depends_on: [storage]
+  startup_timeout: 15s
+  healthcheck_start_period: 5s
+  environment:
+    DEMO_MODE: local
+
+templates:
+  go-worker:
+    process: sleep 300
+    environment:
+      DEMO_IMPLEMENTATION: go
+
+services:
+  # Services named in defaults.depends_on are excluded from all defaults.
+  storage:
+    process: sleep 300
+    healthcheck:
+      command: 'true'
+
+  catalog:
+    default_variant: java
+    healthcheck:
+      command: 'true'
+      start_period: 5s
+      interval: 1s
+      probe_timeout: 500ms
+      retries: 3
+    variants:
+      java:
+        process: sleep 300
+        environment:
+          DEMO_IMPLEMENTATION: java
+      go:
+        extends: go-worker
+        cwd: .
+
+  # No dependency on storage, despite the defaults block.
+  standalone:
+    process: sleep 300
+    depends_on: []
+
+  # A grouping node completes once its dependencies are ready.
+  bundle:
+    depends_on: [catalog]
+
+  # Only included with --profile diagnostics, even with --all or '*'.
+  inspector:
+    process: sleep 300
+    profiles: [diagnostics]

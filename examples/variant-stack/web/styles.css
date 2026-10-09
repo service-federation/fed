@@ -1,0 +1,84 @@
+:root {
+  color-scheme: light;
+  font-family: system-ui, sans-serif;
+  font-size: 18px;
+  line-height: 1.6;
+  color: #193126;
+  background: #f4f7f2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  max-width: 728px;
+  margin: 8vh auto;
+  padding: 24px;
+}
+
+.eyebrow {
+  margin: 0;
+}
+
+h1 {
+  margin: 16px 0;
+  font-size: clamp(28px, 6vw, 44px);
+  line-height: 1.15;
+}
+
+.badge {
+  display: inline-block;
+  padding: 4px 14px;
+  border-radius: 24px;
+  background: #d6eddb;
+}
+
+table {
+  width: 100%;
+  margin: 28px 0;
+  border-collapse: collapse;
+  background: #fff;
+}
+
+caption {
+  padding-bottom: 12px;
+  text-align: left;
+}
+
+th,
+td {
+  padding: 16px;
+  border-bottom: 1px solid #d9e3d8;
+  text-align: left;
+}
+
+th:last-child,
+td:last-child {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+}
+
+a {
+  color: #225c37;
+  text-underline-offset: 4px;
+}
+
+a:hover {
+  text-decoration-thickness: 2px;
+}
+
+a:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 4px;
+}

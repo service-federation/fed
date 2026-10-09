@@ -1,4 +1,4 @@
-use fed::config::{HealthCheck, Parameter, Service};
+use fed::config::{HealthCheck, HealthCheckTiming, Parameter, Service};
 use fed::dependency::Graph;
 use fed::error::Error;
 use fed::parameter::Resolver;
@@ -694,7 +694,7 @@ fn test_env_multiple_templates_same_line() {
 fn test_healthcheck_invalid_url() {
     let hc = HealthCheck::HttpGet {
         http_get: "not-a-url".to_string(),
-        timeout: None,
+        timing: HealthCheckTiming::default(),
     };
 
     use fed::config::HealthCheckType;
@@ -715,7 +715,7 @@ fn test_healthcheck_empty_command() {
 fn test_healthcheck_command_map_format() {
     let hc = HealthCheck::CommandMap {
         command: "curl localhost".to_string(),
-        timeout: None,
+        timing: HealthCheckTiming::default(),
     };
 
     use fed::config::HealthCheckType;

@@ -57,6 +57,12 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compose: Vec<ComposeImport>,
 
+    /// Fallback service fields applied after extension resolution and before
+    /// variant selection. Services named in defaults.depends_on are excluded;
+    /// explicit empty dependencies opt out of inheritance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defaults: Option<Box<Service>>,
+
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub templates: HashMap<String, Service>,
 
@@ -158,6 +164,7 @@ impl Config {
             "parameters",
             "services",
             "compose",
+            "defaults",
             "templates",
             "dependencies",
             "entrypoint",
@@ -181,27 +188,18 @@ impl Config {
                 candidates: Self::known_top_level_keys(),
             });
         }
+        if let Some(defaults) = &self.defaults {
+            collect_service_warnings("defaults", defaults, &mut out);
+        }
         let mut services: Vec<_> = self.services.iter().collect();
         services.sort_by(|a, b| a.0.cmp(b.0));
         for (name, service) in services {
-            for key in service.unknown_fields.keys() {
-                out.push(UnknownKey {
-                    location: format!("service '{name}'"),
-                    key: key.clone(),
-                    candidates: Service::known_field_names(),
-                });
-            }
+            collect_service_warnings(&format!("service '{name}'"), service, &mut out);
         }
         let mut templates: Vec<_> = self.templates.iter().collect();
         templates.sort_by(|a, b| a.0.cmp(b.0));
         for (name, template) in templates {
-            for key in template.unknown_fields.keys() {
-                out.push(UnknownKey {
-                    location: format!("template '{name}'"),
-                    key: key.clone(),
-                    candidates: Service::known_field_names(),
-                });
-            }
+            collect_service_warnings(&format!("template '{name}'"), template, &mut out);
         }
         out
     }
@@ -399,4 +397,29 @@ pub enum PackageAuth {
         username: String,
         password: String,
     },
+}
+
+/// Collect unknown-key warnings for one service definition and each of its
+/// variants. A variant is a partial `Service`, so a typo inside one needs the
+/// same "did you mean?" treatment — and reporting it as `service 'x' variant
+/// 'y'` says where to look.
+fn collect_service_warnings(location: &str, service: &Service, out: &mut Vec<UnknownKey>) {
+    for key in service.unknown_fields.keys() {
+        out.push(UnknownKey {
+            location: location.to_string(),
+            key: key.clone(),
+            candidates: Service::known_field_names(),
+        });
+    }
+    let mut variants: Vec<_> = service.variants.iter().collect();
+    variants.sort_by(|a, b| a.0.cmp(b.0));
+    for (variant_name, variant) in variants {
+        for key in variant.unknown_fields.keys() {
+            out.push(UnknownKey {
+                location: format!("{location} variant '{variant_name}'"),
+                key: key.clone(),
+                candidates: Service::known_field_names(),
+            });
+        }
+    }
 }

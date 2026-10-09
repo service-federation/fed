@@ -911,3 +911,35 @@ async fn test_fed_stop_wins_over_unless_stopped() {
          despite --restart unless-stopped"
     );
 }
+
+#[tokio::test]
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
+async fn live_container_with_failing_probe_is_not_a_liveness_failure() {
+    require_docker!();
+    let dir = tempfile::tempdir().unwrap();
+    let config = ServiceConfig {
+        image: Some("alpine:latest".into()),
+        command: Some(fed::config::DockerCommand::List(vec![
+            "sleep".into(),
+            "30".into(),
+        ])),
+        healthcheck: Some(fed::config::HealthCheck::Command("exit 1".into())),
+        ..Default::default()
+    };
+    let mut service = DockerService::new(
+        "probe-liveness".into(),
+        config,
+        HashMap::new(),
+        dir.path().to_string_lossy().into_owned(),
+        None,
+    );
+    service.start().await.unwrap();
+    let health = service.health().await.unwrap();
+    let alive = service.liveness().await.unwrap();
+    service.stop().await.unwrap();
+    assert!(!health);
+    assert!(
+        alive,
+        "a failed configured probe must be subject to retries, not treated as container death"
+    );
+}
