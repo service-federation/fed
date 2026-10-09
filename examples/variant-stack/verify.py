@@ -30,6 +30,21 @@ class Project:
         shutil.copy2(executable, self.binary)
         print(f"Scratch project and transcript: {self.root}", flush=True)
 
+    def dump_diagnostics(self):
+        """Print what CI needs to explain a failure: logs and status."""
+        status = subprocess.run(
+            [str(self.binary), "status", "--json"],
+            cwd=self.work_dir,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        print("--- fed status --json", status.stdout, status.stderr, sep="\n")
+        for log in sorted((self.work_dir / ".fed").rglob("*.log")):
+            print(f"--- {log.relative_to(self.work_dir)} (last 60 lines)")
+            lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+            print("\n".join(lines[-60:]), flush=True)
+
     def record(self, entry):
         self.evidence.append(entry)
         transcript = json.dumps(self.evidence, indent=2)
@@ -224,6 +239,9 @@ def main():
         verify_supervisor_handoff(project)
         verify_standalone_fixture(project)
         verify_optional_console(project)
+    except BaseException:
+        project.dump_diagnostics()
+        raise
     finally:
         project.run("stop")
 
