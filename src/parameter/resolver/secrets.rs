@@ -14,6 +14,7 @@ enum VaultOutcome {
     /// used automatically; an explicit offline run may use older values.
     Failed(String),
     /// The server refused access or the CLI cannot safely speak its protocol.
+    /// The message opens with which (see `cloud::VaultFailure::Denied`).
     Denied(String),
     /// Not logged in / checkout not linked — ordinary local mode.
     Local,
@@ -435,7 +436,7 @@ impl Resolver {
                     VaultOutcome::Local => {} // not logged in / not linked — local mode
                     VaultOutcome::Denied(reason) => {
                         return Err(Error::Validation(format!(
-                            "team vault denied the request: {}. Cached values were not used; run with --offline only if you intentionally need a local copy",
+                            "{}. Cached values were not used; run with --offline only if you intentionally need a local copy",
                             reason
                         )));
                     }
@@ -1324,7 +1325,9 @@ mod tests {
         let mut resolver = Resolver::new();
         resolver.set_work_dir(temp_dir.path());
         resolver.set_secret_cache(crate::orchestrator::SecretCacheMode::File);
-        resolver.set_test_vault_denied("cloud: fetching secret values failed (403)");
+        resolver.set_test_vault_denied(
+            "team vault denied the request: cloud: fetching secret values failed (403)",
+        );
 
         let mut config = Config::default();
         config.parameters.insert(

@@ -880,7 +880,6 @@ fn secret_write_error(
             "cloud: this vault does not accept secret changes from the CLI yet — {verb} {name} in the dashboard"
         ),
         (403, _) => format!("cloud: only org admins can {verb} secrets in {project}"),
-        (404, Some("secret")) => format!("cloud: {name} is not set in {project}"),
         (404, _) => format!(
             "cloud: project {project} not found, or you are not a member — check `fed link`"
         ),
@@ -900,13 +899,24 @@ struct ErrorBody {
     error: String,
 }
 
+/// A non-2xx answer to a secret write: the status and the server's error code.
+struct Refused {
+    status: reqwest::StatusCode,
+    code: Option<String>,
+}
+
+impl Refused {
+    fn into_error(self, write: SecretWrite, name: &str, link: &CloudLink) -> Error {
+        secret_write_error(self.status, self.code.as_deref(), write, name, link)
+    }
+}
+
+/// Send a secret write. The outer error is a transport failure; the inner one
+/// is the server's refusal, left to the caller to word.
 async fn send_secret_write(
     req: reqwest::RequestBuilder,
     creds: &Credentials,
-    write: SecretWrite,
-    name: &str,
-    link: &CloudLink,
-) -> Result<()> {
+) -> Result<std::result::Result<(), Refused>> {
     let res = req
         .bearer_auth(&creds.token)
         .send()
@@ -914,16 +924,10 @@ async fn send_secret_write(
         .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", creds.url, e)))?;
     let status = res.status();
     if status.is_success() {
-        return Ok(());
+        return Ok(Ok(()));
     }
     let code = res.json::<ErrorBody>().await.ok().map(|b| b.error);
-    Err(secret_write_error(
-        status,
-        code.as_deref(),
-        write,
-        name,
-        link,
-    ))
+    Ok(Err(Refused { status, code }))
 }
 
 /// Create or replace one secret in the linked project:
@@ -940,14 +944,30 @@ pub async fn put_secret(
     let req = client()
         .put(url)
         .json(&serde_json::json!({ "value": value }));
-    send_secret_write(req, creds, SecretWrite::Set, name, link).await
+    send_secret_write(req, creds)
+        .await?
+        .map_err(|r| r.into_error(SecretWrite::Set, name, link))
+}
+
+/// What `delete_secret` found on the server.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Deletion {
+    Removed,
+    /// The vault answered 404 `secret`: the name was not set in the project.
+    NotSet,
 }
 
 /// Delete one secret from the linked project:
 /// `DELETE /api/v1/orgs/{org}/projects/{project}/secrets/{name}`.
-pub async fn delete_secret(creds: &Credentials, link: &CloudLink, name: &str) -> Result<()> {
+pub async fn delete_secret(creds: &Credentials, link: &CloudLink, name: &str) -> Result<Deletion> {
     let url = secret_url(creds, link, name)?;
-    send_secret_write(client().delete(url), creds, SecretWrite::Remove, name, link).await
+    match send_secret_write(client().delete(url), creds).await? {
+        Ok(()) => Ok(Deletion::Removed),
+        Err(r) if r.status.as_u16() == 404 && r.code.as_deref() == Some("secret") => {
+            Ok(Deletion::NotSet)
+        }
+        Err(r) => Err(r.into_error(SecretWrite::Remove, name, link)),
+    }
 }
 
 #[derive(Deserialize)]
@@ -964,8 +984,9 @@ pub struct SecretValues {
 /// - `Unreachable`: `is_connect()` / DNS — nothing is listening, or we're
 ///   offline. Waiting is pointless; a recent cache may be used.
 /// - `Failed`: a timeout or server/rate-limit error. A recent cache may be used.
-/// - `Denied`: rejected access, protocol mismatch, redirect, or malformed
-///   response. The cache must not answer this online request.
+/// - `Denied`: a refusal (401/403), another 4xx, a redirect, an unreadable
+///   response or an invalid vault URL. The cache must not answer this online
+///   request. The message opens with which of these it was.
 #[derive(Debug, Clone)]
 pub enum VaultFailure {
     Unreachable(String),
@@ -1014,7 +1035,7 @@ async fn fetch_values_inner(
             link.org, link.project
         ),
     )
-    .map_err(|e| VaultFailure::Denied(e.to_string()))?;
+    .map_err(|e| VaultFailure::Denied(format!("the vault URL is invalid: {e}")))?;
     url.query_pairs_mut().append_pair("names", &names.join(","));
     let res = client()
         .get(url)
@@ -1023,21 +1044,22 @@ async fn fetch_values_inner(
         .await
         .map_err(|e| classify_send_error(&creds.url, &e))?;
     if !res.status().is_success() {
-        let message = api_error(res.status(), "fetching secret values").to_string();
-        return Err(
-            if res.status().is_redirection()
-                || (res.status().is_client_error() && res.status().as_u16() != 429)
-            {
-                VaultFailure::Denied(message)
-            } else {
-                VaultFailure::Failed(message)
-            },
-        );
+        let status = res.status();
+        let message = api_error(status, "fetching secret values").to_string();
+        return Err(match status.as_u16() {
+            401 | 403 => VaultFailure::Denied(format!("team vault denied the request: {message}")),
+            429 => VaultFailure::Failed(message),
+            _ if status.is_redirection() || status.is_client_error() => {
+                VaultFailure::Denied(format!("the team vault rejected the request ({message})"))
+            }
+            _ => VaultFailure::Failed(message),
+        });
     }
-    let body: SecretValues = res
-        .json()
-        .await
-        .map_err(|e| VaultFailure::Denied(format!("cloud: bad values response: {}", e)))?;
+    let body: SecretValues = res.json().await.map_err(|e| {
+        VaultFailure::Denied(format!(
+            "the team vault sent a response fed cannot read: {e}"
+        ))
+    })?;
     Ok(body.values)
 }
 
@@ -1384,17 +1406,45 @@ mod tests {
             secret_cache: crate::orchestrator::SecretCacheMode::Memory,
         };
         let names = vec!["API_KEY".to_string()];
-        for status in [
-            "401 Unauthorized",
-            "403 Forbidden",
-            "404 Not Found",
-            "426 Upgrade Required",
+        for (status, opening) in [
+            ("401 Unauthorized", "team vault denied the request: "),
+            ("403 Forbidden", "team vault denied the request: "),
+            ("404 Not Found", "the team vault rejected the request ("),
+            (
+                "426 Upgrade Required",
+                "the team vault rejected the request (",
+            ),
+            (
+                "307 Temporary Redirect",
+                "the team vault rejected the request (",
+            ),
         ] {
             let creds = creds_at(spawn_one_shot(status, "{}"));
-            assert!(matches!(
-                fetch_values_inner(&creds, &link, &names).await,
-                Err(VaultFailure::Denied(_))
-            ));
+            match fetch_values_inner(&creds, &link, &names).await {
+                Err(VaultFailure::Denied(m)) => {
+                    assert!(m.starts_with(opening), "{status}: {m}");
+                    let code = status.split(' ').next().unwrap();
+                    assert!(m.contains(code), "{status}: detail kept: {m}");
+                }
+                other => panic!("{status}: expected Denied, got {other:?}"),
+            }
+        }
+        let creds = creds_at(spawn_one_shot("200 OK", "not json"));
+        match fetch_values_inner(&creds, &link, &names).await {
+            Err(VaultFailure::Denied(m)) => assert!(
+                m.starts_with("the team vault sent a response fed cannot read: "),
+                "{m}"
+            ),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        let creds = creds_at("http://vault.example.com".into());
+        match fetch_values_inner(&creds, &link, &names).await {
+            Err(VaultFailure::Denied(m)) => assert!(
+                m.starts_with("the vault URL is invalid: ")
+                    && m.contains("vault URL must be an HTTPS origin"),
+                "{m}"
+            ),
+            other => panic!("expected Denied, got {other:?}"),
         }
         for status in ["429 Too Many Requests", "503 Service Unavailable"] {
             let creds = creds_at(spawn_one_shot(status, "{}"));
@@ -2165,11 +2215,16 @@ mod secret_write_tests {
     #[tokio::test]
     async fn delete_secret_reports_a_missing_secret() {
         let (url, _rx) = spawn_answering("404 Not Found", "{\"error\":\"secret\"}");
+        let found = delete_secret(&creds(url), &link(), "API_KEY")
+            .await
+            .unwrap();
+        assert_eq!(found, Deletion::NotSet);
+        let (url, _rx) = spawn_answering("404 Not Found", "{\"error\":\"project\"}");
         let err = delete_secret(&creds(url), &link(), "API_KEY")
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("API_KEY is not set in acme/web"), "{err}");
+        assert!(err.contains("project acme/web not found"), "{err}");
         let (url, _rx) = spawn_answering("403 Forbidden", "{\"error\":\"admin_only\"}");
         let err = delete_secret(&creds(url), &link(), "API_KEY")
             .await

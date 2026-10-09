@@ -84,8 +84,18 @@ pub async fn run_secrets(
             if !cloud::valid_secret_name(name) {
                 bail!(cloud::INVALID_SECRET_NAME);
             }
-            cloud::delete_secret(&creds, &link, name).await?;
+            let found = cloud::delete_secret(&creds, &link, name).await?;
+            // Also when the vault has no such secret: a stale cached value is
+            // what the user wants gone.
             forget_cached(&work_dir, name, out);
+            if found == cloud::Deletion::NotSet {
+                bail!(
+                    "cloud: {} is not set in {}/{}",
+                    name,
+                    link.org,
+                    link.project
+                );
+            }
             out.success(&format!(
                 "Removed {} from {}/{}",
                 name, link.org, link.project

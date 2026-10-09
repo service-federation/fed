@@ -358,6 +358,23 @@ fn secrets_rm_deletes_and_drops_the_cached_value() {
     assert!(cache.contains("OTHER=kept"), "{cache}");
 }
 
+/// A name the vault does not have is still dropped from the local cache,
+/// then reported as not set.
+#[test]
+fn secrets_rm_of_an_unset_name_still_drops_the_cached_value() {
+    let dir = linked_checkout();
+    let (url, _rx) = stub_vault("404 Not Found", "{\"error\":\"secret\"}");
+    let (ok, output) = fed_secrets(&dir, &url, &["rm", "API_KEY"], "");
+    assert!(!ok, "{output}");
+    assert!(
+        output.contains("API_KEY is not set in acme/web"),
+        "{output}"
+    );
+    let cache = cache(&dir);
+    assert!(!cache.contains("API_KEY"), "{cache}");
+    assert!(cache.contains("OTHER=kept"), "{cache}");
+}
+
 #[test]
 fn secrets_set_requires_login() {
     let tmp = TempDir::new().unwrap();
