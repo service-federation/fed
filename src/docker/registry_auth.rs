@@ -380,6 +380,9 @@ pub fn stderr_indicates_auth_failure(stderr: &str) -> bool {
     lower.contains("unauthorized")
         || lower.contains("denied")
         || lower.contains("authentication required")
+        // containerd's wording when the token step fails, whatever status
+        // the registry chose for it (Scaleway answers a wrong key with 404)
+        || lower.contains("failed to authorize")
 }
 
 /// Registries already warned about in this process, so parallel pulls from
@@ -668,6 +671,10 @@ mod tests {
         ));
         assert!(stderr_indicates_auth_failure(
             "Error: initializing source: authentication required"
+        ));
+        // Scaleway refuses a wrong key at the token step, with a 404.
+        assert!(stderr_indicates_auth_failure(
+            "Error response from daemon: error from registry: failed to resolve reference \"rg.fr-par.scw.cloud/acme/api:latest\": failed to authorize: failed to fetch oauth token: unexpected status from GET request to https://api.scaleway.com/registry-internal/v1/regions/fr-par/tokens?scope=repository%3Aacme%2Fapi%3Apull&service=registry: 404 Not Found"
         ));
         assert!(!stderr_indicates_auth_failure(
             "Error response from daemon: manifest unknown"
