@@ -1035,7 +1035,15 @@ async fn fetch_values_inner(
             link.org, link.project
         ),
     )
-    .map_err(|e| VaultFailure::Denied(format!("the vault URL is invalid: {e}")))?;
+    // The validation error already says what is wrong with the URL; drop
+    // its "Invalid configuration: cloud:" framing so it reads once.
+    .map_err(|e| {
+        let reason = match e {
+            Error::Validation(message) => message,
+            other => other.to_string(),
+        };
+        VaultFailure::Denied(reason.trim_start_matches("cloud: ").to_string())
+    })?;
     url.query_pairs_mut().append_pair("names", &names.join(","));
     let res = client()
         .get(url)
@@ -1440,8 +1448,8 @@ mod tests {
         let creds = creds_at("http://vault.example.com".into());
         match fetch_values_inner(&creds, &link, &names).await {
             Err(VaultFailure::Denied(m)) => assert!(
-                m.starts_with("the vault URL is invalid: ")
-                    && m.contains("vault URL must be an HTTPS origin"),
+                m.starts_with("vault URL must be an HTTPS origin")
+                    && !m.contains("Invalid configuration"),
                 "{m}"
             ),
             other => panic!("expected Denied, got {other:?}"),
