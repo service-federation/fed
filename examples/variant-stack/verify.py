@@ -12,6 +12,12 @@ from urllib.error import HTTPError
 from urllib.request import urlopen
 
 
+def _text(output):
+    if output is None:
+        return ""
+    return output.decode(errors="replace") if isinstance(output, bytes) else output
+
+
 class Project:
     """A scratch project with a stable binary and a transcript of each request."""
 
@@ -40,6 +46,15 @@ class Project:
             timeout=30,
         )
         print("--- fed status --json", status.stdout, status.stderr, sep="\n")
+        for entry in self.evidence[-2:]:
+            print(f"--- fed {' '.join(entry['command'])}")
+            print(entry.get("stdout", ""), entry.get("stderr", "")[-6000:], sep="\n")
+        ps = subprocess.run(["ps", "-axo", "pid,stat,command"], text=True, capture_output=True)
+        print("--- processes", *[l for l in ps.stdout.splitlines() if "server.py" in l], sep="\n")
+        listening = subprocess.run(
+            ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"], text=True, capture_output=True
+        )
+        print("--- listening", *[l for l in listening.stdout.splitlines() if "ython" in l], sep="\n")
         for log in sorted((self.work_dir / ".fed").rglob("*.log")):
             print(f"--- {log.relative_to(self.work_dir)} (last 60 lines)")
             lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -51,14 +66,31 @@ class Project:
         (self.root / "evidence.json").write_text(transcript, encoding="utf-8")
 
     def run(self, *arguments, success=True):
-        result = subprocess.run(
-            [str(self.binary), *arguments],
-            cwd=self.work_dir,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=45,
+        # Health-check debug lines explain a probe that never passes.
+        env = dict(
+            os.environ,
+            RUST_LOG="info,fed::orchestrator::health=debug,fed::healthcheck=debug",
         )
+        try:
+            result = subprocess.run(
+                [str(self.binary), *arguments],
+                cwd=self.work_dir,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=45,
+            )
+        except subprocess.TimeoutExpired as timeout:
+            self.record(
+                {
+                    "command": list(arguments),
+                    "timed_out": True,
+                    "stdout": _text(timeout.stdout),
+                    "stderr": _text(timeout.stderr),
+                }
+            )
+            raise
         self.record(
             {
                 "command": list(arguments),
