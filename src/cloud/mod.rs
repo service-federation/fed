@@ -824,6 +824,132 @@ pub async fn list_secrets(creds: &Credentials, link: &CloudLink) -> Result<Vec<S
     Ok(body.secrets)
 }
 
+/// Secret names the vault accepts. Checked before a request so that a name
+/// can never change the request path.
+pub fn valid_secret_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && name.len() <= 128
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+pub const INVALID_SECRET_NAME: &str =
+    "invalid secret name: use up to 128 letters, digits and _, not starting with a digit";
+
+fn secret_url(creds: &Credentials, link: &CloudLink, name: &str) -> Result<reqwest::Url> {
+    if !valid_secret_name(name) {
+        // The name is not echoed: `NAME=value` typed by mistake would put the
+        // value in the error.
+        return Err(Error::Validation(INVALID_SECRET_NAME.into()));
+    }
+    api_url(
+        &creds.url,
+        &format!(
+            "/api/v1/orgs/{}/projects/{}/secrets/{}",
+            link.org, link.project, name
+        ),
+    )
+}
+
+/// Which secret write a refused response belongs to.
+#[derive(Clone, Copy)]
+enum SecretWrite {
+    Set,
+    Remove,
+}
+
+/// The message for a refused secret write. Built from the status, the server's
+/// `{"error": code}` and the name only: the value never reaches this function.
+fn secret_write_error(
+    status: reqwest::StatusCode,
+    code: Option<&str>,
+    write: SecretWrite,
+    name: &str,
+    link: &CloudLink,
+) -> Error {
+    let verb = match write {
+        SecretWrite::Set => "set",
+        SecretWrite::Remove => "remove",
+    };
+    let project = format!("{}/{}", link.org, link.project);
+    let message = match (status.as_u16(), code) {
+        (401, _) => {
+            "cloud: your login is missing, expired or revoked — run `fed login`".to_string()
+        }
+        (403, Some("session_only")) => format!(
+            "cloud: this vault does not accept secret changes from the CLI yet — {verb} {name} in the dashboard"
+        ),
+        (403, _) => format!("cloud: only org admins can {verb} secrets in {project}"),
+        (404, Some("secret")) => format!("cloud: {name} is not set in {project}"),
+        (404, _) => format!(
+            "cloud: project {project} not found, or you are not a member — check `fed link`"
+        ),
+        (400, Some("value")) => {
+            "cloud: the vault rejected the value — it must be 1 to 65536 characters".to_string()
+        }
+        (400, Some("name")) => format!("cloud: the vault rejected the secret name `{name}`"),
+        (413, _) => "cloud: the value is too large for the vault".to_string(),
+        (429, _) => "cloud: rate limited — try again in a minute".to_string(),
+        _ => return api_error(status, &format!("trying to {verb} {name}")),
+    };
+    Error::Validation(message)
+}
+
+#[derive(Deserialize)]
+struct ErrorBody {
+    error: String,
+}
+
+async fn send_secret_write(
+    req: reqwest::RequestBuilder,
+    creds: &Credentials,
+    write: SecretWrite,
+    name: &str,
+    link: &CloudLink,
+) -> Result<()> {
+    let res = req
+        .bearer_auth(&creds.token)
+        .send()
+        .await
+        .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", creds.url, e)))?;
+    let status = res.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let code = res.json::<ErrorBody>().await.ok().map(|b| b.error);
+    Err(secret_write_error(
+        status,
+        code.as_deref(),
+        write,
+        name,
+        link,
+    ))
+}
+
+/// Create or replace one secret in the linked project:
+/// `PUT /api/v1/orgs/{org}/projects/{project}/secrets/{name}` with
+/// `{"value": ...}`. The body has no `env`, so the server uses its default
+/// environment, the same one `fetch_values` and `list_secrets` read.
+pub async fn put_secret(
+    creds: &Credentials,
+    link: &CloudLink,
+    name: &str,
+    value: &str,
+) -> Result<()> {
+    let url = secret_url(creds, link, name)?;
+    let req = client()
+        .put(url)
+        .json(&serde_json::json!({ "value": value }));
+    send_secret_write(req, creds, SecretWrite::Set, name, link).await
+}
+
+/// Delete one secret from the linked project:
+/// `DELETE /api/v1/orgs/{org}/projects/{project}/secrets/{name}`.
+pub async fn delete_secret(creds: &Credentials, link: &CloudLink, name: &str) -> Result<()> {
+    let url = secret_url(creds, link, name)?;
+    send_secret_write(client().delete(url), creds, SecretWrite::Remove, name, link).await
+}
+
 #[derive(Deserialize)]
 pub struct SecretValues {
     pub values: HashMap<String, String>,
@@ -1871,5 +1997,216 @@ mod tests {
 
         // Unset falls back too.
         assert_eq!(duration_or_default(None, default), default);
+    }
+}
+
+#[cfg(test)]
+mod secret_write_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const VALUE: &str = "s3cr3t-value-must-not-leak";
+
+    /// One-shot server that answers `status_line` with `body` and hands back the
+    /// whole request, headers and body, so a test can check what was sent.
+    fn spawn_answering(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+        (format!("http://127.0.0.1:{port}"), rx)
+    }
+
+    fn creds(url: String) -> Credentials {
+        Credentials {
+            url,
+            token: "fed_test-token".into(),
+        }
+    }
+
+    fn link() -> CloudLink {
+        CloudLink {
+            org: "acme".into(),
+            project: "web".into(),
+            secret_cache: crate::orchestrator::SecretCacheMode::Memory,
+        }
+    }
+
+    #[tokio::test]
+    async fn put_secret_sends_the_value_only_in_the_json_body() {
+        let (url, rx) = spawn_answering("201 Created", "{\"ok\":true}");
+        put_secret(&creds(url), &link(), "API_KEY", VALUE)
+            .await
+            .unwrap();
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        assert!(
+            head.starts_with("PUT /api/v1/orgs/acme/projects/web/secrets/API_KEY HTTP/1.1\r\n"),
+            "{head}"
+        );
+        let head = head.to_ascii_lowercase();
+        assert!(head.contains("authorization: bearer fed_test-token\r\n"));
+        assert!(head.contains("x-fed-api-version: 2\r\n"));
+        assert!(head.contains("content-type: application/json\r\n"));
+        assert!(!head.contains(VALUE));
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json, serde_json::json!({ "value": VALUE }));
+    }
+
+    #[tokio::test]
+    async fn delete_secret_sends_a_bodyless_delete() {
+        let (url, rx) = spawn_answering("200 OK", "{\"ok\":true}");
+        delete_secret(&creds(url), &link(), "API_KEY")
+            .await
+            .unwrap();
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            request
+                .starts_with("DELETE /api/v1/orgs/acme/projects/web/secrets/API_KEY HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-fed-api-version: 2\r\n")
+        );
+        assert!(request.ends_with("\r\n\r\n"), "no body: {request}");
+    }
+
+    #[tokio::test]
+    async fn secret_writes_map_refusals_to_clear_messages_without_the_value() {
+        let cases: [(&'static str, &'static str, &str); 9] = [
+            (
+                "401 Unauthorized",
+                "{\"error\":\"unauthenticated\"}",
+                "run `fed login`",
+            ),
+            (
+                "403 Forbidden",
+                "{\"error\":\"admin_only\"}",
+                "only org admins can set secrets in acme/web",
+            ),
+            (
+                "403 Forbidden",
+                "{\"error\":\"session_only\"}",
+                "does not accept secret changes from the CLI yet",
+            ),
+            (
+                "404 Not Found",
+                "{\"error\":\"project\"}",
+                "project acme/web not found",
+            ),
+            (
+                "404 Not Found",
+                "{\"error\":\"org\"}",
+                "project acme/web not found",
+            ),
+            (
+                "429 Too Many Requests",
+                "{\"error\":\"rate_limited\"}",
+                "rate limited",
+            ),
+            (
+                "400 Bad Request",
+                "{\"error\":\"value\"}",
+                "rejected the value",
+            ),
+            (
+                "426 Upgrade Required",
+                "{\"error\":\"unsupported_api_version\"}",
+                "too old",
+            ),
+            ("500 Internal Server Error", "", "500"),
+        ];
+        for (status, body, expected) in cases {
+            let (url, _rx) = spawn_answering(status, body);
+            let err = put_secret(&creds(url), &link(), "API_KEY", VALUE)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{status}: {err}");
+            assert!(!err.contains(VALUE), "{status} leaked the value: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_secret_reports_a_missing_secret() {
+        let (url, _rx) = spawn_answering("404 Not Found", "{\"error\":\"secret\"}");
+        let err = delete_secret(&creds(url), &link(), "API_KEY")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("API_KEY is not set in acme/web"), "{err}");
+        let (url, _rx) = spawn_answering("403 Forbidden", "{\"error\":\"admin_only\"}");
+        let err = delete_secret(&creds(url), &link(), "API_KEY")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only org admins can remove secrets"), "{err}");
+    }
+
+    /// A redirect is a refusal: the token and the value must not follow it.
+    #[tokio::test]
+    async fn put_secret_does_not_follow_a_redirect() {
+        let (url, _rx) = spawn_answering("307 Temporary Redirect", "");
+        let err = put_secret(&creds(url), &link(), "API_KEY", VALUE)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("307"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn secret_writes_refuse_bad_names_and_insecure_urls_before_sending() {
+        let remote_http = creds("http://vault.example.com".into());
+        assert!(
+            put_secret(&remote_http, &link(), "API_KEY", VALUE)
+                .await
+                .is_err()
+        );
+        let local = creds("http://127.0.0.1:9".into());
+        for name in ["", "1KEY", "A/B", "../x", "KEY=value", &"A".repeat(129)] {
+            let err = put_secret(&local, &link(), name, VALUE)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("invalid secret name"), "{name}: {err}");
+            assert!(!err.contains("value"), "the name is not echoed: {err}");
+        }
+        assert!(valid_secret_name("_A1"));
+        assert!(valid_secret_name(&"A".repeat(128)));
     }
 }

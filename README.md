@@ -356,6 +356,16 @@ Compose files with hardcoded host ports work as they are. One checkout starts ex
 
 If your team needs to share development credentials, an optional hosted vault can fill `source: manual` values during `fed start`. Everything above this line works without it. It handles development credentials, not production secrets, and removing someone's access does not erase values already cached on their machine, so rotate after offboarding. [Team secrets](https://www.service-federation.com/docs/secrets/) covers how it works, what it costs, and how to turn the local cache off. For the local-only path, see [Generated secrets](https://www.service-federation.com/docs/generated-secrets/).
 
+To change a value, org admins can use the dashboard or the CLI in a linked checkout:
+
+```bash
+fed secrets set STRIPE_SECRET_KEY                 # hidden prompt in a terminal
+printf '%s' "$KEY" | fed secrets set STRIPE_SECRET_KEY   # or from stdin
+fed secrets rm STRIPE_SECRET_KEY
+```
+
+The value is never accepted as an argument, because arguments show up in `ps` and shell history. Other checkouts keep a cached value until their next vault request, at most `FED_VAULT_TTL` later.
+
 The vault URL must use HTTPS. An explicitly configured loopback HTTP URL is supported for local development. Vault requests never follow redirects. When file caching is enabled, an online run may use individual cached values during a transient outage only while each value is newer than `FED_VAULT_MAX_AGE` (24 hours by default). Rejected access and incompatible responses stop the run instead of using cached values. `--offline` explicitly skips the vault and can use older cached values; it cannot verify current access or revocation. A cache within `FED_VAULT_TTL` (five minutes by default) skips the request entirely, and a slow request can be bypassed after `FED_VAULT_GRACE` when the cache is fresh, so access changes may take effect after those windows. Rotate downstream credentials after offboarding.
 
 ### Private registry images

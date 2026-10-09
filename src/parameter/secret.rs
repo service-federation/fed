@@ -378,6 +378,27 @@ pub fn write_cache_file(path: &Path, entries: &HashMap<String, CacheEntry>) -> R
     crate::fsutil::write_owner_only_atomic(path, out.as_bytes(), true)
 }
 
+/// Drop one name from the vault cache, keeping every other entry and its stamp.
+/// Used after `fed secrets set` or `fed secrets rm`, so the next run asks the
+/// vault instead of reusing the old value within `FED_VAULT_TTL`. Returns
+/// whether an entry was removed. A missing cache file is left missing.
+pub fn forget_cached_secret(path: &Path, name: &str) -> Result<bool> {
+    let (values, stamps) = load_cache_values_and_stamps(path);
+    if !values.contains_key(name) {
+        return Ok(false);
+    }
+    let entries: HashMap<String, CacheEntry> = values
+        .into_iter()
+        .filter(|(key, _)| key != name)
+        .map(|(key, value)| {
+            let fetched_at = stamps.get(&key).copied();
+            (key, CacheEntry { value, fetched_at })
+        })
+        .collect();
+    write_cache_file(path, &entries)?;
+    Ok(true)
+}
+
 /// Parse per-entry fetched-at stamps from the vault cache's comment lines.
 ///
 /// Lines have the shape `# fetched-at <NAME> <unix-seconds>`. Entries without a
@@ -791,6 +812,29 @@ mod tests {
 
         write_cache_file(&path, &HashMap::new()).unwrap();
         assert!(!path.exists(), "empty cache removes the file");
+    }
+
+    #[test]
+    fn forget_cached_secret_drops_one_name_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.cache.env");
+        std::fs::write(
+            &path,
+            "# fetched-at API_KEY 1721000000\nAPI_KEY=old\n# fetched-at OTHER 1721000001\nOTHER=kept\n",
+        )
+        .unwrap();
+
+        assert!(forget_cached_secret(&path, "API_KEY").unwrap());
+        let (values, stamps) = load_cache_values_and_stamps(&path);
+        assert!(!values.contains_key("API_KEY"));
+        assert_eq!(values.get("OTHER").map(String::as_str), Some("kept"));
+        assert_eq!(stamps.get("OTHER"), Some(&1_721_000_001));
+
+        assert!(!forget_cached_secret(&path, "API_KEY").unwrap());
+        assert!(forget_cached_secret(&path, "OTHER").unwrap());
+        assert!(!path.exists(), "the last entry removes the file");
+        assert!(!forget_cached_secret(&path, "OTHER").unwrap());
+        assert!(!path.exists(), "a missing cache stays missing");
     }
 
     #[test]

@@ -336,6 +336,17 @@ pub enum SecretsCommands {
         #[arg(long, hide = true)]
         env: Option<String>,
     },
+    /// Set a secret in the linked project (org admins only). The value is read
+    /// from stdin, or from a hidden prompt in a terminal, never from arguments.
+    Set {
+        /// Secret name (letters, digits and _)
+        name: String,
+    },
+    /// Remove a secret from the linked project (org admins only)
+    Rm {
+        /// Secret name
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -558,13 +569,34 @@ mod tests {
     }
 
     #[test]
-    fn secrets_set_is_rejected() {
-        // fed 7.0 removed `fed secrets set` — secret writes are dashboard-only,
-        // so a leaked bearer token cannot write. The subcommand must not parse.
-        assert!(
-            Cli::try_parse_from(["fed", "secrets", "set", "API_KEY"]).is_err(),
-            "`fed secrets set` must be rejected after fed 7.0",
-        );
+    fn secrets_set_and_rm_parse_a_name() {
+        let cli = Cli::try_parse_from(["fed", "secrets", "set", "API_KEY"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Secrets(SecretsCommands::Set { ref name }) if name == "API_KEY"
+        ));
+        let cli = Cli::try_parse_from(["fed", "secrets", "rm", "API_KEY"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Secrets(SecretsCommands::Rm { ref name }) if name == "API_KEY"
+        ));
+    }
+
+    /// Arguments are visible in `ps` and shell history, so a value given as an
+    /// argument must fail to parse instead of being sent.
+    #[test]
+    fn secrets_set_refuses_a_value_argument() {
+        for args in [
+            &["fed", "secrets", "set", "API_KEY", "hunter2"][..],
+            &["fed", "secrets", "set", "API_KEY", "--value", "hunter2"][..],
+            &["fed", "secrets", "set", "API_KEY=hunter2", "extra"][..],
+            &["fed", "secrets", "set"][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "{args:?} must not parse"
+            );
+        }
     }
 
     #[test]

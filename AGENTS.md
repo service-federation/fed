@@ -26,6 +26,10 @@ When touching this code, keep the contract intact:
   `reqwest::Client::builder()`), so they carry both version headers.
 - 426 handling must stay in the shared `api_error` mapping so every vault
   request gets the upgrade hint.
+- `fed secrets set` and `fed secrets rm` send `PUT`/`DELETE` to
+  `/api/v1/orgs/{org}/projects/{project}/secrets/{name}` with the bearer
+  token. The value travels only in the JSON body and must never appear in an
+  argument, a message or a log line.
 - Login must verify the server's `x-fed-api-version: 2` response before using
   a pairing code. Missing or different values mean an incompatible server.
 - The server side lives in the `service-federation-cloud` repo; its agent docs

@@ -97,6 +97,9 @@ async-trait = "0.1"
 # Environment file parsing
 dotenvy = "0.15"
 
+# Hidden terminal prompt for `fed secrets set`
+rpassword = "7.4"
+
 # TUI dependencies
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
