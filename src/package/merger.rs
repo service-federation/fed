@@ -280,6 +280,9 @@ impl ServiceMerger {
         if local.image.is_none() {
             local.image = base.image.clone();
         }
+        if local.platform.is_none() {
+            local.platform = base.platform.clone();
+        }
         if local.command.is_none() {
             local.command = base.command.clone();
         }

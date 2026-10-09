@@ -8,7 +8,7 @@
 
 use super::{Dependency, Metadata, Parameter, Script, Service};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A Compose file imported as first-class Fed services.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +102,15 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_file: Vec<String>,
 
+    /// Credentials for pulling `image:` services from private registries,
+    /// keyed by registry host (`ghcr.io`, `docker.io`, `registry.local:5000`).
+    ///
+    /// These stay unresolved templates in the config. The password is always
+    /// a `{{PARAM}}` reference to a `type: secret` parameter (see validation),
+    /// so the config never holds the secret value itself.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub registry_auth: BTreeMap<String, RegistryAuth>,
+
     /// Unknown top-level keys captured for a non-breaking typo warning (e.g. `service:`
     /// where `services:` was meant). serde routes only genuinely-unknown keys here, so
     /// recognized fields are unaffected.
@@ -114,6 +123,15 @@ pub struct Config {
     /// soft deprecation notices at validate/start time, never an error.
     #[serde(skip)]
     pub legacy_key_usages: Vec<LegacyKeyUsage>,
+}
+
+/// One `registry_auth` entry: the login fed uses to pull images from a registry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegistryAuth {
+    /// The registry user. A literal or a `{{PARAM}}` template.
+    pub username: String,
+    /// A `{{PARAM}}` template that references a `type: secret` parameter.
+    pub password: String,
 }
 
 /// A single unrecognized config key, with the candidate names to suggest. Non-fatal:
@@ -173,6 +191,7 @@ impl Config {
             "packages",
             "metadata",
             "env_file",
+            "registry_auth",
         ]
     }
 

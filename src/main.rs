@@ -470,10 +470,29 @@ async fn run() -> anyhow::Result<()> {
     // replace it with the merged result, before anything — the orchestrator,
     // `fed status`, the dry-run preview, the supervisor it may spawn — reads
     // `config.services`. Everything downstream sees ordinary services.
+    //
+    // Commands that look at or stop what is running see each running service
+    // as the variant it was started with. A `--variant` pin still wins,
+    // because it comes later. `start` and `restart` use the selection, so a
+    // changed variant takes effect there.
+    let mut variant_entries = Vec::new();
+    if matches!(
+        cli.command,
+        Commands::Status { .. }
+            | Commands::Stop { .. }
+            | Commands::Logs { .. }
+            | Commands::Attach { .. }
+            | Commands::Tui { .. }
+            | Commands::Top { .. }
+            | Commands::Ports { .. }
+    ) {
+        variant_entries = commands::registered_variants(&config, &work_dir).await;
+    }
+    variant_entries.extend(cli.variant.iter().cloned());
     let mut config = config;
     fed::config::variants::resolve_variants(
         &mut config,
-        &fed::config::variants::VariantSelection::load(&cli.variant, &work_dir)?,
+        &fed::config::variants::VariantSelection::load(&variant_entries, &work_dir)?,
         &cli.profile,
     )?;
     let config = config;

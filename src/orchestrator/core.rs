@@ -2864,6 +2864,14 @@ impl Orchestrator {
         }
     }
 
+    /// Team logins from `registry_auth` whose secret has a value this run.
+    pub(super) fn registry_credentials(&self) -> crate::docker::registry_auth::RegistryCredentials {
+        crate::docker::registry_auth::RegistryCredentials::resolve(
+            &self.config,
+            self.resolver.get_resolved_parameters(),
+        )
+    }
+
     /// Pre-pull Docker images needed by the given services.
     ///
     /// Checks which images are missing locally and pulls them in parallel.
@@ -2871,14 +2879,17 @@ impl Orchestrator {
     pub async fn pre_pull_images(&self, services: &[String]) -> Vec<ImagePullResult> {
         use crate::docker::DockerClient;
 
-        // Collect unique images from Docker-type services
+        // Collect unique images from Docker-type services, with the platform
+        // each one is pulled for
         let mut images: Vec<String> = Vec::new();
+        let mut platforms: HashMap<String, Option<String>> = HashMap::new();
         for name in services {
             if let Some(svc) = self.config.services.get(name)
                 && let Some(ref image) = svc.image
                 && !images.contains(image)
             {
                 images.push(image.clone());
+                platforms.insert(image.clone(), svc.platform.clone());
             }
         }
 
@@ -2887,6 +2898,7 @@ impl Orchestrator {
         }
 
         let client = DockerClient::new();
+        let credentials = self.registry_credentials();
 
         // Check which images exist locally (parallel)
         let exist_checks: Vec<_> = images
@@ -2920,8 +2932,18 @@ impl Orchestrator {
             .map(|img| {
                 let client = client.clone();
                 let img = img.clone();
+                let credential = credentials.for_image(&img).cloned();
+                let platform = platforms.get(&img).cloned().flatten();
                 async move {
-                    let outcome = match client.pull(&img, pull_timeout).await {
+                    let outcome = match client
+                        .pull_with_credential(
+                            &img,
+                            platform.as_deref(),
+                            credential.as_ref(),
+                            pull_timeout,
+                        )
+                        .await
+                    {
                         Ok(()) => Ok(()),
                         Err(e) => Err(e.to_string()),
                     };

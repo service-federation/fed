@@ -1,5 +1,6 @@
 use super::{BaseService, ServiceManager, Status};
 use crate::config::Service as ServiceConfig;
+use crate::docker::registry_auth::RegistryCredential;
 use crate::docker::{DockerClient, DockerError};
 use crate::error::{Error, Result};
 use async_trait::async_trait;
@@ -136,6 +137,9 @@ pub struct DockerService {
     container_id: Arc<RwLock<Option<String>>>,
     session_id: Option<String>,
     client: DockerClient,
+    /// Team login for the image's registry, from `registry_auth`. `None`
+    /// pulls with the environment's own credentials.
+    registry_credential: Option<RegistryCredential>,
     /// Cached logs to avoid spawning docker subprocess on every call
     log_cache: Arc<tokio::sync::RwLock<(Vec<String>, Instant)>>,
     /// Cached health result to avoid spawning `docker exec` on every call.
@@ -158,6 +162,7 @@ impl DockerService {
             container_id: Arc::new(RwLock::new(None)),
             session_id,
             client: DockerClient::new(),
+            registry_credential: None,
             // Initialize with empty cache that's already expired
             log_cache: Arc::new(tokio::sync::RwLock::new((
                 Vec::new(),
@@ -165,6 +170,12 @@ impl DockerService {
             ))),
             health_cache: Arc::new(tokio::sync::Mutex::new((None, Instant::now()))),
         }
+    }
+
+    /// Pull the image with this team login when it is missing locally.
+    pub fn with_registry_credential(mut self, credential: Option<RegistryCredential>) -> Self {
+        self.registry_credential = credential;
+        self
     }
 
     /// Invalidate the cached health result (e.g. after start/stop transitions).
@@ -521,6 +532,10 @@ impl ServiceManager for DockerService {
         // NOTE: Not using --rm flag to avoid race conditions with manual stop/cleanup
         // We'll manually remove containers in stop() to ensure proper state tracking
         let mut args = vec!["run".to_string(), "-d".to_string()];
+        if let Some(ref platform) = self.config.platform {
+            args.push("--platform".to_string());
+            args.push(platform.clone());
+        }
 
         // Native restart mapping: `restart: always` also gets Docker's own
         // `--restart unless-stopped` as an *additional* reboot-survival
@@ -701,7 +716,16 @@ impl ServiceManager for DockerService {
 
         if needs_pull {
             tracing::info!("Pulling image '{}' (not found locally)", image);
-            if let Err(e) = self.client.pull(image, DOCKER_PULL_TIMEOUT).await {
+            if let Err(e) = self
+                .client
+                .pull_with_credential(
+                    image,
+                    self.config.platform.as_deref(),
+                    self.registry_credential.as_ref(),
+                    DOCKER_PULL_TIMEOUT,
+                )
+                .await
+            {
                 let mut base = self.base.write();
                 base.set_status(Status::Failing);
                 return Err(Error::ServiceStartFailed(
