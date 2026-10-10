@@ -436,6 +436,7 @@ pub fn resolve_variants(
         merged.variants.clear();
         merged.default_variant = None;
         merged.variant = Some(chosen);
+        merged.variant_source = Some(source);
         if !is_active(&merged, active_profiles)
             && !matches!(source, VariantSource::Default | VariantSource::OnlyVariant)
         {
