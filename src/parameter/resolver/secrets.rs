@@ -235,7 +235,7 @@ impl Resolver {
         match classify(handle.join(crate::cloud::vault_timeout()), &handle.url) {
             Some(outcome) => outcome,
             None => VaultOutcome::Failed(format!(
-                "cloud: no response within {}s ({})",
+                "Service Federation Cloud did not answer within {}s ({})",
                 crate::cloud::vault_timeout().as_secs(),
                 handle.url
             )),

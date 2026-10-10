@@ -98,8 +98,13 @@ jobs:
         run: cargo test --features docker-tests -- --test-threads=1
 
   remote-beta:
-    name: Remote environments beta (Linux)
-    runs-on: ubuntu-latest
+    name: Remote environments (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS ships a different rsync and ssh, and most users run there.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
 
@@ -118,11 +123,21 @@ jobs:
             ${{ runner.os }}-cargo-
 
       # `fed remote` is behind the remote-beta feature, which release builds
-      # never enable. Beta testers build it from source, so it must keep
-      # compiling and passing its tests. The Clippy job lints it through
+      # do not enable yet. It must keep compiling and passing its tests on
+      # both systems it runs on. The Clippy job lints it through
       # --all-features.
       - name: Run tests with the remote-beta feature
+        if: runner.os == 'Linux'
         run: cargo test --features remote-beta
+
+      # The rest of the suite runs on Linux only, so macOS runs the remote
+      # tests alone.
+      - name: Run the remote tests with the remote-beta feature
+        if: runner.os == 'macOS'
+        run: |
+          cargo test --features remote-beta --test remote_beta_test
+          cargo test --features remote-beta --bin fed remote::
+          cargo test --features remote-beta --lib cloud::
 
   future-incompat:
     name: Future-incompat check

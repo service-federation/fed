@@ -154,6 +154,13 @@ pub enum Error {
     #[diagnostic(code(fed::config::validation))]
     Validation(String),
 
+    /// A request to Service Federation Cloud failed: the server could not be
+    /// reached, refused, or sent an answer fed cannot read. The message is a
+    /// whole sentence that says what to do.
+    #[error("{0}")]
+    #[diagnostic(code(fed::cloud))]
+    Cloud(String),
+
     #[error("Package error: {0}")]
     Package(String),
 

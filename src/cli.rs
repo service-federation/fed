@@ -283,7 +283,7 @@ pub enum Commands {
     #[command(subcommand)]
     Secrets(SecretsCommands),
 
-    /// Remote environments in Service Federation Cloud (beta)
+    /// Remote environments in Service Federation Cloud
     #[cfg(feature = "remote-beta")]
     #[command(subcommand)]
     Remote(RemoteCommands),
@@ -394,10 +394,13 @@ pub enum RemoteCommands {
         #[arg(long = "as", value_name = "WORKSPACE")]
         workspace: Option<String>,
     },
-    /// Open a shell on the environment, or run a command after --
+    /// Open a shell in the workspace on the environment, or run a command after --
     Ssh {
         /// Environment name
         name: String,
+        /// Workspace name on the environment (defaults to the checkout's folder name)
+        #[arg(long = "as", value_name = "WORKSPACE")]
+        workspace: Option<String>,
         /// Command to run instead of a shell
         #[arg(last = true)]
         command: Vec<String>,
