@@ -10,7 +10,8 @@ use super::DockerError;
 use super::registry_auth::{self, RegistryCredential, RuntimeFlavor, TempAuthDir};
 use super::runtime::{self, COMPOSE_V1_BINARY};
 use super::stderr::{
-    stderr_indicates_missing_container, stderr_indicates_not_running, stderr_indicates_pull_noop,
+    stderr_indicates_missing_container, stderr_indicates_no_matching_platform,
+    stderr_indicates_not_running, stderr_indicates_pull_noop,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -64,6 +65,52 @@ fn pull_args(extra: &[String], image: &str, platform: Option<&str>) -> Vec<Strin
     args.push(image.to_string());
     args
 }
+
+/// Go template that prints an image's platform as `os/arch[/variant]`.
+const IMAGE_PLATFORM_FORMAT: &str = "{{.Os}}/{{.Architecture}}{{with .Variant}}/{{.}}{{end}}";
+
+/// `image inspect [--platform P] --format <os/arch> IMAGE`.
+fn platform_inspect_args(image: &str, platform: Option<&str>) -> Vec<String> {
+    let mut args = vec!["image".to_string(), "inspect".to_string()];
+    if let Some(platform) = platform {
+        args.push("--platform".to_string());
+        args.push(platform.to_string());
+    }
+    args.extend(["--format", IMAGE_PLATFORM_FORMAT, image].map(String::from));
+    args
+}
+
+/// Whether a local image's platform, as printed by [`IMAGE_PLATFORM_FORMAT`],
+/// satisfies the platform a service asks for.
+///
+/// OS and architecture must match. The variant is compared only when both
+/// sides have one, because Docker often leaves it out (`linux/arm64` for
+/// `linux/arm64/v8`).
+fn platform_matches(wanted: &str, found: &str) -> bool {
+    fn parts(platform: &str) -> Vec<String> {
+        platform
+            .split('/')
+            .map(|part| match part.to_ascii_lowercase().as_str() {
+                "x86_64" | "x86-64" => "amd64".to_string(),
+                "aarch64" => "arm64".to_string(),
+                other => other.to_string(),
+            })
+            .collect()
+    }
+    let (wanted, found) = (parts(wanted), parts(found));
+    if wanted.len() < 2 || found.len() < 2 || found[0].is_empty() || found[1].is_empty() {
+        return false;
+    }
+    let variants_agree = match (wanted.get(2), found.get(2)) {
+        (Some(w), Some(f)) => w == f,
+        _ => true,
+    };
+    wanted[0] == found[0] && wanted[1] == found[1] && variants_agree
+}
+
+/// The sentence fed adds when a pull fails because the image has no build
+/// for this machine and the service sets no `platform:`.
+const NO_MATCHING_PLATFORM_HINT: &str = "This image has no build for this machine. If it has one for another platform, set `platform:` on the service, for example `platform: linux/amd64`.";
 
 impl DockerClient {
     pub fn new() -> Self {
@@ -233,7 +280,7 @@ impl DockerClient {
         let args = pull_args(&[], image, platform);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let output = self.run(&arg_refs, timeout).await?;
-        Self::pull_outcome(output)
+        Self::pull_outcome(output, platform)
     }
 
     /// Pull an image, using a team credential from `registry_auth` when one
@@ -272,7 +319,7 @@ impl DockerClient {
         let result = self
             .run_with_env(&arg_refs, &auth_dir.pull_env(), timeout)
             .await
-            .and_then(Self::pull_outcome);
+            .and_then(|output| Self::pull_outcome(output, platform));
         drop(auth_dir);
 
         match result {
@@ -287,7 +334,7 @@ impl DockerClient {
     }
 
     /// Map a finished `pull` to success or a [`DockerError`].
-    fn pull_outcome(output: Output) -> Result<(), DockerError> {
+    fn pull_outcome(output: Output, platform: Option<&str>) -> Result<(), DockerError> {
         if output.status.success() {
             return Ok(());
         }
@@ -295,6 +342,13 @@ impl DockerClient {
         // "up to date" or "already exists" aren't real failures
         if stderr_indicates_pull_noop(&stderr) {
             return Ok(());
+        }
+        if platform.is_none() && stderr_indicates_no_matching_platform(&stderr) {
+            return Err(DockerError::cmd_failed(
+                Self::cmd_str(&["pull"]),
+                format!("{}. {}", stderr.trim(), NO_MATCHING_PLATFORM_HINT),
+                output.status.code(),
+            ));
         }
         Err(DockerError::failed(Self::cmd_str(&["pull"]), &output))
     }
@@ -460,15 +514,39 @@ impl DockerClient {
         .await
     }
 
-    /// Check if an image exists locally.
-    pub async fn image_exists(&self, image: &str) -> bool {
-        match self
-            .run(&["inspect", "--type=image", image], Duration::from_secs(10))
-            .await
-        {
-            Ok(o) => o.status.success(),
-            Err(_) => false,
+    /// Check if an image exists locally, for `platform` when one is given.
+    ///
+    /// With a platform, a local copy for another architecture does not count:
+    /// skipping the pull would leave `run --platform` without the image it
+    /// needs. The exit code of `image inspect --platform` is not enough. With
+    /// the containerd image store it succeeds when the image index lists the
+    /// platform but its content was never pulled, and prints an empty
+    /// platform. So the printed platform is compared instead.
+    ///
+    /// When `image inspect --platform` fails (an older runtime has no such
+    /// flag, or the image lacks the platform), a plain `image inspect` prints
+    /// the platform of the local image, which is compared the same way. When
+    /// that differs, fed pulls, which is a no-op for an image that is up to date.
+    pub async fn image_exists(&self, image: &str, platform: Option<&str>) -> bool {
+        let Some(wanted) = platform else {
+            return self
+                .run(&["inspect", "--type=image", image], Duration::from_secs(10))
+                .await
+                .is_ok_and(|o| o.status.success());
+        };
+        for args in [
+            platform_inspect_args(image, Some(wanted)),
+            platform_inspect_args(image, None),
+        ] {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Ok(o) = self.run(&arg_refs, Duration::from_secs(10)).await
+                && o.status.success()
+                && platform_matches(wanted, String::from_utf8_lossy(&o.stdout).trim())
+            {
+                return true;
+            }
         }
+        false
     }
 
     // ========================================================================
@@ -771,6 +849,63 @@ impl DockerClient {
 impl Default for DockerClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod image_platform_tests {
+    use super::{platform_inspect_args, platform_matches};
+
+    #[test]
+    fn the_inspect_asks_for_the_platform_and_prints_it() {
+        assert_eq!(
+            platform_inspect_args("app", Some("linux/amd64")),
+            [
+                "image",
+                "inspect",
+                "--platform",
+                "linux/amd64",
+                "--format",
+                "{{.Os}}/{{.Architecture}}{{with .Variant}}/{{.}}{{end}}",
+                "app"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_fallback_inspect_only_prints_the_platform() {
+        assert_eq!(
+            platform_inspect_args("app", None),
+            [
+                "image",
+                "inspect",
+                "--format",
+                "{{.Os}}/{{.Architecture}}{{with .Variant}}/{{.}}{{end}}",
+                "app"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_local_image_for_the_platform_matches() {
+        assert!(platform_matches("linux/amd64", "linux/amd64"));
+        assert!(platform_matches("linux/arm64/v8", "linux/arm64"));
+        assert!(platform_matches("linux/arm/v7", "linux/arm/v7"));
+        assert!(platform_matches("linux/x86_64", "linux/amd64"));
+    }
+
+    #[test]
+    fn a_local_image_for_another_platform_does_not_match() {
+        assert!(!platform_matches("linux/amd64", "linux/arm64"));
+        assert!(!platform_matches("linux/arm/v7", "linux/arm/v6"));
+    }
+
+    /// The containerd store prints an empty platform when the index lists
+    /// the platform but its content was never pulled.
+    #[test]
+    fn an_empty_platform_does_not_match() {
+        assert!(!platform_matches("linux/amd64", "/"));
+        assert!(!platform_matches("linux/amd64", ""));
     }
 }
 

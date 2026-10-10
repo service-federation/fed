@@ -725,6 +725,24 @@ fn check_service_fields(name: &str, service: &super::Service) -> Result<()> {
         )));
     }
 
+    // A service with variants is checked per variant, merged, so an outer
+    // `platform:` meets the variant's `image:` there. An unresolved `extends:`
+    // may still bring the image.
+    if let Some(ref platform) = service.platform
+        && service.variants.is_empty()
+        && service.extends.is_none()
+    {
+        if service.image.is_none() {
+            return Err(Error::Validation(format!(
+                "Service '{name}' sets platform: {platform} but has no image:. Only image services are pulled and run for a platform. Remove platform:, or move it next to the image:."
+            )));
+        }
+        if !is_platform_string(platform) {
+            return Err(Error::Validation(format!(
+                "Service '{name}' has invalid platform '{platform}'. Use os/architecture, for example 'linux/amd64' or 'linux/arm64'."
+            )));
+        }
+    }
     if let Some(ref gp) = service.grace_period
         && parse_duration_string(gp).is_none()
     {
@@ -762,6 +780,19 @@ fn check_service_fields(name: &str, service: &super::Service) -> Result<()> {
         ))
     })?;
     Ok(())
+}
+
+/// Whether `platform` has Docker's `os/arch[/variant]` shape, such as
+/// `linux/amd64` or `linux/arm/v7`.
+fn is_platform_string(platform: &str) -> bool {
+    let parts: Vec<&str> = platform.split('/').collect();
+    (2..=3).contains(&parts.len())
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        })
 }
 
 fn check_healthcheck_timing(name: &str, hc: &HealthCheck) -> Result<()> {

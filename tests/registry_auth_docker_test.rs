@@ -175,7 +175,7 @@ async fn pulls_from_a_private_registry_with_the_team_credential() {
         .pull_with_credential(&image, None, Some(&right), TIMEOUT)
         .await
         .expect("pull with the team credential");
-    assert!(client.image_exists(&image).await);
+    assert!(client.image_exists(&image, None).await);
     assert!(
         leftover_auth_dirs().is_empty(),
         "temp auth dir was not removed"

@@ -712,7 +712,10 @@ impl ServiceManager for DockerService {
         }
 
         // PERFORMANCE: Check if image exists locally before pulling (avoid 5min timeout on cached images)
-        let needs_pull = !self.client.image_exists(image).await;
+        let needs_pull = !self
+            .client
+            .image_exists(image, self.config.platform.as_deref())
+            .await;
 
         if needs_pull {
             tracing::info!("Pulling image '{}' (not found locally)", image);

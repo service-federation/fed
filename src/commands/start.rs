@@ -217,10 +217,14 @@ pub async fn run_start(
 
             let mut had_errors = false;
             for result in &pull_results {
+                let label = match &result.platform {
+                    Some(platform) => format!("{} for {}", result.image, platform),
+                    None => result.image.clone(),
+                };
                 match &result.outcome {
-                    Ok(()) => out.success(&format!("  \u{2713} {}", result.image)),
+                    Ok(()) => out.success(&format!("  \u{2713} {}", label)),
                     Err(e) => {
-                        out.error(&format!("  \u{2717} {} ({})", result.image, e));
+                        out.error(&format!("  \u{2717} {} ({})", label, e));
                         had_errors = true;
                     }
                 }
