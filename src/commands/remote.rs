@@ -32,6 +32,9 @@ const PORT_OFFSET: u16 = 10_000;
 /// How long `connect` waits before it reports the forwards as up. A forward
 /// whose local port is taken fails within this time.
 const FORWARD_SETTLE: Duration = Duration::from_secs(1);
+/// rsync's exit status when some files vanished during the copy. The rest
+/// were copied.
+const RSYNC_VANISHED: i32 = 24;
 /// rsync gives up when no data moves for this many seconds.
 const RSYNC_IO_TIMEOUT: u32 = 120;
 
@@ -426,9 +429,10 @@ fn minutes_left(deadline: &str, now: chrono::DateTime<chrono::Utc>) -> String {
 }
 
 /// What fed prints when an environment the user still has keys for is gone.
+/// Someone may have deleted it, so the expiry is one of two reasons.
 pub(crate) fn deleted_message(name: &str) -> String {
     format!(
-        "{name} was deleted (it was idle for {IDLE_MINUTES} minutes or reached its {LIFETIME_HOURS}-hour limit). Create it again with `fed remote up {name}`."
+        "{name} no longer exists. It was deleted, or it expired ({IDLE_MINUTES} idle minutes or {LIFETIME_HOURS} hours). Create it again with `fed remote up {name}`."
     )
 }
 
@@ -765,6 +769,18 @@ impl Remote {
             .await
             .context("running ssh")?;
         if status.success() {
+            // A machine whose `fed remote up` was interrupted may still be
+            // setting up. Each new connection waits for that, which on a set-up
+            // machine returns at once.
+            let _ = self
+                .ssh()
+                .arg(self.target())
+                .arg("cloud-init status --wait >/dev/null 2>&1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
             return Ok(());
         }
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
@@ -1084,14 +1100,14 @@ pub async fn run_remote(
             let checkout = checkout_root(workdir)?;
             let ws = workspace_name(&checkout, workspace.as_deref())?;
             check_tools("fed remote push", false).await?;
-            let remote = open(&root, name, linked_project(&checkout).as_ref()).await?;
+            let remote = open(&root, name, linked_project(&checkout).as_ref(), out).await?;
             push(&remote, &checkout, &ws, out).await
         }
         RemoteCommands::Start { name, workspace } => {
             let checkout = checkout_root(workdir)?;
             let ws = workspace_name(&checkout, workspace.as_deref())?;
             check_tools("fed remote start", false).await?;
-            let remote = open(&root, name, linked_project(&checkout).as_ref()).await?;
+            let remote = open(&root, name, linked_project(&checkout).as_ref(), out).await?;
             push(&remote, &checkout, &ws, out).await?;
             match_fed_version(&remote, out).await?;
             if let Some(project) = linked_project(&checkout) {
@@ -1108,7 +1124,7 @@ pub async fn run_remote(
         RemoteCommands::Connect { name, workspace } => {
             let checkout = checkout_root(workdir)?;
             let ws = workspace_name(&checkout, workspace.as_deref())?;
-            let remote = open(&root, name, linked_project(&checkout).as_ref()).await?;
+            let remote = open(&root, name, linked_project(&checkout).as_ref(), out).await?;
             connect(&remote, &ws, out).await
         }
         RemoteCommands::Ssh {
@@ -1123,7 +1139,7 @@ pub async fn run_remote(
                 (None, Some(checkout)) => workspace_name(checkout, None).ok(),
                 (None, None) => None,
             };
-            let remote = open(&root, name, project.as_ref()).await?;
+            let remote = open(&root, name, project.as_ref(), out).await?;
             let code = ssh(&remote, ws.as_deref(), command).await?;
             std::process::exit(code);
         }
@@ -1137,8 +1153,16 @@ pub async fn run_remote(
 /// The environment called `name`, ready for SSH. One past its deadline is
 /// checked against the cloud first, so the user gets the reason instead of
 /// an SSH timeout.
-async fn open(root: &Path, name: &str, project: Option<&api::ProjectRef>) -> Result<Remote> {
+async fn open(
+    root: &Path,
+    name: &str,
+    project: Option<&api::ProjectRef>,
+    out: &dyn UserOutput,
+) -> Result<Remote> {
     let (dir, state) = find_environment(root, name, project).await?;
+    if let Some(project) = project {
+        note_other_project(&state, project, out);
+    }
     let remote = Remote::new(dir, state)?;
     if deadline_passed(&remote.state.deadline, chrono::Utc::now())
         && let Some(gone) = remote.deleted().await
@@ -1187,11 +1211,16 @@ async fn up(
         bail!(api::INVALID_ENVIRONMENT_NAME);
     }
 
+    // Once tokio listens for SIGINT, Ctrl-C no longer ends the process. One
+    // listener for the whole command, so every step after this sees Ctrl-C.
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt()).context("listening for Ctrl-C")?;
+
     create_private_dir(root)?;
     remove_stale_staging(root, std::time::SystemTime::now());
     let staging = root.join(format!("{STAGING_PREFIX}{:016x}", rand::random::<u64>()));
     create_private_dir(&staging)?;
-    let created = create(&creds, &project, &staging, &name, kind, out).await;
+    let created = create(&creds, &project, &staging, &name, kind, &mut interrupt, out).await;
     let env = match created {
         Ok(env) => env,
         Err(e) => {
@@ -1225,36 +1254,38 @@ async fn up(
     std::fs::rename(&staging, &dir)
         .with_context(|| format!("moving the keys to {}", dir.display()))?;
 
-    // The cloud only gives out a name that no active environment has, so an
-    // older environment by this name is gone.
-    for (old_dir, old) in local_environments(root) {
-        if old.name == name && old.in_project(&project) && old.id != env.id {
-            forget(Some(&creds), &old_dir, &old).await;
+    let finish = async {
+        // The cloud only gives out a name that no active environment has, so
+        // an older environment by this name is gone.
+        for (old_dir, old) in local_environments(root) {
+            if old.name == name && old.in_project(&project) && old.id != env.id {
+                forget(Some(&creds), &old_dir, &old).await;
+            }
         }
-    }
-
-    let (Some(ip), Some(port)) = (env.ip.clone(), env.port) else {
-        bail!(
-            "Service Federation Cloud has no address for {name} yet. Delete it with `fed remote down {name}` and try again."
-        );
+        let (Some(ip), Some(port)) = (env.ip.clone(), env.port) else {
+            bail!(
+                "Service Federation Cloud has no address for {name} yet. Delete it with `fed remote down {name}` and try again."
+            );
+        };
+        let host_public = read_trimmed(&dir.join("host_key.pub"))?;
+        write_private(
+            &dir.join("known_hosts"),
+            known_hosts_line(&ip, port, &host_public)?.as_bytes(),
+        )?;
+        let remote = Remote::new(dir.clone(), state.clone())?;
+        wait_until_ready(&remote, &ip, port, out).await?;
+        Ok((ip, port))
     };
-    let host_public = read_trimmed(&dir.join("host_key.pub"))?;
-    write_private(
-        &dir.join("known_hosts"),
-        known_hosts_line(&ip, port, &host_public)?.as_bytes(),
-    )?;
-
-    let remote = Remote::new(dir, state)?;
-    tokio::select! {
+    let (ip, port) = tokio::select! {
         biased;
-        _ = tokio::signal::ctrl_c() => {
+        _ = interrupt.recv() => {
             out.clear_progress();
             bail!(
-                "Stopped waiting for {name}. It keeps starting up. Continue with `fed remote start {name}`, or delete it with `fed remote down {name}`."
+                "Stopped waiting for {name}. It keeps starting up, and deletes itself {IDLE_MINUTES} minutes after the last SSH session ends. Continue with `fed remote start {name}`, or delete it with `fed remote down {name}`."
             );
         }
-        ready = wait_until_ready(&remote, &ip, port, out) => ready?,
-    }
+        ready = finish => ready?,
+    };
 
     out.success(&format!("{name} is ready at {ip} (SSH port {port})."));
     out.status(&format!(
@@ -1306,6 +1337,7 @@ async fn create(
     staging: &Path,
     name: &str,
     kind: Option<&str>,
+    interrupt: &mut tokio::signal::unix::Signal,
     out: &dyn UserOutput,
 ) -> Result<api::Environment> {
     keygen(
@@ -1334,7 +1366,7 @@ async fn create(
     };
     let stopped = tokio::select! {
         biased;
-        _ = tokio::signal::ctrl_c() => "you pressed Ctrl-C",
+        _ = interrupt.recv() => "you pressed Ctrl-C",
         _ = tokio::time::sleep(api::CREATE_TIMEOUT) => "it took more than 5 minutes",
         result = api::create_environment(creds, project, &body) => {
             let _ = std::fs::remove_file(staging.join("host_key"));
@@ -1352,20 +1384,24 @@ async fn create(
     };
     let _ = std::fs::remove_file(staging.join("host_key"));
     out.clear_progress();
-    let check = tokio::time::timeout(
-        Duration::from_secs(20),
-        api::list_environments(creds, project),
-    )
-    .await;
+    out.status("Checking whether it exists. Press Ctrl-C again to skip.");
+    let check = tokio::select! {
+        biased;
+        _ = interrupt.recv() => None,
+        listed = tokio::time::timeout(
+            Duration::from_secs(20),
+            api::list_environments(creds, project),
+        ) => listed.ok().and_then(|l| l.ok()),
+    };
     match check {
-        Ok(Ok(list)) if list.iter().any(|e| e.name == name) => bail!(
+        Some(list) if list.iter().any(|e| e.name == name) => bail!(
             "fed stopped waiting for {name} because {stopped}. {name} exists in {project}, but this machine has no keys for it. Delete it with `fed remote down {name}`, then create it again."
         ),
-        Ok(Ok(_)) => bail!(
+        Some(_) => bail!(
             "fed stopped waiting for {name} because {stopped}. {project} has no environment called {name} yet. If it shows up in `fed remote ls`, delete it with `fed remote down {name}`."
         ),
-        _ => bail!(
-            "fed stopped waiting for {name} because {stopped}, and cannot check whether it exists. If it shows up in `fed remote ls`, delete it with `fed remote down {name}`."
+        None => bail!(
+            "fed stopped waiting for {name} because {stopped}, and did not check whether it exists. If it shows up in `fed remote ls`, delete it with `fed remote down {name}`."
         ),
     }
 }
@@ -1504,7 +1540,12 @@ async fn push(remote: &Remote, checkout: &Path, ws: &str, out: &dyn UserOutput) 
     };
     // When rsync stops early, its status says why. The broken pipe does not.
     let status = child.wait().await?;
-    if !status.success() {
+    if status.code() == Some(RSYNC_VANISHED) {
+        out.warning(&format!(
+            "Some files were deleted while fed copied them to {}. Push again to copy the checkout as it is now.",
+            remote.name()
+        ));
+    } else if !status.success() {
         // rsync exits with 255 when ssh does, and with 12 when the connection
         // drops in the middle of the copy.
         let lost = matches!(status.code(), Some(12 | 255));
@@ -1780,6 +1821,41 @@ async fn every_forward_stopped(remote: &Remote) -> anyhow::Error {
     anyhow!("every port forward to {} stopped.", remote.name())
 }
 
+/// The caller's environment called `name` in `project`, from the cloud list.
+/// For one created on another machine. An org admin's list also holds other
+/// people's environments, and only the caller's own count.
+async fn cloud_environment(
+    creds: &cloud::Credentials,
+    project: &api::ProjectRef,
+    name: &str,
+) -> Result<Option<EnvState>> {
+    let list = api::list_environments(creds, project).await?;
+    let me = my_user_id(creds, &list).await;
+    Ok(list
+        .into_iter()
+        .find(|e| e.name == name && e.is_owned_by(me.as_deref()))
+        .map(|env| EnvState {
+            id: env.id,
+            name: env.name,
+            org: project.org.clone(),
+            project: project.project.clone(),
+            ip: env.ip.unwrap_or_default(),
+            port: env.port.unwrap_or(22),
+            deadline: env.deadline,
+        }))
+}
+
+/// Say so when a command acts on an environment outside the linked project.
+fn note_other_project(state: &EnvState, linked: &api::ProjectRef, out: &dyn UserOutput) {
+    if !state.in_project(linked) {
+        out.status(&format!(
+            "Using {} in {}. This checkout is linked to {linked}.",
+            state.name,
+            state.project_ref()
+        ));
+    }
+}
+
 async fn down(
     root: &Path,
     name: &str,
@@ -1787,34 +1863,25 @@ async fn down(
     out: &dyn UserOutput,
 ) -> Result<()> {
     let creds = credentials()?;
-    let (dir, state) = match find_environment(root, name, project).await {
-        Ok(found) => (Some(found.0), found.1),
-        Err(not_found) => {
-            // Created on another machine: the cloud still knows it by name.
-            // An org admin's list also holds other people's environments,
-            // and only the caller's own count.
-            let Some(project) = project else {
-                return Err(not_found);
-            };
-            let list = api::list_environments(&creds, project).await?;
-            let me = my_user_id(&creds, &list).await;
-            let Some(env) = list
-                .into_iter()
-                .find(|e| e.name == name && e.is_owned_by(me.as_deref()))
-            else {
-                bail!("you have no environment called {name} in {project}. See `fed remote ls`.");
-            };
-            let state = EnvState {
-                id: env.id,
-                name: env.name,
-                org: project.org.clone(),
-                project: project.project.clone(),
-                ip: env.ip.unwrap_or_default(),
-                port: env.port.unwrap_or(22),
-                deadline: env.deadline,
-            };
-            (None, state)
-        }
+    let local = find_environment(root, name, project).await;
+    // An environment in the linked project wins over one this machine has in
+    // another project, also when only the cloud knows the linked one.
+    let (dir, state) = match (local, project) {
+        (Ok((dir, state)), None) => (Some(dir), state),
+        (Ok((dir, state)), Some(project)) if state.in_project(project) => (Some(dir), state),
+        (local, Some(project)) => match cloud_environment(&creds, project, name).await? {
+            Some(state) => (None, state),
+            None => match local {
+                Ok((dir, state)) => {
+                    note_other_project(&state, project, out);
+                    (Some(dir), state)
+                }
+                Err(_) => bail!(
+                    "you have no environment called {name} in {project}. See `fed remote ls`."
+                ),
+            },
+        },
+        (Err(not_found), None) => return Err(not_found),
     };
 
     if let Some(dir) = &dir {
@@ -2260,10 +2327,15 @@ mod tests {
         std::fs::create_dir_all(ws.join(".fed")).unwrap();
         std::fs::create_dir_all(ws.join("node_modules")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(ws.join("deep/a/b")).unwrap();
+        std::fs::create_dir_all(ws.join("deep/keep")).unwrap();
         for file in [
             "keep.txt",
             "gone.txt",
+            "-n",
             "src/old/gone.rs",
+            "deep/a/b/gone.txt",
+            "deep/keep/kept.txt",
             "node_modules/x.js",
             ".fed/lock.db",
         ] {
@@ -2273,7 +2345,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, ws.join("escape")).unwrap();
         std::fs::write(
             ws.join(PUSH_MANIFEST),
-            b"keep.txt\0gone.txt\0src/old/gone.rs\0escape/victim\0",
+            b"keep.txt\0gone.txt\0-n\0src/old/gone.rs\0deep/a/b/gone.txt\0deep/keep/kept.txt\0escape/victim\0",
         )
         .unwrap();
 
@@ -2289,19 +2361,22 @@ mod tests {
             .stdin
             .take()
             .unwrap()
-            .write_all(b"keep.txt\0new.txt\0")
+            .write_all(b"keep.txt\0deep/keep/kept.txt\0new.txt\0")
             .unwrap();
         assert!(child.wait().unwrap().success());
 
         assert!(ws.join("keep.txt").exists());
         assert!(!ws.join("gone.txt").exists());
+        assert!(!ws.join("-n").exists(), "a name like an option is a name");
         assert!(!ws.join("src").exists(), "emptied folders go too");
+        assert!(!ws.join("deep/a").exists());
+        assert!(ws.join("deep/keep/kept.txt").exists());
         assert!(ws.join("node_modules/x.js").exists());
         assert!(ws.join(".fed/lock.db").exists());
         assert!(outside.join("victim").exists());
         assert_eq!(
             std::fs::read(ws.join(PUSH_MANIFEST)).unwrap(),
-            b"keep.txt\0new.txt\0"
+            b"deep/keep/kept.txt\0keep.txt\0new.txt\0"
         );
     }
 
@@ -2309,7 +2384,7 @@ mod tests {
     fn deleted_message_says_why_and_what_to_do() {
         assert_eq!(
             deleted_message("box"),
-            "box was deleted (it was idle for 5 minutes or reached its 6-hour limit). Create it again with `fed remote up box`."
+            "box no longer exists. It was deleted, or it expired (5 idle minutes or 6 hours). Create it again with `fed remote up box`."
         );
     }
 

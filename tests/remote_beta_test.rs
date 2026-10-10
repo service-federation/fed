@@ -74,6 +74,12 @@ mod with_feature {
                         None => ("404 Not Found", r#"{"error":"route"}"#.to_string()),
                     };
                     seen.lock().unwrap().push(request);
+                    if status == HANG {
+                        // Never answers. The connection stays open until the
+                        // test process ends.
+                        std::mem::forget(stream);
+                        continue;
+                    }
                     use std::io::Write;
                     let resp = format!(
                         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -125,7 +131,8 @@ mod with_feature {
     /// Logs every call as `name [arg] [arg] ...`, one line each, written at
     /// once so that parallel calls do not mix. Keeps each command's stdin in
     /// `<log>.stdin.<pid>`. `FAKE_SSH=dead` makes every connection fail as
-    /// for a deleted machine.
+    /// for a deleted machine. `FAKE_FORWARD=hold` keeps a port forward running
+    /// and writes its pid to `<log>.forward.<pid>`.
     const FAKE_SSH: &str = r#"#!/bin/sh
 line=ssh; for a in "$@"; do line="$line [$a]"; done
 printf '%s\n' "$line" >> "$FAKE_LOG"
@@ -142,7 +149,12 @@ case "$opts " in
   *" -O check "*) exit 1 ;;
   *" -O exit "*) exit 0 ;;
   *" -f -N "*) exit 0 ;;
-  *" -L "*) exit 255 ;;
+  *" -L "*)
+    if [ "$FAKE_FORWARD" = hold ]; then
+      echo $$ > "$FAKE_LOG.forward.$$"
+      exec sleep 600
+    fi
+    exit 255 ;;
 esac
 case "$last" in
   "fed --version") echo "fed ${FAKE_VM_FED:-999.0.0}" ;;
@@ -159,7 +171,7 @@ esac
 line=rsync; for a in "$@"; do line="$line [$a]"; done
 printf '%s CHOSEN_RSYNC=%s\n' "$line" "$CHOSEN_RSYNC" >> "$FAKE_LOG"
 cat > "$FAKE_LOG.rsync-list"
-exit 0
+exit "${FAKE_RSYNC_EXIT:-0}"
 "#;
 
     /// A fake home with a git checkout `app` linked to acme/web, and the fake
@@ -294,6 +306,9 @@ exit 0
     }
 
     const WEB: &str = "GET /api/v1/orgs/acme/projects/web/environments ";
+
+    /// A route status that makes the mock cloud never answer.
+    const HANG: &str = "hang";
 
     /// A refusal reaches the user as a plain sentence, the keys went in the
     /// body, and no half-made state stays behind.
@@ -602,7 +617,7 @@ exit 0
             assert!(!ok, "{command}: {output}");
             assert!(
                 output.contains(
-                    "Error: box was deleted (it was idle for 5 minutes or reached its 6-hour limit). Create it again with `fed remote up box`.\n"
+                    "Error: box no longer exists. It was deleted, or it expired (5 idle minutes or 6 hours). Create it again with `fed remote up box`.\n"
                 ),
                 "{command}: {output}"
             );
@@ -777,5 +792,230 @@ exit 0
         );
         assert!(output.contains("203.0.113.7:23456"), "{output}");
         assert_eq!(setup.remote_dirs(), vec!["env-live", "env-other"]);
+    }
+
+    #[test]
+    fn push_warns_when_files_vanish_during_the_copy() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (ok, output) = setup.fed(
+            "http://127.0.0.1:9",
+            &["remote", "push", "box"],
+            &[("FAKE_RSYNC_EXIT", "24")],
+        );
+        assert!(ok, "{output}");
+        assert!(
+            output.contains("Some files were deleted while fed copied them to box."),
+            "{output}"
+        );
+        let log = std::fs::read_to_string(setup.log_path()).unwrap();
+        assert!(
+            log.contains(".fed/remote-push-files"),
+            "the cleanup still runs"
+        );
+
+        let (ok, output) = setup.fed(
+            "http://127.0.0.1:9",
+            &["remote", "push", "box"],
+            &[("FAKE_RSYNC_EXIT", "23")],
+        );
+        assert!(!ok, "{output}");
+        assert!(output.contains("rsync to box failed"), "{output}");
+    }
+
+    /// In a checkout linked to acme/web, `down box` deletes the box of
+    /// acme/web, even when this machine only has keys for a box in acme/api.
+    #[test]
+    fn down_prefers_the_linked_project() {
+        let setup = Setup::new();
+        let other = setup.save("env-api", "box", "api");
+        let cloud = Cloud::start(vec![
+            (WEB, "200 OK", list(&[environment("env-web", "box")])),
+            (
+                "DELETE /api/v1/orgs/acme/projects/web/environments/env-web ",
+                "200 OK",
+                r#"{"deleted":true}"#.to_string(),
+            ),
+        ]);
+        let (ok, output) = setup.fed(&cloud.url, &["remote", "down", "box"], &[]);
+        assert!(ok, "{output}");
+        assert!(other.exists(), "the box of acme/api stays");
+        assert!(
+            cloud
+                .request("DELETE /api/v1/orgs/acme/projects/web/environments/env-web ")
+                .is_some()
+        );
+
+        let cloud = Cloud::start(vec![
+            (WEB, "200 OK", list(&[])),
+            (
+                "DELETE /api/v1/orgs/acme/projects/api/environments/env-api ",
+                "200 OK",
+                r#"{"deleted":true}"#.to_string(),
+            ),
+        ]);
+        let (ok, output) = setup.fed(&cloud.url, &["remote", "down", "box"], &[]);
+        assert!(ok, "{output}");
+        assert!(
+            output.contains("Using box in acme/api. This checkout is linked to acme/web."),
+            "{output}"
+        );
+        assert!(!other.exists());
+    }
+
+    fn alive(pid: i32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// A port forward is a logged-in session that keeps the machine awake.
+    /// When `connect` gets SIGTERM or SIGHUP, it ends every forward.
+    #[test]
+    fn connect_ends_its_forwards_on_sigterm_and_sighup() {
+        for signal in ["TERM", "HUP"] {
+            let setup = Setup::new();
+            setup.save("env-1", "box", "web");
+            let path = format!(
+                "{}:{}",
+                setup.home().join("bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let child = Command::new(fed_binary())
+                .arg("--workdir")
+                .arg(&setup.checkout)
+                .args(["remote", "connect", "box"])
+                .env("HOME", setup.home())
+                .env("PATH", path)
+                .env("FAKE_LOG", setup.log_path())
+                .env("FAKE_FORWARD", "hold")
+                .env("FED_TOKEN", "fed_test-token")
+                .env("FED_CLOUD_URL", "http://127.0.0.1:9")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+
+            let pid_files = || -> Vec<i32> {
+                std::fs::read_dir(setup.home())
+                    .unwrap()
+                    .flatten()
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("calls.log.forward.")
+                    })
+                    .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                    .filter_map(|pid| pid.trim().parse().ok())
+                    .collect()
+            };
+            let start = std::time::Instant::now();
+            while pid_files().len() < 2 {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(20),
+                    "the forwards did not start"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            // Past the moment `connect` reports the forwards as up.
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let forwards = pid_files();
+            assert!(forwards.iter().all(|pid| alive(*pid)), "{forwards:?}");
+
+            let ok = Command::new("kill")
+                .args([&format!("-{signal}"), &child.id().to_string()])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+            let output = child.wait_with_output().unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.status.success(), "{signal}: {text}");
+            assert!(text.contains("Connected."), "{signal}: {text}");
+            assert!(text.contains("Disconnected."), "{signal}: {text}");
+            let start = std::time::Instant::now();
+            while forwards.iter().any(|pid| alive(*pid)) {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(5),
+                    "{signal} left forwards running: {forwards:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+
+    /// Ctrl-C while the create is pending makes fed check the list, and a
+    /// second Ctrl-C skips that check. Neither is swallowed.
+    #[test]
+    fn ctrl_c_during_up_stops_the_wait_and_the_check() {
+        let setup = Setup::new();
+        let cloud = Cloud::start(vec![
+            (
+                "POST /api/v1/orgs/acme/projects/web/environments ",
+                HANG,
+                String::new(),
+            ),
+            (WEB, HANG, String::new()),
+        ]);
+        let path = format!(
+            "{}:{}",
+            setup.home().join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let child = Command::new(fed_binary())
+            .arg("--workdir")
+            .arg(&setup.checkout)
+            .args(["remote", "up", "box"])
+            .env("HOME", setup.home())
+            .env("PATH", path)
+            .env("FAKE_LOG", setup.log_path())
+            .env("FED_TOKEN", "fed_test-token")
+            .env("FED_CLOUD_URL", &cloud.url)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let wait_for = |prefix: &str| {
+            let start = std::time::Instant::now();
+            while cloud.request(prefix).is_none() {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(20),
+                    "no {prefix}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        let interrupt = || {
+            let ok = Command::new("kill")
+                .args(["-INT", &child.id().to_string()])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        };
+        wait_for("POST /api/v1/orgs/acme/projects/web/environments ");
+        interrupt();
+        wait_for(WEB);
+        interrupt();
+        let output = child.wait_with_output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "{text}");
+        assert!(
+            text.contains(
+                "Error: fed stopped waiting for box because you pressed Ctrl-C, and did not check whether it exists."
+            ),
+            "{text}"
+        );
+        assert!(setup.remote_dirs().is_empty(), "{:?}", setup.remote_dirs());
     }
 }

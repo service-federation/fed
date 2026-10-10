@@ -278,8 +278,11 @@ pub fn environment_error(
         }
         (429, _, _) => "too many requests. Try again in a minute.".to_string(),
         (502, _, _) => match request {
+            EnvironmentRequest::Create { .. } => "the cloud provider failed to create the environment. Try again in a minute.".to_string(),
             EnvironmentRequest::Delete => "the cloud provider did not delete the environment. Try again in a minute.".to_string(),
-            _ => "the cloud provider failed to create the environment. Try again in a minute.".to_string(),
+            EnvironmentRequest::List => "Service Federation Cloud could not list the environments. Try again in a minute.".to_string(),
+            EnvironmentRequest::MintToken => "Service Federation Cloud could not create a vault token. Try again in a minute.".to_string(),
+            EnvironmentRequest::RevokeToken => "Service Federation Cloud could not revoke a vault token. Try again in a minute.".to_string(),
         },
         _ => {
             let context = match request {
@@ -749,6 +752,25 @@ mod tests {
                 "Service Federation Cloud sent a list of environments that fed cannot read: "
             ),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn a_bad_gateway_names_the_request_it_failed() {
+        let status = reqwest::StatusCode::BAD_GATEWAY;
+        let message =
+            |request| environment_error(status, None, None, request, &project()).to_string();
+        assert_eq!(
+            message(EnvironmentRequest::List),
+            "Service Federation Cloud could not list the environments. Try again in a minute."
+        );
+        assert_eq!(
+            message(EnvironmentRequest::MintToken),
+            "Service Federation Cloud could not create a vault token. Try again in a minute."
+        );
+        assert_eq!(
+            message(EnvironmentRequest::RevokeToken),
+            "Service Federation Cloud could not revoke a vault token. Try again in a minute."
         );
     }
 

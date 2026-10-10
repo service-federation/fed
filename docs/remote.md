@@ -95,6 +95,9 @@ fed remote ssh box -- fed logs api
 
 Outside a checkout, the shell opens in root's home folder.
 
+When this computer has keys for a machine by that name in another project, but
+not in the linked one, commands use that machine and say so.
+
 ### `fed remote down NAME`
 
 Deletes the machine now, revokes its vault tokens and forgets its keys. Run
@@ -108,7 +111,7 @@ created on another computer.
 - **6 hours after it was created**, it is deleted in any case. `fed remote up`
   prints the time.
 
-After that, a command on the machine says it was deleted. Create a new one with
+After that, a command on the machine says it no longer exists. Create a new one with
 `fed remote up NAME`. Nothing on the old machine is kept.
 
 ## Limits
@@ -139,8 +142,9 @@ fed connects with its own SSH settings and ignores `~/.ssh/config`.
 
 ## Troubleshooting
 
-**"box was deleted (it was idle for 5 minutes or reached its 6-hour limit)"**
-The machine is gone, and fed has forgotten its keys. Run `fed remote up box`.
+**"box no longer exists"**
+Someone deleted the machine, or it expired. fed has forgotten its keys. Run
+`fed remote up box`.
 
 **"Remote environments are not enabled for acme"**
 Your org cannot create machines yet. Ask a Service Federation admin to turn
