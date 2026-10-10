@@ -89,12 +89,7 @@ pub async fn run_secrets(
             // what the user wants gone.
             forget_cached(&work_dir, name, out);
             if found == cloud::Deletion::NotSet {
-                bail!(
-                    "cloud: {} is not set in {}/{}",
-                    name,
-                    link.org,
-                    link.project
-                );
+                bail!("{} is not set in {}/{}", name, link.org, link.project);
             }
             out.success(&format!(
                 "Removed {} from {}/{}",

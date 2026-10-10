@@ -139,10 +139,10 @@ mod with_feature {
             .unwrap_or_default()
     }
 
-    /// The closed-beta refusal reaches the user as a plain sentence, the keys
-    /// went in the body, and no half-made state stays behind.
+    /// A refusal reaches the user as a plain sentence, the keys went in the
+    /// body, and no half-made state stays behind.
     #[test]
-    fn up_refused_by_the_closed_beta_sends_keys_and_leaves_no_state() {
+    fn up_refused_for_the_org_sends_keys_and_leaves_no_state() {
         let (home, checkout) = linked_checkout();
         let (url, rx) = spawn_answering(
             "403 Forbidden",
@@ -151,10 +151,12 @@ mod with_feature {
         let (ok, output) = fed(home.path(), &checkout, &url, &["remote", "up", "box"]);
         assert!(!ok, "{output}");
         assert!(
-            output
-                .contains("remote environments are in a closed beta and not enabled for this org"),
+            output.contains(
+                "Error: Remote environments are not enabled for acme. Ask a Service Federation admin to turn them on.\n"
+            ),
             "{output}"
         );
+        assert!(!output.contains("Invalid configuration"), "{output}");
 
         let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let (head, body) = request.split_once("\r\n\r\n").unwrap();

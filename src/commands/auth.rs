@@ -171,7 +171,7 @@ async fn login_flow(
     // The code came over HTTPS from the server; anything not shaped like our
     // exchange code is contract drift. Checked without echoing it.
     if !valid_prefixed_id(&code, "fedac_") {
-        bail!("cloud: malformed sign-in code from server — run `fed login` again");
+        bail!("Service Federation Cloud sent a malformed sign-in code. Run `fed login` again.");
     }
 
     // Redeem the single-use code for the bearer token over HTTPS. The token
@@ -180,7 +180,7 @@ async fn login_flow(
     // drift; treat it like a failed exchange (and never echo it).
     let token = cloud::exchange_code(base_url, &code).await?;
     if !token.starts_with("fed_") {
-        bail!("cloud: malformed token from server — run `fed login` again");
+        bail!("Service Federation Cloud sent a malformed token. Run `fed login` again.");
     }
     let creds = cloud::Credentials {
         url: base_url.to_string(),
@@ -329,14 +329,16 @@ async fn recover_pending_login(
 async fn checked_auth_request(base_url: &str, label: &str) -> Result<cloud::AuthRequest> {
     let auth = cloud::create_auth_request(base_url, label).await?;
     if !valid_prefixed_id(&auth.request, "fedar_") {
-        bail!("cloud: malformed authorize request id from server — run `fed login` again");
+        bail!(
+            "Service Federation Cloud sent a malformed authorize request id. Run `fed login` again."
+        );
     }
     if !valid_prefixed_id(&auth.poll_secret, "fedps_") {
-        bail!("cloud: malformed poll secret from server — run `fed login` again");
+        bail!("Service Federation Cloud sent a malformed poll secret. Run `fed login` again.");
     }
     if auth.pairing_code.len() != 8 || !auth.pairing_code.bytes().all(|byte| byte.is_ascii_digit())
     {
-        bail!("cloud: malformed pairing code from server — run `fed login` again");
+        bail!("Service Federation Cloud sent a malformed pairing code. Run `fed login` again.");
     }
     Ok(auth)
 }

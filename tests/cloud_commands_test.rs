@@ -307,11 +307,11 @@ fn secrets_set_refused_by_the_vault_never_prints_the_value_or_touches_the_cache(
             "{\"error\":\"unauthenticated\"}",
             "fed login",
         ),
-        ("404 Not Found", "{\"error\":\"project\"}", "not found"),
+        ("404 Not Found", "{\"error\":\"project\"}", "does not exist"),
         (
             "429 Too Many Requests",
             "{\"error\":\"rate_limited\"}",
-            "rate limited",
+            "too many requests",
         ),
         ("500 Internal Server Error", "{}", "500"),
     ] {

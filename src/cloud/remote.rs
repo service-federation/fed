@@ -1,13 +1,12 @@
-//! Remote environments (beta, behind the `remote-beta` cargo feature): the
-//! cloud API that creates, lists and deletes them, and the env tokens a remote
-//! environment uses to read the team vault.
+//! Remote environments: the cloud API that creates, lists and deletes them,
+//! and the env tokens a remote environment uses to read the team vault.
 //!
 //! Every request goes through `client_builder()`, so it carries the version
 //! headers, and every refusal ends in `api_error` or a message built from the
 //! status and the server's error code. Tokens and key material travel only in
 //! JSON bodies and never reach an error message.
 
-use super::{Credentials, api_error, api_url, client_builder};
+use super::{Credentials, api_error, api_url, bad_response, client_builder, unreachable};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -46,6 +45,10 @@ pub struct Environment {
     pub deadline: String,
 }
 
+/// How long `fed remote up` waits for the create request. The cloud answers
+/// once the provider has powered the machine on, which can take minutes.
+pub const CREATE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Environment names the cloud accepts: `^[a-z0-9][a-z0-9-]{0,30}$`.
 pub fn valid_environment_name(name: &str) -> bool {
     let bytes = name.as_bytes();
@@ -56,7 +59,7 @@ pub fn valid_environment_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
-pub const INVALID_ENVIRONMENT_NAME: &str = "invalid environment name: use 1 to 31 lowercase letters, digits and -, starting with a letter or digit";
+pub const INVALID_ENVIRONMENT_NAME: &str = "invalid environment name. Use 1 to 31 lowercase letters, digits and -, starting with a letter or digit.";
 
 /// What `fed remote up` sends to create an environment. The host private key
 /// is in here, so `Debug` leaves the keys out.
@@ -99,11 +102,12 @@ impl std::fmt::Debug for EnvToken {
 
 fn client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    // Creating an environment waits for the cloud provider, so the budget is
-    // longer than the vault's.
+    // Creating an environment waits for the cloud provider, so its request
+    // sets a longer timeout of its own.
     CLIENT.get_or_init(|| {
         client_builder()
-            .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(60))
             .build()
             .expect("building HTTP client")
     })
@@ -137,7 +141,9 @@ fn checked_id(id: &str) -> Result<&str> {
     if valid_id(id) {
         Ok(id)
     } else {
-        Err(Error::Validation("cloud: invalid id".into()))
+        Err(Error::Cloud(
+            "Service Federation Cloud sent an environment or token id that fed cannot use".into(),
+        ))
     }
 }
 
@@ -153,7 +159,7 @@ async fn send(req: reqwest::RequestBuilder, creds: &Credentials) -> Result<reqwe
     req.bearer_auth(&creds.token)
         .send()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", creds.url, e)))
+        .map_err(|e| unreachable(&creds.url, &e))
 }
 
 async fn refusal(res: reqwest::Response) -> (reqwest::StatusCode, ErrorBody) {
@@ -176,7 +182,8 @@ pub enum EnvironmentRequest<'a> {
 }
 
 /// The message for a refused environment or env token request. Built from the
-/// status and the server's `{"error", "limit"}` only.
+/// status and the server's `{"error", "limit"}` only. Known error codes are
+/// matched first, because the server may move one to another status.
 pub fn environment_error(
     status: reqwest::StatusCode,
     code: Option<&str>,
@@ -184,55 +191,86 @@ pub fn environment_error(
     request: EnvironmentRequest<'_>,
     project: &ProjectRef,
 ) -> Error {
-    let message = match (status.as_u16(), code) {
-        (401, _) => {
-            "cloud: your login is missing, expired or revoked — run `fed login`".to_string()
-        }
-        (403, Some("compute_not_enabled")) => {
-            "cloud: remote environments are in a closed beta and not enabled for this org"
-                .to_string()
-        }
-        (403, Some("token_scope")) => "cloud: this login token may not manage remote environments — run `fed login` on this machine to get one that can".to_string(),
-        (404, _) => format!(
-            "cloud: project {project} not found, or you are not a member — check `fed link`"
+    let org = &project.org;
+    let created = match request {
+        EnvironmentRequest::Create { name, .. } => Some(name),
+        _ => None,
+    };
+    let limit = match code {
+        Some("user_limit") => Some("user_environments"),
+        Some("hours") => Some("monthly_hours"),
+        Some("limit") => Some(limit.unwrap_or("")),
+        _ => None,
+    };
+    let message = match (status.as_u16(), code, limit) {
+        (401, _, _) => "your login is missing, expired or revoked. Run `fed login`.".to_string(),
+        (_, Some("compute_not_enabled"), _) => format!(
+            "Remote environments are not enabled for {org}. Ask a Service Federation admin to turn them on."
         ),
-        (409, Some("name_taken")) => match request {
-            EnvironmentRequest::Create { name, .. } => format!(
-                "cloud: {project} already has an environment called {name} — pick another name, or remove it with `fed remote down {name}`"
+        (_, Some("token_scope"), _) => "this login cannot manage remote environments. Run `fed login` on this machine to get one that can.".to_string(),
+        (_, Some("cleanup_unavailable"), _) => "Service Federation Cloud has paused new remote environments for a moment. Try again in a few minutes.".to_string(),
+        (_, Some("capacity"), _) => "Service Federation Cloud has no room for new remote environments right now. Try again in a few minutes.".to_string(),
+        (_, Some("compute_unavailable"), _) => "Service Federation Cloud cannot create remote environments right now. Try again later, or ask a Service Federation admin.".to_string(),
+        (_, _, Some("user_environments")) => "you already have as many remote environments as one person may have. Delete one with `fed remote down NAME`, or wait until one deletes itself.".to_string(),
+        (_, _, Some("max_environments")) => format!(
+            "{org} already has as many remote environments as it may have. Delete one with `fed remote down NAME`, or wait until one deletes itself."
+        ),
+        (_, _, Some("allowed_types")) => {
+            let kind = match request {
+                EnvironmentRequest::Create { kind, .. } => kind.unwrap_or(DEFAULT_TYPE),
+                _ => "this type of",
+            };
+            format!("{org} may not create {kind} environments. Pick another type with `--type`.")
+        }
+        (_, _, Some("monthly_hours")) => format!(
+            "{org} has used all its remote environment hours for this month."
+        ),
+        (_, _, Some(_)) => format!("{org} has reached a limit for remote environments."),
+        (409, Some("name_taken"), _) => match created {
+            Some(name) => format!(
+                "{project} already has an environment called {name}. Pick another name, or delete it with `fed remote down {name}`."
             ),
-            _ => format!("cloud: the name is already taken in {project}"),
+            None => format!("that name is already taken in {project}."),
         },
-        (422, Some("limit")) => match limit {
-            Some("max_environments") => format!(
-                "cloud: {project} already has as many environments as its org allows — `fed remote ls`, then `fed remote down NAME`"
+        (409, Some("busy"), _) => {
+            "the environment is still being set up. Try again in a few seconds.".to_string()
+        }
+        (410, _, _) => match created {
+            Some(name) => format!(
+                "{name} was deleted while it was being created. Create it again with `fed remote up {name}`."
             ),
-            Some("allowed_types") => {
-                let kind = match request {
-                    EnvironmentRequest::Create { kind, .. } => kind.unwrap_or(DEFAULT_TYPE),
-                    _ => "this type",
-                };
-                format!("cloud: the org may not create {kind} environments — try `--type` with another type")
-            }
-            Some("monthly_hours") => {
-                "cloud: the org has used all its remote environment hours for this month"
-                    .to_string()
-            }
-            _ => "cloud: an org limit for remote environments was reached".to_string(),
+            None => "the environment was deleted.".to_string(),
         },
-        (502, _) => "cloud: the cloud provider failed to create the environment — try again in a minute".to_string(),
-        (503, _) => "cloud: no capacity for new environments right now — try again in a few minutes".to_string(),
+        (404, Some("environment"), _) => {
+            format!("{project} has no such environment. See `fed remote ls`.")
+        }
+        (404, _, _) => format!(
+            "project {project} does not exist, or you are not a member of it. Check `fed link`."
+        ),
+        (400, Some("type"), _) => {
+            let kind = match request {
+                EnvironmentRequest::Create { kind, .. } => kind.unwrap_or(DEFAULT_TYPE),
+                _ => "this",
+            };
+            format!("Service Federation Cloud does not know the server type {kind}. Pick another type with `--type`.")
+        }
+        (429, _, _) => "too many requests. Try again in a minute.".to_string(),
+        (502, _, _) => match request {
+            EnvironmentRequest::Delete => "the cloud provider did not delete the environment. Try again in a minute.".to_string(),
+            _ => "the cloud provider failed to create the environment. Try again in a minute.".to_string(),
+        },
         _ => {
             let context = match request {
                 EnvironmentRequest::Create { .. } => "creating the environment",
                 EnvironmentRequest::List => "listing environments",
                 EnvironmentRequest::Delete => "deleting the environment",
-                EnvironmentRequest::MintToken => "creating an env token",
-                EnvironmentRequest::RevokeToken => "revoking an env token",
+                EnvironmentRequest::MintToken => "creating a vault token",
+                EnvironmentRequest::RevokeToken => "revoking a vault token",
             };
             return api_error(status, context);
         }
     };
-    Error::Validation(message)
+    Error::Cloud(message)
 }
 
 async fn into_error(
@@ -260,7 +298,7 @@ pub async fn create_environment(
         return Err(Error::Validation(INVALID_ENVIRONMENT_NAME.into()));
     }
     let url = api_url(&creds.url, &environments_path(project))?;
-    let res = send(client().post(url).json(body), creds).await?;
+    let res = send(client().post(url).timeout(CREATE_TIMEOUT).json(body), creds).await?;
     if !res.status().is_success() {
         let request = EnvironmentRequest::Create {
             name: body.name,
@@ -270,7 +308,7 @@ pub async fn create_environment(
     }
     res.json()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: bad environment response: {}", e)))
+        .map_err(|e| bad_response("new environment", e))
 }
 
 #[derive(Deserialize)]
@@ -292,7 +330,7 @@ pub async fn list_environments(
     let body: EnvironmentList = res
         .json()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: bad environments response: {}", e)))?;
+        .map_err(|e| bad_response("list of environments", e))?;
     Ok(body.environments)
 }
 
@@ -302,7 +340,8 @@ struct Deleted {
 }
 
 /// `DELETE /api/v1/orgs/{org}/projects/{project}/environments/{id}`. Returns
-/// false when the environment was already gone.
+/// false when the environment was already gone, or the cloud does not know
+/// it (404 `environment`).
 pub async fn delete_environment(
     creds: &Credentials,
     project: &ProjectRef,
@@ -311,12 +350,22 @@ pub async fn delete_environment(
     let path = format!("{}/{}", environments_path(project), checked_id(id)?);
     let res = send(client().delete(api_url(&creds.url, &path)?), creds).await?;
     if !res.status().is_success() {
-        return Err(into_error(res, EnvironmentRequest::Delete, project).await);
+        let (status, body) = refusal(res).await;
+        if status.as_u16() == 404 && body.error.as_deref() == Some("environment") {
+            return Ok(false);
+        }
+        return Err(environment_error(
+            status,
+            body.error.as_deref(),
+            body.limit.as_deref(),
+            EnvironmentRequest::Delete,
+            project,
+        ));
     }
     let body: Deleted = res
         .json()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: bad delete response: {}", e)))?;
+        .map_err(|e| bad_response("delete confirmation", e))?;
     Ok(body.deleted)
 }
 
@@ -329,7 +378,7 @@ pub async fn mint_env_token(
 ) -> Result<EnvToken> {
     if !(MIN_TOKEN_TTL..=MAX_TOKEN_TTL).contains(&ttl_seconds) {
         return Err(Error::Validation(format!(
-            "cloud: an env token must live {MIN_TOKEN_TTL} to {MAX_TOKEN_TTL} seconds, not {ttl_seconds}"
+            "a vault token must live {MIN_TOKEN_TTL} to {MAX_TOKEN_TTL} seconds, not {ttl_seconds}"
         )));
     }
     let url = api_url(&creds.url, &env_tokens_path(project))?;
@@ -340,7 +389,7 @@ pub async fn mint_env_token(
     }
     res.json()
         .await
-        .map_err(|_| Error::Validation("cloud: bad env token response".into()))
+        .map_err(|_| bad_response("vault token", "the answer is not the expected JSON"))
 }
 
 /// `DELETE /api/v1/orgs/{org}/projects/{project}/env-tokens/{id}`. A token
@@ -528,79 +577,184 @@ mod tests {
         assert!(valid_environment_name(&"a".repeat(31)));
     }
 
+    /// What the user reads after `Error: `, for every refusal the cloud has.
     #[tokio::test]
     async fn create_maps_refusals_to_clear_messages() {
-        let cases: [(&'static str, &str, &str); 12] = [
+        let cases: &[(&str, &str, &str)] = &[
             (
                 "401 Unauthorized",
                 r#"{"error":"unauthenticated"}"#,
-                "run `fed login`",
+                "your login is missing, expired or revoked. Run `fed login`.",
             ),
             (
                 "403 Forbidden",
                 r#"{"error":"compute_not_enabled"}"#,
-                "remote environments are in a closed beta and not enabled for this org",
+                "Remote environments are not enabled for acme. Ask a Service Federation admin to turn them on.",
             ),
             (
                 "403 Forbidden",
                 r#"{"error":"token_scope"}"#,
-                "may not manage remote environments",
+                "this login cannot manage remote environments. Run `fed login` on this machine to get one that can.",
             ),
             (
                 "404 Not Found",
                 r#"{"error":"project"}"#,
-                "project acme/web not found",
+                "project acme/web does not exist, or you are not a member of it. Check `fed link`.",
             ),
             (
                 "404 Not Found",
                 r#"{"error":"org"}"#,
-                "project acme/web not found",
+                "project acme/web does not exist, or you are not a member of it. Check `fed link`.",
             ),
             (
                 "409 Conflict",
                 r#"{"error":"name_taken"}"#,
-                "already has an environment called box",
+                "acme/web already has an environment called box. Pick another name, or delete it with `fed remote down box`.",
+            ),
+            (
+                "410 Gone",
+                r#"{"error":"deleted"}"#,
+                "box was deleted while it was being created. Create it again with `fed remote up box`.",
             ),
             (
                 "422 Unprocessable Entity",
                 r#"{"error":"limit","limit":"max_environments"}"#,
-                "as many environments as its org allows",
+                "acme already has as many remote environments as it may have. Delete one with `fed remote down NAME`, or wait until one deletes itself.",
+            ),
+            (
+                "422 Unprocessable Entity",
+                r#"{"error":"limit","limit":"user_environments"}"#,
+                "you already have as many remote environments as one person may have. Delete one with `fed remote down NAME`, or wait until one deletes itself.",
+            ),
+            (
+                "422 Unprocessable Entity",
+                r#"{"error":"user_limit"}"#,
+                "you already have as many remote environments as one person may have. Delete one with `fed remote down NAME`, or wait until one deletes itself.",
             ),
             (
                 "422 Unprocessable Entity",
                 r#"{"error":"limit","limit":"allowed_types"}"#,
-                "may not create DEV1-S environments",
+                "acme may not create DEV1-S environments. Pick another type with `--type`.",
             ),
             (
                 "422 Unprocessable Entity",
                 r#"{"error":"limit","limit":"monthly_hours"}"#,
-                "hours for this month",
+                "acme has used all its remote environment hours for this month.",
+            ),
+            (
+                "422 Unprocessable Entity",
+                r#"{"error":"hours"}"#,
+                "acme has used all its remote environment hours for this month.",
+            ),
+            (
+                "422 Unprocessable Entity",
+                r#"{"error":"limit","limit":"something_new"}"#,
+                "acme has reached a limit for remote environments.",
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":"type"}"#,
+                "Service Federation Cloud does not know the server type DEV1-S. Pick another type with `--type`.",
+            ),
+            (
+                "429 Too Many Requests",
+                r#"{"error":"rate_limited"}"#,
+                "too many requests. Try again in a minute.",
             ),
             (
                 "502 Bad Gateway",
                 r#"{"error":"provider"}"#,
-                "cloud provider failed",
+                "the cloud provider failed to create the environment. Try again in a minute.",
             ),
             (
                 "503 Service Unavailable",
                 r#"{"error":"capacity"}"#,
-                "no capacity",
+                "Service Federation Cloud has no room for new remote environments right now. Try again in a few minutes.",
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"error":"cleanup_unavailable"}"#,
+                "Service Federation Cloud has paused new remote environments for a moment. Try again in a few minutes.",
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"error":"compute_unavailable"}"#,
+                "Service Federation Cloud cannot create remote environments right now. Try again later, or ask a Service Federation admin.",
+            ),
+            (
+                "500 Internal Server Error",
+                r#"{"error":"internal"}"#,
+                "creating the environment failed: Service Federation Cloud answered 500 Internal Server Error.",
             ),
             (
                 "426 Upgrade Required",
                 r#"{"error":"unsupported_api_version"}"#,
-                "too old",
+                "creating the environment failed: Service Federation Cloud answered 426 Upgrade Required. This version of fed is too old for the server. Upgrade fed (`brew upgrade fed`) and try again.",
             ),
         ];
         for (status, body, expected) in cases {
             let (url, _rx) = spawn_answering(status, body.to_string());
             let err = create_environment(&creds(url), &project(), &create_body())
                 .await
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains(expected), "{status} {body}: {err}");
-            assert!(!err.contains("host-private-must-not-leak"), "{err}");
+                .unwrap_err();
+            assert!(matches!(err, Error::Cloud(_)), "{status} {body}: {err:?}");
+            assert_eq!(err.to_string(), *expected, "{status} {body}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_cloud_is_a_plain_sentence() {
+        let err = list_environments(&creds("http://127.0.0.1:9".into()), &project())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("cannot reach Service Federation Cloud at http://127.0.0.1:9: "),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_answer_is_a_plain_sentence() {
+        let (url, _rx) = spawn_answering("200 OK", "not json".into());
+        let err = list_environments(&creds(url), &project())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(
+                "Service Federation Cloud sent a list of environments that fed cannot read: "
+            ),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_maps_its_own_refusals() {
+        let (url, _rx) = spawn_answering("404 Not Found", r#"{"error":"environment"}"#.into());
+        assert!(
+            !delete_environment(&creds(url), &project(), "env-1")
+                .await
+                .unwrap()
+        );
+        let (url, _rx) = spawn_answering("409 Conflict", r#"{"error":"busy"}"#.into());
+        let err = delete_environment(&creds(url), &project(), "env-1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "the environment is still being set up. Try again in a few seconds."
+        );
+        let (url, _rx) = spawn_answering("502 Bad Gateway", r#"{"error":"provider"}"#.into());
+        let err = delete_environment(&creds(url), &project(), "env-1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "the cloud provider did not delete the environment. Try again in a minute."
+        );
     }
 
     #[tokio::test]
@@ -700,6 +854,6 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("revoking an env token"), "{err}");
+        assert!(err.contains("revoking a vault token"), "{err}");
     }
 }

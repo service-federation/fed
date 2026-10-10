@@ -413,8 +413,9 @@ fn client_builder() -> reqwest::ClientBuilder {
 /// a loopback HTTP URL is an explicit local development choice; all remote
 /// origins must use HTTPS.
 pub fn cloud_base_url(raw: &str) -> Result<reqwest::Url> {
-    let url = reqwest::Url::parse(raw)
-        .map_err(|_| Error::Validation("cloud: invalid vault URL".into()))?;
+    let url = reqwest::Url::parse(raw).map_err(|_| {
+        Error::Validation("the Service Federation Cloud URL is not a valid URL".into())
+    })?;
     let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     let local_http = url.scheme() == "http" && loopback;
     if !(url.scheme() == "https" || local_http)
@@ -426,7 +427,7 @@ pub fn cloud_base_url(raw: &str) -> Result<reqwest::Url> {
         || url.path() != "/"
     {
         return Err(Error::Validation(
-            "cloud: vault URL must be an HTTPS origin or an explicit local loopback HTTP origin"
+            "the Service Federation Cloud URL must be an HTTPS origin, or an HTTP origin on localhost"
                 .into(),
         ));
     }
@@ -456,18 +457,35 @@ fn client() -> &'static reqwest::Client {
 
 fn api_error(status: reqwest::StatusCode, context: &str) -> Error {
     let hint = match status.as_u16() {
-        401 => " — your token is invalid or revoked; run `fed login`",
-        403 => " — you no longer have access; ask an org admin",
-        404 => " — org or project not found; check `fed link`",
+        401 => " Your login is invalid or revoked. Run `fed login`.",
+        403 => " You no longer have access. Ask an org admin.",
+        404 => " The org or project does not exist. Check `fed link`.",
         // The server saw our x-fed-version header (or its absence) and refused:
         // this build no longer speaks the protocol it requires.
         426 => {
-            " — this version of fed is too old for the server; upgrade fed (`brew upgrade fed`) and retry"
+            " This version of fed is too old for the server. Upgrade fed (`brew upgrade fed`) and try again."
         }
-        429 => " — rate limited; try again in a minute",
+        429 => " Too many requests. Try again in a minute.",
         _ => "",
     };
-    Error::Validation(format!("cloud: {} failed ({}){}", context, status, hint))
+    Error::Cloud(format!(
+        "{context} failed: Service Federation Cloud answered {status}.{hint}"
+    ))
+}
+
+/// The error for a request that never got an answer.
+fn unreachable(url: &str, e: &reqwest::Error) -> Error {
+    Error::Cloud(format!(
+        "cannot reach Service Federation Cloud at {url}: {e}"
+    ))
+}
+
+/// The error for an answer fed cannot read. `what` is the kind of answer,
+/// such as "list of projects".
+fn bad_response(what: &str, e: impl std::fmt::Display) -> Error {
+    Error::Cloud(format!(
+        "Service Federation Cloud sent a {what} that fed cannot read: {e}"
+    ))
 }
 
 #[derive(Deserialize)]
@@ -495,13 +513,11 @@ pub async fn whoami(creds: &Credentials) -> Result<Me> {
         .bearer_auth(&creds.token)
         .send()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", creds.url, e)))?;
+        .map_err(|e| unreachable(&creds.url, &e))?;
     if !res.status().is_success() {
         return Err(api_error(res.status(), "whoami"));
     }
-    res.json()
-        .await
-        .map_err(|e| Error::Validation(format!("cloud: bad whoami response: {}", e)))
+    res.json().await.map_err(|e| bad_response("profile", e))
 }
 
 // ── Login: authorization request + poll + code exchange ───────────────
@@ -562,7 +578,7 @@ pub async fn create_auth_request(base_url: &str, label: &str) -> Result<AuthRequ
         .json(&AuthRequestBody { poll: true, label })
         .send()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", base_url, e)))?;
+        .map_err(|e| unreachable(base_url, &e))?;
     if !res.status().is_success() {
         return Err(api_error(res.status(), "starting login"));
     }
@@ -572,15 +588,14 @@ pub async fn create_auth_request(base_url: &str, label: &str) -> Result<AuthRequ
         .and_then(|value| value.to_str().ok())
         != Some(API_VERSION)
     {
-        return Err(Error::Validation(
-            "cloud: server did not confirm API protocol version 2; update the server or use a compatible fed build"
-                .into(),
+        return Err(Error::Cloud(
+            "the server did not confirm cloud API version 2. Use a fed build that matches the server.".into(),
         ));
     }
     let body: AuthRequestResponse = res
         .json()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: bad authorize-request response: {}", e)))?;
+        .map_err(|e| bad_response("login request", e))?;
     Ok(AuthRequest {
         request: body.request,
         poll_secret: body.poll_secret,
@@ -634,7 +649,7 @@ pub async fn poll_auth_request(base_url: &str, auth: &AuthRequest) -> Result<Pol
         })
         .send()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", base_url, e)))?;
+        .map_err(|e| unreachable(base_url, &e))?;
     match res.status().as_u16() {
         410 => Ok(PollOutcome::Gone),
         429 => Ok(PollOutcome::RateLimited),
@@ -643,12 +658,13 @@ pub async fn poll_auth_request(base_url: &str, auth: &AuthRequest) -> Result<Pol
             let body: PollResponse = res
                 .json()
                 .await
-                .map_err(|e| Error::Validation(format!("cloud: bad poll response: {}", e)))?;
+                .map_err(|e| bad_response("login status", e))?;
             match (body.code, body.status.as_deref()) {
                 (Some(code), _) => Ok(PollOutcome::Code(code)),
                 (None, Some("pending")) => Ok(PollOutcome::Pending),
-                _ => Err(Error::Validation(
-                    "cloud: bad poll response — run `fed login` again".to_string(),
+                _ => Err(Error::Cloud(
+                    "Service Federation Cloud sent a login status that fed cannot read. Run `fed login` again."
+                        .to_string(),
                 )),
             }
         }
@@ -677,10 +693,10 @@ pub async fn exchange_code(base_url: &str, code: &str) -> Result<String> {
         .json(&ExchangeCodeBody { code })
         .send()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", base_url, e)))?;
+        .map_err(|e| unreachable(base_url, &e))?;
     if res.status().as_u16() == 400 {
-        return Err(Error::Validation(
-            "the sign-in link expired or was already used — run `fed login` again".to_string(),
+        return Err(Error::Cloud(
+            "the sign-in link expired or was already used. Run `fed login` again.".to_string(),
         ));
     }
     if !res.status().is_success() {
@@ -689,7 +705,7 @@ pub async fn exchange_code(base_url: &str, code: &str) -> Result<String> {
     let body: ExchangeCodeResponse = res
         .json()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: bad token response: {}", e)))?;
+        .map_err(|e| bad_response("login token", e))?;
     Ok(body.token)
 }
 
@@ -745,7 +761,7 @@ pub async fn activate_token(creds: &Credentials) -> Activation {
                     let _ = body.activated;
                     return Activation::Activated;
                 }
-                Err(e) => last = format!("cloud: bad activate response: {}", e),
+                Err(e) => last = bad_response("login confirmation", e).to_string(),
             },
             // Dead token: no retry will resurrect it.
             Ok(res) if res.status().as_u16() == 401 => return Activation::Dead,
@@ -755,7 +771,7 @@ pub async fn activate_token(creds: &Credentials) -> Activation {
                 return Activation::Failed(api_error(res.status(), "activating login").to_string());
             }
             Ok(res) => last = api_error(res.status(), "activating login").to_string(),
-            Err(e) => last = format!("cloud: cannot reach {}: {}", creds.url, e),
+            Err(e) => last = unreachable(&creds.url, &e).to_string(),
         }
     }
     Activation::Failed(last)
@@ -781,14 +797,14 @@ pub async fn list_projects(creds: &Credentials, org: &str) -> Result<Vec<Project
         .bearer_auth(&creds.token)
         .send()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", creds.url, e)))?;
+        .map_err(|e| unreachable(&creds.url, &e))?;
     if !res.status().is_success() {
         return Err(api_error(res.status(), "listing projects"));
     }
     let body: ProjectsResponse = res
         .json()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: bad projects response: {}", e)))?;
+        .map_err(|e| bad_response("list of projects", e))?;
     Ok(body.projects)
 }
 
@@ -816,14 +832,14 @@ pub async fn list_secrets(creds: &Credentials, link: &CloudLink) -> Result<Vec<S
         .bearer_auth(&creds.token)
         .send()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", creds.url, e)))?;
+        .map_err(|e| unreachable(&creds.url, &e))?;
     if !res.status().is_success() {
         return Err(api_error(res.status(), "listing secrets"));
     }
     let body: SecretListResponse = res
         .json()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: bad secrets response: {}", e)))?;
+        .map_err(|e| bad_response("list of secrets", e))?;
     Ok(body.secrets)
 }
 
@@ -876,25 +892,24 @@ fn secret_write_error(
     };
     let project = format!("{}/{}", link.org, link.project);
     let message = match (status.as_u16(), code) {
-        (401, _) => {
-            "cloud: your login is missing, expired or revoked — run `fed login`".to_string()
-        }
+        (401, _) => "your login is missing, expired or revoked. Run `fed login`.".to_string(),
         (403, Some("session_only")) => format!(
-            "cloud: this vault does not accept secret changes from the CLI yet — {verb} {name} in the dashboard"
+            "this vault does not accept secret changes from the CLI yet. {} {name} in the dashboard.",
+            if verb == "set" { "Set" } else { "Remove" }
         ),
-        (403, _) => format!("cloud: only org admins can {verb} secrets in {project}"),
+        (403, _) => format!("only org admins can {verb} secrets in {project}."),
         (404, _) => format!(
-            "cloud: project {project} not found, or you are not a member — check `fed link`"
+            "project {project} does not exist, or you are not a member of it. Check `fed link`."
         ),
         (400, Some("value")) => {
-            "cloud: the vault rejected the value — it must be 1 to 65536 characters".to_string()
+            "the vault refused the value. It must be 1 to 65536 characters.".to_string()
         }
-        (400, Some("name")) => format!("cloud: the vault rejected the secret name `{name}`"),
-        (413, _) => "cloud: the value is too large for the vault".to_string(),
-        (429, _) => "cloud: rate limited — try again in a minute".to_string(),
+        (400, Some("name")) => format!("the vault refused the secret name `{name}`."),
+        (413, _) => "the value is too large for the vault.".to_string(),
+        (429, _) => "too many requests. Try again in a minute.".to_string(),
         _ => return api_error(status, &format!("trying to {verb} {name}")),
     };
-    Error::Validation(message)
+    Error::Cloud(message)
 }
 
 #[derive(Deserialize)]
@@ -924,7 +939,7 @@ async fn send_secret_write(
         .bearer_auth(&creds.token)
         .send()
         .await
-        .map_err(|e| Error::Validation(format!("cloud: cannot reach {}: {}", creds.url, e)))?;
+        .map_err(|e| unreachable(&creds.url, &e))?;
     let status = res.status();
     if status.is_success() {
         return Ok(Ok(()));
@@ -1018,9 +1033,11 @@ impl VaultFailure {
 /// usefully in time.
 fn classify_send_error(url: &str, e: &reqwest::Error) -> VaultFailure {
     if e.is_connect() {
-        VaultFailure::Unreachable(format!("cannot reach {}: {}", url, e))
+        VaultFailure::Unreachable(unreachable(url, e).to_string())
     } else {
-        VaultFailure::Failed(format!("cloud: {}", e))
+        VaultFailure::Failed(format!(
+            "the request to Service Federation Cloud failed: {e}"
+        ))
     }
 }
 
@@ -1038,14 +1055,9 @@ async fn fetch_values_inner(
             link.org, link.project
         ),
     )
-    // The validation error already says what is wrong with the URL; drop
-    // its "Invalid configuration: cloud:" framing so it reads once.
-    .map_err(|e| {
-        let reason = match e {
-            Error::Validation(message) => message,
-            other => other.to_string(),
-        };
-        VaultFailure::Denied(reason.trim_start_matches("cloud: ").to_string())
+    .map_err(|e| match e {
+        Error::Validation(message) => VaultFailure::Denied(message),
+        other => VaultFailure::Denied(other.to_string()),
     })?;
     url.query_pairs_mut().append_pair("names", &names.join(","));
     let res = client()
@@ -1104,7 +1116,7 @@ impl VaultHandle {
             Ok(result) => VaultJoin::Answered(result),
             Err(RecvTimeoutError::Timeout) => VaultJoin::Pending,
             Err(RecvTimeoutError::Disconnected) => VaultJoin::Answered(Err(VaultFailure::Failed(
-                "cloud: vault lookup thread ended unexpectedly".to_string(),
+                "the vault lookup ended unexpectedly".to_string(),
             ))),
         }
     }
@@ -1126,7 +1138,7 @@ pub fn spawn_fetch_values(work_dir: &Path, names: &[String]) -> Option<VaultHand
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|e| VaultFailure::Failed(format!("cloud: runtime: {}", e)))?;
+                .map_err(|e| VaultFailure::Failed(format!("cannot start the vault lookup: {e}")))?;
             rt.block_on(fetch_values_inner(&creds, &link, &names))
         })();
         let _ = tx.send(out);
@@ -1184,7 +1196,7 @@ pub async fn revoke_current_token(creds: &Credentials) -> Revocation {
     };
     let client = match client_builder().timeout(Duration::from_secs(10)).build() {
         Ok(client) => client,
-        Err(e) => return Revocation::Failed(format!("cloud client: {}", e)),
+        Err(e) => return Revocation::Failed(format!("cannot build the HTTP client: {e}")),
     };
     let res = match client.delete(url).bearer_auth(&creds.token).send().await {
         Ok(res) => res,
@@ -1451,7 +1463,7 @@ mod tests {
         let creds = creds_at("http://vault.example.com".into());
         match fetch_values_inner(&creds, &link, &names).await {
             Err(VaultFailure::Denied(m)) => assert!(
-                m.starts_with("vault URL must be an HTTPS origin")
+                m.starts_with("the Service Federation Cloud URL must be an HTTPS origin")
                     && !m.contains("Invalid configuration"),
                 "{m}"
             ),
@@ -1820,7 +1832,7 @@ mod tests {
             let err = create_auth_request(&url, "dev-box").await.unwrap_err();
             assert!(
                 err.to_string()
-                    .contains("server did not confirm API protocol version 2"),
+                    .contains("server did not confirm cloud API version 2"),
                 "unexpected error: {err}"
             );
         }
@@ -2068,6 +2080,43 @@ mod secret_write_tests {
 
     const VALUE: &str = "s3cr3t-value-must-not-leak";
 
+    /// What fed prints after `Error: ` for a cloud failure: a sentence, with no
+    /// "Invalid configuration" or "cloud:" in front.
+    #[test]
+    fn cloud_errors_print_as_plain_sentences() {
+        let status = |code| reqwest::StatusCode::from_u16(code).unwrap();
+        let err = api_error(status(401), "listing projects");
+        assert!(matches!(err, Error::Cloud(_)));
+        assert_eq!(
+            err.to_string(),
+            "listing projects failed: Service Federation Cloud answered 401 Unauthorized. Your login is invalid or revoked. Run `fed login`."
+        );
+        assert_eq!(
+            api_error(status(500), "listing secrets").to_string(),
+            "listing secrets failed: Service Federation Cloud answered 500 Internal Server Error."
+        );
+        let err = secret_write_error(status(403), None, SecretWrite::Set, "API_KEY", &link());
+        assert_eq!(
+            err.to_string(),
+            "only org admins can set secrets in acme/web."
+        );
+        let err = secret_write_error(
+            status(403),
+            Some("session_only"),
+            SecretWrite::Remove,
+            "API_KEY",
+            &link(),
+        );
+        assert_eq!(
+            err.to_string(),
+            "this vault does not accept secret changes from the CLI yet. Remove API_KEY in the dashboard."
+        );
+        assert_eq!(
+            bad_response("list of projects", "expected value").to_string(),
+            "Service Federation Cloud sent a list of projects that fed cannot read: expected value"
+        );
+    }
+
     /// One-shot server that answers `status_line` with `body` and hands back the
     /// whole request, headers and body, so a test can check what was sent.
     fn spawn_answering(
@@ -2173,7 +2222,7 @@ mod secret_write_tests {
             (
                 "401 Unauthorized",
                 "{\"error\":\"unauthenticated\"}",
-                "run `fed login`",
+                "Run `fed login`",
             ),
             (
                 "403 Forbidden",
@@ -2188,22 +2237,22 @@ mod secret_write_tests {
             (
                 "404 Not Found",
                 "{\"error\":\"project\"}",
-                "project acme/web not found",
+                "project acme/web does not exist",
             ),
             (
                 "404 Not Found",
                 "{\"error\":\"org\"}",
-                "project acme/web not found",
+                "project acme/web does not exist",
             ),
             (
                 "429 Too Many Requests",
                 "{\"error\":\"rate_limited\"}",
-                "rate limited",
+                "too many requests",
             ),
             (
                 "400 Bad Request",
                 "{\"error\":\"value\"}",
-                "rejected the value",
+                "refused the value",
             ),
             (
                 "426 Upgrade Required",
@@ -2235,7 +2284,7 @@ mod secret_write_tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("project acme/web not found"), "{err}");
+        assert!(err.contains("project acme/web does not exist"), "{err}");
         let (url, _rx) = spawn_answering("403 Forbidden", "{\"error\":\"admin_only\"}");
         let err = delete_secret(&creds(url), &link(), "API_KEY")
             .await
