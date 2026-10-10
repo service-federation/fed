@@ -239,6 +239,11 @@ pub struct Service {
     #[serde(skip)]
     pub variant: Option<String>,
 
+    /// What chose [`Self::variant`], recorded next to it so `fed start` can
+    /// point at a choice saved by `fed variant set`.
+    #[serde(skip)]
+    pub variant_source: Option<crate::config::variants::VariantSource>,
+
     /// Collection keys this definition wrote as explicitly empty in YAML
     /// (`depends_on: []`, `environment: {}`).
     ///
@@ -921,6 +926,7 @@ mod merge_completeness {
             variants: [("go".to_string(), Service::default())].into(),
             default_variant: Some("go".to_string()),
             variant: Some("go".to_string()),
+            variant_source: Some(crate::config::variants::VariantSource::FilePin),
             explicit_empty: ["ports".to_string()].into(),
             unknown_fields: [(
                 "typo_key".to_string(),
@@ -977,6 +983,7 @@ mod merge_completeness {
             variants,
             default_variant,
             variant,
+            variant_source,
             explicit_empty,
             unknown_fields,
         } = local;
@@ -1040,6 +1047,10 @@ mod merge_completeness {
         assert!(variants.contains_key("go"), "variants must be copied");
         assert_eq!(default_variant.as_deref(), Some("go"));
         assert_eq!(variant.as_deref(), Some("go"));
+        assert_eq!(
+            variant_source,
+            Some(crate::config::variants::VariantSource::FilePin)
+        );
         assert!(
             unknown_fields.contains_key("typo_key"),
             "unknown keys must survive so the typo warning still fires"

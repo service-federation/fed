@@ -171,8 +171,21 @@ pub async fn run_start(
         ensure_not_already_running(orchestrator, name).await?;
     }
 
-    // Show what we're about to start with their dependencies
+    // Every service this run touches, dependencies first.
     let dep_graph = orchestrator.get_dependency_graph();
+    let mut all_services: Vec<String> = Vec::new();
+    for service in &services_to_start {
+        for dep in dep_graph.get_dependencies(service) {
+            if !all_services.contains(&dep) {
+                all_services.push(dep);
+            }
+        }
+        if !all_services.contains(service) {
+            all_services.push(service.clone());
+        }
+    }
+
+    // Show what we're about to start with their dependencies
     for service in &services_to_start {
         let deps = dep_graph.get_dependencies(service);
         if deps.is_empty() {
@@ -185,23 +198,13 @@ pub async fn run_start(
             ));
         }
     }
+    for note in saved_variant_notes(config, &all_services) {
+        out.status(&note);
+    }
     out.blank();
 
     // Pre-pull Docker images in parallel before starting services
     {
-        let dep_graph = orchestrator.get_dependency_graph();
-        let mut all_services: Vec<String> = Vec::new();
-        for service in &services_to_start {
-            for dep in dep_graph.get_dependencies(service) {
-                if !all_services.contains(&dep) {
-                    all_services.push(dep);
-                }
-            }
-            if !all_services.contains(service) {
-                all_services.push(service.clone());
-            }
-        }
-
         let pull_results = orchestrator.pre_pull_images(&all_services).await;
         if !pull_results.is_empty() {
             let label = if pull_results.len() == 1 {
@@ -268,7 +271,11 @@ pub async fn run_start(
     // An interactive start with no dependencies leaves the plan empty;
     // the summary and status snapshot below have nothing to report.
     let report_background_start = !plan.is_empty();
-    let name_width = plan.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    let mut name_width = 0;
+    for name in &plan {
+        let label = service_label(name, running_variant(orchestrator, config, name).await);
+        name_width = name_width.max(label.chars().count());
+    }
 
     // Track which services we've already started (to avoid duplicate messages)
     let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -310,8 +317,16 @@ pub async fn run_start(
         let group: Vec<&String> = group.iter().filter(|s| !started.contains(*s)).collect();
         let result = if group.len() == 1 {
             let service = group[0];
-            let outcome =
-                start_one_service(orchestrator, config, service, name_width, true, out).await;
+            let outcome = start_one_service(
+                orchestrator,
+                config,
+                service,
+                name_width,
+                true,
+                &flags.variants,
+                out,
+            )
+            .await;
             outcome.map(|w| {
                 started.insert(service.clone());
                 if let Some(w) = w {
@@ -328,9 +343,11 @@ pub async fn run_start(
             let mut remaining: Vec<&str> = group.iter().map(|s| s.as_str()).collect();
             out.progress(&format!("  ⋯ starting {}", remaining.join(", ")));
 
+            let variant_flags = &flags.variants;
             let mut stream = futures::stream::iter(group.iter().map(|service| async move {
                 let outcome =
-                    start_one_service(orch, config, service, name_width, false, out).await;
+                    start_one_service(orch, config, service, name_width, false, variant_flags, out)
+                        .await;
                 (*service, outcome)
             }))
             .buffer_unordered(jobs);
@@ -462,7 +479,8 @@ pub async fn run_start(
             Status::Stopping => "Stopping",
             Status::Completed => "Completed",
         };
-        out.status(&format!("  {}: {}", name, status_str));
+        let label = service_label(name, running_variant(orchestrator, config, name).await);
+        out.status(&format!("  {}: {}", label, status_str));
     }
 
     // If any services are failing, check ALL port parameters for conflicts
@@ -615,6 +633,14 @@ pub async fn run_start(
         // is never supervised.
         spawn_restart_supervisor(orchestrator, config, &started, config_path, &flags, out);
         warn_ignored_restart_policy(config, name, out);
+        // The foreground service prints no line of its own once it owns the
+        // terminal, so this is the one place its variant can show.
+        if let Some(variant) = config.services.get(name).and_then(|s| s.variant.as_deref()) {
+            out.status(&format!(
+                "  \u{25b8} {}  runs in this terminal",
+                service_label(name, Some(variant.to_string()))
+            ));
+        }
 
         // Registration of the foreground service is serialized like every
         // other start; only the wait that follows it happens unlocked.
@@ -698,9 +724,18 @@ async fn start_foreground_service(
     out: &dyn UserOutput,
 ) -> Result<(), FedError> {
     fed::progress::set_silent(true);
-    let result = start_one_service(orchestrator, config, name, name.chars().count(), false, out)
-        .await
-        .map(|_| ());
+    // Output is silenced here, so no other line needs the `--variant` flags.
+    let result = start_one_service(
+        orchestrator,
+        config,
+        name,
+        name.chars().count(),
+        false,
+        &[],
+        out,
+    )
+    .await
+    .map(|_| ());
     if result.is_err() {
         fed::progress::set_silent(false);
     }
@@ -1130,13 +1165,15 @@ async fn start_one_service(
     name: &str,
     name_width: usize,
     inline_progress: bool,
+    variant_flags: &[String],
     out: &dyn UserOutput,
 ) -> Result<Option<(String, StartHealth)>, FedError> {
     let timer = std::time::Instant::now();
+    let chosen_variant = config.services.get(name).and_then(|s| s.variant.clone());
     if inline_progress {
         out.progress(&format!(
             "  ⋯ {:<width$}  starting",
-            name,
+            service_label(name, chosen_variant.clone()),
             width = name_width
         ));
     }
@@ -1144,6 +1181,17 @@ async fn start_one_service(
     match orchestrator.start(name).await {
         Ok(start_outcome) => {
             let elapsed = fmt_duration(timer.elapsed());
+            // An already-running service is left as it is, so it can still
+            // run the variant an earlier start chose.
+            let running = running_variant(orchestrator, config, name).await;
+            let other_variant_note = match (&running, &chosen_variant) {
+                (Some(running), Some(chosen)) if running != chosen => Some(format!(
+                    "    {name} was already running as {running}. To switch it to {chosen}: {}",
+                    restart_command(name, variant_flags)
+                )),
+                _ => None,
+            };
+            let label = service_label(name, running);
             let is_oneshot = config
                 .services
                 .get(name)
@@ -1152,13 +1200,13 @@ async fn start_one_service(
 
             let (line, warning) = match start_outcome.get(name) {
                 Some(StartHealth::Healthy) => (
-                    format!("  ✓ {:<w$}  healthy in {}", name, elapsed, w = name_width),
+                    format!("  ✓ {:<w$}  healthy in {}", label, elapsed, w = name_width),
                     None,
                 ),
                 Some(StartHealth::TimedOut { timeout }) => (
                     format!(
                         "  ⚠ {:<w$}  started, healthcheck timed out after {}",
-                        name,
+                        label,
                         fmt_duration(timeout),
                         w = name_width
                     ),
@@ -1167,7 +1215,7 @@ async fn start_one_service(
                 Some(StartHealth::CheckerInvalid { reason }) => (
                     format!(
                         "  ⚠ {:<w$}  started, healthcheck invalid ({})",
-                        name,
+                        label,
                         elapsed,
                         w = name_width
                     ),
@@ -1176,11 +1224,16 @@ async fn start_one_service(
                 // Unchecked or absent: no healthcheck configured, an
                 // already-running dedup, or a hook-only oneshot.
                 _ if is_oneshot => (
-                    format!("  ✓ {:<w$}  completed in {}", name, elapsed, w = name_width),
+                    format!(
+                        "  ✓ {:<w$}  completed in {}",
+                        label,
+                        elapsed,
+                        w = name_width
+                    ),
                     None,
                 ),
                 _ => (
-                    format!("  ✓ {:<w$}  running ({})", name, elapsed, w = name_width),
+                    format!("  ✓ {:<w$}  running ({})", label, elapsed, w = name_width),
                     None,
                 ),
             };
@@ -1190,10 +1243,17 @@ async fn start_one_service(
             } else {
                 out.status(&line);
             }
+            if let Some(note) = other_variant_note {
+                out.warning(&note);
+            }
             Ok(warning)
         }
         Err(e) => {
-            let line = format!("  ✗ {:<w$}  failed", name, w = name_width);
+            let line = format!(
+                "  ✗ {:<w$}  failed",
+                service_label(name, chosen_variant),
+                w = name_width
+            );
             if inline_progress {
                 out.finish_progress_with(&line);
             } else {
@@ -1226,6 +1286,72 @@ fn start_warning_line(name: &str, health: &StartHealth) -> String {
         // fallback for completeness.
         _ => format!("{}: health unverified", name),
     }
+}
+
+/// A service's name as `fed start` prints it: `catalog (go)` for a service
+/// that declares `variants:`, the bare name otherwise. `fed status` prints
+/// the same form.
+fn service_label(name: &str, variant: Option<String>) -> String {
+    match variant {
+        Some(variant) => format!("{name} ({variant})"),
+        None => name.to_string(),
+    }
+}
+
+/// The variant `name` runs as: the one recorded for it in state when it is
+/// meant to be running, else the one this run chose. `None` for a service
+/// without variants.
+async fn running_variant(
+    orchestrator: &Orchestrator,
+    config: &Config,
+    name: &str,
+) -> Option<String> {
+    let chosen = config.services.get(name)?.variant.clone()?;
+    let recorded = orchestrator
+        .state_tracker
+        .read()
+        .await
+        .get_service(name)
+        .await
+        .filter(|state| state.desired_state == fed::state::DesiredState::Running)
+        .and_then(|state| state.variant);
+    Some(recorded.unwrap_or(chosen))
+}
+
+/// The `fed restart` command that applies this run's variant choice.
+fn restart_command(name: &str, variant_flags: &[String]) -> String {
+    let mut command = format!("fed restart {name}");
+    for flag in variant_flags {
+        command.push_str(&format!(" --variant {flag}"));
+    }
+    command
+}
+
+/// One line for each of `services` whose variant comes from
+/// `.fed/variants.yaml`. Unlike `--variant` or `default_variant`, that file
+/// is out of sight when someone runs `fed start`, so the line says where the
+/// choice came from and how to undo it.
+fn saved_variant_notes(config: &Config, services: &[String]) -> Vec<String> {
+    use fed::config::variants::VariantSource;
+
+    let mut notes = Vec::new();
+    for name in services {
+        let Some(service) = config.services.get(name) else {
+            continue;
+        };
+        let Some(variant) = service.variant.as_deref() else {
+            continue;
+        };
+        let undo = match service.variant_source {
+            Some(VariantSource::FilePin) => format!("fed variant unset {name}"),
+            Some(VariantSource::FilePrefer) => "fed variant clear".to_string(),
+            _ => continue,
+        };
+        notes.push(format!(
+            "Variant: {name} set to {variant} by 'fed variant set'. To undo: {undo}"
+        ));
+    }
+    notes
 }
 
 /// Print startup messages from services in a Unicode box.
@@ -1513,6 +1639,14 @@ async fn run_dry_run(
         }
         if !all_services.contains(service) {
             all_services.push(service.clone());
+        }
+    }
+
+    let notes = saved_variant_notes(config, &all_services);
+    if !notes.is_empty() {
+        out.blank();
+        for note in notes {
+            out.status(&note);
         }
     }
 
