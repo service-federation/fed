@@ -998,7 +998,9 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
     let ports = parse_ports(&json)?;
     let name = &remote.state.name;
     if ports.is_empty() {
-        bail!("/srv/{ws} on {name} has no ports — run `fed remote start {name}` first");
+        bail!(
+            "No ports to forward in /srv/{ws} on {name}. Its services publish none, or `fed remote start {name}` has not run."
+        );
     }
 
     // One ssh per port, outside the shared connection, so Ctrl-C ends them and
@@ -1029,9 +1031,13 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
         "Connected. Ctrl-C to disconnect. {name} deletes itself {IDLE_MINUTES} minutes after the last SSH session ends."
     ));
 
-    // One listener for the whole loop, so a Ctrl-C between two rounds is kept.
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .context("listening for Ctrl-C")?;
+    // One listener per signal for the whole loop, so a signal between two
+    // rounds is kept. Each forward is a logged-in session, so a forward left
+    // behind by `kill` or a closed terminal would keep the VM awake.
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt()).context("listening for Ctrl-C")?;
+    let mut terminate = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
+    let mut hangup = signal(SignalKind::hangup()).context("listening for SIGHUP")?;
     loop {
         let stopped = {
             let waits = forwards
@@ -1040,6 +1046,8 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
                 .collect::<Vec<_>>();
             tokio::select! {
                 _ = interrupt.recv() => None,
+                _ = terminate.recv() => None,
+                _ = hangup.recv() => None,
                 (status, index, _) = futures::future::select_all(waits) => Some((
                     index,
                     status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()),
