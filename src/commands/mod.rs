@@ -19,6 +19,8 @@ mod logs;
 mod package;
 mod ports;
 mod prune;
+#[cfg(feature = "remote-beta")]
+mod remote;
 mod restart;
 mod script;
 mod secrets_cmd;
@@ -50,6 +52,8 @@ pub use logs::run_logs;
 pub use package::run_package;
 pub use ports::run_ports;
 pub use prune::run_prune;
+#[cfg(feature = "remote-beta")]
+pub use remote::run_remote;
 pub use restart::run_restart;
 pub use script::run_script;
 pub use secrets_cmd::run_secrets;

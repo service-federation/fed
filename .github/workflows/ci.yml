@@ -97,6 +97,33 @@ jobs:
       - name: Run Docker-backed integration tests
         run: cargo test --features docker-tests -- --test-threads=1
 
+  remote-beta:
+    name: Remote environments beta (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # `fed remote` is behind the remote-beta feature, which release builds
+      # never enable. Beta testers build it from source, so it must keep
+      # compiling and passing its tests. The Clippy job lints it through
+      # --all-features.
+      - name: Run tests with the remote-beta feature
+        run: cargo test --features remote-beta
+
   future-incompat:
     name: Future-incompat check
     runs-on: ubuntu-latest
@@ -158,6 +185,12 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # --all-features compiles out code behind cfg(not(feature = ...)), such
+      # as the default build's half of the remote-beta gating, so lint the
+      # default feature set too.
+      - name: Run clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
 
   orchestrator-construction-gate:
     name: Orchestrator construction gate
