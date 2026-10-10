@@ -43,6 +43,30 @@ pub struct Environment {
     pub port: Option<u16>,
     pub created_at: String,
     pub deadline: String,
+    /// Who created it. An org admin's list holds everyone's environments in
+    /// the project. `None` when the server leaves it out or the user is gone.
+    #[serde(default)]
+    pub owner: Option<Owner>,
+}
+
+/// The user who created an environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Owner {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl Environment {
+    /// Whether the user with id `me` created this environment. Without an
+    /// owner or an id to compare, it counts as the caller's: servers that do
+    /// not send owners list only the caller's environments.
+    pub fn is_owned_by(&self, me: Option<&str>) -> bool {
+        match (&self.owner, me) {
+            (Some(owner), Some(me)) => owner.id == me,
+            _ => true,
+        }
+    }
 }
 
 /// How long `fed remote up` waits for the create request. The cloud answers
@@ -197,8 +221,6 @@ pub fn environment_error(
         _ => None,
     };
     let limit = match code {
-        Some("user_limit") => Some("user_environments"),
-        Some("hours") => Some("monthly_hours"),
         Some("limit") => Some(limit.unwrap_or("")),
         _ => None,
     };
@@ -369,12 +391,14 @@ pub async fn delete_environment(
     Ok(body.deleted)
 }
 
-/// `POST /api/v1/orgs/{org}/projects/{project}/env-tokens`.
+/// `POST /api/v1/orgs/{org}/projects/{project}/env-tokens`. With an
+/// `environment_id`, the cloud revokes the token when that environment ends.
 pub async fn mint_env_token(
     creds: &Credentials,
     project: &ProjectRef,
     label: &str,
     ttl_seconds: i64,
+    environment_id: Option<&str>,
 ) -> Result<EnvToken> {
     if !(MIN_TOKEN_TTL..=MAX_TOKEN_TTL).contains(&ttl_seconds) {
         return Err(Error::Validation(format!(
@@ -382,7 +406,10 @@ pub async fn mint_env_token(
         )));
     }
     let url = api_url(&creds.url, &env_tokens_path(project))?;
-    let body = serde_json::json!({ "label": label, "ttl_seconds": ttl_seconds });
+    let mut body = serde_json::json!({ "label": label, "ttl_seconds": ttl_seconds });
+    if let Some(id) = environment_id {
+        body["environment_id"] = checked_id(id)?.into();
+    }
     let res = send(client().post(url).json(&body), creds).await?;
     if !res.status().is_success() {
         return Err(into_error(res, EnvironmentRequest::MintToken, project).await);
@@ -628,22 +655,12 @@ mod tests {
             ),
             (
                 "422 Unprocessable Entity",
-                r#"{"error":"user_limit"}"#,
-                "you already have as many remote environments as one person may have. Delete one with `fed remote down NAME`, or wait until one deletes itself.",
-            ),
-            (
-                "422 Unprocessable Entity",
                 r#"{"error":"limit","limit":"allowed_types"}"#,
                 "acme may not create DEV1-S environments. Pick another type with `--type`.",
             ),
             (
                 "422 Unprocessable Entity",
                 r#"{"error":"limit","limit":"monthly_hours"}"#,
-                "acme has used all its remote environment hours for this month.",
-            ),
-            (
-                "422 Unprocessable Entity",
-                r#"{"error":"hours"}"#,
                 "acme has used all its remote environment hours for this month.",
             ),
             (
@@ -757,6 +774,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn owners_decide_whose_environment_it_is() {
+        let mut env: Environment = serde_json::from_str(&environment_json()).unwrap();
+        assert_eq!(env.owner, None);
+        assert!(env.is_owned_by(Some("u-1")));
+        env = serde_json::from_value(serde_json::json!({
+            "id": "e", "name": "box", "type": "DEV1-S", "state": "ready",
+            "ip": null, "port": null, "created_at": "x", "deadline": "y",
+            "project": "web", "owner": {"id": "u-2", "name": "Bob"},
+        }))
+        .unwrap();
+        assert!(!env.is_owned_by(Some("u-1")));
+        assert!(env.is_owned_by(Some("u-2")));
+        assert!(env.is_owned_by(None));
+    }
+
     #[tokio::test]
     async fn list_reads_the_environments() {
         let body = format!("{{\"environments\":[{}]}}", environment_json());
@@ -810,9 +843,15 @@ mod tests {
             "{{\"id\":\"tok-1\",\"token\":\"{TOKEN}\",\"expires_at\":\"2026-10-10T16:00:00Z\"}}"
         );
         let (url, rx) = spawn_answering("201 Created", body);
-        let token = mint_env_token(&creds(url), &project(), "fed remote box/alice", 3600)
-            .await
-            .unwrap();
+        let token = mint_env_token(
+            &creds(url),
+            &project(),
+            "fed remote box/alice",
+            3600,
+            Some("env-1"),
+        )
+        .await
+        .unwrap();
         assert_eq!(token.token, TOKEN);
         assert!(!format!("{token:?}").contains(TOKEN));
         let (head, json) = split(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
@@ -823,7 +862,11 @@ mod tests {
         assert_cloud_headers(&head);
         assert_eq!(
             json,
-            serde_json::json!({ "label": "fed remote box/alice", "ttl_seconds": 3600 })
+            serde_json::json!({
+                "label": "fed remote box/alice",
+                "ttl_seconds": 3600,
+                "environment_id": "env-1",
+            })
         );
     }
 
@@ -832,7 +875,9 @@ mod tests {
         let local = creds("http://127.0.0.1:9".into());
         for ttl in [59, 21_601, -1] {
             assert!(
-                mint_env_token(&local, &project(), "x", ttl).await.is_err(),
+                mint_env_token(&local, &project(), "x", ttl, None)
+                    .await
+                    .is_err(),
                 "{ttl}"
             );
         }

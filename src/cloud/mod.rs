@@ -496,6 +496,8 @@ pub struct Me {
 
 #[derive(Deserialize)]
 pub struct MeUser {
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: Option<String>,
     pub email: Option<String>,
 }

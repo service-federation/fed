@@ -1,22 +1,22 @@
-//! `fed remote` (beta, behind the `remote-beta` cargo feature): disposable
-//! machines in Service Federation Cloud that run a checkout's fed stack.
+//! `fed remote`: disposable machines in Service Federation Cloud that run a
+//! checkout's fed stack.
 //!
 //! The cloud API lives in `fed::cloud::remote`. This module holds what runs on
 //! this machine: the SSH keys and state under `~/.fed/remote/<id>/`, the shared
 //! SSH connection, the file copy with rsync and the port forwards.
 //!
 //! Tokens never appear in a process argument. The cloud token travels in HTTP
-//! headers, and an env token travels to the machine over SSH stdin.
+//! headers, and a vault token travels to the machine over SSH stdin.
 
 use crate::cli::RemoteCommands;
 use crate::output::UserOutput;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use fed::cloud::{self, remote as api};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 
@@ -24,11 +24,28 @@ use tokio::process::Command;
 const SSH_WAIT: Duration = Duration::from_secs(300);
 /// How long an environment lives without an SSH session.
 const IDLE_MINUTES: u32 = 5;
+/// How long an environment lives in any case.
+const LIFETIME_HOURS: u32 = 6;
 /// Remote port P is forwarded from local P + PORT_OFFSET, so the same stack can
 /// run on this machine at the same time.
 const PORT_OFFSET: u16 = 10_000;
+/// How long `connect` waits before it reports the forwards as up. A forward
+/// whose local port is taken fails within this time.
+const FORWARD_SETTLE: Duration = Duration::from_secs(1);
+/// rsync gives up when no data moves for this many seconds.
+const RSYNC_IO_TIMEOUT: u32 = 120;
 
 const STATE_FILE: &str = "env.json";
+/// `fed remote up` builds a new environment's state in `.new-<random>` and
+/// renames it to the id once the cloud has answered.
+const STAGING_PREFIX: &str = ".new-";
+/// A staging directory older than this belongs to an `up` that died. It may
+/// hold a host private key, so the next `up` deletes it.
+const STALE_STAGING: Duration = Duration::from_secs(15 * 60);
+/// The list of files the last push copied, on the machine, relative to the
+/// workspace. fed never copies `.fed/` there except `.fed/cloud.yaml`, so
+/// the list is not overwritten by a push.
+const PUSH_MANIFEST: &str = ".fed/remote-push-files";
 
 // ── Local state (~/.fed/remote/<id>/) ────────────────────────────────
 
@@ -51,10 +68,14 @@ impl EnvState {
             project: self.project.clone(),
         }
     }
+
+    fn in_project(&self, project: &api::ProjectRef) -> bool {
+        self.org == project.org && self.project == project.project
+    }
 }
 
-/// The env token minted for one workspace, in `tokens/<workspace>.json`. Only
-/// the id: the token itself lives on the remote machine.
+/// The vault token minted for one workspace, in `tokens/<workspace>.json`.
+/// Only the id: the token itself lives on the remote machine.
 #[derive(Debug, Serialize, Deserialize)]
 struct TokenRecord {
     id: String,
@@ -63,7 +84,7 @@ struct TokenRecord {
 }
 
 fn state_root() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("cannot determine the home directory")?;
+    let home = dirs::home_dir().context("cannot find the home directory")?;
     Ok(home.join(".fed").join("remote"))
 }
 
@@ -109,17 +130,49 @@ fn local_environments(root: &Path) -> Vec<(PathBuf, EnvState)> {
         .map(|e| e.path())
         .filter_map(|dir| read_state(&dir).map(|state| (dir, state)))
         .collect();
-    found.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+    found.sort_by(|a, b| a.1.name.cmp(&b.1.name).then(a.1.id.cmp(&b.1.id)));
     found
 }
 
-/// The environment called `name`. When several projects have one by that name,
-/// the checkout's link decides.
-pub(crate) fn find_environment(
-    root: &Path,
-    name: &str,
-    project: Option<&api::ProjectRef>,
-) -> Result<(PathBuf, EnvState)> {
+/// Delete the staging directories of `up` runs that died more than
+/// `STALE_STAGING` ago. A younger one may belong to an `up` still running.
+fn remove_stale_staging(root: &Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(STAGING_PREFIX)
+        {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > STALE_STAGING);
+        if old {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// What the local state knows about an environment name.
+#[derive(Debug)]
+pub(crate) enum Lookup {
+    Found(PathBuf, EnvState),
+    Missing,
+    /// Several environments by that name, and the checkout's link does not
+    /// pick one.
+    Ambiguous(Vec<(PathBuf, EnvState)>),
+}
+
+/// The environment called `name`. When several have that name, the
+/// checkout's link decides.
+pub(crate) fn lookup(root: &Path, name: &str, project: Option<&api::ProjectRef>) -> Lookup {
     let mut matches: Vec<_> = local_environments(root)
         .into_iter()
         .filter(|(_, s)| s.name == name)
@@ -127,17 +180,96 @@ pub(crate) fn find_environment(
     if matches.len() > 1
         && let Some(project) = project
     {
-        matches.retain(|(_, s)| s.org == project.org && s.project == project.project);
+        let linked: Vec<_> = matches
+            .iter()
+            .filter(|(_, s)| s.in_project(project))
+            .cloned()
+            .collect();
+        if !linked.is_empty() {
+            matches = linked;
+        }
     }
     match matches.len() {
-        0 => bail!(
-            "this machine has no environment called {name} — see `fed remote ls`, or create it with `fed remote up {name}`"
-        ),
-        1 => Ok(matches.remove(0)),
-        _ => bail!(
-            "several projects have an environment called {name} — run this from a checkout linked to the one you mean"
+        0 => Lookup::Missing,
+        1 => {
+            let (dir, state) = matches.remove(0);
+            Lookup::Found(dir, state)
+        }
+        _ => Lookup::Ambiguous(matches),
+    }
+}
+
+fn no_such_environment(name: &str) -> anyhow::Error {
+    anyhow!(
+        "this machine has no environment called {name}. See `fed remote ls`, or create it with `fed remote up {name}`."
+    )
+}
+
+/// The environment called `name`. When the name is ambiguous, environments
+/// the cloud no longer has are forgotten first.
+async fn find_environment(
+    root: &Path,
+    name: &str,
+    project: Option<&api::ProjectRef>,
+) -> Result<(PathBuf, EnvState)> {
+    match lookup(root, name, project) {
+        Lookup::Found(dir, state) => return Ok((dir, state)),
+        Lookup::Missing => return Err(no_such_environment(name)),
+        Lookup::Ambiguous(found) => {
+            if let Ok(creds) = credentials() {
+                let states: Vec<EnvState> = found.into_iter().map(|(_, s)| s).collect();
+                forget_deleted(&creds, root, &states).await;
+            }
+        }
+    }
+    match lookup(root, name, project) {
+        Lookup::Found(dir, state) => Ok((dir, state)),
+        Lookup::Missing => Err(no_such_environment(name)),
+        Lookup::Ambiguous(_) => bail!(
+            "several environments are called {name}. Run this from a checkout linked to the project of the one you mean."
         ),
     }
+}
+
+/// Forget every local environment in the projects of `states` that the cloud
+/// no longer lists. A project whose list fails is left alone.
+async fn forget_deleted(creds: &cloud::Credentials, root: &Path, states: &[EnvState]) {
+    let mut projects: Vec<api::ProjectRef> = Vec::new();
+    for state in states {
+        let project = state.project_ref();
+        if !projects.contains(&project) {
+            projects.push(project);
+        }
+    }
+    for project in projects {
+        let Ok(list) = api::list_environments(creds, &project).await else {
+            continue;
+        };
+        for (dir, state) in local_environments(root) {
+            if state.in_project(&project) && !list.iter().any(|e| e.id == state.id) {
+                forget(Some(creds), &dir, &state).await;
+            }
+        }
+    }
+}
+
+/// Remove this machine's state for an environment: revoke its vault tokens
+/// where the cloud still knows them, close the shared connection and delete
+/// the directory. Every step is best effort. A token left behind expires at
+/// the environment's deadline.
+async fn forget(creds: Option<&cloud::Credentials>, dir: &Path, state: &EnvState) {
+    if let Some(creds) = creds
+        && let Ok(entries) = std::fs::read_dir(dir.join("tokens"))
+    {
+        for entry in entries.flatten() {
+            let _ = revoke_token_file(creds, &entry.path()).await;
+        }
+    }
+    let control = control_path(dir, &state.id);
+    if control.exists() {
+        close_connection(&control, &state.ip).await;
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 // ── Pure helpers ──────────────────────────────────────────────────────
@@ -154,15 +286,12 @@ pub(crate) fn valid_workspace_name(name: &str) -> bool {
 }
 
 const INVALID_WORKSPACE_NAME: &str =
-    "use 1 to 64 letters, digits, '.', '_' and '-', starting with a letter or digit";
+    "Use 1 to 64 letters, digits, '.', '_' and '-', starting with a letter or digit.";
 
 /// The workspace name: `--as`, or else the checkout's folder name.
 fn workspace_name(checkout: &Path, given: Option<&str>) -> Result<String> {
     if let Some(name) = given {
-        if !valid_workspace_name(name) {
-            bail!("invalid workspace name `{name}`: {INVALID_WORKSPACE_NAME}");
-        }
-        return Ok(name.to_string());
+        return checked_workspace(name);
     }
     let folder = checkout
         .file_name()
@@ -170,10 +299,17 @@ fn workspace_name(checkout: &Path, given: Option<&str>) -> Result<String> {
         .unwrap_or_default();
     if !valid_workspace_name(&folder) {
         bail!(
-            "the checkout folder `{folder}` cannot be a workspace name ({INVALID_WORKSPACE_NAME}) — pass one with --as"
+            "the checkout folder `{folder}` cannot be a workspace name. Pass one with --as. {INVALID_WORKSPACE_NAME}"
         );
     }
     Ok(folder)
+}
+
+fn checked_workspace(name: &str) -> Result<String> {
+    if !valid_workspace_name(name) {
+        bail!("`{name}` cannot be a workspace name. {INVALID_WORKSPACE_NAME}");
+    }
+    Ok(name.to_string())
 }
 
 /// Whether a path from `git ls-files` goes to the remote machine. Never
@@ -192,12 +328,25 @@ pub(crate) fn keep_path(path: &[u8]) -> bool {
     dirs_ok && last != Some(b".git")
 }
 
-/// Filter the NUL-separated output of `git ls-files -z`. The result is
-/// NUL-terminated, for `rsync --from0 --files-from=-`.
+/// Filter the NUL-separated output of `git ls-files -z`.
 pub(crate) fn filter_file_list(raw: &[u8]) -> Vec<Vec<u8>> {
     raw.split(|c| *c == 0)
         .filter(|p| keep_path(p))
         .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// The submodule paths in the output of `git ls-files -z --stage`. A
+/// submodule is an entry with mode 160000.
+pub(crate) fn submodule_paths(staged: &[u8]) -> Vec<Vec<u8>> {
+    staged
+        .split(|c| *c == 0)
+        .filter_map(|entry| {
+            let tab = entry.iter().position(|c| *c == b'\t')?;
+            entry
+                .starts_with(b"160000 ")
+                .then(|| entry[tab + 1..].to_vec())
+        })
         .collect()
 }
 
@@ -210,7 +359,7 @@ pub(crate) fn known_hosts_line(ip: &str, port: u16, host_public_key: &str) -> Re
         bail!("the host public key is malformed");
     };
     if ip.is_empty() || ip.contains(|c: char| c.is_whitespace() || c == '[' || c == ']') {
-        bail!("cloud: the environment's IP address `{ip}` is malformed");
+        bail!("Service Federation Cloud sent a malformed IP address `{ip}` for the environment.");
     }
     // ssh looks up port 22 by the bare address.
     if port == 22 {
@@ -228,7 +377,7 @@ pub(crate) fn local_port(remote: u16) -> u16 {
 /// with the parameters that use it, sorted by port.
 pub(crate) fn parse_ports(json: &str) -> Result<Vec<(u16, Vec<String>)>> {
     let map: std::collections::BTreeMap<String, u16> = serde_json::from_str(json.trim())
-        .context("the remote `fed ports list --json` printed something unexpected")?;
+        .context("`fed ports list --json` on the environment printed something unexpected")?;
     let mut by_port: std::collections::BTreeMap<u16, Vec<String>> = Default::default();
     for (param, port) in map {
         by_port.entry(port).or_default().push(param);
@@ -236,18 +385,24 @@ pub(crate) fn parse_ports(json: &str) -> Result<Vec<(u16, Vec<String>)>> {
     Ok(by_port.into_iter().collect())
 }
 
-/// Seconds from `now` until `deadline`, as an env token lifetime. Capped at
+/// Seconds from `now` until `deadline`, as a vault token lifetime. Capped at
 /// the cloud's maximum.
 pub(crate) fn token_ttl(deadline: &str, now: chrono::DateTime<chrono::Utc>) -> Result<i64> {
-    let deadline = chrono::DateTime::parse_from_rfc3339(deadline)
-        .with_context(|| format!("cloud: the environment deadline `{deadline}` is malformed"))?;
+    let deadline = chrono::DateTime::parse_from_rfc3339(deadline).with_context(|| {
+        format!("Service Federation Cloud sent a malformed deadline `{deadline}`")
+    })?;
     let left = (deadline.with_timezone(&chrono::Utc) - now).num_seconds();
     if left < api::MIN_TOKEN_TTL {
         bail!(
-            "the environment has less than a minute left — create a new one with `fed remote up`"
+            "the environment has less than a minute left. Create a new one with `fed remote up`."
         );
     }
     Ok(left.min(api::MAX_TOKEN_TTL))
+}
+
+fn deadline_passed(deadline: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    chrono::DateTime::parse_from_rfc3339(deadline)
+        .is_ok_and(|d| d.with_timezone(&chrono::Utc) <= now)
 }
 
 fn local_time(deadline: &str) -> String {
@@ -268,6 +423,112 @@ fn minutes_left(deadline: &str, now: chrono::DateTime<chrono::Utc>) -> String {
         ),
         Err(_) => "-".to_string(),
     }
+}
+
+/// What fed prints when an environment the user still has keys for is gone.
+pub(crate) fn deleted_message(name: &str) -> String {
+    format!(
+        "{name} was deleted (it was idle for {IDLE_MINUTES} minutes or reached its {LIFETIME_HOURS}-hour limit). Create it again with `fed remote up {name}`."
+    )
+}
+
+/// The `X.Y.Z` in `fed X.Y.Z`, or in a bare `X.Y.Z`. A pre-release such as
+/// `8.4.0-rc.1` has no comparable version and gives `None`.
+pub(crate) fn parse_version(text: &str) -> Option<[u64; 3]> {
+    let word = text.split_whitespace().last()?;
+    let word = word.strip_prefix('v').unwrap_or(word);
+    let mut parts = word.split('.').map(|p| p.parse::<u64>().ok());
+    let version = [parts.next()??, parts.next()??, parts.next()??];
+    parts.next().is_none().then_some(version)
+}
+
+fn version_string(v: [u64; 3]) -> String {
+    format!("{}.{}.{}", v[0], v[1], v[2])
+}
+
+/// The shell command that runs `command` (the words after `--`) on the
+/// machine. In a workspace it runs in `/srv/<ws>`, as `start` does, so fed
+/// there finds the workspace's vault token.
+pub(crate) fn remote_command(env: &str, ws: Option<&str>, command: &[String]) -> String {
+    let words = shell_words::join(command);
+    match ws {
+        None => words,
+        Some(ws) => {
+            let missing = shell_words::quote(&format!(
+                "/srv/{ws} does not exist on {env}. Copy this checkout there with `fed remote push {env}`."
+            ))
+            .into_owned();
+            format!("cd /srv/{ws} 2>/dev/null || {{ echo {missing} >&2; exit 1; }}; {words}")
+        }
+    }
+}
+
+/// The shell command for `fed remote ssh` without a command: a login shell,
+/// in `/srv/<ws>` when that exists.
+pub(crate) fn remote_shell(ws: Option<&str>) -> Option<String> {
+    ws.map(|ws| format!("cd /srv/{ws} 2>/dev/null; exec \"${{SHELL:-/bin/sh}}\" -l"))
+}
+
+/// The script that deletes from `/srv/<ws>` the files the previous push
+/// copied and this one does not. Its stdin is this push's NUL-separated file
+/// list, which it keeps in `PUSH_MANIFEST` for the next push. It deletes only
+/// files fed copied, so build output and fed's own state stay. A path whose
+/// folder resolves outside the workspace is skipped.
+pub(crate) fn push_cleanup_script(ws: &str) -> String {
+    format!(
+        r#"set -e
+cd /srv/{ws}
+mkdir -p .fed
+new=$(mktemp .fed/remote-push.XXXXXX)
+trap 'rm -f "$new"' EXIT
+LC_ALL=C sort -z -u > "$new"
+if [ -f {PUSH_MANIFEST} ]; then
+  LC_ALL=C sort -z -u {PUSH_MANIFEST} | LC_ALL=C comm -z -23 - "$new" | xargs -0 -r sh -c '
+    for p; do
+      d=$(readlink -f -- "$(dirname -- "$p")") || continue
+      case "$d/" in /srv/{ws}/*) ;; *) continue ;; esac
+      if [ -d "$p" ] && [ ! -L "$p" ]; then continue; fi
+      rm -f -- "$p"
+      rmdir -p -- "$(dirname -- "$p")" 2>/dev/null || true
+    done' sh
+fi
+mv -f "$new" {PUSH_MANIFEST}
+"#
+    )
+}
+
+/// Exit status of `install_fed_script` when the release does not exist.
+const NO_RELEASE: i32 = 3;
+
+/// The script that installs fed `version` from its GitHub release on the
+/// machine. The wrapper in /usr/local/sbin runs /usr/local/bin/fed, so that
+/// is the file it replaces. It checks the archive against the release's
+/// SHA-256 file.
+pub(crate) fn install_fed_script(version: [u64; 3]) -> String {
+    let version = version_string(version);
+    format!(
+        r#"set -e
+case $(uname -m) in
+  x86_64) t=x86_64-unknown-linux-gnu ;;
+  aarch64) t=aarch64-unknown-linux-gnu ;;
+  *) exit 4 ;;
+esac
+url=https://github.com/service-federation/fed/releases/download/v{version}/fed-$t.tar.xz
+d=$(mktemp -d)
+trap 'rm -rf "$d"' EXIT
+cd "$d"
+code=$(curl -sSL --retry 2 -o fed.tar.xz.sha256 -w '%{{http_code}}' "$url.sha256") || exit 5
+if [ "$code" = 404 ]; then exit {NO_RELEASE}; fi
+if [ "$code" != 200 ]; then exit 5; fi
+curl -fsSL --retry 2 -o fed.tar.xz "$url"
+echo "$(cut -d ' ' -f 1 fed.tar.xz.sha256)  fed.tar.xz" | sha256sum -c --status
+tar -xJf fed.tar.xz
+bin=$(find . -type f -name fed | head -n 1)
+[ -n "$bin" ]
+install -m 0755 "$bin" /usr/local/bin/fed.new
+mv -f /usr/local/bin/fed.new /usr/local/bin/fed
+"#
+    )
 }
 
 /// Where the shared SSH connection listens. ssh first creates the socket under
@@ -305,8 +566,87 @@ fn prepare_control_dir(path: &Path, state_dir: &Path) -> Result<()> {
     let meta = std::fs::symlink_metadata(dir)?;
     if meta.uid() != unsafe { nix::libc::geteuid() } || meta.mode() & 0o077 != 0 {
         bail!(
-            "{} is not private to this user — remove it and retry",
+            "{} is not private to this user. Remove it and try again.",
             dir.display()
+        );
+    }
+    Ok(())
+}
+
+// ── Tools on this machine ─────────────────────────────────────────────
+
+fn find_program(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// macOS ships /usr/bin/rsync as a switch between samba rsync and openrsync.
+/// This picks samba rsync. Other rsync builds ignore it.
+const CHOSEN_RSYNC: (&str, &str) = ("CHOSEN_RSYNC", "rsync_samba");
+
+/// Whether `rsync --version` printed by openrsync. openrsync never finishes a
+/// copy with `--files-from`.
+pub(crate) fn is_openrsync(version_output: &str) -> bool {
+    version_output.to_ascii_lowercase().contains("openrsync")
+}
+
+fn rsync() -> Command {
+    let mut cmd = Command::new("rsync");
+    cmd.env(CHOSEN_RSYNC.0, CHOSEN_RSYNC.1);
+    cmd
+}
+
+/// Check that `ssh`, `rsync` and, for `up`, `ssh-keygen` are on PATH and
+/// work. `command` is the fed command, for the message.
+async fn check_tools(command: &str, keygen: bool) -> Result<()> {
+    let mut needed = vec!["ssh", "rsync"];
+    if keygen {
+        needed.insert(1, "ssh-keygen");
+    }
+    let missing: Vec<&str> = needed
+        .iter()
+        .copied()
+        .filter(|name| find_program(name).is_none())
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "{command} needs {}, which this machine does not have. Install OpenSSH and rsync, then try again.",
+            missing.join(" and ")
+        );
+    }
+    let ssh = Command::new("ssh")
+        .arg("-V")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("running ssh -V")?;
+    if !ssh.status.success() {
+        bail!(
+            "{command} needs a working ssh, but `ssh -V` failed ({}).",
+            ssh.status
+        );
+    }
+    let out = rsync()
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("running rsync --version")?;
+    let version = String::from_utf8_lossy(&out.stdout);
+    if is_openrsync(&version) {
+        bail!(
+            "{command} needs the original rsync, but the rsync on PATH is openrsync, which hangs on the file list fed sends. Install rsync with `brew install rsync` (or your package manager), then try again."
+        );
+    }
+    if !out.status.success() {
+        bail!(
+            "{command} needs a working rsync, but `rsync --version` failed ({}).",
+            out.status
         );
     }
     Ok(())
@@ -322,7 +662,7 @@ struct Remote {
 }
 
 impl Remote {
-    fn open(dir: PathBuf, state: EnvState) -> Result<Self> {
+    fn new(dir: PathBuf, state: EnvState) -> Result<Self> {
         let control = control_path(&dir, &state.id);
         prepare_control_dir(&control, &dir)?;
         Ok(Self {
@@ -334,6 +674,10 @@ impl Remote {
 
     fn target(&self) -> String {
         format!("root@{}", self.state.ip)
+    }
+
+    fn name(&self) -> &str {
+        &self.state.name
     }
 
     /// The options every ssh call uses. ControlMaster and ControlPath are added
@@ -356,11 +700,35 @@ impl Remote {
         cmd
     }
 
+    /// Hold the environment's `ssh.lock` until the returned file is dropped.
+    /// The file is opened close-on-exec, so ssh does not inherit the lock.
+    async fn lock(&self) -> Result<std::fs::File> {
+        let path = self.dir.join("ssh.lock");
+        tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("opening {}", path.display()))?;
+            fs2::FileExt::lock_exclusive(&file)
+                .with_context(|| format!("locking {}", path.display()))?;
+            Ok(file)
+        })
+        .await?
+    }
+
     /// Open the shared connection unless it is already open. It is detached
     /// from every stream: started by an ordinary command, it would keep that
-    /// command's output open and hang whoever reads it. It is a logged-in
-    /// session, so it keeps the machine awake until 60 s after the last use.
-    async fn share_connection(&self) {
+    /// command's output open and hang whoever reads it. Its stderr goes to
+    /// `ssh.log`, for the error when it fails. It is a logged-in session, so
+    /// it keeps the machine awake until 60 s after the last use.
+    ///
+    /// The check and the start run under `ssh.lock`. Two commands that both
+    /// start a connection would leave one as a plain session with no
+    /// ControlPersist limit, which keeps the machine awake for good.
+    async fn share_connection(&self) -> Result<()> {
+        let _lock = self.lock().await?;
         let open = Command::new("ssh")
             .args(self.shared_args())
             .args(["-O", "check"])
@@ -373,11 +741,14 @@ impl Remote {
             .map(|s| s.success())
             .unwrap_or(false);
         if open {
-            return;
+            return Ok(());
         }
         // A socket left by a crashed master would make the new one fail to
         // listen and stay up as a plain session with no ControlPersist limit.
         let _ = std::fs::remove_file(&self.control);
+        let log_path = self.dir.join("ssh.log");
+        let log = std::fs::File::create(&log_path)
+            .with_context(|| format!("creating {}", log_path.display()))?;
         let mut cmd = Command::new("ssh");
         cmd.args(self.base_args());
         // With its streams closed, a prompt would wait forever.
@@ -386,29 +757,60 @@ impl Remote {
         cmd.args(opt("ControlPersist=60"));
         cmd.args(opt_path("ControlPath=", &self.control));
         cmd.args(["-f", "-N"]).arg(self.target());
-        let _ = cmd
+        let status = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(log)
             .status()
-            .await;
+            .await
+            .context("running ssh")?;
+        if status.success() {
+            return Ok(());
+        }
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let detail = log
+            .lines()
+            .rfind(|l| !l.trim().is_empty())
+            .map(|l| format!(" ssh said: {}", l.trim()))
+            .unwrap_or_default();
+        Err(self
+            .failure(
+                format!(
+                    "cannot connect to {} over SSH ({status}).{detail}",
+                    self.name()
+                ),
+                ssh_lost(status),
+            )
+            .await)
     }
 
-    async fn close_connection(&self) {
-        let _ = Command::new("ssh")
-            .args(opt_path("ControlPath=", &self.control))
-            .args(["-O", "exit"])
-            .arg(self.target())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
+    /// The error for a failed ssh or rsync call. When the connection was
+    /// `lost`, the cloud list says whether the environment is gone, and a gone
+    /// one is forgotten.
+    async fn failure(&self, message: String, lost: bool) -> anyhow::Error {
+        if lost && let Some(gone) = self.deleted().await {
+            return gone;
+        }
+        anyhow!(message)
+    }
+
+    /// When the cloud no longer lists this environment, forget it and return
+    /// the error that says so. `None` when it is listed, or the list fails.
+    async fn deleted(&self) -> Option<anyhow::Error> {
+        let creds = credentials().ok()?;
+        let list = api::list_environments(&creds, &self.state.project_ref())
+            .await
+            .ok()?;
+        if list.iter().any(|e| e.id == self.state.id) {
+            return None;
+        }
+        forget(Some(&creds), &self.dir, &self.state).await;
+        Some(anyhow!(deleted_message(self.name())))
     }
 
     /// Run `command` on the machine with this terminal's streams.
-    async fn run(&self, command: &str) -> Result<std::process::ExitStatus> {
-        self.share_connection().await;
+    async fn run(&self, command: &str) -> Result<ExitStatus> {
+        self.share_connection().await?;
         self.ssh()
             .arg(self.target())
             .arg(command)
@@ -421,14 +823,19 @@ impl Remote {
     async fn run_checked(&self, command: &str, what: &str) -> Result<()> {
         let status = self.run(command).await?;
         if !status.success() {
-            bail!("{what} failed on {} ({status})", self.state.name);
+            return Err(self
+                .failure(
+                    format!("{what} failed on {} ({status}).", self.name()),
+                    ssh_lost(status),
+                )
+                .await);
         }
         Ok(())
     }
 
     /// Run `command` on the machine and return what it printed.
-    async fn output(&self, command: &str) -> Result<String> {
-        self.share_connection().await;
+    async fn output(&self, command: &str, what: &str) -> Result<String> {
+        self.share_connection().await?;
         let out = self
             .ssh()
             .arg(self.target())
@@ -439,15 +846,20 @@ impl Remote {
             .await
             .context("running ssh")?;
         if !out.status.success() {
-            bail!("`{command}` failed on {} ({})", self.state.name, out.status);
+            return Err(self
+                .failure(
+                    format!("{what} failed on {} ({}).", self.name(), out.status),
+                    ssh_lost(out.status),
+                )
+                .await);
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// Run `command` on the machine with `input` on its stdin.
-    async fn run_with_input(&self, command: &str, input: &[u8]) -> Result<()> {
+    async fn run_with_input(&self, command: &str, input: &[u8], what: &str) -> Result<()> {
         use tokio::io::AsyncWriteExt;
-        self.share_connection().await;
+        self.share_connection().await?;
         let mut child = self
             .ssh()
             .arg(self.target())
@@ -456,14 +868,25 @@ impl Remote {
             .stdout(Stdio::null())
             .spawn()
             .context("running ssh")?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(input).await?;
-            stdin.shutdown().await?;
-        }
+        let written = match child.stdin.take() {
+            Some(mut stdin) => {
+                let result = stdin.write_all(input).await;
+                drop(stdin);
+                result
+            }
+            None => Ok(()),
+        };
+        // When ssh stops early, its status says why. The broken pipe does not.
         let status = child.wait().await?;
         if !status.success() {
-            bail!("writing to {} failed ({status})", self.state.name);
+            return Err(self
+                .failure(
+                    format!("{what} failed on {} ({status}).", self.name()),
+                    ssh_lost(status),
+                )
+                .await);
         }
+        written.with_context(|| format!("{what} on {}", self.name()))?;
         Ok(())
     }
 
@@ -486,6 +909,25 @@ impl Remote {
     }
 }
 
+/// Whether ssh lost or never got its connection: it exits with 255 then.
+fn ssh_lost(status: ExitStatus) -> bool {
+    status.code() == Some(255)
+}
+
+/// Ask the shared connection at `control` to end.
+async fn close_connection(control: &Path, ip: &str) {
+    let _ = Command::new("ssh")
+        .args(["-F", "none"])
+        .args(opt_path("ControlPath=", control))
+        .args(["-O", "exit"])
+        .arg(format!("root@{ip}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
 fn opt(value: &str) -> [OsString; 2] {
     ["-o".into(), value.into()]
 }
@@ -504,9 +946,12 @@ fn opt_path(key: &str, path: &Path) -> [OsString; 2] {
     ["-o".into(), value]
 }
 
-/// The ssh options for every call to an environment.
+/// The ssh options for every call to an environment. `-F none` keeps the
+/// user's ~/.ssh/config out: everything the connection needs is here.
 pub(crate) fn ssh_base_args(state_dir: &Path, port: u16) -> Vec<OsString> {
-    let mut args: Vec<OsString> = vec!["-i".into(), state_dir.join("client_key").into()];
+    let mut args: Vec<OsString> = vec!["-F".into(), "none".into()];
+    args.push("-i".into());
+    args.push(state_dir.join("client_key").into());
     args.push("-p".into());
     args.push(port.to_string().into());
     args.extend(opt("IdentitiesOnly=yes"));
@@ -518,6 +963,26 @@ pub(crate) fn ssh_base_args(state_dir: &Path, port: u16) -> Vec<OsString> {
     args.extend(opt("ConnectTimeout=10"));
     args.extend(opt("ServerAliveInterval=15"));
     args
+}
+
+/// The `-e` value for rsync: ssh with `args`. rsync splits it into words
+/// itself and knows quotes but not backslashes, so an argument with a `'`
+/// cannot be passed.
+pub(crate) fn rsync_shell(args: Vec<OsString>) -> Result<String> {
+    let words = std::iter::once(OsString::from("ssh"))
+        .chain(args)
+        .map(|a| match a.into_string() {
+            Ok(a) if !a.contains('\'') => Ok(a),
+            Ok(a) => Err(anyhow!(
+                "fed remote push cannot copy files while the path `{a}` contains a ' character, because rsync cannot pass it to ssh. Rename the folder, or move your home directory to a path without '."
+            )),
+            Err(a) => Err(anyhow!(
+                "fed remote push cannot copy files while the path `{}` is not valid UTF-8, because rsync cannot pass it to ssh.",
+                a.to_string_lossy()
+            )),
+        })
+        .collect::<Result<Vec<String>>>()?;
+    Ok(shell_words::join(&words))
 }
 
 // ── Checkout ──────────────────────────────────────────────────────────
@@ -535,40 +1000,56 @@ fn checkout_root(workdir: Option<PathBuf>) -> Result<PathBuf> {
         .output()
         .context("running git")?;
     if !out.status.success() {
-        bail!("{} is not in a git checkout", dir.display());
+        bail!("{} is not in a git checkout.", dir.display());
     }
     let root = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
     Ok(PathBuf::from(root))
 }
 
-/// The files `fed remote push` copies: tracked and untracked-but-not-ignored,
-/// filtered by `keep_path`, and only the ones that exist (a deleted tracked
-/// file would fail the copy).
-fn files_to_push(root: &Path) -> Result<Vec<Vec<u8>>> {
-    use std::os::unix::ffi::OsStrExt;
+fn git_output(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["ls-files", "-z", "-co", "--exclude-standard"])
+        .args(args)
         .output()
-        .context("running git ls-files")?;
+        .context("running git")?;
     if !out.status.success() {
         bail!(
-            "git ls-files failed in {}: {}",
+            "git {} failed in {}: {}",
+            args.join(" "),
             root.display(),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(filter_file_list(&out.stdout)
+    Ok(out.stdout)
+}
+
+/// What `fed remote push` copies, as paths relative to the checkout.
+struct PushList {
+    /// Tracked and untracked-but-not-ignored files, filtered by `keep_path`,
+    /// and only the ones that exist (a deleted tracked file would fail the
+    /// copy).
+    files: Vec<Vec<u8>>,
+    /// Submodules, which are left out: rsync would only make their folders.
+    submodules: Vec<Vec<u8>>,
+}
+
+fn files_to_push(root: &Path) -> Result<PushList> {
+    use std::os::unix::ffi::OsStrExt;
+    let listed = git_output(root, &["ls-files", "-z", "-co", "--exclude-standard"])?;
+    let submodules = submodule_paths(&git_output(root, &["ls-files", "-z", "--stage"])?);
+    let files = filter_file_list(&listed)
         .into_iter()
+        .filter(|p| !submodules.contains(p))
         .filter(|p| std::fs::symlink_metadata(root.join(std::ffi::OsStr::from_bytes(p))).is_ok())
-        .collect())
+        .collect();
+    Ok(PushList { files, submodules })
 }
 
 // ── Commands ──────────────────────────────────────────────────────────
 
 fn credentials() -> Result<cloud::Credentials> {
-    cloud::load_credentials().context("not signed in — run `fed login`")
+    cloud::load_credentials().context("you are not signed in. Run `fed login`.")
 }
 
 fn linked_project(root: &Path) -> Option<api::ProjectRef> {
@@ -579,7 +1060,8 @@ fn linked_project(root: &Path) -> Option<api::ProjectRef> {
 }
 
 fn required_project(root: &Path) -> Result<api::ProjectRef> {
-    linked_project(root).context("this checkout isn't linked — run `fed link org/project`")
+    linked_project(root)
+        .context("this checkout is not linked to a project. Run `fed link org/project`.")
 }
 
 pub async fn run_remote(
@@ -591,6 +1073,7 @@ pub async fn run_remote(
     match cmd {
         RemoteCommands::Up { name, kind } => {
             let checkout = checkout_root(workdir)?;
+            check_tools("fed remote up", true).await?;
             up(&root, &checkout, name.as_deref(), kind.as_deref(), out).await
         }
         RemoteCommands::Ls => {
@@ -600,16 +1083,19 @@ pub async fn run_remote(
         RemoteCommands::Push { name, workspace } => {
             let checkout = checkout_root(workdir)?;
             let ws = workspace_name(&checkout, workspace.as_deref())?;
-            let remote = open(&root, name, linked_project(&checkout).as_ref())?;
+            check_tools("fed remote push", false).await?;
+            let remote = open(&root, name, linked_project(&checkout).as_ref()).await?;
             push(&remote, &checkout, &ws, out).await
         }
         RemoteCommands::Start { name, workspace } => {
             let checkout = checkout_root(workdir)?;
             let ws = workspace_name(&checkout, workspace.as_deref())?;
-            let remote = open(&root, name, linked_project(&checkout).as_ref())?;
+            check_tools("fed remote start", false).await?;
+            let remote = open(&root, name, linked_project(&checkout).as_ref()).await?;
             push(&remote, &checkout, &ws, out).await?;
+            match_fed_version(&remote, out).await?;
             if let Some(project) = linked_project(&checkout) {
-                give_env_token(&remote, &project, &ws, out).await?;
+                give_vault_token(&remote, &project, &ws, out).await?;
             }
             remote
                 .run_checked(&format!("cd /srv/{ws} && fed start"), "fed start")
@@ -622,24 +1108,24 @@ pub async fn run_remote(
         RemoteCommands::Connect { name, workspace } => {
             let checkout = checkout_root(workdir)?;
             let ws = workspace_name(&checkout, workspace.as_deref())?;
-            let remote = open(&root, name, linked_project(&checkout).as_ref())?;
+            let remote = open(&root, name, linked_project(&checkout).as_ref()).await?;
             connect(&remote, &ws, out).await
         }
-        RemoteCommands::Ssh { name, command } => {
-            let project = checkout_root(workdir).ok().and_then(|c| linked_project(&c));
-            let remote = open(&root, name, project.as_ref())?;
-            remote.share_connection().await;
-            let mut ssh = remote.ssh();
-            if command.is_empty() {
-                ssh.arg("-t");
-            }
-            let status = ssh
-                .arg(remote.target())
-                .args(command)
-                .status()
-                .await
-                .context("running ssh")?;
-            std::process::exit(status.code().unwrap_or(1));
+        RemoteCommands::Ssh {
+            name,
+            workspace,
+            command,
+        } => {
+            let checkout = checkout_root(workdir).ok();
+            let project = checkout.as_deref().and_then(linked_project);
+            let ws = match (workspace, &checkout) {
+                (Some(ws), _) => Some(checked_workspace(ws)?),
+                (None, Some(checkout)) => workspace_name(checkout, None).ok(),
+                (None, None) => None,
+            };
+            let remote = open(&root, name, project.as_ref()).await?;
+            let code = ssh(&remote, ws.as_deref(), command).await?;
+            std::process::exit(code);
         }
         RemoteCommands::Down { name } => {
             let project = checkout_root(workdir).ok().and_then(|c| linked_project(&c));
@@ -648,9 +1134,18 @@ pub async fn run_remote(
     }
 }
 
-fn open(root: &Path, name: &str, project: Option<&api::ProjectRef>) -> Result<Remote> {
-    let (dir, state) = find_environment(root, name, project)?;
-    Remote::open(dir, state)
+/// The environment called `name`, ready for SSH. One past its deadline is
+/// checked against the cloud first, so the user gets the reason instead of
+/// an SSH timeout.
+async fn open(root: &Path, name: &str, project: Option<&api::ProjectRef>) -> Result<Remote> {
+    let (dir, state) = find_environment(root, name, project).await?;
+    let remote = Remote::new(dir, state)?;
+    if deadline_passed(&remote.state.deadline, chrono::Utc::now())
+        && let Some(gone) = remote.deleted().await
+    {
+        return Err(gone);
+    }
+    Ok(remote)
 }
 
 async fn keygen(path: &Path, comment: &str) -> Result<()> {
@@ -663,7 +1158,7 @@ async fn keygen(path: &Path, comment: &str) -> Result<()> {
         .await
         .context("running ssh-keygen (it comes with OpenSSH)")?;
     if !status.success() {
-        bail!("ssh-keygen failed ({status})");
+        bail!("ssh-keygen failed ({status}).");
     }
     Ok(())
 }
@@ -693,7 +1188,8 @@ async fn up(
     }
 
     create_private_dir(root)?;
-    let staging = root.join(format!(".new-{:016x}", rand::random::<u64>()));
+    remove_stale_staging(root, std::time::SystemTime::now());
+    let staging = root.join(format!("{STAGING_PREFIX}{:016x}", rand::random::<u64>()));
     create_private_dir(&staging)?;
     let created = create(&creds, &project, &staging, &name, kind, out).await;
     let env = match created {
@@ -708,7 +1204,9 @@ async fn up(
     // `fed remote down` can find the environment whatever fails after this.
     if !api::valid_id(&env.id) {
         let _ = std::fs::remove_dir_all(&staging);
-        bail!("cloud: the new environment has an invalid id — remove it in the dashboard");
+        bail!(
+            "Service Federation Cloud sent an invalid id for {name}. Delete it in the dashboard."
+        );
     }
     let state = EnvState {
         id: env.id.clone(),
@@ -726,9 +1224,18 @@ async fn up(
     let dir = root.join(&env.id);
     std::fs::rename(&staging, &dir)
         .with_context(|| format!("moving the keys to {}", dir.display()))?;
+
+    // The cloud only gives out a name that no active environment has, so an
+    // older environment by this name is gone.
+    for (old_dir, old) in local_environments(root) {
+        if old.name == name && old.in_project(&project) && old.id != env.id {
+            forget(Some(&creds), &old_dir, &old).await;
+        }
+    }
+
     let (Some(ip), Some(port)) = (env.ip.clone(), env.port) else {
         bail!(
-            "cloud: {name} has no address yet — remove it with `fed remote down {name}` and try again"
+            "Service Federation Cloud has no address for {name} yet. Delete it with `fed remote down {name}` and try again."
         );
     };
     let host_public = read_trimmed(&dir.join("host_key.pub"))?;
@@ -737,23 +1244,17 @@ async fn up(
         known_hosts_line(&ip, port, &host_public)?.as_bytes(),
     )?;
 
-    let remote = Remote::open(dir, state)?;
-    out.progress(&format!("Waiting for {name} to answer SSH ({ip}:{port}) "));
-    let start = Instant::now();
-    while !remote.answers().await {
-        if start.elapsed() > SSH_WAIT {
-            out.finish_progress("timed out");
+    let remote = Remote::new(dir, state)?;
+    tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c() => {
+            out.clear_progress();
             bail!(
-                "{name} does not answer SSH after {} minutes — remove it with `fed remote down {name}`",
-                SSH_WAIT.as_secs() / 60
+                "Stopped waiting for {name}. It keeps starting up. Continue with `fed remote start {name}`, or delete it with `fed remote down {name}`."
             );
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        ready = wait_until_ready(&remote, &ip, port, out) => ready?,
     }
-    out.finish_progress(&format!("after {}s", start.elapsed().as_secs()));
-    remote
-        .run_checked("cloud-init status --wait >/dev/null", "cloud-init")
-        .await?;
 
     out.success(&format!("{name} is ready at {ip} (SSH port {port})."));
     out.status(&format!(
@@ -764,8 +1265,41 @@ async fn up(
     Ok(())
 }
 
+async fn wait_until_ready(
+    remote: &Remote,
+    ip: &str,
+    port: u16,
+    out: &dyn UserOutput,
+) -> Result<()> {
+    let name = remote.name();
+    out.progress(&format!("Waiting for {name} to answer SSH ({ip}:{port}) "));
+    let start = Instant::now();
+    while !remote.answers().await {
+        if start.elapsed() > SSH_WAIT {
+            out.finish_progress("timed out");
+            if let Some(gone) = remote.deleted().await {
+                return Err(gone);
+            }
+            bail!(
+                "{name} does not answer SSH after {} minutes. Delete it with `fed remote down {name}` and try again.",
+                SSH_WAIT.as_secs() / 60
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    out.finish_progress(&format!("after {}s", start.elapsed().as_secs()));
+    remote
+        .run_checked("cloud-init status --wait >/dev/null", "cloud-init")
+        .await
+}
+
 /// Make the keys in `staging` and ask the cloud for the environment. The host
 /// private key is only needed for the request, so it is deleted after it.
+///
+/// When the answer does not come within `api::CREATE_TIMEOUT`, or the user
+/// presses Ctrl-C, the request is dropped and the cloud list says what
+/// exists. This machine never got the address, so an environment that was
+/// made anyway can only be deleted.
 async fn create(
     creds: &cloud::Credentials,
     project: &api::ProjectRef,
@@ -798,18 +1332,51 @@ async fn create(
         host_private_key: &host_private,
         host_public_key: &host_public,
     };
-    let result = api::create_environment(creds, project, &body).await;
+    let stopped = tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c() => "you pressed Ctrl-C",
+        _ = tokio::time::sleep(api::CREATE_TIMEOUT) => "it took more than 5 minutes",
+        result = api::create_environment(creds, project, &body) => {
+            let _ = std::fs::remove_file(staging.join("host_key"));
+            return match result {
+                Ok(env) => {
+                    out.finish_progress("done");
+                    Ok(env)
+                }
+                Err(e) => {
+                    out.clear_progress();
+                    Err(e.into())
+                }
+            };
+        }
+    };
     let _ = std::fs::remove_file(staging.join("host_key"));
-    match result {
-        Ok(env) => {
-            out.finish_progress("done");
-            Ok(env)
-        }
-        Err(e) => {
-            out.clear_progress();
-            Err(e.into())
-        }
+    out.clear_progress();
+    let check = tokio::time::timeout(
+        Duration::from_secs(20),
+        api::list_environments(creds, project),
+    )
+    .await;
+    match check {
+        Ok(Ok(list)) if list.iter().any(|e| e.name == name) => bail!(
+            "fed stopped waiting for {name} because {stopped}. {name} exists in {project}, but this machine has no keys for it. Delete it with `fed remote down {name}`, then create it again."
+        ),
+        Ok(Ok(_)) => bail!(
+            "fed stopped waiting for {name} because {stopped}. {project} has no environment called {name} yet. If it shows up in `fed remote ls`, delete it with `fed remote down {name}`."
+        ),
+        _ => bail!(
+            "fed stopped waiting for {name} because {stopped}, and cannot check whether it exists. If it shows up in `fed remote ls`, delete it with `fed remote down {name}`."
+        ),
     }
+}
+
+/// The caller's user id, to tell their environments from others' in an org
+/// admin's list. Only asked for when the list has owners.
+async fn my_user_id(creds: &cloud::Credentials, list: &[api::Environment]) -> Option<String> {
+    if list.iter().all(|e| e.owner.is_none()) {
+        return None;
+    }
+    cloud::whoami(creds).await.ok()?.user.id
 }
 
 async fn ls(root: &Path, checkout: &Path, out: &dyn UserOutput) -> Result<()> {
@@ -817,15 +1384,19 @@ async fn ls(root: &Path, checkout: &Path, out: &dyn UserOutput) -> Result<()> {
     let project = required_project(checkout)?;
     let list = api::list_environments(&creds, &project).await?;
 
-    // The cloud deletes idle environments without telling us. Forget their keys.
+    // The cloud deletes idle environments without telling us. Forget their
+    // keys, in this project and in every other one this machine has keys for.
     for (dir, state) in local_environments(root) {
-        if state.org == project.org
-            && state.project == project.project
-            && !list.iter().any(|e| e.id == state.id)
-        {
-            let _ = std::fs::remove_dir_all(&dir);
+        if state.in_project(&project) && !list.iter().any(|e| e.id == state.id) {
+            forget(Some(&creds), &dir, &state).await;
         }
     }
+    let others: Vec<EnvState> = local_environments(root)
+        .into_iter()
+        .map(|(_, s)| s)
+        .filter(|s| !s.in_project(&project))
+        .collect();
+    forget_deleted(&creds, root, &others).await;
 
     if list.is_empty() {
         out.status(&format!(
@@ -833,11 +1404,18 @@ async fn ls(root: &Path, checkout: &Path, out: &dyn UserOutput) -> Result<()> {
         ));
         return Ok(());
     }
+    let me = my_user_id(&creds, &list).await;
+    let show_owner = list.iter().any(|e| !e.is_owned_by(me.as_deref()));
     let now = chrono::Utc::now();
-    let rows: Vec<[String; 5]> = list
+    let mut header = vec!["NAME", "TYPE", "STATE", "ADDRESS", "LEFT"];
+    if show_owner {
+        header.push("OWNER");
+    }
+    let header: Vec<String> = header.into_iter().map(String::from).collect();
+    let rows: Vec<Vec<String>> = list
         .iter()
         .map(|e| {
-            [
+            let mut row = vec![
                 e.name.clone(),
                 e.kind.clone(),
                 e.state.clone(),
@@ -846,11 +1424,18 @@ async fn ls(root: &Path, checkout: &Path, out: &dyn UserOutput) -> Result<()> {
                     _ => "-".to_string(),
                 },
                 minutes_left(&e.deadline, now),
-            ]
+            ];
+            if show_owner {
+                row.push(match &e.owner {
+                    _ if e.is_owned_by(me.as_deref()) => "you".to_string(),
+                    Some(owner) => owner.name.clone().unwrap_or_else(|| owner.id.clone()),
+                    None => "-".to_string(),
+                });
+            }
+            row
         })
         .collect();
-    let header = ["NAME", "TYPE", "STATE", "ADDRESS", "LEFT"].map(String::from);
-    let mut widths = header.clone().map(|h| h.len());
+    let mut widths: Vec<usize> = header.iter().map(String::len).collect();
     for row in &rows {
         for (w, cell) in widths.iter_mut().zip(row) {
             *w = (*w).max(cell.len());
@@ -859,7 +1444,7 @@ async fn ls(root: &Path, checkout: &Path, out: &dyn UserOutput) -> Result<()> {
     for row in std::iter::once(&header).chain(&rows) {
         let line: Vec<String> = row
             .iter()
-            .zip(widths)
+            .zip(&widths)
             .map(|(cell, w)| format!("{cell:w$}"))
             .collect();
         out.status(line.join("  ").trim_end());
@@ -867,9 +1452,23 @@ async fn ls(root: &Path, checkout: &Path, out: &dyn UserOutput) -> Result<()> {
     Ok(())
 }
 
+/// Copy the checkout to `/srv/<ws>`, then delete there the files an earlier
+/// push copied that the checkout no longer has.
 async fn push(remote: &Remote, checkout: &Path, ws: &str, out: &dyn UserOutput) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    let files = files_to_push(checkout)?;
+    let PushList { files, submodules } = files_to_push(checkout)?;
+    if !submodules.is_empty() {
+        let names: Vec<String> = submodules
+            .iter()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        out.warning(&format!(
+            "fed remote push skips git submodules. These do not reach {}: {}",
+            remote.name(),
+            names.join(", ")
+        ));
+    }
+    let shell = rsync_shell(remote.shared_args())?;
     remote
         .run_checked(&format!("mkdir -p /srv/{ws}"), "creating the workspace")
         .await?;
@@ -877,27 +1476,20 @@ async fn push(remote: &Remote, checkout: &Path, ws: &str, out: &dyn UserOutput) 
         1 => "1 file".to_string(),
         n => format!("{n} files"),
     };
-    out.status(&format!(
-        "Pushing {count} to {}:/srv/{ws}",
-        remote.state.name
-    ));
+    out.status(&format!("Pushing {count} to {}:/srv/{ws}", remote.name()));
 
-    let ssh_command: Vec<String> = std::iter::once(OsString::from("ssh"))
-        .chain(remote.shared_args())
-        .map(|a| match a.into_string() {
-            // rsync splits this command itself and knows quotes but not
-            // backslashes, so a quote in a path cannot be escaped.
-            Ok(a) if !a.contains('\'') => Ok(a),
-            _ => Err(anyhow::anyhow!(
-                "the state directory path must be valid UTF-8 without a ' in it"
-            )),
-        })
-        .collect::<Result<_>>()?;
+    let mut list = Vec::new();
+    for path in &files {
+        list.extend_from_slice(std::ffi::OsStr::from_bytes(path).as_bytes());
+        list.push(0);
+    }
     let mut source = checkout.as_os_str().to_os_string();
     source.push("/");
-    let mut child = Command::new("rsync")
-        .args(["-a", "--from0", "--files-from=-", "-e"])
-        .arg(shell_words::join(&ssh_command))
+    let mut child = rsync()
+        .args(["-a", "--from0", "--files-from=-"])
+        .arg(format!("--timeout={RSYNC_IO_TIMEOUT}"))
+        .arg("-e")
+        .arg(shell)
         .arg(source)
         .arg(format!("{}:/srv/{ws}/", remote.target()))
         .stdin(Stdio::piped())
@@ -906,11 +1498,6 @@ async fn push(remote: &Remote, checkout: &Path, ws: &str, out: &dyn UserOutput) 
     let written = {
         use tokio::io::AsyncWriteExt;
         let mut stdin = child.stdin.take().context("rsync stdin")?;
-        let mut list = Vec::new();
-        for path in &files {
-            list.extend_from_slice(std::ffi::OsStr::from_bytes(path).as_bytes());
-            list.push(0);
-        }
         let result = stdin.write_all(&list).await;
         drop(stdin);
         result
@@ -918,48 +1505,109 @@ async fn push(remote: &Remote, checkout: &Path, ws: &str, out: &dyn UserOutput) 
     // When rsync stops early, its status says why. The broken pipe does not.
     let status = child.wait().await?;
     if !status.success() {
-        bail!("rsync to {} failed ({status})", remote.state.name);
+        // rsync exits with 255 when ssh does, and with 12 when the connection
+        // drops in the middle of the copy.
+        let lost = matches!(status.code(), Some(12 | 255));
+        return Err(remote
+            .failure(
+                format!("rsync to {} failed ({status}).", remote.name()),
+                lost,
+            )
+            .await);
     }
     written.context("sending the file list to rsync")?;
-    Ok(())
+    remote
+        .run_with_input(&push_cleanup_script(ws), &list, "removing deleted files")
+        .await
 }
 
-/// Give the workspace an env token: read access to the linked project's vault
-/// until the environment's deadline. The previous token for the workspace is
-/// revoked first, so there is one per workspace.
-async fn give_env_token(
+/// Make fed on the machine at least as new as this one. The machine image
+/// has a fixed fed version. A newer released version is installed from its
+/// GitHub release. A version with no release, such as a build from source,
+/// gets a warning.
+async fn match_fed_version(remote: &Remote, out: &dyn UserOutput) -> Result<()> {
+    let name = remote.name();
+    let Some(local) = parse_version(env!("CARGO_PKG_VERSION")) else {
+        return Ok(());
+    };
+    let printed = remote.output("fed --version", "fed --version").await?;
+    let Some(theirs) = parse_version(&printed) else {
+        out.warning(&format!(
+            "fed on {name} printed an unexpected version ({}). Commands there may behave differently from this fed.",
+            printed.trim()
+        ));
+        return Ok(());
+    };
+    if theirs >= local {
+        return Ok(());
+    }
+    let (local_s, theirs_s) = (version_string(local), version_string(theirs));
+    out.status(&format!(
+        "Installing fed {local_s} on {name}, which has fed {theirs_s}"
+    ));
+    let status = remote.run(&install_fed_script(local)).await?;
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(NO_RELEASE) => {
+            out.warning(&format!(
+                "fed {local_s} has no release to install on {name}, so commands there run fed {theirs_s}."
+            ));
+            Ok(())
+        }
+        _ => {
+            out.warning(&format!(
+                "installing fed {local_s} on {name} failed ({status}), so commands there run fed {theirs_s}."
+            ));
+            Ok(())
+        }
+    }
+}
+
+/// Give the workspace a vault token: read access to the linked project's
+/// vault until the environment's deadline. The cloud revokes it when the
+/// environment ends. The new token is in place before the previous one for
+/// the workspace is revoked, so a failure leaves the workspace with a token.
+async fn give_vault_token(
     remote: &Remote,
     project: &api::ProjectRef,
     ws: &str,
     out: &dyn UserOutput,
 ) -> Result<()> {
     let creds =
-        credentials().context("this checkout uses the team vault — run `fed login` first")?;
+        credentials().context("this checkout uses the team vault. Run `fed login` first.")?;
     let base = cloud::cloud_base_url(&creds.url)?;
     let ttl = token_ttl(&remote.state.deadline, chrono::Utc::now())?;
 
     let tokens = remote.dir.join("tokens");
     create_private_dir(&tokens)?;
     let record_path = tokens.join(format!("{ws}.json"));
-    revoke_token_file(&creds, &record_path, out).await;
 
-    let label = format!("fed remote {}/{ws}", remote.state.name);
-    let token = api::mint_env_token(&creds, project, &label, ttl).await?;
+    let label = format!("fed remote {}/{ws}", remote.name());
+    let token = api::mint_env_token(&creds, project, &label, ttl, Some(&remote.state.id)).await?;
+    let url = base.as_str().trim_end_matches('/');
+    let command = format!(
+        "umask 077 && mkdir -p /run/fedenv/tokens && cat > /run/fedenv/tokens/{ws} && printf '%s\\n' {} > /run/fedenv/cloud-url",
+        shell_words::quote(url)
+    );
+    if let Err(e) = remote
+        .run_with_input(&command, token.token.as_bytes(), "storing the vault token")
+        .await
+    {
+        let _ = api::revoke_env_token(&creds, project, &token.id).await;
+        return Err(e);
+    }
+
+    if let Err(e) = revoke_token_file(&creds, &record_path).await {
+        out.warning(&format!(
+            "Could not revoke the previous vault token for /srv/{ws}: {e}. It expires at the environment's deadline."
+        ));
+    }
     let record = TokenRecord {
         id: token.id.clone(),
         org: project.org.clone(),
         project: project.project.clone(),
     };
     write_private(&record_path, serde_json::to_string(&record)?.as_bytes())?;
-
-    let url = base.as_str().trim_end_matches('/');
-    let command = format!(
-        "umask 077 && mkdir -p /run/fedenv/tokens && cat > /run/fedenv/tokens/{ws} && printf '%s\\n' {} > /run/fedenv/cloud-url",
-        shell_words::quote(url)
-    );
-    remote
-        .run_with_input(&command, token.token.as_bytes())
-        .await?;
     out.status(&format!(
         "Gave /srv/{ws} read access to {project}'s vault for {}m",
         ttl / 60
@@ -967,49 +1615,79 @@ async fn give_env_token(
     Ok(())
 }
 
-/// Revoke the token in a record file and delete the file. A failure is a
-/// warning: the token expires at the environment's deadline anyway.
-async fn revoke_token_file(creds: &cloud::Credentials, path: &Path, out: &dyn UserOutput) {
+/// Revoke the token in a record file and delete the file. Without a readable
+/// record there is nothing to revoke.
+async fn revoke_token_file(creds: &cloud::Credentials, path: &Path) -> Result<()> {
     let Some(record) = std::fs::read_to_string(path)
         .ok()
         .and_then(|raw| serde_json::from_str::<TokenRecord>(&raw).ok())
     else {
-        return;
+        return Ok(());
     };
     let project = api::ProjectRef {
         org: record.org,
         project: record.project,
     };
-    match api::revoke_env_token(creds, &project, &record.id).await {
-        Ok(()) => {
-            let _ = std::fs::remove_file(path);
+    api::revoke_env_token(creds, &project, &record.id).await?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// `fed remote ssh`: a shell, or the command after `--`, in the workspace.
+/// Returns ssh's exit code.
+async fn ssh(remote: &Remote, ws: Option<&str>, command: &[String]) -> Result<i32> {
+    remote.share_connection().await?;
+    let mut ssh = remote.ssh();
+    if command.is_empty() {
+        ssh.arg("-t").arg(remote.target());
+        if let Some(shell) = remote_shell(ws) {
+            ssh.arg(shell);
         }
-        Err(e) => out.warning(&format!(
-            "could not revoke env token {}: {e}. It expires at the environment's deadline.",
-            record.id
-        )),
+    } else {
+        ssh.arg(remote.target())
+            .arg(remote_command(remote.name(), ws, command));
     }
+    let status = ssh.status().await.context("running ssh")?;
+    if ssh_lost(status)
+        && let Some(gone) = remote.deleted().await
+    {
+        return Err(gone);
+    }
+    Ok(status.code().unwrap_or(1))
 }
 
 async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> {
     let json = remote
-        .output(&format!("cd /srv/{ws} && fed ports list --json"))
+        .output(
+            &format!("cd /srv/{ws} && fed ports list --json"),
+            "fed ports list",
+        )
         .await?;
     let ports = parse_ports(&json)?;
-    let name = &remote.state.name;
+    let name = remote.name();
     if ports.is_empty() {
         bail!(
-            "No ports to forward in /srv/{ws} on {name}. Its services publish none, or `fed remote start {name}` has not run."
+            "/srv/{ws} on {name} has no ports to forward. Its services publish none, or `fed remote start {name}` has not run."
         );
     }
 
-    // One ssh per port, outside the shared connection, so Ctrl-C ends them and
-    // one failed forward does not stop the others.
+    // One listener per signal for the whole command, so a signal between two
+    // rounds is kept. Each forward is a logged-in session, so a forward left
+    // behind by `kill` or a closed terminal would keep the VM awake.
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt()).context("listening for Ctrl-C")?;
+    let mut terminate = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
+    let mut hangup = signal(SignalKind::hangup()).context("listening for SIGHUP")?;
+
+    // One ssh per port, outside the shared connection, so one failed forward
+    // does not stop the others. Each runs in its own process group, so Ctrl-C
+    // in the terminal reaches only fed, which then ends them.
     let mut forwards = Vec::new();
     for (port, params) in &ports {
         let local = local_port(*port);
         let child = Command::new("ssh")
             .args(remote.base_args())
+            .args(opt("BatchMode=yes"))
             .args(opt("ControlMaster=no"))
             .args(opt("ControlPath=none"))
             .args(opt("ExitOnForwardFailure=yes"))
@@ -1018,58 +1696,88 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
             .arg(format!("{local}:127.0.0.1:{port}"))
             .arg(remote.target())
             .stdin(Stdio::null())
+            .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .context("running ssh")?;
-        out.status(&format!(
-            "  localhost:{local} -> {name}:{port}  ({})",
-            params.join(", ")
-        ));
-        forwards.push((local, child));
+        forwards.push((local, *port, params.join(", "), child));
     }
-    out.status(&format!(
-        "Connected. Ctrl-C to disconnect. {name} deletes itself {IDLE_MINUTES} minutes after the last SSH session ends."
-    ));
 
-    // One listener per signal for the whole loop, so a signal between two
-    // rounds is kept. Each forward is a logged-in session, so a forward left
-    // behind by `kill` or a closed terminal would keep the VM awake.
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut interrupt = signal(SignalKind::interrupt()).context("listening for Ctrl-C")?;
-    let mut terminate = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
-    let mut hangup = signal(SignalKind::hangup()).context("listening for SIGHUP")?;
-    loop {
-        let stopped = {
-            let waits = forwards
-                .iter_mut()
-                .map(|(_, child)| Box::pin(child.wait()))
-                .collect::<Vec<_>>();
-            tokio::select! {
-                _ = interrupt.recv() => None,
-                _ = terminate.recv() => None,
-                _ = hangup.recv() => None,
-                (status, index, _) = futures::future::select_all(waits) => Some((
-                    index,
-                    status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()),
+    let stop_requested = tokio::select! {
+        biased;
+        _ = interrupt.recv() => true,
+        _ = terminate.recv() => true,
+        _ = hangup.recv() => true,
+        _ = tokio::time::sleep(FORWARD_SETTLE) => false,
+    };
+    if !stop_requested {
+        let mut alive = Vec::new();
+        for (local, port, params, mut child) in forwards {
+            match child.try_wait() {
+                Ok(None) => {
+                    out.status(&format!("  localhost:{local} -> {name}:{port}  ({params})"));
+                    alive.push((local, child));
+                }
+                Ok(Some(status)) => out.warning(&format!(
+                    "The forward from localhost:{local} to {name}:{port} stopped ({status})."
+                )),
+                Err(e) => out.warning(&format!(
+                    "The forward from localhost:{local} to {name}:{port} failed: {e}"
                 )),
             }
-        };
-        let Some((index, status)) = stopped else {
-            break;
-        };
-        let (local, _) = forwards.remove(index);
-        out.warning(&format!(
-            "the forward from localhost:{local} stopped ({status})"
-        ));
-        if forwards.is_empty() {
-            bail!("every port forward to {name} stopped");
         }
-    }
-    for (_, child) in &mut forwards {
-        let _ = child.kill().await;
+        let mut forwards = alive;
+        if forwards.is_empty() {
+            return Err(every_forward_stopped(remote).await);
+        }
+        out.status(&format!(
+            "Connected. Press Ctrl-C to disconnect. {name} deletes itself {IDLE_MINUTES} minutes after the last SSH session ends."
+        ));
+        loop {
+            let stopped = {
+                let waits = forwards
+                    .iter_mut()
+                    .map(|(_, child)| Box::pin(child.wait()))
+                    .collect::<Vec<_>>();
+                tokio::select! {
+                    biased;
+                    _ = interrupt.recv() => None,
+                    _ = terminate.recv() => None,
+                    _ = hangup.recv() => None,
+                    (status, index, _) = futures::future::select_all(waits) => Some((
+                        index,
+                        status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()),
+                    )),
+                }
+            };
+            let Some((index, status)) = stopped else {
+                break;
+            };
+            let (local, _) = forwards.remove(index);
+            out.warning(&format!(
+                "The forward from localhost:{local} stopped ({status})."
+            ));
+            if forwards.is_empty() {
+                return Err(every_forward_stopped(remote).await);
+            }
+        }
+        for (_, child) in &mut forwards {
+            let _ = child.kill().await;
+        }
+    } else {
+        for (_, _, _, child) in &mut forwards {
+            let _ = child.kill().await;
+        }
     }
     out.status("Disconnected.");
     Ok(())
+}
+
+async fn every_forward_stopped(remote: &Remote) -> anyhow::Error {
+    if let Some(gone) = remote.deleted().await {
+        return gone;
+    }
+    anyhow!("every port forward to {} stopped.", remote.name())
 }
 
 async fn down(
@@ -1079,16 +1787,22 @@ async fn down(
     out: &dyn UserOutput,
 ) -> Result<()> {
     let creds = credentials()?;
-    let (dir, state) = match find_environment(root, name, project) {
+    let (dir, state) = match find_environment(root, name, project).await {
         Ok(found) => (Some(found.0), found.1),
         Err(not_found) => {
             // Created on another machine: the cloud still knows it by name.
+            // An org admin's list also holds other people's environments,
+            // and only the caller's own count.
             let Some(project) = project else {
                 return Err(not_found);
             };
             let list = api::list_environments(&creds, project).await?;
-            let Some(env) = list.into_iter().find(|e| e.name == name) else {
-                bail!("{project} has no environment called {name} — see `fed remote ls`");
+            let me = my_user_id(&creds, &list).await;
+            let Some(env) = list
+                .into_iter()
+                .find(|e| e.name == name && e.is_owned_by(me.as_deref()))
+            else {
+                bail!("you have no environment called {name} in {project}. See `fed remote ls`.");
             };
             let state = EnvState {
                 id: env.id,
@@ -1106,13 +1820,15 @@ async fn down(
     if let Some(dir) = &dir {
         if let Ok(entries) = std::fs::read_dir(dir.join("tokens")) {
             for entry in entries.flatten() {
-                revoke_token_file(&creds, &entry.path(), out).await;
+                if let Err(e) = revoke_token_file(&creds, &entry.path()).await {
+                    out.warning(&format!(
+                        "Could not revoke a vault token of {name}: {e}. It expires at the environment's deadline."
+                    ));
+                }
             }
         }
-        if !state.ip.is_empty()
-            && let Ok(remote) = Remote::open(dir.clone(), state.clone())
-        {
-            remote.close_connection().await;
+        if !state.ip.is_empty() {
+            close_connection(&control_path(dir, &state.id), &state.ip).await;
         }
     }
 
@@ -1222,6 +1938,7 @@ mod tests {
 
         let mut files: Vec<String> = files_to_push(root)
             .unwrap()
+            .files
             .into_iter()
             .map(|p| String::from_utf8(p).unwrap())
             .collect();
@@ -1331,6 +2048,7 @@ mod tests {
 
     #[test]
     fn ssh_args_carry_every_required_option_and_no_control_master() {
+        // `-F none` comes first, so no option from ~/.ssh/config applies.
         let args: Vec<String> = ssh_base_args(Path::new("/s/env"), 23456)
             .into_iter()
             .map(|a| a.into_string().unwrap())
@@ -1338,6 +2056,8 @@ mod tests {
         assert_eq!(
             args,
             [
+                "-F",
+                "none",
                 "-i",
                 "/s/env/client_key",
                 "-p",
@@ -1401,19 +2121,205 @@ mod tests {
         save(root, &state("id-3", "other", "web"));
         std::fs::create_dir_all(root.join(".new-123")).unwrap();
 
-        let (_, found) = find_environment(root, "other", None).unwrap();
-        assert_eq!(found.id, "id-3");
-        let err = find_environment(root, "box", None).unwrap_err().to_string();
-        assert!(err.contains("several projects"), "{err}");
+        let found = |name, project: Option<&api::ProjectRef>| match lookup(root, name, project) {
+            Lookup::Found(_, state) => Some(state.id),
+            Lookup::Missing => None,
+            Lookup::Ambiguous(all) => Some(format!("{} matches", all.len())),
+        };
+        assert_eq!(found("other", None).as_deref(), Some("id-3"));
+        assert_eq!(found("box", None).as_deref(), Some("2 matches"));
         let api_project = api::ProjectRef {
             org: "acme".into(),
             project: "api".into(),
         };
-        let (_, found) = find_environment(root, "box", Some(&api_project)).unwrap();
-        assert_eq!(found.id, "id-2");
-        let err = find_environment(root, "nope", None)
+        assert_eq!(found("box", Some(&api_project)).as_deref(), Some("id-2"));
+        let elsewhere = api::ProjectRef {
+            org: "acme".into(),
+            project: "cli".into(),
+        };
+        assert_eq!(found("box", Some(&elsewhere)).as_deref(), Some("2 matches"));
+        assert_eq!(found("nope", None), None);
+    }
+
+    #[test]
+    fn submodules_are_found_by_their_mode() {
+        let staged =
+            b"100644 aaaa 0\tsrc/main.rs\x00160000 bbbb 0\tvendor/lib\x00120000 cccc 0\tlink\0";
+        assert_eq!(submodule_paths(staged), vec![b"vendor/lib".to_vec()]);
+        assert!(submodule_paths(b"").is_empty());
+    }
+
+    #[test]
+    fn stale_staging_dirs_are_removed_and_fresh_ones_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let staging = root.join(".new-0123");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("host_key"), "private").unwrap();
+        let env = save(root, &state("id-1", "box", "web"));
+        let now = std::time::SystemTime::now();
+        remove_stale_staging(root, now);
+        assert!(staging.exists(), "a staging dir from a running up stays");
+        remove_stale_staging(root, now + STALE_STAGING + Duration::from_secs(60));
+        assert!(!staging.exists());
+        assert!(env.exists(), "environment state is not staging");
+    }
+
+    #[test]
+    fn versions_parse_from_fed_version_output() {
+        assert_eq!(parse_version("fed 8.3.0\n"), Some([8, 3, 0]));
+        assert_eq!(parse_version("8.10.2"), Some([8, 10, 2]));
+        assert_eq!(parse_version("v1.2.3"), Some([1, 2, 3]));
+        assert_eq!(parse_version("fed 8.4.0-rc.1"), None);
+        assert_eq!(parse_version("fed 8.4"), None);
+        assert_eq!(parse_version("fed 1.2.3.4"), None);
+        assert_eq!(parse_version(""), None);
+        assert!(parse_version("fed 8.10.0") > parse_version("fed 8.9.9"));
+    }
+
+    #[test]
+    fn install_script_downloads_the_release_and_checks_it() {
+        let script = install_fed_script([8, 4, 0]);
+        assert!(
+            script.contains(
+                "https://github.com/service-federation/fed/releases/download/v8.4.0/fed-$t.tar.xz"
+            ),
+            "{script}"
+        );
+        assert!(script.contains("sha256sum -c"), "{script}");
+        assert!(script.contains("/usr/local/bin/fed"), "{script}");
+        assert!(script.contains(&format!("exit {NO_RELEASE}")), "{script}");
+    }
+
+    #[test]
+    fn openrsync_is_told_apart_from_rsync() {
+        assert!(is_openrsync(
+            "openrsync: protocol version 29\nrsync version 2.6.9 compatible\n"
+        ));
+        assert!(!is_openrsync(
+            "rsync  version 3.2.7  protocol version 31\nCopyright (C) 1996-2022\n"
+        ));
+        assert!(!is_openrsync("rsync  version 2.6.9  protocol version 29\n"));
+    }
+
+    #[test]
+    fn rsync_shell_quotes_spaces_and_refuses_a_quote() {
+        let shell = rsync_shell(ssh_base_args(Path::new("/Users/a b/env"), 1)).unwrap();
+        assert!(
+            shell.starts_with("ssh -F none -i '/Users/a b/env/client_key'"),
+            "{shell}"
+        );
+        let err = rsync_shell(ssh_base_args(Path::new("/Users/o'neil/env"), 1))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("fed remote up nope"), "{err}");
+        assert!(err.contains("contains a ' character"), "{err}");
+    }
+
+    #[test]
+    fn ssh_commands_keep_their_quoting_and_run_in_the_workspace() {
+        let words: Vec<String> = ["echo", "a b", "it's", "$HOME"].map(String::from).to_vec();
+        assert_eq!(
+            remote_command("box", None, &words),
+            r#"echo 'a b' 'it'\''s' '$HOME'"#
+        );
+        let in_ws = remote_command("box", Some("app"), &words);
+        assert!(
+            in_ws.starts_with("cd /srv/app 2>/dev/null || { echo "),
+            "{in_ws}"
+        );
+        assert!(
+            in_ws.ends_with(r#"exit 1; }; echo 'a b' 'it'\''s' '$HOME'"#),
+            "{in_ws}"
+        );
+        assert_eq!(remote_shell(None), None);
+        assert_eq!(
+            remote_shell(Some("app")).unwrap(),
+            r#"cd /srv/app 2>/dev/null; exec "${SHELL:-/bin/sh}" -l"#
+        );
+    }
+
+    /// The push cleanup runs with the real tools on a copy of a workspace:
+    /// files the last push copied and this one does not are deleted, build
+    /// output, fed's state and anything outside the workspace stay.
+    #[test]
+    fn push_cleanup_deletes_only_files_an_earlier_push_copied() {
+        let comm_z = std::process::Command::new("comm")
+            .args(["-z", "/dev/null", "/dev/null"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !comm_z {
+            eprintln!("skipped: this machine's comm has no -z");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        // The script compares resolved paths, and /var is a symlink on macOS.
+        let srv = tmp.path().canonicalize().unwrap().join("srv");
+        let ws = srv.join("app");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(ws.join("src/old")).unwrap();
+        std::fs::create_dir_all(ws.join(".fed")).unwrap();
+        std::fs::create_dir_all(ws.join("node_modules")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        for file in [
+            "keep.txt",
+            "gone.txt",
+            "src/old/gone.rs",
+            "node_modules/x.js",
+            ".fed/lock.db",
+        ] {
+            std::fs::write(ws.join(file), "x").unwrap();
+        }
+        std::fs::write(outside.join("victim"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("escape")).unwrap();
+        std::fs::write(
+            ws.join(PUSH_MANIFEST),
+            b"keep.txt\0gone.txt\0src/old/gone.rs\0escape/victim\0",
+        )
+        .unwrap();
+
+        let script = push_cleanup_script("app").replace("/srv/", &format!("{}/", srv.display()));
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"keep.txt\0new.txt\0")
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+
+        assert!(ws.join("keep.txt").exists());
+        assert!(!ws.join("gone.txt").exists());
+        assert!(!ws.join("src").exists(), "emptied folders go too");
+        assert!(ws.join("node_modules/x.js").exists());
+        assert!(ws.join(".fed/lock.db").exists());
+        assert!(outside.join("victim").exists());
+        assert_eq!(
+            std::fs::read(ws.join(PUSH_MANIFEST)).unwrap(),
+            b"keep.txt\0new.txt\0"
+        );
+    }
+
+    #[test]
+    fn deleted_message_says_why_and_what_to_do() {
+        assert_eq!(
+            deleted_message("box"),
+            "box was deleted (it was idle for 5 minutes or reached its 6-hour limit). Create it again with `fed remote up box`."
+        );
+    }
+
+    #[test]
+    fn a_passed_deadline_is_noticed() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-10T15:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(deadline_passed("2026-10-10T14:59:59Z", now));
+        assert!(!deadline_passed("2026-10-10T15:00:01Z", now));
+        assert!(!deadline_passed("garbage", now));
     }
 }
