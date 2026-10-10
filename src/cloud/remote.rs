@@ -320,7 +320,13 @@ pub async fn create_environment(
         return Err(Error::Validation(INVALID_ENVIRONMENT_NAME.into()));
     }
     let url = api_url(&creds.url, &environments_path(project))?;
-    let res = send(client().post(url).timeout(CREATE_TIMEOUT).json(body), creds).await?;
+    // `fed remote up` stops waiting at CREATE_TIMEOUT and then checks the
+    // list. This later limit only ends a request nobody waits for.
+    let req = client()
+        .post(url)
+        .timeout(CREATE_TIMEOUT + Duration::from_secs(60))
+        .json(body);
+    let res = send(req, creds).await?;
     if !res.status().is_success() {
         let request = EnvironmentRequest::Create {
             name: body.name,
