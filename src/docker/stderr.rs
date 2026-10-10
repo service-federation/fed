@@ -47,9 +47,27 @@ pub fn stderr_indicates_pull_noop(stderr: &str) -> bool {
     lower.contains("up to date") || lower.contains("already exists")
 }
 
+/// Whether a failed `pull` says the image has no build for the platform
+/// asked for (the host's, when no `--platform` was passed).
+pub fn stderr_indicates_no_matching_platform(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("no matching manifest for")
+        || lower.contains("no match for platform in manifest")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_matching_platform_matches_dockers_phrasing() {
+        assert!(stderr_indicates_no_matching_platform(
+            "Error response from daemon: no matching manifest for linux/arm64/v8 in the manifest list entries: no match for platform in manifest: not found"
+        ));
+        assert!(!stderr_indicates_no_matching_platform(
+            "Error response from daemon: pull access denied for app"
+        ));
+    }
 
     #[test]
     fn missing_container_matches_dockers_phrasing() {

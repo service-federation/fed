@@ -396,6 +396,21 @@ Before you add a token:
 
 `registry_auth` covers `image:` services and the image pull before `fed start`. Compose services and the base images of Dockerfile `build:` services still pull with your own Docker credentials.
 
+### Images for another architecture
+
+When an image is published only for `linux/amd64`, the pull fails on an Apple Silicon Mac with `no matching manifest for linux/arm64/v8`. Set `platform:` on the service:
+
+```yaml
+services:
+  presentation:
+    image: example/presentation:latest
+    platform: linux/amd64
+```
+
+fed passes `--platform` to the pull and to `docker run`. Docker Desktop runs the container under emulation (Rosetta), which is slower than a native build. A local copy of the image for another platform does not count, so fed pulls the one you asked for.
+
+`platform:` is valid only next to `image:`. In a service with variants, put it in the variant that sets the image. It does not change Dockerfile `build:` services or Compose services.
+
 ## Documentation and examples
 
 - [Quickstart](https://www.service-federation.com/docs/)

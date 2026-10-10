@@ -2879,17 +2879,18 @@ impl Orchestrator {
     pub async fn pre_pull_images(&self, services: &[String]) -> Vec<ImagePullResult> {
         use crate::docker::DockerClient;
 
-        // Collect unique images from Docker-type services, with the platform
-        // each one is pulled for
-        let mut images: Vec<String> = Vec::new();
-        let mut platforms: HashMap<String, Option<String>> = HashMap::new();
+        // Collect unique (image, platform) pairs from Docker-type services.
+        // Two services may run one image for different platforms, and each
+        // needs its own pull.
+        let mut images: Vec<(String, Option<String>)> = Vec::new();
         for name in services {
             if let Some(svc) = self.config.services.get(name)
                 && let Some(ref image) = svc.image
-                && !images.contains(image)
             {
-                images.push(image.clone());
-                platforms.insert(image.clone(), svc.platform.clone());
+                let pair = (image.clone(), svc.platform.clone());
+                if !images.contains(&pair) {
+                    images.push(pair);
+                }
             }
         }
 
@@ -2902,23 +2903,22 @@ impl Orchestrator {
 
         // Check which images exist locally (parallel)
         let exist_checks: Vec<_> = images
-            .iter()
-            .map(|img| {
+            .into_iter()
+            .map(|(img, platform)| {
                 let client = client.clone();
-                let img = img.clone();
                 async move {
-                    let exists = client.image_exists(&img).await;
-                    (img, exists)
+                    let exists = client.image_exists(&img, platform.as_deref()).await;
+                    (img, platform, exists)
                 }
             })
             .collect();
         let exist_results = futures::future::join_all(exist_checks).await;
 
         // Filter to only missing images
-        let missing: Vec<String> = exist_results
+        let missing: Vec<(String, Option<String>)> = exist_results
             .into_iter()
-            .filter(|(_, exists)| !exists)
-            .map(|(img, _)| img)
+            .filter(|(_, _, exists)| !exists)
+            .map(|(img, platform, _)| (img, platform))
             .collect();
 
         if missing.is_empty() {
@@ -2928,12 +2928,10 @@ impl Orchestrator {
         // Pull missing images in parallel
         let pull_timeout = Duration::from_secs(300); // 5 minutes, matches DOCKER_PULL_TIMEOUT
         let pull_futures: Vec<_> = missing
-            .iter()
-            .map(|img| {
+            .into_iter()
+            .map(|(img, platform)| {
                 let client = client.clone();
-                let img = img.clone();
                 let credential = credentials.for_image(&img).cloned();
-                let platform = platforms.get(&img).cloned().flatten();
                 async move {
                     let outcome = match client
                         .pull_with_credential(
@@ -2949,6 +2947,7 @@ impl Orchestrator {
                     };
                     ImagePullResult {
                         image: img,
+                        platform,
                         outcome,
                     }
                 }
@@ -2962,6 +2961,8 @@ impl Orchestrator {
 /// Result of a Docker image pull attempt.
 pub struct ImagePullResult {
     pub image: String,
+    /// The service's `platform:`, when it sets one.
+    pub platform: Option<String>,
     pub outcome: std::result::Result<(), String>,
 }
 

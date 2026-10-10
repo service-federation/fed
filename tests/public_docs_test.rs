@@ -46,3 +46,28 @@ fn readme_registry_auth_config_is_valid() {
         .expect("README registry_auth YAML must pass fed validation");
     assert!(config.registry_auth.contains_key("ghcr.io"));
 }
+
+#[test]
+fn readme_image_platform_config_is_valid() {
+    let readme = include_str!("../README.md");
+    let section = readme
+        .split_once("### Images for another architecture")
+        .expect("README must keep an 'Images for another architecture' section")
+        .1;
+    let yaml = section
+        .split_once("```yaml")
+        .expect("platform section must contain a YAML example")
+        .1
+        .split_once("```")
+        .expect("platform YAML block must be closed")
+        .0;
+
+    let config = support::parse_checked(yaml);
+    config
+        .validate()
+        .expect("README platform YAML must pass fed validation");
+    assert_eq!(
+        config.services["presentation"].platform.as_deref(),
+        Some("linux/amd64")
+    );
+}
