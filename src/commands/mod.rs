@@ -19,7 +19,10 @@ mod logs;
 mod package;
 mod ports;
 mod prune;
-#[cfg(feature = "remote-beta")]
+#[cfg(all(unix, feature = "remote-beta"))]
+mod remote;
+#[cfg(all(not(unix), feature = "remote-beta"))]
+#[path = "remote_unsupported.rs"]
 mod remote;
 mod restart;
 mod script;
