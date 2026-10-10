@@ -283,6 +283,11 @@ pub enum Commands {
     #[command(subcommand)]
     Secrets(SecretsCommands),
 
+    /// Remote environments in Service Federation Cloud (beta)
+    #[cfg(feature = "remote-beta")]
+    #[command(subcommand)]
+    Remote(RemoteCommands),
+
     /// Manage git worktrees for isolated service stacks
     #[command(subcommand, alias = "ws")]
     Workspace(WorkspaceCommands),
@@ -345,6 +350,61 @@ pub enum SecretsCommands {
     /// Remove a secret from the linked project (org admins only)
     Rm {
         /// Secret name
+        name: String,
+    },
+}
+
+/// Subcommands of `fed remote`. They act on the project in the checkout's
+/// `.fed/cloud.yaml`.
+#[cfg(feature = "remote-beta")]
+#[derive(Subcommand)]
+pub enum RemoteCommands {
+    /// Create a remote environment for the linked project
+    Up {
+        /// Environment name (lowercase letters, digits and -; defaults to env-HHMMSS)
+        name: Option<String>,
+        /// Server type (defaults to DEV1-S)
+        #[arg(long = "type", value_name = "TYPE")]
+        kind: Option<String>,
+    },
+    /// List your remote environments in the linked project
+    #[command(alias = "list")]
+    Ls,
+    /// Copy this checkout to /srv/<workspace> on the environment
+    Push {
+        /// Environment name
+        name: String,
+        /// Workspace name on the environment (defaults to the checkout's folder name)
+        #[arg(long = "as", value_name = "WORKSPACE")]
+        workspace: Option<String>,
+    },
+    /// Copy this checkout to the environment and run `fed start` there
+    Start {
+        /// Environment name
+        name: String,
+        /// Workspace name on the environment (defaults to the checkout's folder name)
+        #[arg(long = "as", value_name = "WORKSPACE")]
+        workspace: Option<String>,
+    },
+    /// Forward the workspace's ports to this machine until Ctrl-C
+    Connect {
+        /// Environment name
+        name: String,
+        /// Workspace name on the environment (defaults to the checkout's folder name)
+        #[arg(long = "as", value_name = "WORKSPACE")]
+        workspace: Option<String>,
+    },
+    /// Open a shell on the environment, or run a command after --
+    Ssh {
+        /// Environment name
+        name: String,
+        /// Command to run instead of a shell
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Delete the environment and this machine's keys for it
+    Down {
+        /// Environment name
         name: String,
     },
 }

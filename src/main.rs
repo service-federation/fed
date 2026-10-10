@@ -327,6 +327,10 @@ async fn run() -> anyhow::Result<()> {
         Commands::Secrets(secrets_cmd) => {
             return commands::run_secrets(secrets_cmd, cli.workdir.clone(), &out).await;
         }
+        #[cfg(feature = "remote-beta")]
+        Commands::Remote(remote_cmd) => {
+            return commands::run_remote(remote_cmd, cli.workdir.clone(), &out).await;
+        }
         Commands::Isolate(isolate_cmd) => {
             return commands::run_isolate(
                 isolate_cmd,
@@ -908,6 +912,10 @@ async fn run() -> anyhow::Result<()> {
             }
             #[cfg(unix)]
             Commands::Host { .. } => {
+                unreachable!("handled in earlier dispatch tiers");
+            }
+            #[cfg(feature = "remote-beta")]
+            Commands::Remote(_) => {
                 unreachable!("handled in earlier dispatch tiers");
             }
         }

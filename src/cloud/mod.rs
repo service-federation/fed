@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "remote-beta")]
+pub mod remote;
+
 pub const DEFAULT_URL: &str = "https://app.service-federation.com";
 
 // ── Credentials (~/.fed/credentials) ─────────────────────────────────
