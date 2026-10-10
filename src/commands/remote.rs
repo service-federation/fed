@@ -32,6 +32,9 @@ const PORT_OFFSET: u16 = 10_000;
 /// How long `connect` waits before it reports the forwards as up. A forward
 /// whose local port is taken fails within this time.
 const FORWARD_SETTLE: Duration = Duration::from_secs(1);
+/// How long a connection may take before fed asks the cloud whether the
+/// environment still exists.
+const SLOW_CONNECT: Duration = Duration::from_secs(2);
 /// rsync's exit status when some files vanished during the copy. The rest
 /// were copied.
 const RSYNC_VANISHED: i32 = 24;
@@ -744,9 +747,50 @@ impl Remote {
             .await
             .map(|s| s.success())
             .unwrap_or(false);
-        if open {
+        // A machine whose `fed remote up` was interrupted may still be setting
+        // up, so a new connection waits for that. On a set-up machine it
+        // returns at once. The probe ends with `true`, so only a failed
+        // connection fails it.
+        let probe = if open {
+            "true"
+        } else {
+            self.start_master().await?;
+            "cloud-init status --wait >/dev/null 2>&1; true"
+        };
+        // A master that has not yet noticed its machine is gone passes the
+        // check, and fails the first session. The probe takes that failure,
+        // with its stderr, before a command with the terminal's streams can.
+        let out = self
+            .or_gone(
+                self.ssh()
+                    .arg(self.target())
+                    .arg(probe)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await?
+            .context("running ssh")?;
+        if out.status.success() {
             return Ok(());
         }
+        Err(self
+            .failure(
+                connect_error(
+                    self.name(),
+                    out.status,
+                    &String::from_utf8_lossy(&out.stderr),
+                ),
+                ssh_lost(out.status),
+            )
+            .await)
+    }
+
+    /// Start the shared connection. Its stderr goes to `ssh.log`, for the
+    /// error when it fails.
+    async fn start_master(&self) -> Result<()> {
         // A socket left by a crashed master would make the new one fail to
         // listen and stay up as a plain session with no ControlPersist limit.
         let _ = std::fs::remove_file(&self.control);
@@ -765,39 +809,32 @@ impl Remote {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log)
-            .status()
-            .await
-            .context("running ssh")?;
+            .kill_on_drop(true)
+            .status();
+        let status = self.or_gone(status).await?.context("running ssh")?;
         if status.success() {
-            // A machine whose `fed remote up` was interrupted may still be
-            // setting up. Each new connection waits for that, which on a set-up
-            // machine returns at once.
-            let _ = self
-                .ssh()
-                .arg(self.target())
-                .arg("cloud-init status --wait >/dev/null 2>&1")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
             return Ok(());
         }
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        let detail = log
-            .lines()
-            .rfind(|l| !l.trim().is_empty())
-            .map(|l| format!(" ssh said: {}", l.trim()))
-            .unwrap_or_default();
         Err(self
-            .failure(
-                format!(
-                    "cannot connect to {} over SSH ({status}).{detail}",
-                    self.name()
-                ),
-                ssh_lost(status),
-            )
+            .failure(connect_error(self.name(), status, &log), ssh_lost(status))
             .await)
+    }
+
+    /// Wait for `connecting`. When it takes longer than `SLOW_CONNECT`, ask
+    /// the cloud whether the environment still exists, so a deleted one does
+    /// not keep the user waiting for ssh's timeout. A gone environment drops
+    /// `connecting`, which ends its ssh.
+    async fn or_gone<T>(&self, connecting: impl std::future::Future<Output = T>) -> Result<T> {
+        tokio::pin!(connecting);
+        tokio::select! {
+            done = &mut connecting => return Ok(done),
+            _ = tokio::time::sleep(SLOW_CONNECT) => {}
+        }
+        if let Some(gone) = self.deleted().await {
+            return Err(gone);
+        }
+        Ok(connecting.await)
     }
 
     /// The error for a failed ssh or rsync call. When the connection was
@@ -923,6 +960,40 @@ impl Remote {
             .map(|s| s.success())
             .unwrap_or(false)
     }
+}
+
+/// The error for a connection that failed, with the last line ssh printed.
+fn connect_error(name: &str, status: ExitStatus, ssh_stderr: &str) -> String {
+    let detail = ssh_stderr
+        .lines()
+        .rfind(|l| !l.trim().is_empty())
+        .map(|l| format!(" ssh said: {}", l.trim()))
+        .unwrap_or_default();
+    format!("cannot connect to {name} over SSH ({status}).{detail}")
+}
+
+/// Whether `cloud-init status --wait` exit `code` means the machine is set
+/// up. 2 is "done, with recoverable errors", such as a metadata fetch that
+/// failed once early in boot.
+pub(crate) fn cloud_init_done(code: Option<i32>) -> bool {
+    matches!(code, Some(0 | 2))
+}
+
+/// The entries under `errors:` in `cloud-init status --long`.
+pub(crate) fn cloud_init_errors(long: &str) -> Vec<String> {
+    let mut lines = long.lines().skip_while(|l| !l.starts_with("errors:"));
+    let Some(first) = lines.next() else {
+        return Vec::new();
+    };
+    let inline = first["errors:".len()..].trim();
+    if !inline.is_empty() && inline != "[]" {
+        return vec![inline.to_string()];
+    }
+    lines
+        .take_while(|l| l.starts_with(char::is_whitespace) || l.starts_with('-'))
+        .map(|l| l.trim().trim_start_matches("- ").to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 /// Whether ssh lost or never got its connection: it exits with 255 then.
@@ -1319,9 +1390,28 @@ async fn wait_until_ready(
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     out.finish_progress(&format!("after {}s", start.elapsed().as_secs()));
-    remote
-        .run_checked("cloud-init status --wait >/dev/null", "cloud-init")
+    let status = remote.run("cloud-init status --wait >/dev/null").await?;
+    if cloud_init_done(status.code()) {
+        return Ok(());
+    }
+    if ssh_lost(status) {
+        return Err(remote
+            .failure(format!("cannot reach {name} over SSH ({status})."), true)
+            .await);
+    }
+    let long = remote
+        .output("cloud-init status --long", "cloud-init status")
         .await
+        .unwrap_or_default();
+    let errors = cloud_init_errors(&long);
+    let detail = if errors.is_empty() {
+        String::new()
+    } else {
+        format!(" Its errors: {}", errors.join(" | "))
+    };
+    bail!(
+        "{name} failed to set itself up ({status}).{detail} Delete it with `fed remote down {name}` and try again."
+    )
 }
 
 /// Make the keys in `staging` and ask the cloud for the environment. The host
@@ -2396,5 +2486,44 @@ mod tests {
         assert!(deadline_passed("2026-10-10T14:59:59Z", now));
         assert!(!deadline_passed("2026-10-10T15:00:01Z", now));
         assert!(!deadline_passed("garbage", now));
+    }
+
+    #[test]
+    fn cloud_init_done_with_recoverable_errors_counts_as_done() {
+        assert!(cloud_init_done(Some(0)));
+        assert!(cloud_init_done(Some(2)));
+        assert!(!cloud_init_done(Some(1)));
+        assert!(!cloud_init_done(Some(255)));
+        assert!(!cloud_init_done(None));
+    }
+
+    #[test]
+    fn cloud_init_errors_are_read_from_the_long_status() {
+        let failed = "status: error\nextended_status: error - done\nerrors:\n\t- ('init', RuntimeError('boom'))\n\t- second\nrecoverable_errors:\nWARNING:\n\t- fetch failed\n";
+        assert_eq!(
+            cloud_init_errors(failed),
+            vec!["('init', RuntimeError('boom'))", "second"]
+        );
+        let degraded =
+            "status: done\nerrors: []\nrecoverable_errors:\nWARNING:\n\t- fetch failed\n";
+        assert!(cloud_init_errors(degraded).is_empty());
+        assert!(cloud_init_errors("").is_empty());
+    }
+
+    #[test]
+    fn a_connect_error_ends_with_what_ssh_said() {
+        let status = std::os::unix::process::ExitStatusExt::from_raw(255 << 8);
+        assert_eq!(
+            connect_error(
+                "box",
+                status,
+                "debug\nssh: connect to host 1.2.3.4 port 22: Operation timed out\n\n"
+            ),
+            "cannot connect to box over SSH (exit status: 255). ssh said: ssh: connect to host 1.2.3.4 port 22: Operation timed out"
+        );
+        assert_eq!(
+            connect_error("box", status, ""),
+            "cannot connect to box over SSH (exit status: 255)."
+        );
     }
 }

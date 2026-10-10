@@ -131,7 +131,9 @@ mod with_feature {
     /// Logs every call as `name [arg] [arg] ...`, one line each, written at
     /// once so that parallel calls do not mix. Keeps each command's stdin in
     /// `<log>.stdin.<pid>`. `FAKE_SSH=dead` makes every connection fail as
-    /// for a deleted machine. `FAKE_FORWARD=hold` keeps a port forward running
+    /// for a deleted machine, and `FAKE_SSH=stale` for a master that has not
+    /// noticed yet. `FAKE_CLOUD_INIT` is the exit status of the setup wait
+    /// in `up`. `FAKE_FORWARD=hold` keeps a port forward running
     /// and writes its pid to `<log>.forward.<pid>`.
     const FAKE_SSH: &str = r#"#!/bin/sh
 line=ssh; for a in "$@"; do line="$line [$a]"; done
@@ -142,6 +144,14 @@ if [ "$1" = -V ]; then echo "OpenSSH_9.8p1" >&2; exit 0; fi
 opts=""; last=""
 for a in "$@"; do opts="$opts $last"; last="$a"; done
 if [ "$FAKE_SSH" = dead ]; then
+  echo "ssh: connect to host 203.0.113.7 port 23456: Operation timed out" >&2
+  exit 255
+fi
+if [ "$FAKE_SSH" = stale ]; then
+  # A master that has not noticed its machine is gone: the check passes,
+  # every session fails.
+  case "$opts " in *" -O "*) exit 0 ;; esac
+  echo "mux_client_request_session: read from master failed: Broken pipe" >&2
   echo "ssh: connect to host 203.0.113.7 port 23456: Operation timed out" >&2
   exit 255
 fi
@@ -158,6 +168,9 @@ case "$opts " in
 esac
 case "$last" in
   "fed --version") echo "fed ${FAKE_VM_FED:-999.0.0}" ;;
+  "cloud-init status --wait >/dev/null") exit "${FAKE_CLOUD_INIT:-0}" ;;
+  "cloud-init status --long")
+    printf 'status: error\nerrors:\n\t- (%s)\nrecoverable_errors: {}\n' "'init', RuntimeError('disk full')" ;;
   *"fed ports list --json"*) echo '{"WEB_PORT": 18080, "DB_PORT": 15432}' ;;
   *) cat > "$FAKE_LOG.stdin.$$" ;;
 esac
@@ -622,10 +635,75 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 "{command}: {output}"
             );
             assert!(
+                !output.contains("ssh: connect to host"),
+                "{command}: ssh's own text is left out: {output}"
+            );
+            assert!(
                 setup.remote_dirs().is_empty(),
                 "{command}: {:?}",
                 setup.remote_dirs()
             );
+        }
+    }
+
+    /// The shared connection passes its check but its machine is gone. fed
+    /// prints the reason, not ssh's lines, unless the machine still exists.
+    #[test]
+    fn a_stale_connection_to_a_deleted_environment_prints_only_the_reason() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let cloud = Cloud::start(vec![(WEB, "200 OK", list(&[]))]);
+        let (ok, output) = setup.fed(
+            &cloud.url,
+            &["remote", "start", "box"],
+            &[("FAKE_SSH", "stale")],
+        );
+        assert!(!ok, "{output}");
+        assert!(output.contains("Error: box no longer exists."), "{output}");
+        assert!(!output.contains("mux_client"), "{output}");
+        assert!(!output.contains("ssh: connect to host"), "{output}");
+
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let cloud = Cloud::start(vec![(WEB, "200 OK", list(&[environment("env-1", "box")]))]);
+        let (ok, output) = setup.fed(
+            &cloud.url,
+            &["remote", "push", "box"],
+            &[("FAKE_SSH", "stale")],
+        );
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains("Error: cannot connect to box over SSH (exit status: 255). ssh said: ssh: connect to host 203.0.113.7 port 23456: Operation timed out"),
+            "{output}"
+        );
+        assert_eq!(setup.remote_dirs(), vec!["env-1"]);
+    }
+
+    /// cloud-init exits with 2 when it finished with recoverable errors only.
+    /// The machine is fine then. Exit 1 is a failure, with cloud-init's errors.
+    #[test]
+    fn up_accepts_cloud_init_done_with_recoverable_errors() {
+        for (code, ready) in [("2", true), ("1", false)] {
+            let setup = Setup::new();
+            let cloud = Cloud::start(vec![(
+                "POST /api/v1/orgs/acme/projects/web/environments ",
+                "201 Created",
+                environment("env-1", "box").to_string(),
+            )]);
+            let (ok, output) = setup.fed(
+                &cloud.url,
+                &["remote", "up", "box"],
+                &[("FAKE_CLOUD_INIT", code)],
+            );
+            assert_eq!(ok, ready, "{code}: {output}");
+            if ready {
+                assert!(output.contains("box is ready"), "{output}");
+            } else {
+                assert!(
+                    output.contains("Error: box failed to set itself up (exit status: 1). Its errors: ('init', RuntimeError('disk full')) Delete it with `fed remote down box` and try again."),
+                    "{output}"
+                );
+            }
         }
     }
 
