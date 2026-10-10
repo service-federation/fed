@@ -25,10 +25,9 @@ path = "src/main.rs"
 # skipped, and with it they run.
 docker-tests = []
 # `fed remote`: disposable remote environments in Service Federation Cloud.
-# A closed beta, OFF by default and never enabled in release builds. Beta
-# testers install with
+# OFF by default and not in release builds yet. Install it with
 # `cargo install --git https://github.com/service-federation/fed --features remote-beta`.
-# See docs/remote-beta.md.
+# See docs/remote.md.
 remote-beta = []
 
 [dependencies]
