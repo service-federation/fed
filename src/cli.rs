@@ -359,6 +359,12 @@ pub enum SecretsCommands {
 #[cfg(feature = "remote-beta")]
 #[derive(Subcommand)]
 pub enum RemoteCommands {
+    /// Internal pipe-owned SSH process supervisor.
+    #[command(name = "forward-supervisor", hide = true)]
+    Forward {
+        #[arg(last = true)]
+        args: Vec<std::ffi::OsString>,
+    },
     /// Create a remote environment for the linked project
     Up {
         /// Environment name (lowercase letters, digits and -; defaults to env-HHMMSS)

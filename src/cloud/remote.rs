@@ -233,6 +233,7 @@ pub fn environment_error(
         (_, Some("cleanup_unavailable"), _) => "Service Federation Cloud has paused new remote environments for a moment. Try again in a few minutes.".to_string(),
         (_, Some("capacity"), _) => "Service Federation Cloud has no room for new remote environments right now. Try again in a few minutes.".to_string(),
         (_, Some("compute_unavailable"), _) => "Service Federation Cloud cannot create remote environments right now. Try again later, or ask a Service Federation admin.".to_string(),
+        (_, _, Some("create_rate")) => "you have reached the hourly remote environment creation limit, including failed attempts. Wait before trying again.".to_string(),
         (_, _, Some("user_environments")) => "you already have as many remote environments as one person may have. Delete one with `fed remote down NAME`, or wait until one deletes itself.".to_string(),
         (_, _, Some("max_environments")) => format!(
             "{org} already has as many remote environments as it may have. Delete one with `fed remote down NAME`, or wait until one deletes itself."
@@ -245,7 +246,7 @@ pub fn environment_error(
             format!("{org} may not create {kind} environments. Pick another type with `--type`.")
         }
         (_, _, Some("monthly_hours")) => format!(
-            "{org} has used all its remote environment hours for this month."
+            "{org} does not have enough unreserved remote environment hours for another full lifetime this month."
         ),
         (_, _, Some(_)) => format!("{org} has reached a limit for remote environments."),
         (409, Some("name_taken"), _) => match created {
@@ -669,8 +670,13 @@ mod tests {
             ),
             (
                 "422 Unprocessable Entity",
+                r#"{"error":"limit","limit":"create_rate"}"#,
+                "you have reached the hourly remote environment creation limit, including failed attempts. Wait before trying again.",
+            ),
+            (
+                "422 Unprocessable Entity",
                 r#"{"error":"limit","limit":"monthly_hours"}"#,
-                "acme has used all its remote environment hours for this month.",
+                "acme does not have enough unreserved remote environment hours for another full lifetime this month.",
             ),
             (
                 "422 Unprocessable Entity",

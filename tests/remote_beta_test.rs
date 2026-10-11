@@ -950,10 +950,10 @@ exit "${FAKE_RSYNC_EXIT:-0}"
     }
 
     /// A port forward is a logged-in session that keeps the machine awake.
-    /// When `connect` gets SIGTERM or SIGHUP, it ends every forward.
+    /// Signals and uncatchable owner death must end every forward.
     #[test]
-    fn connect_ends_its_forwards_on_sigterm_and_sighup() {
-        for signal in ["TERM", "HUP"] {
+    fn connect_ends_its_forwards_even_when_the_owner_is_killed() {
+        for signal in ["TERM", "HUP", "KILL"] {
             let setup = Setup::new();
             setup.save("env-1", "box", "web");
             let path = format!(
@@ -961,6 +961,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 setup.home().join("bin").display(),
                 std::env::var("PATH").unwrap_or_default()
             );
+            let output_path = setup.home().join("connect-output");
             let child = Command::new(fed_binary())
                 .arg("--workdir")
                 .arg(&setup.checkout)
@@ -971,7 +972,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 .env("FAKE_FORWARD", "hold")
                 .env("FED_TOKEN", "fed_test-token")
                 .env("FED_CLOUD_URL", "http://127.0.0.1:9")
-                .stdout(std::process::Stdio::piped())
+                .stdout(std::fs::File::create(&output_path).unwrap())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
@@ -997,8 +998,16 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            // Past the moment `connect` reports the forwards as up.
-            std::thread::sleep(std::time::Duration::from_millis(1500));
+            while !std::fs::read_to_string(&output_path)
+                .unwrap()
+                .contains("Connected.")
+            {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(20),
+                    "connect did not become ready"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
             let forwards = pid_files();
             assert!(forwards.iter().all(|pid| alive(*pid)), "{forwards:?}");
 
@@ -1011,12 +1020,18 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             let output = child.wait_with_output().unwrap();
             let text = format!(
                 "{}{}",
-                String::from_utf8_lossy(&output.stdout),
+                std::fs::read_to_string(&output_path).unwrap(),
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert!(output.status.success(), "{signal}: {text}");
+            assert_eq!(
+                output.status.success(),
+                signal != "KILL",
+                "{signal}: {text}"
+            );
             assert!(text.contains("Connected."), "{signal}: {text}");
-            assert!(text.contains("Disconnected."), "{signal}: {text}");
+            if signal != "KILL" {
+                assert!(text.contains("Disconnected."), "{signal}: {text}");
+            }
             let start = std::time::Instant::now();
             while forwards.iter().any(|pid| alive(*pid)) {
                 assert!(
