@@ -439,18 +439,11 @@ pub(crate) fn deleted_message(name: &str) -> String {
     )
 }
 
-/// The `X.Y.Z` in `fed X.Y.Z`, or in a bare `X.Y.Z`. A pre-release such as
-/// `8.4.0-rc.1` has no comparable version and gives `None`.
-pub(crate) fn parse_version(text: &str) -> Option<[u64; 3]> {
+/// Parse stable and prerelease versions using the same SemVer ordering as Cargo.
+/// The parsed type also keeps shell metacharacters out of release download URLs.
+pub(crate) fn parse_version(text: &str) -> Option<semver::Version> {
     let word = text.split_whitespace().last()?;
-    let word = word.strip_prefix('v').unwrap_or(word);
-    let mut parts = word.split('.').map(|p| p.parse::<u64>().ok());
-    let version = [parts.next()??, parts.next()??, parts.next()??];
-    parts.next().is_none().then_some(version)
-}
-
-fn version_string(v: [u64; 3]) -> String {
-    format!("{}.{}.{}", v[0], v[1], v[2])
+    semver::Version::parse(word.strip_prefix('v').unwrap_or(word)).ok()
 }
 
 /// The shell command that runs `command` (the words after `--`) on the
@@ -511,8 +504,7 @@ const NO_RELEASE: i32 = 3;
 /// machine. The wrapper in /usr/local/sbin runs /usr/local/bin/fed, so that
 /// is the file it replaces. It checks the archive against the release's
 /// SHA-256 file.
-pub(crate) fn install_fed_script(version: [u64; 3]) -> String {
-    let version = version_string(version);
+pub(crate) fn install_fed_script(version: &semver::Version) -> String {
     format!(
         r#"set -e
 case $(uname -m) in
@@ -1670,14 +1662,14 @@ async fn match_fed_version(remote: &Remote, out: &dyn UserOutput) -> Result<()> 
         ));
         return Ok(());
     };
-    if theirs >= local {
+    if !theirs.cmp_precedence(&local).is_lt() {
         return Ok(());
     }
-    let (local_s, theirs_s) = (version_string(local), version_string(theirs));
+    let (local_s, theirs_s) = (local.to_string(), theirs.to_string());
     out.status(&format!(
         "Installing fed {local_s} on {name}, which has fed {theirs_s}"
     ));
-    let status = remote.run(&install_fed_script(local)).await?;
+    let status = remote.run(&install_fed_script(&local)).await?;
     match status.code() {
         Some(0) => Ok(()),
         Some(NO_RELEASE) => {
@@ -2379,10 +2371,30 @@ mod tests {
 
     #[test]
     fn versions_parse_from_fed_version_output() {
-        assert_eq!(parse_version("fed 8.3.0\n"), Some([8, 3, 0]));
-        assert_eq!(parse_version("8.10.2"), Some([8, 10, 2]));
-        assert_eq!(parse_version("v1.2.3"), Some([1, 2, 3]));
-        assert_eq!(parse_version("fed 8.4.0-rc.1"), None);
+        assert_eq!(
+            parse_version("fed 8.3.0\n"),
+            Some(semver::Version::new(8, 3, 0))
+        );
+        assert_eq!(
+            parse_version("8.10.2"),
+            Some(semver::Version::new(8, 10, 2))
+        );
+        assert_eq!(parse_version("v1.2.3"), Some(semver::Version::new(1, 2, 3)));
+        assert_eq!(
+            parse_version("fed 8.4.0-rc.1").unwrap().to_string(),
+            "8.4.0-rc.1"
+        );
+        let beta = parse_version("8.4.0-beta.1").unwrap();
+        assert!(
+            beta.cmp_precedence(&parse_version("8.3.0").unwrap())
+                .is_gt()
+        );
+        assert!(
+            beta.cmp_precedence(&parse_version("8.4.0").unwrap())
+                .is_lt()
+        );
+        assert!(parse_version("8.4.0;touch /tmp/injected").is_none());
+        assert!(parse_version("8.4.0-beta.$(id)").is_none());
         assert_eq!(parse_version("fed 8.4"), None);
         assert_eq!(parse_version("fed 1.2.3.4"), None);
         assert_eq!(parse_version(""), None);
@@ -2391,7 +2403,7 @@ mod tests {
 
     #[test]
     fn install_script_downloads_the_release_and_checks_it() {
-        let script = install_fed_script([8, 4, 0]);
+        let script = install_fed_script(&semver::Version::new(8, 4, 0));
         assert!(
             script.contains(
                 "https://github.com/service-federation/fed/releases/download/v8.4.0/fed-$t.tar.xz"
