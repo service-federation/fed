@@ -28,7 +28,7 @@ docker-tests = []
 # OFF by default and not in release builds yet. Install it with
 # `cargo install --git https://github.com/service-federation/fed --features remote-beta`.
 # See docs/remote.md.
-remote-beta = []
+remote-beta = ["tokio/io-std"]
 
 [dependencies]
 # Async runtime

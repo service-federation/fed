@@ -1158,6 +1158,7 @@ pub async fn run_remote(
 ) -> Result<()> {
     let root = state_root()?;
     match cmd {
+        RemoteCommands::Forward { args } => supervise_forward(args).await,
         RemoteCommands::Up { name, kind } => {
             let checkout = checkout_root(workdir)?;
             check_tools("fed remote up", true).await?;
@@ -1787,6 +1788,54 @@ async fn ssh(remote: &Remote, ws: Option<&str>, command: &[String]) -> Result<i3
     Ok(status.code().unwrap_or(1))
 }
 
+/// The pipe's lifetime belongs to the calling fed process. Even SIGKILL closes
+/// it, allowing the supervisor to kill and reap SSH without relying on Drop in
+/// the caller. Keep the writer separate: Child::wait closes its own stdin.
+struct OwnedForward {
+    child: tokio::process::Child,
+    lease: Option<tokio::process::ChildStdin>,
+}
+
+impl OwnedForward {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    async fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.child.wait().await
+    }
+
+    async fn kill(&mut self) -> std::io::Result<ExitStatus> {
+        self.lease.take();
+        self.child.wait().await
+    }
+}
+
+async fn supervise_forward(args: &[OsString]) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut hup = signal(SignalKind::hangup())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut child = Command::new("ssh")
+        .args(args)
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = tokio::io::stdin();
+    let mut byte = [0];
+    let code = tokio::select! {
+        status = child.wait() => status?.code().unwrap_or(1),
+        _ = stdin.read(&mut byte) => { child.kill().await?; 0 },
+        _ = term.recv() => { child.kill().await?; 0 },
+        _ = hup.recv() => { child.kill().await?; 0 },
+        _ = interrupt.recv() => { child.kill().await?; 0 },
+    };
+    // Tokio's blocking stdin reader may still wait when SSH exits first. SSH
+    // has been reaped; do not wait for that unrelated reader at runtime exit.
+    std::process::exit(code);
+}
+
 async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> {
     let json = remote
         .output(
@@ -1816,7 +1865,8 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
     let mut forwards = Vec::new();
     for (port, params) in &ports {
         let local = local_port(*port);
-        let child = Command::new("ssh")
+        let mut child = Command::new(std::env::current_exe()?)
+            .args(["remote", "forward-supervisor", "--"])
             .args(remote.base_args())
             .args(opt("BatchMode=yes"))
             .args(opt("ControlMaster=no"))
@@ -1826,12 +1876,17 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
             .arg("-L")
             .arg(format!("{local}:127.0.0.1:{port}"))
             .arg(remote.target())
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .process_group(0)
-            .kill_on_drop(true)
             .spawn()
             .context("running ssh")?;
-        forwards.push((local, *port, params.join(", "), child));
+        let lease = child.stdin.take();
+        forwards.push((
+            local,
+            *port,
+            params.join(", "),
+            OwnedForward { child, lease },
+        ));
     }
 
     let stop_requested = tokio::select! {
