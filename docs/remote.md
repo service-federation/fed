@@ -181,11 +181,19 @@ machine.
 **Can I use my own SSH key?** No. fed makes a key pair for each machine, and
 only that key gets in.
 
-## Building with remote enabled
+## Installing the remote beta
 
-For now, `fed remote` is only in builds with the `remote-beta` cargo feature.
-Release builds and Homebrew do not have it yet. To build it from source:
+The `v8.4.0-beta.1` prerelease includes remote commands for Linux and macOS.
+Download the archive for your platform from the
+[beta release](https://github.com/service-federation/fed/releases/tag/v8.4.0-beta.1),
+verify its published checksum, and run the extracted `fed` binary. Stable
+Homebrew installations remain on the stable release.
+
+Cloud access is still a limited beta: your organisation must be enabled by a
+platform admin. Installing the CLI does not enable compute access or allocate a VM.
+
+To build the same version from source:
 
 ```sh
-cargo install --git https://github.com/service-federation/fed --features remote-beta
+cargo install --git https://github.com/service-federation/fed --tag v8.4.0-beta.1 --features remote-beta
 ```
