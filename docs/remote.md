@@ -1,12 +1,11 @@
 # Remote environments
 
-With `fed remote`, fed runs your stack on a fresh machine in Service Federation
-Cloud instead of on your laptop. You copy your checkout there, start it with
-`fed start` as usual, and reach its ports on `localhost`. The machine deletes
-itself when you stop using it.
+**Develop locally, run remotely.** Keep your editor, checkout and language server
+on your machine. Run your services in a disposable cloud VM and reach them on
+`localhost` through an authenticated tunnel.
 
-Use it when your laptop is short on memory or CPU, or when you want a clean
-machine to try something on.
+Remote environments are currently a limited beta. Public prepaid access and the
+launch-credit offer are not open yet.
 
 ## What you need
 
@@ -31,6 +30,16 @@ fed remote down box       # delete it when you are done
 
 `connect` prints where each port went, for example
 `localhost:15432 -> box:5432  (DB_PORT)`.
+
+## Local development and syncing
+
+Your editor and language server stay local. Run local installation and codegen
+with `fed run TASK`. `fed start` still runs locally; remote operations use the
+explicit `fed remote` prefix.
+
+Edits are not continuously synced. Run `fed remote push NAME` after editing, or
+`fed remote start NAME` to push and start the stack. Copy any output you need from
+the VM before it is deleted; remote-only files are temporary.
 
 ## Commands
 
@@ -106,10 +115,14 @@ created on another computer.
 
 ## How long a machine lives
 
-- **5 minutes after the last SSH session ends**, the machine deletes itself.
+- **5 minutes after the last SSH session ends**, the machine powers off. Cloud
+  cleanup then deletes it and its resources.
   Every fed remote command and an open `fed remote connect` count as a session.
-- **6 hours after it was created**, it is deleted in any case. `fed remote up`
-  prints the time.
+- **6 hours after it was created**, cloud cleanup enforces its deadline
+  independently of software running inside it. `fed remote up` prints the time.
+
+Deletion is asynchronous. The cleanup schedule and provider operations add time
+after shutdown or expiry; provider failures can delay it further.
 
 After that, a command on the machine says it no longer exists. Create a new one with
 `fed remote up NAME`. Nothing on the old machine is kept.
