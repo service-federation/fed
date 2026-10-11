@@ -229,6 +229,11 @@ pub fn environment_error(
         (_, Some("compute_not_enabled"), _) => format!(
             "Remote environments are not enabled for {org}. Ask a Service Federation admin to turn them on."
         ),
+        (_, Some("payments_unavailable"), _) => "compute payment verification is temporarily unavailable. New allocations are paused; existing environments can still be deleted.".to_string(),
+        (_, Some("compute_permission"), _) => format!("this login cannot spend compute credit for {org}. An org admin must enable it on the dashboard's Compute credit page."),
+        (_, Some("credit_required"), _) => format!("{org} does not have enough available compute credit for a full environment lifetime. Add credit or wait for existing reservations to settle."),
+        (_, Some("credit_blocked"), _) => format!("compute spending is paused for {org}. Check the dashboard or contact support. Existing environments can still be deleted."),
+        (_, Some("tariff_unavailable"), _) => "compute pricing is not available for this machine type. Try again later or check the dashboard.".to_string(),
         (_, Some("token_scope"), _) => "this login cannot manage remote environments. Run `fed login` on this machine to get one that can.".to_string(),
         (_, Some("cleanup_unavailable"), _) => "Service Federation Cloud has paused new remote environments for a moment. Try again in a few minutes.".to_string(),
         (_, Some("capacity"), _) => "Service Federation Cloud has no room for new remote environments right now. Try again in a few minutes.".to_string(),
@@ -619,6 +624,11 @@ mod tests {
     async fn create_maps_refusals_to_clear_messages() {
         let cases: &[(&str, &str, &str)] = &[
             (
+                "503 Service Unavailable",
+                r#"{"error":"payments_unavailable"}"#,
+                "compute payment verification is temporarily unavailable. New allocations are paused; existing environments can still be deleted.",
+            ),
+            (
                 "401 Unauthorized",
                 r#"{"error":"unauthenticated"}"#,
                 "your login is missing, expired or revoked. Run `fed login`.",
@@ -627,6 +637,26 @@ mod tests {
                 "403 Forbidden",
                 r#"{"error":"compute_not_enabled"}"#,
                 "Remote environments are not enabled for acme. Ask a Service Federation admin to turn them on.",
+            ),
+            (
+                "403 Forbidden",
+                r#"{"error":"compute_permission"}"#,
+                "this login cannot spend compute credit for acme. An org admin must enable it on the dashboard's Compute credit page.",
+            ),
+            (
+                "402 Payment Required",
+                r#"{"error":"credit_required"}"#,
+                "acme does not have enough available compute credit for a full environment lifetime. Add credit or wait for existing reservations to settle.",
+            ),
+            (
+                "403 Forbidden",
+                r#"{"error":"credit_blocked"}"#,
+                "compute spending is paused for acme. Check the dashboard or contact support. Existing environments can still be deleted.",
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"error":"tariff_unavailable"}"#,
+                "compute pricing is not available for this machine type. Try again later or check the dashboard.",
             ),
             (
                 "403 Forbidden",
