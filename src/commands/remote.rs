@@ -1353,7 +1353,7 @@ async fn up(
         _ = interrupt.recv() => {
             out.clear_progress();
             bail!(
-                "Stopped waiting for {name}. It keeps starting up, and deletes itself {IDLE_MINUTES} minutes after the last SSH session ends. Continue with `fed remote start {name}`, or delete it with `fed remote down {name}`."
+                "Stopped waiting for {name}. It keeps starting up, and powers off after {IDLE_MINUTES} minutes without an SSH session. Cloud cleanup follows automatically. Continue with `fed remote start {name}`, or delete it with `fed remote down {name}`."
             );
         }
         ready = finish => ready?,
@@ -1361,7 +1361,7 @@ async fn up(
 
     out.success(&format!("{name} is ready at {ip} (SSH port {port})."));
     out.status(&format!(
-        "It deletes itself {IDLE_MINUTES} minutes after the last SSH session ends, and at {} in any case.",
+        "It powers off after {IDLE_MINUTES} minutes without an SSH session. Cloud cleanup also enforces expiry at {}.",
         local_time(&env.deadline)
     ));
     out.status(&format!("Next: `fed remote start {name}`"));
@@ -1917,7 +1917,7 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
             return Err(every_forward_stopped(remote).await);
         }
         out.status(&format!(
-            "Connected. Press Ctrl-C to disconnect. {name} deletes itself {IDLE_MINUTES} minutes after the last SSH session ends."
+            "Connected. Press Ctrl-C to disconnect. {name} powers off after {IDLE_MINUTES} minutes without an SSH session; cloud cleanup follows automatically."
         ));
         loop {
             let stopped = {
