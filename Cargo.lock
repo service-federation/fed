@@ -576,6 +576,7 @@ dependencies = [
  "rexpect",
  "rpassword",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",

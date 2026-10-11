@@ -28,9 +28,10 @@ docker-tests = []
 # Enabled in beta release artifacts by dist-workspace.toml. Source builds use
 # `cargo install --git https://github.com/service-federation/fed --features remote-beta`.
 # See docs/remote.md.
-remote-beta = ["tokio/io-std"]
+remote-beta = ["tokio/io-std", "dep:semver"]
 
 [dependencies]
+semver = { version = "1", optional = true }
 # Async runtime
 tokio = { version = "1.40", features = ["rt-multi-thread", "process", "sync", "signal", "time", "io-util", "macros", "fs"] }
 tokio-util = "0.7"
