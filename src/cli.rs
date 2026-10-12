@@ -499,6 +499,16 @@ pub enum PortsCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Resolve and save the port of every port parameter without starting
+    /// anything, then print them as JSON. `fed remote start` runs this on the
+    /// remote environment.
+    #[command(hide = true)]
+    Resolve {
+        /// Pin a port parameter to an exact port before resolving. A free
+        /// config `default:` does not replace a pinned port.
+        #[arg(long = "pin", value_name = "PARAM=PORT")]
+        pins: Vec<String>,
+    },
 }
 
 /// Subcommands of `fed variant`, which reads and writes `.fed/variants.yaml`.

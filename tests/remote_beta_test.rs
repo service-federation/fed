@@ -134,7 +134,10 @@ mod with_feature {
     /// for a deleted machine, and `FAKE_SSH=stale` for a master that has not
     /// noticed yet. `FAKE_CLOUD_INIT` is the exit status of the setup wait
     /// in `up`. `FAKE_FORWARD=hold` keeps a port forward running
-    /// and writes its pid to `<log>.forward.<pid>`.
+    /// and writes its pid to `<log>.forward.<pid>`. `FAKE_PORTS` is the JSON
+    /// that `fed ports resolve` prints, with each `--pin` applied. The last
+    /// one printed is what `fed ports list --json` prints. `FAKE_NO_RESOLVE`
+    /// makes the machine's fed one without `fed ports resolve`.
     const FAKE_SSH: &str = r#"#!/bin/sh
 line=ssh; for a in "$@"; do line="$line [$a]"; done
 printf '%s\n' "$line" >> "$FAKE_LOG"
@@ -171,7 +174,17 @@ case "$last" in
   "cloud-init status --wait >/dev/null") exit "${FAKE_CLOUD_INIT:-0}" ;;
   "cloud-init status --long")
     printf 'status: error\nerrors:\n\t- (%s)\nrecoverable_errors: {}\n' "'init', RuntimeError('disk full')" ;;
-  *"fed ports list --json"*) echo '{"WEB_PORT": 18080, "DB_PORT": 15432}' ;;
+  *"fed ports resolve"*)
+    if [ -n "$FAKE_NO_RESOLVE" ]; then exit 4; fi
+    json="$FAKE_PORTS"
+    for pin in $(printf '%s\n' "$last" | grep -o "pin '[A-Z_0-9]*=[0-9]*" | sed "s/^pin '//"); do
+      json=$(printf '%s' "$json" | sed "s/\"${pin%%=*}\": *[0-9]*/\"${pin%%=*}\": ${pin#*=}/")
+    done
+    printf '%s' "$json" > "$FAKE_LOG.ports"
+    echo "Resolving ports"
+    echo "$json" ;;
+  *"fed ports list --json"*)
+    if [ -f "$FAKE_LOG.ports" ]; then cat "$FAKE_LOG.ports"; else echo "$FAKE_PORTS"; fi ;;
   *) cat > "$FAKE_LOG.stdin.$$" ;;
 esac
 exit 0
@@ -192,6 +205,15 @@ exit "${FAKE_RSYNC_EXIT:-0}"
     struct Setup {
         home: TempDir,
         checkout: PathBuf,
+        /// The stack's two ports on the machine, free on this one when the
+        /// test starts: (WEB_PORT, DB_PORT).
+        ports: (u16, u16),
+    }
+
+    /// A port nothing on this machine uses right now.
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        listener.local_addr().unwrap().port()
     }
 
     impl Setup {
@@ -219,7 +241,22 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 std::fs::write(&path, script).unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
-            Self { home, checkout }
+            let mut ports = (free_port(), free_port());
+            while ports.0 == ports.1 {
+                ports.1 = free_port();
+            }
+            Self {
+                home,
+                checkout,
+                ports,
+            }
+        }
+
+        fn ports_json(&self) -> String {
+            format!(
+                r#"{{"WEB_PORT": {}, "DB_PORT": {}}}"#,
+                self.ports.0, self.ports.1
+            )
         }
 
         fn home(&self) -> &Path {
@@ -281,6 +318,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 .env("FAKE_LOG", self.log_path())
                 .env("FED_TOKEN", "fed_test-token")
                 .env("FED_CLOUD_URL", url)
+                .env("FAKE_PORTS", self.ports_json())
                 .envs(env.iter().copied())
                 .output()
                 .unwrap();
@@ -592,11 +630,11 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         let calls = setup.calls();
         let forwards: Vec<&String> = calls.iter().filter(|c| c.contains(" [-L] ")).collect();
         assert_eq!(forwards.len(), 2, "{calls:#?}");
-        for (local, remote) in [(25432, 15432), (28080, 18080)] {
+        for port in [setup.ports.0, setup.ports.1] {
             let forward = forwards
                 .iter()
-                .find(|c| c.contains(&format!("[-L] [{local}:127.0.0.1:{remote}]")))
-                .unwrap_or_else(|| panic!("no forward for {remote}: {forwards:#?}"));
+                .find(|c| c.contains(&format!("[-L] [{port}:127.0.0.1:{port}]")))
+                .unwrap_or_else(|| panic!("no forward for {port}: {forwards:#?}"));
             for option in [
                 "[BatchMode=yes]",
                 "[ExitOnForwardFailure=yes]",
@@ -612,6 +650,141 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 .any(|c| c.ends_with(" [cd /srv/app && fed ports list --json]")),
             "{calls:#?}"
         );
+    }
+
+    fn token_route() -> Cloud {
+        Cloud::start(vec![(
+            "POST /api/v1/orgs/acme/projects/web/env-tokens ",
+            "201 Created",
+            r#"{"id":"tok-1","token":"t","expires_at":"2099-01-01T00:00:00Z"}"#.to_string(),
+        )])
+    }
+
+    /// The index of the first call that ends with `command`.
+    fn position(calls: &[String], command: &str) -> Option<usize> {
+        calls
+            .iter()
+            .position(|c| c.ends_with(&format!(" [{command}]")))
+    }
+
+    /// With every port of the stack free here, `start` resolves the ports
+    /// before `fed start` and pins nothing.
+    #[test]
+    fn start_with_every_port_free_here_keeps_the_ports() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let cloud = token_route();
+        let (ok, output) = setup.fed(&cloud.url, &["remote", "start", "box"], &[]);
+        assert!(ok, "{output}");
+        assert!(!output.contains("is taken on this machine"), "{output}");
+
+        let calls = setup.calls();
+        let resolve = position(
+            &calls,
+            "cd /srv/app && { fed ports resolve --help >/dev/null 2>&1 || exit 4; } && fed ports resolve",
+        )
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+        let start = position(&calls, "cd /srv/app && fed start").unwrap();
+        assert!(resolve < start, "{calls:#?}");
+        assert!(calls.iter().all(|c| !c.contains("--pin")), "{calls:#?}");
+        assert!(position(&calls, "cd /srv/app && fed stop").is_none());
+    }
+
+    /// A port of the stack that a program here uses moves to a port this
+    /// machine has free. `fed start` and `connect` then use the new port on
+    /// both machines, so `localhost:{{PORT}}` values agree.
+    #[test]
+    fn start_moves_a_port_taken_here_and_connect_forwards_the_new_one() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (web, db) = setup.ports;
+        let _here = std::net::TcpListener::bind(("127.0.0.1", web)).unwrap();
+        let cloud = token_route();
+        let (ok, output) = setup.fed(&cloud.url, &["remote", "start", "box"], &[]);
+        assert!(ok, "{output}");
+
+        let calls = setup.calls();
+        let pin = calls
+            .iter()
+            .find_map(|c| c.split("--pin 'WEB_PORT=").nth(1))
+            .unwrap_or_else(|| panic!("no pin: {calls:#?}"));
+        let moved: u16 = pin.trim_end_matches("']").parse().unwrap();
+        assert!(moved != web && moved != db, "{moved}");
+        assert!(
+            calls.iter().all(|c| !c.contains("--pin DB_PORT")),
+            "{calls:#?}"
+        );
+        assert!(
+            output.contains(&format!(
+                "Port {web} is taken on this machine, so WEB_PORT uses port {moved} on box."
+            )),
+            "{output}"
+        );
+        let stop = position(&calls, "cd /srv/app && fed stop").unwrap();
+        let start = position(&calls, "cd /srv/app && fed start").unwrap();
+        assert!(stop < start, "{calls:#?}");
+
+        let (_, output) = setup.fed(&cloud.url, &["remote", "connect", "box"], &[]);
+        assert!(!output.contains("cannot forward"), "{output}");
+        let calls = setup.calls();
+        let forwards: Vec<&String> = calls.iter().filter(|c| c.contains(" [-L] ")).collect();
+        assert_eq!(forwards.len(), 2, "{forwards:#?}");
+        for port in [moved, db] {
+            assert!(
+                forwards
+                    .iter()
+                    .any(|c| c.contains(&format!("[-L] [{port}:127.0.0.1:{port}]"))),
+                "{port}: {forwards:#?}"
+            );
+        }
+    }
+
+    /// A port taken here after `start` stops `connect` before any forward,
+    /// with the port, its parameter and what to do.
+    #[test]
+    fn connect_refuses_a_port_taken_here() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (web, _) = setup.ports;
+        let _here = std::net::TcpListener::bind(("127.0.0.1", web)).unwrap();
+        let (ok, output) = setup.fed("http://127.0.0.1:9", &["remote", "connect", "box"], &[]);
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains(
+                "Error: fed remote connect cannot forward every port of box, because programs on this machine use these ports:"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("  {web} (WEB_PORT): ")),
+            "{output}"
+        );
+        assert!(
+            output.contains("Stop those programs, or run `fed remote start box`"),
+            "{output}"
+        );
+        let calls = setup.calls();
+        assert!(calls.iter().all(|c| !c.contains(" [-L] ")), "{calls:#?}");
+    }
+
+    /// fed on the machine without `fed ports resolve` stops `start` before
+    /// `fed start`, with the reason.
+    #[test]
+    fn start_says_when_the_machine_has_an_older_fed() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let cloud = token_route();
+        let (ok, output) = setup.fed(
+            &cloud.url,
+            &["remote", "start", "box"],
+            &[("FAKE_NO_RESOLVE", "1")],
+        );
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains("Error: fed remote start needs a newer fed on box."),
+            "{output}"
+        );
+        assert!(position(&setup.calls(), "cd /srv/app && fed start").is_none());
     }
 
     /// An environment deleted under the user: the first SSH fails, the cloud
@@ -970,6 +1143,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 .env("PATH", path)
                 .env("FAKE_LOG", setup.log_path())
                 .env("FAKE_FORWARD", "hold")
+                .env("FAKE_PORTS", setup.ports_json())
                 .env("FED_TOKEN", "fed_test-token")
                 .env("FED_CLOUD_URL", "http://127.0.0.1:9")
                 .stdout(std::fs::File::create(&output_path).unwrap())

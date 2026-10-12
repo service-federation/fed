@@ -1,6 +1,6 @@
 # Decision: the same port on the laptop and on the remote environment
 
-Status: accepted, 2026-10-12. Not built yet.
+Status: accepted and built, 2026-10-12.
 
 ## Problem
 

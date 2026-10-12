@@ -81,7 +81,8 @@ pub fn compute_project_id(work_dir: &Path, isolation_id: Option<&str>) -> String
 /// Port parameters are allocated with the following priority:
 /// 1. Explicit `value:` field (validated and reserved exactly)
 /// 2. Preferred port from `default:` (if available and defaults are
-///    preferred — normal, non-isolated `fed start`)
+///    preferred — normal, non-isolated `fed start`), unless the persisted
+///    port is pinned (`fed ports resolve --pin`)
 /// 3. Persisted port from previous run (if available)
 /// 4. Random available port (fallback)
 ///
@@ -450,8 +451,13 @@ impl Resolver {
                 let (port, reason) = if let Some(cached_port) = self.port_store.get_port(name) {
                     // A config default that's available supersedes the cached port
                     // (normal mode only) — otherwise editing `default:` in the
-                    // config would silently have no effect.
-                    if let Some(reclaimed) = self.try_reclaim_config_default(param, cached_port) {
+                    // config would silently have no effect. A pinned port stays.
+                    let reclaimed = if self.port_store.is_pinned(name) {
+                        None
+                    } else {
+                        self.try_reclaim_config_default(param, cached_port)
+                    };
+                    if let Some(reclaimed) = reclaimed {
                         reclaimed
                     } else {
                         // Port store has a cached value — validate it's still usable

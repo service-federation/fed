@@ -543,6 +543,29 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_port_wins_over_a_free_config_default() {
+        use crate::config::Config;
+
+        let mut resolver = Resolver::new();
+        resolver.set_prefer_config_defaults(true);
+
+        let mut cached = HashMap::new();
+        cached.insert("API_PORT".to_string(), 59921u16);
+        let pinned = ["API_PORT".to_string()].into_iter().collect();
+        resolver.set_port_store(Box::new(crate::port::SqlitePortStore::with_pins(
+            cached, pinned,
+        )));
+
+        let mut config = Config::default();
+        config
+            .parameters
+            .insert("API_PORT".to_string(), port_param_with_default(59922));
+
+        resolver.resolve_parameters(&mut config).unwrap();
+        assert_eq!(resolver.get_resolved_parameters()["API_PORT"], "59921");
+    }
+
+    #[test]
     fn test_cached_port_wins_when_defaults_not_preferred() {
         use crate::config::Config;
 

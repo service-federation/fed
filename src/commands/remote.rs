@@ -26,9 +26,6 @@ const SSH_WAIT: Duration = Duration::from_secs(300);
 const IDLE_MINUTES: u32 = 5;
 /// How long an environment lives in any case.
 const LIFETIME_HOURS: u32 = 6;
-/// Remote port P is forwarded from local P + PORT_OFFSET, so the same stack can
-/// run on this machine at the same time.
-const PORT_OFFSET: u16 = 10_000;
 /// How long `connect` waits before it reports the forwards as up. A forward
 /// whose local port is taken fails within this time.
 const FORWARD_SETTLE: Duration = Duration::from_secs(1);
@@ -374,21 +371,129 @@ pub(crate) fn known_hosts_line(ip: &str, port: u16, host_public_key: &str) -> Re
     Ok(format!("[{ip}]:{port} {kind} {key}\n"))
 }
 
-/// The local port that forwards to remote port `remote`.
-pub(crate) fn local_port(remote: u16) -> u16 {
-    remote.checked_add(PORT_OFFSET).unwrap_or(remote)
-}
+/// The ports of a stack, each with the parameters that use it, sorted by port.
+pub(crate) type StackPorts = Vec<(u16, Vec<String>)>;
 
-/// The ports in the JSON of `fed ports list --json` (`{"PARAM": port}`), each
-/// with the parameters that use it, sorted by port.
-pub(crate) fn parse_ports(json: &str) -> Result<Vec<(u16, Vec<String>)>> {
+/// The ports in the JSON that `command` printed (`{"PARAM": port}`).
+pub(crate) fn parse_ports(json: &str, command: &str) -> Result<StackPorts> {
     let map: std::collections::BTreeMap<String, u16> = serde_json::from_str(json.trim())
-        .context("`fed ports list --json` on the environment printed something unexpected")?;
+        .with_context(|| format!("`{command}` on the environment printed something unexpected"))?;
     let mut by_port: std::collections::BTreeMap<u16, Vec<String>> = Default::default();
     for (param, port) in map {
         by_port.entry(port).or_default().push(param);
     }
     Ok(by_port.into_iter().collect())
+}
+
+/// Whether a program on this machine uses `port`, so a forward from it would
+/// not reach the environment. A dual-stack listener on `[::]` lets a
+/// 127.0.0.1 bind succeed on macOS, so the wildcard and `::1` count too.
+pub(crate) fn taken_here(port: u16) -> bool {
+    use std::net::{Ipv6Addr, TcpListener};
+    if TcpListener::bind(("127.0.0.1", port)).is_err()
+        || TcpListener::bind(("0.0.0.0", port)).is_err()
+    {
+        return true;
+    }
+    matches!(
+        TcpListener::bind((Ipv6Addr::LOCALHOST, port)),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
+    )
+}
+
+/// A port this machine has free, picked by the system.
+fn free_port_here() -> Result<u16> {
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|l| l.local_addr())
+        .context("looking for a free port on this machine")?
+        .port();
+    Ok(port)
+}
+
+/// A port of the stack that this machine uses, and the port its parameters
+/// move to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PortMove {
+    pub from: u16,
+    pub to: u16,
+    pub params: Vec<String>,
+}
+
+/// A move for each port in `ports` that is `taken` on this machine. The new
+/// port comes from `free`, and is neither taken nor another port of the stack.
+pub(crate) fn plan_moves(
+    ports: &[(u16, Vec<String>)],
+    taken: impl Fn(u16) -> bool,
+    mut free: impl FnMut() -> Result<u16>,
+) -> Result<Vec<PortMove>> {
+    let mut used: std::collections::HashSet<u16> = ports.iter().map(|(p, _)| *p).collect();
+    let mut moves = Vec::new();
+    for (port, params) in ports {
+        if !taken(*port) {
+            continue;
+        }
+        let mut to = None;
+        for _ in 0..32 {
+            let candidate = free()?;
+            if !used.contains(&candidate) && !taken(candidate) {
+                to = Some(candidate);
+                break;
+            }
+        }
+        let to = to.context("finding a free port on this machine")?;
+        used.insert(to);
+        moves.push(PortMove {
+            from: *port,
+            to,
+            params: params.clone(),
+        });
+    }
+    Ok(moves)
+}
+
+/// The `fed ports resolve` command that pins each parameter of `moves` to
+/// its new port. Without moves, it only resolves.
+pub(crate) fn resolve_command(ws: &str, moves: &[PortMove]) -> String {
+    let mut command = format!(
+        "cd /srv/{ws} && {{ fed ports resolve --help >/dev/null 2>&1 || exit {NO_PORTS_RESOLVE}; }} && fed ports resolve"
+    );
+    for m in moves {
+        for param in &m.params {
+            command.push_str(" --pin ");
+            command.push_str(&shell_words::quote(&format!("{param}={}", m.to)));
+        }
+    }
+    command
+}
+
+/// Exit status of `resolve_command` when fed on the machine has no
+/// `fed ports resolve`.
+const NO_PORTS_RESOLVE: i32 = 4;
+
+/// The error for ports of the stack that programs on this machine use.
+/// Each entry is a port, its parameters, and the program, when known.
+pub(crate) fn taken_ports_message(
+    name: &str,
+    taken: &[(u16, Vec<String>, Option<String>)],
+) -> String {
+    let mut message = format!(
+        "fed remote connect cannot forward every port of {name}, because programs on this machine use these ports:"
+    );
+    for (port, params, holder) in taken {
+        let holder = holder.as_deref().unwrap_or("an unknown program");
+        message.push_str(&format!("\n  {port} ({}): {holder}", params.join(", ")));
+    }
+    message.push_str(&format!(
+        "\nStop those programs, or run `fed remote start {name}` to move these ports to free ones."
+    ));
+    message
+}
+
+/// The program on `port` on this machine, as `name (PID n)`.
+fn program_on(port: u16) -> Option<String> {
+    let conflict = fed::port::PortConflict::check(port)?;
+    let process = conflict.processes.first()?;
+    Some(format!("{} (PID {})", process.name, process.pid))
 }
 
 /// Seconds from `now` until `deadline`, as a vault token lifetime. Capped at
@@ -880,16 +985,7 @@ impl Remote {
 
     /// Run `command` on the machine and return what it printed.
     async fn output(&self, command: &str, what: &str) -> Result<String> {
-        self.share_connection().await?;
-        let out = self
-            .ssh()
-            .arg(self.target())
-            .arg(command)
-            .stdin(Stdio::null())
-            .stderr(Stdio::inherit())
-            .output()
-            .await
-            .context("running ssh")?;
+        let out = self.capture(command).await?;
         if !out.status.success() {
             return Err(self
                 .failure(
@@ -899,6 +995,20 @@ impl Remote {
                 .await);
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Run `command` on the machine and return its status and what it printed
+    /// on stdout. Its stderr goes to this terminal.
+    async fn capture(&self, command: &str) -> Result<std::process::Output> {
+        self.share_connection().await?;
+        self.ssh()
+            .arg(self.target())
+            .arg(command)
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit())
+            .output()
+            .await
+            .context("running ssh")
     }
 
     /// Run `command` on the machine with `input` on its stdin.
@@ -1176,6 +1286,12 @@ pub async fn run_remote(
             match_fed_version(&remote, out).await?;
             if let Some(project) = linked_project(&checkout) {
                 give_vault_token(&remote, &project, &ws, out).await?;
+            }
+            if pick_ports(&remote, &ws, out).await? {
+                // A running service keeps the port it started with.
+                remote
+                    .run_checked(&format!("cd /srv/{ws} && fed stop"), "fed stop")
+                    .await?;
             }
             remote
                 .run_checked(&format!("cd /srv/{ws} && fed start"), "fed start")
@@ -1828,6 +1944,66 @@ async fn supervise_forward(args: &[OsString]) -> Result<()> {
     std::process::exit(code);
 }
 
+/// Ask the environment for the ports of the stack in `/srv/{ws}`, after
+/// pinning the parameters of `moves`. The environment saves them, so
+/// `fed start` there uses the same ports.
+async fn resolve_remote_ports(remote: &Remote, ws: &str, moves: &[PortMove]) -> Result<StackPorts> {
+    let name = remote.name();
+    let out = remote.capture(&resolve_command(ws, moves)).await?;
+    if out.status.code() == Some(NO_PORTS_RESOLVE) {
+        bail!(
+            "fed remote start needs a newer fed on {name}. The fed there has no `fed ports resolve`, which picks ports that this machine can forward. Install a fed release that has it on {name}, for example with `fed remote ssh {name}`."
+        );
+    }
+    if !out.status.success() {
+        return Err(remote
+            .failure(
+                format!("fed ports resolve failed on {name} ({}).", out.status),
+                ssh_lost(out.status),
+            )
+            .await);
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .unwrap_or("");
+    parse_ports(json, "fed ports resolve")
+}
+
+/// Make every port of the stack one that this machine has free, so each one
+/// is forwarded to the same number and `localhost:{{PORT}}` values work on
+/// both machines. A port this machine uses is pinned to a free one on the
+/// environment. Returns whether a port moved.
+async fn pick_ports(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<bool> {
+    let name = remote.name();
+    let ports = resolve_remote_ports(remote, ws, &[]).await?;
+    let moves = plan_moves(&ports, taken_here, free_port_here)?;
+    if moves.is_empty() {
+        return Ok(false);
+    }
+    let ports = resolve_remote_ports(remote, ws, &moves).await?;
+    for m in &moves {
+        let now = ports
+            .iter()
+            .find(|(_, params)| params.contains(&m.params[0]))
+            .map_or(m.to, |(port, _)| *port);
+        if taken_here(now) {
+            bail!(
+                "fed remote start cannot move {} off port {now}, which a program on this machine uses. A value in fed.yaml or .env may fix the port. Stop the program on port {now} here, then run `fed remote start {name}` again.",
+                m.params.join(", ")
+            );
+        }
+        out.status(&format!(
+            "Port {} is taken on this machine, so {} uses port {now} on {name}.",
+            m.from,
+            m.params.join(", ")
+        ));
+    }
+    Ok(true)
+}
+
 async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> {
     let json = remote
         .output(
@@ -1835,12 +2011,20 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
             "fed ports list",
         )
         .await?;
-    let ports = parse_ports(&json)?;
+    let ports = parse_ports(&json, "fed ports list --json")?;
     let name = remote.name();
     if ports.is_empty() {
         bail!(
             "/srv/{ws} on {name} has no ports to forward. Its services publish none, or `fed remote start {name}` has not run."
         );
+    }
+    let taken: Vec<_> = ports
+        .iter()
+        .filter(|(port, _)| taken_here(*port))
+        .map(|(port, params)| (*port, params.clone(), program_on(*port)))
+        .collect();
+    if !taken.is_empty() {
+        bail!(taken_ports_message(name, &taken));
     }
 
     // One listener per signal for the whole command, so a signal between two
@@ -1856,7 +2040,7 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
     // in the terminal reaches only fed, which then ends them.
     let mut forwards = Vec::new();
     for (port, params) in &ports {
-        let local = local_port(*port);
+        let local = *port;
         let mut child = Command::new(std::env::current_exe()?)
             .args(["remote", "forward-supervisor", "--"])
             .args(remote.base_args())
@@ -2215,26 +2399,101 @@ mod tests {
     }
 
     #[test]
-    fn local_ports_are_offset_unless_that_overflows() {
-        assert_eq!(local_port(5432), 15432);
-        assert_eq!(local_port(18743), 28743);
-        assert_eq!(local_port(55535), 65535);
-        assert_eq!(local_port(55536), 55536);
-        assert_eq!(local_port(65535), 65535);
-    }
-
-    #[test]
     fn ports_json_is_grouped_and_sorted_by_port() {
         let json = r#"{"WEB_PORT": 18080, "DB_PORT": 15432, "ALSO_WEB": 18080}"#;
         assert_eq!(
-            parse_ports(json).unwrap(),
+            parse_ports(json, "fed ports list --json").unwrap(),
             vec![
                 (15432, vec!["DB_PORT".to_string()]),
                 (18080, vec!["ALSO_WEB".to_string(), "WEB_PORT".to_string()]),
             ]
         );
-        assert_eq!(parse_ports("{}\n").unwrap(), vec![]);
-        assert!(parse_ports("Port Allocations").is_err());
+        assert_eq!(
+            parse_ports("{}\n", "fed ports list --json").unwrap(),
+            vec![]
+        );
+        let error = parse_ports("Port Allocations", "fed ports list --json").unwrap_err();
+        assert!(
+            error.to_string().contains("`fed ports list --json`"),
+            "{error}"
+        );
+    }
+
+    fn stack(ports: &[(u16, &str)]) -> StackPorts {
+        ports
+            .iter()
+            .map(|(port, param)| (*port, vec![param.to_string()]))
+            .collect()
+    }
+
+    #[test]
+    fn only_ports_taken_here_move_to_free_ports_outside_the_stack() {
+        let ports = stack(&[(3000, "WEB_PORT"), (3001, "SOCKET_PORT"), (5432, "DB_PORT")]);
+        let taken = |p: u16| p == 3000 || p == 5432 || p == 40000;
+        // 3001 belongs to the stack and 40000 is taken, so both are skipped.
+        let mut offers = vec![3001, 40000, 40001, 40001, 40002].into_iter();
+        let moves = plan_moves(&ports, taken, || Ok(offers.next().unwrap())).unwrap();
+        assert_eq!(
+            moves,
+            vec![
+                PortMove {
+                    from: 3000,
+                    to: 40001,
+                    params: vec!["WEB_PORT".into()]
+                },
+                PortMove {
+                    from: 5432,
+                    to: 40002,
+                    params: vec!["DB_PORT".into()]
+                },
+            ]
+        );
+        assert!(
+            plan_moves(&ports, |_| false, || unreachable!())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resolve_command_checks_for_the_command_and_pins_each_parameter() {
+        assert_eq!(
+            resolve_command("app", &[]),
+            "cd /srv/app && { fed ports resolve --help >/dev/null 2>&1 || exit 4; } && fed ports resolve"
+        );
+        let moves = [PortMove {
+            from: 3000,
+            to: 40001,
+            params: vec!["ALSO_WEB".into(), "WEB_PORT".into()],
+        }];
+        assert!(
+            resolve_command("app", &moves)
+                .ends_with("fed ports resolve --pin 'ALSO_WEB=40001' --pin 'WEB_PORT=40001'")
+        );
+    }
+
+    #[test]
+    fn a_port_in_use_here_is_reported_with_its_program() {
+        let message = taken_ports_message(
+            "box",
+            &[
+                (3000, vec!["WEB_PORT".into()], Some("node (PID 42)".into())),
+                (5432, vec!["DB_PORT".into(), "PG_PORT".into()], None),
+            ],
+        );
+        assert_eq!(
+            message,
+            "fed remote connect cannot forward every port of box, because programs on this machine use these ports:\n  3000 (WEB_PORT): node (PID 42)\n  5432 (DB_PORT, PG_PORT): an unknown program\nStop those programs, or run `fed remote start box` to move these ports to free ones."
+        );
+    }
+
+    #[test]
+    fn a_listening_port_is_taken_here() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(taken_here(port));
+        drop(listener);
+        assert!(!taken_here(port));
     }
 
     #[test]

@@ -29,7 +29,8 @@ fed remote down box       # delete it when you are done
 ```
 
 `connect` prints where each port went, for example
-`localhost:15432 -> box:5432  (DB_PORT)`.
+`localhost:5432 -> box:5432  (DB_PORT)`. Each port keeps its number, so a
+`localhost:{{DB_PORT}}` value in fed.yaml works in your browser too.
 
 ## Local development and syncing
 
@@ -75,22 +76,30 @@ the checkout's folder name unless you pass `--as`.
 
 ### `fed remote start NAME [--as WORKSPACE]`
 
-Pushes, then runs `fed start` in the workspace. Before that it does two things:
+Pushes, then runs `fed start` in the workspace. Before that it does three things:
 
 - If the machine has an older fed than yours, it installs your version from
   its GitHub release. A version with no release, such as a build from source,
   gets a warning instead.
 - If the checkout uses the team vault, it gives the workspace read access to
   it. See [Secrets](#secrets).
+- It picks the stack's ports. The machine works out which ports the stack
+  uses, without starting anything. When a program on your laptop uses one of
+  them, fed moves that parameter to a port your laptop has free, and says so:
+  `Port 3000 is taken on this machine, so NEXT_PORT uses port 52114 on box.`
+  The machine keeps the new port for later starts. When a port moves, the
+  stack restarts so that every service uses it.
 
 ### `fed remote connect NAME [--as WORKSPACE]`
 
-Forwards every port the workspace's stack uses to this machine until you press
-Ctrl-C. Remote port P is on local port P + 10000, so the same stack can also
-run on your laptop. Ports above 55535 keep their number.
+Forwards every port the workspace's stack uses to the same port on this
+machine until you press Ctrl-C. Values such as `http://localhost:{{WEB_PORT}}`
+are then right on both machines.
 
-A port that is taken on your laptop gets a warning, and the other ports still
-work.
+When a program on your laptop has taken one of the ports since
+`fed remote start`, `connect` forwards nothing. It lists each such port with
+its parameter and, when fed can find it, the program. Stop that program, or
+run `fed remote start NAME` again to move the port.
 
 ### `fed remote ssh NAME [--as WORKSPACE] [-- COMMAND...]`
 
@@ -173,8 +182,14 @@ The machine exists but does not answer. Check your network. A firewall that
 blocks outgoing SSH on high ports also causes this. The error ends with what
 ssh said.
 
-**A port is taken.** `connect` warns about each forward that stopped. Free the
-local port, or stop the local stack, and run `connect` again.
+**"fed remote connect cannot forward every port of box"**
+A program on your laptop uses a port of the remote stack. Stop it, or run
+`fed remote start box` to move the stack to free ports.
+
+**"fed remote start needs a newer fed on box"**
+The machine's fed cannot work out the stack's ports. This happens when your
+fed is a build from source with no release to install. Use a released fed on
+your laptop, so `fed remote start` can install the same release on the machine.
 
 **"fed X has no release to install"**
 You run a fed built from source that is newer than the machine's. Commands on
