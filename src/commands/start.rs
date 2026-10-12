@@ -1686,9 +1686,7 @@ async fn run_dry_run(
             match &resolution.reason {
                 PortResolutionReason::Explicit
                 | PortResolutionReason::DefaultAvailable
-                | PortResolutionReason::Cached
-                | PortResolutionReason::Pinned
-                | PortResolutionReason::Taken => {
+                | PortResolutionReason::Cached => {
                     // Check if port is still available (it might have been taken since resolution)
                     if let Some(conflict) = PortConflict::check(resolution.resolved_port) {
                         conflicts_found = true;

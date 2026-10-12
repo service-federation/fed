@@ -30,7 +30,7 @@ use tokio::sync::RwLock;
 ///
 /// If ANY service is alive, all globally persisted ports are trusted as managed.
 /// This handles process services which don't write to `port_allocations`.
-pub async fn collect_managed_ports(
+pub(super) async fn collect_managed_ports(
     resolver: &mut Resolver,
     state_tracker: &Arc<RwLock<StateTracker>>,
     isolation_id: Option<&str>,

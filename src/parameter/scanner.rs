@@ -173,27 +173,6 @@ pub fn parameters_tainted_by(config: &Config, poison: &HashSet<String>) -> HashS
     tainted
 }
 
-/// The services whose config uses one of `params`, directly or through
-/// another parameter that references one. A service listed here gets
-/// different values when one of `params` changes.
-pub fn services_using(config: &Config, params: &HashSet<String>) -> HashSet<String> {
-    if params.is_empty() {
-        return HashSet::new();
-    }
-    let mut affected = parameters_tainted_by(config, params);
-    affected.extend(params.iter().cloned());
-    config
-        .services
-        .iter()
-        .filter(|(_, service)| {
-            let mut refs = HashSet::new();
-            scan_serializable(service, &mut refs);
-            refs.iter().any(|r| affected.contains(r))
-        })
-        .map(|(name, _)| name.clone())
-        .collect()
-}
-
 /// Enqueue a dependency name as a service and/or a script node. A name may
 /// resolve to either (or neither, if it's dangling — harmless, it's skipped on
 /// visit). Whole-struct scanning happens when the node is popped.
@@ -245,33 +224,6 @@ mod tests {
     use crate::config::{
         Config, DependsOn, HealthCheck, HealthCheckTiming, Parameter, Script, Service,
     };
-
-    #[test]
-    fn services_using_a_port_follow_parameters_that_reference_it() {
-        let config: Config = serde_yaml::from_str(
-            r#"
-parameters:
-  WEB_PORT: { type: port, default: 3000 }
-  DB_PORT: { type: port, default: 5432 }
-  WEB_URL: { default: "http://localhost:{{WEB_PORT}}" }
-services:
-  web:
-    process: "next dev -p {{WEB_PORT}}"
-  auth:
-    process: "auth"
-    environment:
-      CALLBACK: "{{WEB_URL}}/callback"
-  db:
-    image: postgres
-    ports: ["{{DB_PORT}}:5432"]
-"#,
-        )
-        .unwrap();
-        let changed: HashSet<String> = ["WEB_PORT".to_string()].into();
-        let using = services_using(&config, &changed);
-        assert_eq!(using, ["web".to_string(), "auth".to_string()].into());
-        assert!(services_using(&config, &HashSet::new()).is_empty());
-    }
 
     fn secret_param() -> Parameter {
         Parameter {

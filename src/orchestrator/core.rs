@@ -9,7 +9,7 @@ use tracing::Instrument;
 // Using tokio::sync::RwLock for async-aware locking
 // Previous implementation used parking_lot::RwLock which required HashMap removal pattern
 // to avoid blocking tokio threads across .await points.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -339,12 +339,6 @@ impl Orchestrator {
     }
 
     /// Enable auto-resolve mode for port conflicts (use in TUI mode to avoid interactive prompts)
-    /// Pin port parameters to exact ports for the next initialization, as
-    /// `fed start --pin` does.
-    pub fn set_port_pins(&mut self, pins: HashMap<String, u16>) {
-        self.resolver.set_pins(pins);
-    }
-
     pub fn set_auto_resolve_conflicts(&mut self, auto_resolve: bool) {
         self.resolver.set_auto_resolve_conflicts(auto_resolve);
     }
@@ -508,14 +502,14 @@ impl Orchestrator {
             tracing::debug!("Randomize mode: using NoopPortStore for fresh allocation");
             Box::new(crate::port::NoopPortStore)
         } else {
-            let (persisted_ports, pinned) = if read_only {
+            let persisted_ports = if read_only {
                 Self::load_persisted_ports_read_only(&self.work_dir, scope.as_deref())
             } else {
-                let tracker = self.state_tracker.read().await;
-                (
-                    tracker.get_global_port_allocations(scope.as_deref()).await,
-                    tracker.get_pinned_ports(scope.as_deref()).await,
-                )
+                self.state_tracker
+                    .read()
+                    .await
+                    .get_global_port_allocations(scope.as_deref())
+                    .await
             };
             if !persisted_ports.is_empty() {
                 tracing::debug!(
@@ -523,10 +517,7 @@ impl Orchestrator {
                     persisted_ports.len()
                 );
             }
-            Box::new(crate::port::SqlitePortStore::with_pins(
-                persisted_ports,
-                pinned,
-            ))
+            Box::new(crate::port::SqlitePortStore::new(persisted_ports))
         };
         self.resolver.set_port_store(port_store);
         // Normal (non-isolated) starts honor config `default:` ports over cached
@@ -577,11 +568,11 @@ impl Orchestrator {
     fn load_persisted_ports_read_only(
         work_dir: &std::path::Path,
         isolation_id: Option<&str>,
-    ) -> (HashMap<String, u16>, HashSet<String>) {
+    ) -> HashMap<String, u16> {
         let scope = isolation_id.unwrap_or("");
         let db_path = work_dir.join(".fed").join("lock.db");
         if !db_path.exists() {
-            return Default::default();
+            return HashMap::new();
         }
 
         let conn = match rusqlite::Connection::open_with_flags(
@@ -595,12 +586,12 @@ impl Orchestrator {
                     db_path.display(),
                     e
                 );
-                return Default::default();
+                return HashMap::new();
             }
         };
 
         let mut stmt = match conn
-            .prepare("SELECT param_name, port, source FROM persisted_ports WHERE isolation_id = ?1")
+            .prepare("SELECT param_name, port FROM persisted_ports WHERE isolation_id = ?1")
         {
             Ok(stmt) => stmt,
             Err(e) => {
@@ -609,16 +600,12 @@ impl Orchestrator {
                     db_path.display(),
                     e
                 );
-                return Default::default();
+                return HashMap::new();
             }
         };
 
         let rows = match stmt.query_map(rusqlite::params![scope], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, u16>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, u16>(1)?))
         }) {
             Ok(rows) => rows,
             Err(e) => {
@@ -627,18 +614,14 @@ impl Orchestrator {
                     db_path.display(),
                     e
                 );
-                return Default::default();
+                return HashMap::new();
             }
         };
 
         let mut ports = HashMap::new();
-        let mut pinned = HashSet::new();
         for row in rows {
             match row {
-                Ok((name, port, source)) => {
-                    if source == "pin" {
-                        pinned.insert(name.clone());
-                    }
+                Ok((name, port)) => {
                     ports.insert(name, port);
                 }
                 Err(e) => {
@@ -646,7 +629,7 @@ impl Orchestrator {
                 }
             }
         }
-        (ports, pinned)
+        ports
     }
 
     /// Lightweight initialization for read-only commands (status, logs).
@@ -1056,25 +1039,17 @@ impl Orchestrator {
         // Persist resolved port parameters globally so that on next `fed start`,
         // collect_managed_ports can detect ports owned by process/Gradle services
         // (not just Docker).
-        let resolutions = self.resolver.get_port_resolutions();
-        let port_resolutions: Vec<(String, u16)> = resolutions
+        let port_resolutions: Vec<(String, u16)> = self
+            .resolver
+            .get_port_resolutions()
             .iter()
             .map(|r| (r.param_name.clone(), r.resolved_port))
-            .collect();
-        let pinned: HashSet<String> = resolutions
-            .iter()
-            .filter(|r| r.reason == crate::parameter::PortResolutionReason::Pinned)
-            .map(|r| r.param_name.clone())
             .collect();
         if !port_resolutions.is_empty() {
             self.state_tracker
                 .write()
                 .await
-                .save_pinned_port_resolutions(
-                    &port_resolutions,
-                    &pinned,
-                    self.isolation_id.as_deref(),
-                )
+                .save_port_resolutions(&port_resolutions, self.isolation_id.as_deref())
                 .await?;
         }
 

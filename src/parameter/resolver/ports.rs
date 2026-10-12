@@ -16,11 +16,6 @@ pub enum PortResolutionReason {
     },
     /// Port was restored from cache
     Cached,
-    /// Port is pinned, by `fed start --pin` or by an earlier pin
-    Pinned,
-    /// Port is the one this parameter would use, but a program outside the
-    /// stack uses it. Only reported by `fed ports resolve`.
-    Taken,
     /// No default available, allocated a random port
     Random,
 }
@@ -43,8 +38,6 @@ impl std::fmt::Display for PortResolutionReason {
                 }
             }
             Self::Cached => write!(f, "restored from cache"),
-            Self::Pinned => write!(f, "pinned"),
-            Self::Taken => write!(f, "taken by another program"),
             Self::Random => write!(f, "randomly allocated"),
         }
     }
@@ -80,32 +73,6 @@ impl Resolver {
                     param_name, port, detail
                 ))
             })
-    }
-
-    /// Reserve a pinned port exactly. A running service of this stack may
-    /// hold it only when the parameter already had this port (`kept`). A new
-    /// pin must be free, whatever runs, so a pin cannot take a port from a
-    /// program outside the stack.
-    pub(super) fn reserve_pin(
-        &mut self,
-        port: u16,
-        param_name: &str,
-        kept: bool,
-    ) -> Result<(u16, PortResolutionReason)> {
-        if kept && self.managed_ports.contains(&port) {
-            self.port_allocator.mark_allocated(port);
-            return Ok((port, PortResolutionReason::Pinned));
-        }
-        if self.port_allocator.try_allocate_port(port).is_ok() {
-            return Ok((port, PortResolutionReason::Pinned));
-        }
-        if self.report_taken {
-            return Ok((port, PortResolutionReason::Taken));
-        }
-        Err(Error::PinnedPortTaken {
-            param: param_name.to_string(),
-            port,
-        })
     }
 
     /// Get all allocated ports
@@ -155,8 +122,6 @@ impl Resolver {
                 param_name
             );
             Ok((cached_port, PortResolutionReason::Cached))
-        } else if self.report_taken {
-            Ok((cached_port, PortResolutionReason::Taken))
         } else {
             tracing::warn!(
                 "Cached port {} for '{}' is no longer available, resolving conflict...",
@@ -243,8 +208,6 @@ impl Resolver {
                     Ok((default_port, PortResolutionReason::DefaultAvailable))
                 } else if self.port_allocator.try_allocate_port(default_port).is_ok() {
                     Ok((default_port, PortResolutionReason::DefaultAvailable))
-                } else if self.report_taken {
-                    Ok((default_port, PortResolutionReason::Taken))
                 } else {
                     let (p, conflict) =
                         self.handle_port_conflict_interactive(default_port, param_name)?;
@@ -576,145 +539,6 @@ mod tests {
         assert_eq!(
             port, 59912,
             "available config default should supersede cached port"
-        );
-    }
-
-    #[test]
-    fn a_pinned_port_wins_over_a_free_config_default() {
-        use crate::config::Config;
-
-        let mut resolver = Resolver::new();
-        resolver.set_prefer_config_defaults(true);
-
-        let mut cached = HashMap::new();
-        cached.insert("API_PORT".to_string(), 59921u16);
-        let pinned = ["API_PORT".to_string()].into_iter().collect();
-        resolver.set_port_store(Box::new(crate::port::SqlitePortStore::with_pins(
-            cached, pinned,
-        )));
-
-        let mut config = Config::default();
-        config
-            .parameters
-            .insert("API_PORT".to_string(), port_param_with_default(59922));
-
-        resolver.resolve_parameters(&mut config).unwrap();
-        assert_eq!(resolver.get_resolved_parameters()["API_PORT"], "59921");
-    }
-
-    fn web_config(default: u16) -> crate::config::Config {
-        let mut config = crate::config::Config::default();
-        config
-            .parameters
-            .insert("WEB_PORT".to_string(), port_param_with_default(default));
-        config
-    }
-
-    fn held_port() -> (std::net::TcpListener, u16) {
-        let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        (listener, port)
-    }
-
-    fn pinned_store(param: &str, port: u16) -> Box<crate::port::SqlitePortStore> {
-        Box::new(crate::port::SqlitePortStore::with_pins(
-            [(param.to_string(), port)].into(),
-            [param.to_string()].into(),
-        ))
-    }
-
-    /// A new pin must be free. A running service makes every saved port look
-    /// like the stack's own, so that must not let a pin take a port that
-    /// another program holds.
-    #[test]
-    fn a_new_pin_on_a_port_another_program_holds_fails_while_services_run() {
-        let (_held, port) = held_port();
-        let mut resolver = Resolver::new();
-        resolver.set_managed_ports([port].into());
-        resolver.set_port_store(Box::new(crate::port::SqlitePortStore::new(
-            [("WEB_PORT".to_string(), free_port_candidate())].into(),
-        )));
-        resolver.set_pins([("WEB_PORT".to_string(), port)].into());
-        let error = resolver
-            .resolve_parameters(&mut web_config(free_port_candidate()))
-            .unwrap_err();
-        assert!(
-            matches!(&error, Error::PinnedPortTaken { param, port: p } if param == "WEB_PORT" && *p == port),
-            "{error:?}"
-        );
-    }
-
-    /// Pinning a parameter to the port its running service already holds
-    /// keeps it.
-    #[test]
-    fn a_pin_to_the_port_the_stack_already_holds_is_kept() {
-        let (_held, port) = held_port();
-        let mut resolver = Resolver::new();
-        resolver.set_managed_ports([port].into());
-        resolver.set_port_store(Box::new(crate::port::SqlitePortStore::new(
-            [("WEB_PORT".to_string(), port)].into(),
-        )));
-        resolver.set_pins([("WEB_PORT".to_string(), port)].into());
-        resolver
-            .resolve_parameters(&mut web_config(free_port_candidate()))
-            .unwrap();
-        let resolution = &resolver.get_port_resolutions()[0];
-        assert_eq!(resolution.resolved_port, port);
-        assert_eq!(resolution.reason, PortResolutionReason::Pinned);
-    }
-
-    /// A saved pin that another program took fails the start. It is not moved
-    /// to a random port, and the config default does not replace it, since
-    /// the default is the port the pin moved away from.
-    #[test]
-    fn a_saved_pin_another_program_took_fails_instead_of_moving() {
-        let (_held, port) = held_port();
-        let default = free_port_candidate();
-        let mut resolver = Resolver::new();
-        resolver.set_prefer_config_defaults(true);
-        resolver.set_auto_resolve_conflicts(true);
-        resolver.set_port_store(pinned_store("WEB_PORT", port));
-        let error = resolver
-            .resolve_parameters(&mut web_config(default))
-            .unwrap_err();
-        assert!(matches!(error, Error::PinnedPortTaken { .. }), "{error:?}");
-
-        let mut resolver = Resolver::new();
-        resolver.set_report_taken(true);
-        resolver.set_port_store(pinned_store("WEB_PORT", port));
-        resolver
-            .resolve_parameters(&mut web_config(default))
-            .unwrap();
-        let resolution = &resolver.get_port_resolutions()[0];
-        assert_eq!(resolution.resolved_port, port);
-        assert_eq!(resolution.reason, PortResolutionReason::Taken);
-    }
-
-    /// `fed ports resolve` reports a taken port instead of moving it.
-    #[test]
-    fn report_mode_reports_a_taken_port_instead_of_moving_it() {
-        let (_held, port) = held_port();
-        let mut resolver = Resolver::new();
-        resolver.set_report_taken(true);
-        resolver.resolve_parameters(&mut web_config(port)).unwrap();
-        let resolution = &resolver.get_port_resolutions()[0];
-        assert_eq!(resolution.resolved_port, port);
-        assert_eq!(resolution.reason, PortResolutionReason::Taken);
-    }
-
-    #[test]
-    fn a_pin_cannot_move_a_parameter_with_a_fixed_value() {
-        let mut config = web_config(3000);
-        config.parameters.get_mut("WEB_PORT").unwrap().value = Some("3000".to_string());
-        let mut resolver = Resolver::new();
-        resolver.set_pins([("WEB_PORT".to_string(), 4000)].into());
-        let error = resolver
-            .resolve_parameters(&mut config)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("fed start --pin WEB_PORT=4000 cannot move WEB_PORT, because fed.yaml or .env sets its value to 3000."),
-            "{error}"
         );
     }
 

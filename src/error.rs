@@ -8,11 +8,6 @@ use miette::Diagnostic;
 use std::io;
 use thiserror::Error;
 
-/// Exit status of `fed start` when a pinned port is taken by a program
-/// outside the stack. `fed remote start` tells it apart from other failures
-/// and tries another port.
-pub const PINNED_PORT_TAKEN_EXIT: i32 = 75;
-
 #[derive(Error, Diagnostic, Debug)]
 pub enum Error {
     #[error("Configuration error: {0}")]
@@ -128,11 +123,6 @@ pub enum Error {
 
     #[error("Operation aborted by user")]
     Aborted,
-
-    /// A port parameter is pinned to a port that a program outside the
-    /// stack uses. fed does not move a pinned port.
-    #[error("{param} is pinned to port {port}, but another program uses that port.")]
-    PinnedPortTaken { param: String, port: u16 },
 
     #[error("Git error: {0}")]
     Git(#[from] git2::Error),

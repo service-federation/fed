@@ -1,6 +1,5 @@
 // Split from sqlite.rs (see git history before this commit for pre-split blame).
 use super::*;
-use std::collections::HashSet;
 
 impl SqliteStateTracker {
     /// Track a newly allocated port
@@ -170,23 +169,8 @@ impl SqliteStateTracker {
         resolutions: &[(String, u16)],
         isolation_id: Option<&str>,
     ) -> Result<()> {
-        self.save_pinned_port_resolutions(resolutions, &HashSet::new(), isolation_id)
-            .await
-    }
-
-    /// Save resolved port parameters like [`Self::save_port_resolutions`],
-    /// and mark the `pinned` ones. A pinned port stays on its port in later
-    /// resolutions: a free config `default:` does not replace it, and a
-    /// program outside the stack on it fails the start instead of moving it.
-    pub async fn save_pinned_port_resolutions(
-        &mut self,
-        resolutions: &[(String, u16)],
-        pinned: &HashSet<String>,
-        isolation_id: Option<&str>,
-    ) -> Result<()> {
         let count = resolutions.len();
         let resolutions = resolutions.to_vec();
-        let pinned = pinned.clone();
         let scope = isolation_id.unwrap_or("").to_string();
         let now = Utc::now().to_rfc3339();
 
@@ -202,14 +186,9 @@ impl SqliteStateTracker {
 
                 // Insert all resolved port parameters
                 for (param_name, port) in &resolutions {
-                    let source = if pinned.contains(param_name) {
-                        "pin"
-                    } else {
-                        "resolver"
-                    };
                     tx.execute(
-                        "INSERT INTO persisted_ports (param_name, port, source, allocated_at, isolation_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        rusqlite::params![param_name, port, source, &now, &scope],
+                        "INSERT INTO persisted_ports (param_name, port, source, allocated_at, isolation_id) VALUES (?1, ?2, 'resolver', ?3, ?4)",
+                        rusqlite::params![param_name, port, &now, &scope],
                     )?;
                     tx.execute(
                         "INSERT OR IGNORE INTO allocated_ports (port, allocated_at) VALUES (?1, ?2)",
@@ -261,33 +240,6 @@ impl SqliteStateTracker {
             Err(e) => {
                 warn!("Failed to read global port allocations: {}", e);
                 HashMap::new()
-            }
-        }
-    }
-
-    /// The names of the pinned port parameters in an isolation scope.
-    pub async fn get_pinned_ports(&self, isolation_id: Option<&str>) -> HashSet<String> {
-        let scope = isolation_id.unwrap_or("").to_string();
-        match self
-            .conn
-            .call(
-                move |conn: &mut rusqlite::Connection| -> tokio_rusqlite::Result<HashSet<String>> {
-                    let mut stmt = conn.prepare(
-                        "SELECT param_name FROM persisted_ports WHERE isolation_id = ?1 AND source = 'pin'",
-                    )?;
-                    let names = stmt
-                        .query_map(rusqlite::params![&scope], |row| row.get::<_, String>(0))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    Ok(names)
-                },
-            )
-            .await
-        {
-            Ok(names) => names,
-            Err(e) => {
-                warn!("Failed to read pinned ports: {}", e);
-                HashSet::new()
             }
         }
     }
@@ -442,28 +394,6 @@ mod tests {
         assert_eq!(globals.len(), 1, "Previous resolutions should be replaced");
         assert_eq!(globals.get("NEW_PORT"), Some(&4000));
         assert!(!globals.contains_key("OLD_PORT"));
-    }
-
-    #[tokio::test]
-    async fn pinned_resolutions_are_marked_and_the_next_save_replaces_them() {
-        let mut tracker = create_ephemeral_tracker().await;
-        let resolved = vec![
-            ("WEB_PORT".to_string(), 4000),
-            ("DB_PORT".to_string(), 5432),
-        ];
-        let pinned: HashSet<String> = ["WEB_PORT".to_string()].into();
-        tracker
-            .save_pinned_port_resolutions(&resolved, &pinned, None)
-            .await
-            .unwrap();
-        assert_eq!(tracker.get_pinned_ports(None).await, pinned);
-        assert!(tracker.get_pinned_ports(Some("iso-other")).await.is_empty());
-
-        tracker
-            .save_port_resolutions(&resolved, None)
-            .await
-            .unwrap();
-        assert!(tracker.get_pinned_ports(None).await.is_empty());
     }
 
     #[tokio::test]

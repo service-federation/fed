@@ -1,5 +1,5 @@
 use crate::error::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Unified port storage abstraction.
 ///
@@ -21,12 +21,6 @@ pub trait PortStore: Send + Sync {
 
     /// Get all stored port allocations.
     fn get_all_ports(&self) -> HashMap<String, u16>;
-
-    /// Whether the stored port for a parameter is pinned: a free config
-    /// `default:` must not replace it.
-    fn is_pinned(&self, _param_name: &str) -> bool {
-        false
-    }
 }
 
 /// Port store backed by ports loaded from SQLite `persisted_ports` table.
@@ -37,17 +31,11 @@ pub trait PortStore: Send + Sync {
 /// `Orchestrator::initialize`).
 pub struct SqlitePortStore {
     ports: HashMap<String, u16>,
-    pinned: HashSet<String>,
 }
 
 impl SqlitePortStore {
     pub fn new(ports: HashMap<String, u16>) -> Self {
-        Self::with_pins(ports, HashSet::new())
-    }
-
-    /// A store whose `pinned` parameters keep their stored port.
-    pub fn with_pins(ports: HashMap<String, u16>, pinned: HashSet<String>) -> Self {
-        Self { ports, pinned }
+        Self { ports }
     }
 }
 
@@ -63,10 +51,6 @@ impl PortStore for SqlitePortStore {
 
     fn get_all_ports(&self) -> HashMap<String, u16> {
         self.ports.clone()
-    }
-
-    fn is_pinned(&self, param_name: &str) -> bool {
-        self.pinned.contains(param_name)
     }
 }
 
