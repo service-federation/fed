@@ -489,6 +489,20 @@ pub(crate) fn taken_ports_message(
     message
 }
 
+/// The error for forwards that stopped while the others started. Each entry
+/// is a port, its parameters and what ssh's exit said.
+pub(crate) fn failed_forwards_message(name: &str, failed: &[(u16, String, String)]) -> String {
+    let mut message =
+        format!("fed remote connect stopped every forward to {name}, because these did not start:");
+    for (port, params, why) in failed {
+        message.push_str(&format!("\n  {port} ({params}): {why}"));
+    }
+    message.push_str(&format!(
+        "\nA program on this machine may have taken the port. Run `fed remote connect {name}` again."
+    ));
+    message
+}
+
 /// The program on `port` on this machine, as `name (PID n)`.
 fn program_on(port: u16) -> Option<String> {
     let conflict = fed::port::PortConflict::check(port)?;
@@ -2115,23 +2129,32 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
     };
     if !stop_requested {
         let mut alive = Vec::new();
+        let mut failed = Vec::new();
+        let mut up = Vec::new();
         for (local, port, params, mut child) in forwards {
             match child.try_wait() {
                 Ok(None) => {
-                    out.status(&format!("  localhost:{local} -> {name}:{port}  ({params})"));
+                    up.push(format!("  localhost:{local} -> {name}:{port}  ({params})"));
                     alive.push((local, child));
                 }
-                Ok(Some(status)) => out.warning(&format!(
-                    "The forward from localhost:{local} to {name}:{port} stopped ({status})."
-                )),
-                Err(e) => out.warning(&format!(
-                    "The forward from localhost:{local} to {name}:{port} failed: {e}"
-                )),
+                Ok(Some(status)) => failed.push((port, params, status.to_string())),
+                Err(e) => failed.push((port, params, e.to_string())),
             }
         }
         let mut forwards = alive;
-        if forwards.is_empty() {
-            return Err(every_forward_stopped(remote).await);
+        if !failed.is_empty() {
+            // Some ports reach the environment and others reach whatever
+            // took them here, which is worse than no connection.
+            for (_, child) in &mut forwards {
+                let _ = child.kill().await;
+            }
+            if forwards.is_empty() {
+                return Err(every_forward_stopped(remote).await);
+            }
+            bail!(failed_forwards_message(name, &failed));
+        }
+        for line in up {
+            out.status(&line);
         }
         out.status(&format!(
             "Connected. Press Ctrl-C to disconnect. {name} powers off after {IDLE_MINUTES} minutes without an SSH session; cloud cleanup follows automatically."
@@ -2525,6 +2548,17 @@ mod tests {
         assert_eq!(
             message,
             "fed remote connect cannot forward every port of box, because programs on this machine use these ports:\n  3000 (WEB_PORT): node (PID 42)\n  5432 (DB_PORT, PG_PORT): an unknown program\nStop those programs, or run `fed remote start box` to move these ports to free ones."
+        );
+    }
+
+    #[test]
+    fn failed_forwards_are_listed_with_what_ssh_said() {
+        assert_eq!(
+            failed_forwards_message(
+                "box",
+                &[(3000, "WEB_PORT".into(), "exit status: 255".into())]
+            ),
+            "fed remote connect stopped every forward to box, because these did not start:\n  3000 (WEB_PORT): exit status: 255\nA program on this machine may have taken the port. Run `fed remote connect box` again."
         );
     }
 

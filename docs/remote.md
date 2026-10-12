@@ -104,7 +104,9 @@ are then right on both machines.
 When a program on your laptop has taken one of the ports since
 `fed remote start`, `connect` forwards nothing. It lists each such port with
 its parameter and, when fed can find it, the program. Stop that program, or
-run `fed remote start NAME` again to move the port.
+run `fed remote start NAME` again to move the port. A program can also take a
+port in the moment between that check and the forward. Then the forward fails,
+and `connect` ends the other forwards too and says which port failed.
 
 ### `fed remote ssh NAME [--as WORKSPACE] [-- COMMAND...]`
 

@@ -134,7 +134,8 @@ mod with_feature {
     /// for a deleted machine, and `FAKE_SSH=stale` for a master that has not
     /// noticed yet. `FAKE_CLOUD_INIT` is the exit status of the setup wait
     /// in `up`. `FAKE_FORWARD=hold` keeps a port forward running
-    /// and writes its pid to `<log>.forward.<pid>`. `FAKE_PORTS` is the JSON
+    /// and writes its pid to `<log>.forward.<pid>`, except the forward from
+    /// the port in `FAKE_FORWARD_FAIL`, which fails. `FAKE_PORTS` is the JSON
     /// that `fed ports resolve` prints, with each `--pin` applied. The last
     /// one printed is what `fed ports list --json` prints. `FAKE_NO_RESOLVE`
     /// makes the machine's fed one without `fed ports resolve`.
@@ -163,6 +164,9 @@ case "$opts " in
   *" -O exit "*) exit 0 ;;
   *" -f -N "*) exit 0 ;;
   *" -L "*)
+    if [ -n "$FAKE_FORWARD_FAIL" ]; then
+      case "$opts " in *" $FAKE_FORWARD_FAIL:127.0.0.1:"*) exit 255 ;; esac
+    fi
     if [ "$FAKE_FORWARD" = hold ]; then
       echo $$ > "$FAKE_LOG.forward.$$"
       exec sleep 600
@@ -869,6 +873,53 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         );
         let calls = setup.calls();
         assert!(calls.iter().all(|c| !c.contains(" [-L] ")), "{calls:#?}");
+    }
+
+    /// When one forward fails to start, `connect` ends the others and fails,
+    /// so no port reaches whatever took it on this machine.
+    #[test]
+    fn connect_ends_every_forward_when_one_fails() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (web, _) = setup.ports;
+        let web = web.to_string();
+        let (ok, output) = setup.fed(
+            "http://127.0.0.1:9",
+            &["remote", "connect", "box"],
+            &[("FAKE_FORWARD", "hold"), ("FAKE_FORWARD_FAIL", &web)],
+        );
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains(
+                "Error: fed remote connect stopped every forward to box, because these did not start:"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("  {web} (WEB_PORT): ")),
+            "{output}"
+        );
+        assert!(!output.contains("Connected."), "{output}");
+        let held: Vec<i32> = std::fs::read_dir(setup.home())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("calls.log.forward.")
+            })
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter_map(|pid| pid.trim().parse().ok())
+            .collect();
+        assert_eq!(held.len(), 1, "{held:?}");
+        let start = std::time::Instant::now();
+        while held.iter().any(|pid| alive(*pid)) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "the other forward still runs"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     /// fed on the machine without `fed ports resolve` stops `start` before
