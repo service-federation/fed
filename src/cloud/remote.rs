@@ -234,6 +234,21 @@ pub enum EnvironmentRequest<'a> {
 /// The longest server message fed prints, in characters.
 const MAX_SERVER_MESSAGE: usize = 300;
 
+/// Characters a terminal does not show but that change how text around them
+/// reads: the bidirectional marks, embeddings, overrides and isolates
+/// (U+061C, U+200E-U+200F, U+202A-U+202E, U+2066-U+2069), zero-width
+/// characters and the byte order mark.
+fn is_hidden_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
 /// The server's `message` as fed prints it, or `None` when nothing is left.
 /// It comes from the network, so control and bidirectional formatting
 /// characters become spaces, runs of white space become one, and a long
@@ -242,8 +257,7 @@ pub fn clean_server_message(raw: &str) -> Option<String> {
     let visible: String = raw
         .chars()
         .map(|c| {
-            let hidden = c.is_control()
-                || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}');
+            let hidden = c.is_control() || is_hidden_format(c);
             if hidden { ' ' } else { c }
         })
         .collect();
@@ -946,6 +960,16 @@ mod tests {
             Some("Line one. Line [31m two.")
         );
         assert_eq!(clean_server_message(" \n\u{7} "), None);
+        for hidden in [
+            '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202e}', '\u{2066}', '\u{2069}',
+        ] {
+            assert_eq!(
+                clean_server_message(&format!("Pay{hidden}now.")).as_deref(),
+                Some("Pay now."),
+                "U+{:04X}",
+                hidden as u32
+            );
+        }
         let long = clean_server_message(&"word ".repeat(200)).unwrap();
         assert_eq!(long.chars().count(), MAX_SERVER_MESSAGE);
         assert!(long.ends_with("word…") || long.ends_with('…'), "{long}");
