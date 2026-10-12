@@ -235,6 +235,8 @@ fed variant set go,ts,rust        # persist it; fed variant list shows the resul
 
 For each service, the first name in the list it offers wins; otherwise its `default_variant`. A name no service has produces a warning, so one list can serve several checkouts. Precedence, highest first: a `--variant` pin, the `--variant` list, `.fed/variants.yaml` (written by `fed variant set`), then `default_variant`. Persisting matters because `fed restart`, `fed status`, the TUI and the background supervisor all have to agree without the flag being repeated.
 
+To show which implementation runs, `fed start` and `fed status` print the variant next to the service name, as in `catalog (go)`. When the choice comes from `.fed/variants.yaml`, `fed start` says so and prints the command that undoes it.
+
 Switching variant while the service runs is a `fed stop` and a `fed start` — the ports and container names are the same, so the two implementations can't coexist. A variant that needs a *different* port is a different service, not a variant: the contract lives on the outer service by design.
 
 See [`examples/variants-example.yaml`](./examples/variants-example.yaml) for a minimal version, or the [variant stack walkthrough](./examples/variant-stack/) for real HTTP services, a browser page, health failure/recovery, and an attachable console.

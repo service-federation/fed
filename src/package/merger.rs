@@ -330,6 +330,7 @@ impl ServiceMerger {
         }
         if local.variant.is_none() {
             local.variant = base.variant.clone();
+            local.variant_source = base.variant_source;
         }
 
         // `tty`, `expose`, and `compose_imported` are booleans with no "unset"

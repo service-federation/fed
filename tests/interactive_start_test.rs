@@ -419,3 +419,38 @@ services:
         );
     }
 }
+
+/// The interactive service prints no start line of its own, so when it
+/// declares variants, fed says which one gets the terminal.
+#[test]
+fn interactive_start_shows_the_variant_that_gets_the_terminal() {
+    let dir = TempDir::new().expect("temp dir");
+    let config = write_config(
+        &dir,
+        r#"
+services:
+  catalog:
+    default_variant: java
+    variants:
+      java:
+        process: echo java
+      go:
+        process: echo go
+"#,
+    );
+    let _guard = StopGuard {
+        config: config.clone(),
+    };
+
+    let output = run_fed(
+        &config,
+        &["start", "-i", "--variant", "go", "catalog"],
+        Duration::from_secs(30),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "fed start -i failed: {stdout}");
+    assert!(
+        stdout.contains("  ▸ catalog (go)  runs in this terminal"),
+        "{stdout}"
+    );
+}

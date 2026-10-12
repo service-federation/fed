@@ -1206,3 +1206,162 @@ services:
     assert_eq!(svc["service_type"], "docker", "{svc}");
     assert!(stop.status.success());
 }
+
+// ── What `fed start` prints ───────────────────────────────────────────────
+
+/// A process-only stack, so `fed start` runs without Docker: `catalog` has
+/// two variants and `storage` has none.
+const STARTABLE: &str = r#"
+services:
+  storage:
+    process: sleep 300
+  catalog:
+    depends_on: [storage]
+    default_variant: java
+    variants:
+      java:
+        process: sleep 301
+      go:
+        process: sleep 302
+"#;
+
+/// Runs fed against one config in its own work dir, and stops whatever it
+/// started when the test ends, even after a failed assertion.
+struct Stack {
+    dir: tempfile::TempDir,
+    config_path: std::path::PathBuf,
+}
+
+impl Stack {
+    fn new(yaml: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("fed.yaml");
+        std::fs::write(&config_path, yaml).unwrap();
+        Self { dir, config_path }
+    }
+
+    /// Run `fed <args>` and return stdout and stderr together.
+    fn fed(&self, args: &[&str]) -> String {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_fed"))
+            .arg("--workdir")
+            .arg(self.dir.path())
+            .arg("--config")
+            .arg(&self.config_path)
+            .args(args)
+            .env("FED_NON_INTERACTIVE", "1")
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "fed {args:?} failed: {combined}");
+        combined
+    }
+}
+
+impl Drop for Stack {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_fed"))
+            .arg("--workdir")
+            .arg(self.dir.path())
+            .arg("--config")
+            .arg(&self.config_path)
+            .arg("stop")
+            .output();
+    }
+}
+
+/// The line `fed start` prints for `label` once it has started.
+fn start_line<'a>(output: &'a str, label: &str) -> &'a str {
+    output
+        .lines()
+        .find(|line| line.starts_with(&format!("  ✓ {label} ")))
+        .unwrap_or_else(|| panic!("no start line for '{label}' in:\n{output}"))
+}
+
+/// Someone who edits one implementation must be able to see from `fed start`
+/// which one runs. A service without variants keeps its plain name.
+#[test]
+fn fed_start_shows_the_variant_each_service_runs() {
+    let stack = Stack::new(STARTABLE);
+    let output = stack.fed(&["start", "catalog"]);
+
+    start_line(&output, "catalog (java)");
+    start_line(&output, "storage");
+    assert!(
+        output.contains("  catalog (java): Running"),
+        "the status list should show the variant too:\n{output}"
+    );
+    assert!(
+        output.contains("  storage: Running"),
+        "a service without variants should look as before:\n{output}"
+    );
+    assert!(
+        !output.contains("Variant:"),
+        "the default variant needs no explanation:\n{output}"
+    );
+}
+
+#[test]
+fn fed_start_shows_the_variant_given_with_the_flag() {
+    let stack = Stack::new(STARTABLE);
+    let output = stack.fed(&["start", "catalog", "--variant", "go"]);
+
+    start_line(&output, "catalog (go)");
+    assert!(
+        !output.contains("Variant:"),
+        "a variant passed on this command line needs no explanation:\n{output}"
+    );
+}
+
+/// A choice saved by `fed variant set` is invisible when running `fed start`,
+/// so the start output says where it came from and how to undo it.
+#[test]
+fn fed_start_points_at_a_saved_variant_choice() {
+    let stack = Stack::new(STARTABLE);
+    stack.fed(&["variant", "set", "catalog:go"]);
+    let output = stack.fed(&["start", "catalog"]);
+
+    start_line(&output, "catalog (go)");
+    assert!(
+        output.contains(
+            "Variant: catalog set to go by 'fed variant set'. To undo: fed variant unset catalog"
+        ),
+        "{output}"
+    );
+}
+
+#[test]
+fn fed_start_points_at_a_saved_preference_list() {
+    let stack = Stack::new(STARTABLE);
+    stack.fed(&["variant", "set", "go"]);
+    let output = stack.fed(&["start", "catalog", "--dry-run"]);
+
+    assert!(
+        output.contains(
+            "Variant: catalog set to go by 'fed variant set'. To undo: fed variant clear"
+        ),
+        "{output}"
+    );
+}
+
+/// `fed start` leaves a running service alone. When that service runs
+/// another variant than the one asked for, the output must show the one
+/// that runs and how to switch.
+#[test]
+fn fed_start_shows_the_running_variant_when_it_differs() {
+    let stack = Stack::new(STARTABLE);
+    stack.fed(&["start", "catalog"]);
+    let output = stack.fed(&["start", "catalog", "--variant", "catalog:go"]);
+
+    start_line(&output, "catalog (java)");
+    assert!(
+        output.contains(
+            "catalog was already running as java. To switch it to go: \
+             fed restart catalog --variant catalog:go"
+        ),
+        "{output}"
+    );
+}
