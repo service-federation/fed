@@ -134,7 +134,10 @@ mod with_feature {
     /// for a deleted machine, and `FAKE_SSH=stale` for a master that has not
     /// noticed yet. `FAKE_CLOUD_INIT` is the exit status of the setup wait
     /// in `up`. `FAKE_FORWARD=hold` keeps a port forward running
-    /// and writes its pid to `<log>.forward.<pid>`.
+    /// and writes its pid to `<log>.forward.<pid>`, except the forward from
+    /// the port in `FAKE_FORWARD_FAIL`, which fails after `FAKE_FORWARD_DELAY`
+    /// seconds, at once by default. `FAKE_PORTS` is what the
+    /// machine's `fed ports list --json` prints.
     const FAKE_SSH: &str = r#"#!/bin/sh
 line=ssh; for a in "$@"; do line="$line [$a]"; done
 printf '%s\n' "$line" >> "$FAKE_LOG"
@@ -160,6 +163,9 @@ case "$opts " in
   *" -O exit "*) exit 0 ;;
   *" -f -N "*) exit 0 ;;
   *" -L "*)
+    if [ -n "$FAKE_FORWARD_FAIL" ]; then
+      case "$opts " in *" $FAKE_FORWARD_FAIL:127.0.0.1:"*) sleep "${FAKE_FORWARD_DELAY:-0}"; exit 255 ;; esac
+    fi
     if [ "$FAKE_FORWARD" = hold ]; then
       echo $$ > "$FAKE_LOG.forward.$$"
       exec sleep 600
@@ -171,7 +177,7 @@ case "$last" in
   "cloud-init status --wait >/dev/null") exit "${FAKE_CLOUD_INIT:-0}" ;;
   "cloud-init status --long")
     printf 'status: error\nerrors:\n\t- (%s)\nrecoverable_errors: {}\n' "'init', RuntimeError('disk full')" ;;
-  *"fed ports list --json"*) echo '{"WEB_PORT": 18080, "DB_PORT": 15432}' ;;
+  *"fed ports list --json"*) echo "$FAKE_PORTS" ;;
   *) cat > "$FAKE_LOG.stdin.$$" ;;
 esac
 exit 0
@@ -192,6 +198,15 @@ exit "${FAKE_RSYNC_EXIT:-0}"
     struct Setup {
         home: TempDir,
         checkout: PathBuf,
+        /// The stack's two ports on the machine, free on this one when the
+        /// test starts: (WEB_PORT, DB_PORT).
+        ports: (u16, u16),
+    }
+
+    /// A port nothing on this machine uses right now.
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        listener.local_addr().unwrap().port()
     }
 
     impl Setup {
@@ -219,7 +234,22 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 std::fs::write(&path, script).unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
-            Self { home, checkout }
+            let mut ports = (free_port(), free_port());
+            while ports.0 == ports.1 {
+                ports.1 = free_port();
+            }
+            Self {
+                home,
+                checkout,
+                ports,
+            }
+        }
+
+        fn ports_json(&self) -> String {
+            format!(
+                r#"{{"WEB_PORT": {}, "DB_PORT": {}}}"#,
+                self.ports.0, self.ports.1
+            )
         }
 
         fn home(&self) -> &Path {
@@ -281,6 +311,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 .env("FAKE_LOG", self.log_path())
                 .env("FED_TOKEN", "fed_test-token")
                 .env("FED_CLOUD_URL", url)
+                .env("FAKE_PORTS", self.ports_json())
                 .envs(env.iter().copied())
                 .output()
                 .unwrap();
@@ -349,6 +380,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         let json = json_body(&request);
         assert_eq!(json["name"], "box");
         assert!(json.get("type").is_none(), "{json}");
+        assert!(json.get("root_volume_gb").is_none(), "{json}");
         assert!(
             json["client_public_key"]
                 .as_str()
@@ -375,6 +407,109 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             0o700
         );
         assert!(setup.remote_dirs().is_empty(), "{:?}", setup.remote_dirs());
+    }
+
+    #[test]
+    fn up_sends_the_disk_size() {
+        let setup = Setup::new();
+        let cloud = Cloud::start(vec![(
+            "POST /api/v1/orgs/acme/projects/web/environments ",
+            "403 Forbidden",
+            r#"{"error":"compute_not_enabled"}"#.to_string(),
+        )]);
+        let (ok, output) = setup.fed(&cloud.url, &["remote", "up", "box", "--disk", "40"], &[]);
+        assert!(!ok, "{output}");
+        let request = cloud
+            .request("POST /api/v1/orgs/acme/projects/web/environments ")
+            .unwrap();
+        assert_eq!(json_body(&request)["root_volume_gb"], 40);
+    }
+
+    #[test]
+    fn up_refuses_a_bad_disk_size_before_any_request() {
+        let setup = Setup::new();
+        let cloud = Cloud::start(vec![]);
+        for bad in ["5", "201", "40.5", "big"] {
+            let (ok, output) = setup.fed(&cloud.url, &["remote", "up", "box", "--disk", bad], &[]);
+            assert!(!ok, "{output}");
+            assert!(
+                output.contains(&format!(
+                    "Error: fed remote up --disk needs a whole number of GB from 10 to 200, such as --disk 40. It received `{bad}`."
+                )),
+                "{output}"
+            );
+        }
+        assert!(cloud.requests().is_empty(), "{:?}", cloud.requests());
+    }
+
+    /// The cloud's own sentence reaches the user, without the characters a
+    /// terminal would act on.
+    #[test]
+    fn up_prints_the_cloud_message_for_a_refusal() {
+        let setup = Setup::new();
+        let cloud = Cloud::start(vec![(
+            "POST /api/v1/orgs/acme/projects/web/environments ",
+            "403 Forbidden",
+            r#"{"error":"user_held","message":"Your account is on hold.\u001b[2J Contact support.\n"}"#
+                .to_string(),
+        )]);
+        let (ok, output) = setup.fed(&cloud.url, &["remote", "up", "box"], &[]);
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains("Error: Your account is on hold. [2J Contact support.\n"),
+            "{output}"
+        );
+        assert!(!output.contains('\u{1b}'), "{output:?}");
+    }
+
+    /// A refusal for the disk size keeps fed's hint after the cloud's message.
+    #[test]
+    fn up_adds_the_disk_hint_to_the_cloud_message() {
+        let setup = Setup::new();
+        let cloud = Cloud::start(vec![(
+            "POST /api/v1/orgs/acme/projects/web/environments ",
+            "422 Unprocessable Entity",
+            r#"{"error":"limit","limit":"root_volume_gb","message":"acme may use disks of at most 100 GB."}"#
+                .to_string(),
+        )]);
+        let (ok, output) = setup.fed(&cloud.url, &["remote", "up", "box", "--disk", "150"], &[]);
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains(
+                "Error: acme may use disks of at most 100 GB. Pick another size with `--disk`.\n"
+            ),
+            "{output}"
+        );
+    }
+
+    /// Without a message, fed's own wording stays.
+    #[test]
+    fn ls_prints_the_cloud_message_or_its_own_wording() {
+        let setup = Setup::new();
+        let cloud = Cloud::start(vec![(
+            WEB,
+            "403 Forbidden",
+            r#"{"error":"user_not_approved","message":"An admin of acme has not approved you yet."}"#
+                .to_string(),
+        )]);
+        let (ok, output) = setup.fed(&cloud.url, &["remote", "ls"], &[]);
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains("Error: An admin of acme has not approved you yet.\n"),
+            "{output}"
+        );
+
+        let cloud = Cloud::start(vec![(
+            WEB,
+            "422 Unprocessable Entity",
+            r#"{"error":"limit","limit":"org_limit"}"#.to_string(),
+        )]);
+        let (ok, output) = setup.fed(&cloud.url, &["remote", "ls"], &[]);
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains("Error: acme has reached a limit for remote environments.\n"),
+            "{output}"
+        );
     }
 
     #[test]
@@ -584,7 +719,9 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         let (ok, output) = setup.fed(&cloud.url, &["remote", "connect", "box"], &[]);
         assert!(!ok, "{output}");
         assert!(
-            output.contains("Error: every port forward to box stopped."),
+            output.contains(
+                "Error: fed remote connect ended every forward to box, because these stopped:"
+            ),
             "{output}"
         );
         assert!(!output.contains("Connected."), "{output}");
@@ -592,11 +729,11 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         let calls = setup.calls();
         let forwards: Vec<&String> = calls.iter().filter(|c| c.contains(" [-L] ")).collect();
         assert_eq!(forwards.len(), 2, "{calls:#?}");
-        for (local, remote) in [(25432, 15432), (28080, 18080)] {
+        for port in [setup.ports.0, setup.ports.1] {
             let forward = forwards
                 .iter()
-                .find(|c| c.contains(&format!("[-L] [{local}:127.0.0.1:{remote}]")))
-                .unwrap_or_else(|| panic!("no forward for {remote}: {forwards:#?}"));
+                .find(|c| c.contains(&format!("[-L] [{port}:127.0.0.1:{port}]")))
+                .unwrap_or_else(|| panic!("no forward for {port}: {forwards:#?}"));
             for option in [
                 "[BatchMode=yes]",
                 "[ExitOnForwardFailure=yes]",
@@ -612,6 +749,111 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 .any(|c| c.ends_with(" [cd /srv/app && fed ports list --json]")),
             "{calls:#?}"
         );
+    }
+
+    /// A port taken on this machine stops `connect` before any forward, with
+    /// the port, its parameter, the program and what to do.
+    #[test]
+    fn connect_refuses_a_port_taken_here() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (web, _) = setup.ports;
+        let _here = std::net::TcpListener::bind(("127.0.0.1", web)).unwrap();
+        let (ok, output) = setup.fed("http://127.0.0.1:9", &["remote", "connect", "box"], &[]);
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains(
+                "Error: fed remote connect cannot forward every port of box, because programs on this machine use these ports:"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("  {web} (WEB_PORT): ")),
+            "{output}"
+        );
+        // The listener belongs to this test process, which the port lookup
+        // finds by its PID.
+        assert!(
+            output.contains(&format!("(PID {})", std::process::id())),
+            "{output}"
+        );
+        assert!(
+            output.contains("Stop those programs, then run `fed remote connect box` again."),
+            "{output}"
+        );
+        let calls = setup.calls();
+        assert!(calls.iter().all(|c| !c.contains(" [-L] ")), "{calls:#?}");
+    }
+
+    /// Run `connect` with the forward of WEB_PORT failing after `delay`
+    /// seconds and the other one held, and check that `connect` fails, names
+    /// the port, and leaves no forward running. Returns the output.
+    fn connect_with_a_failing_forward(delay: &str) -> String {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (web, _) = setup.ports;
+        let web = web.to_string();
+        let (ok, output) = setup.fed(
+            "http://127.0.0.1:9",
+            &["remote", "connect", "box"],
+            &[
+                ("FAKE_FORWARD", "hold"),
+                ("FAKE_FORWARD_FAIL", &web),
+                ("FAKE_FORWARD_DELAY", delay),
+            ],
+        );
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains(
+                "Error: fed remote connect ended every forward to box, because these stopped:"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("  {web} (WEB_PORT): ssh exit status: 255")),
+            "{output}"
+        );
+        assert!(
+            output.contains("Run `fed remote connect box` again."),
+            "{output}"
+        );
+        let held: Vec<i32> = std::fs::read_dir(setup.home())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("calls.log.forward.")
+            })
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter_map(|pid| pid.trim().parse().ok())
+            .collect();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(
+            held.iter().all(|pid| !alive(*pid)),
+            "the other forward still runs after connect ended"
+        );
+        output
+    }
+
+    /// When one forward fails to start, `connect` ends the others and fails,
+    /// so no port reaches whatever took it on this machine.
+    #[test]
+    fn connect_ends_every_forward_when_one_fails_to_start() {
+        let output = connect_with_a_failing_forward("0");
+        assert!(!output.contains("Connected."), "{output}");
+        assert!(
+            output.contains("A program on this machine may have taken the port."),
+            "{output}"
+        );
+    }
+
+    /// A forward that stops after the connection is up ends the whole
+    /// connection too.
+    #[test]
+    fn connect_ends_every_forward_when_one_stops_later() {
+        let output = connect_with_a_failing_forward("2");
+        assert!(output.contains("Connected."), "{output}");
     }
 
     /// An environment deleted under the user: the first SSH fails, the cloud
@@ -840,6 +1082,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         theirs["owner"] = serde_json::json!({"id": "u-bob", "name": "Bob"});
         let mut mine = environment("env-live", "box");
         mine["owner"] = serde_json::json!({"id": "u-me", "name": "Me"});
+        mine["root_volume_gb"] = 40.into();
         let cloud = Cloud::start(vec![
             (WEB, "200 OK", list(&[mine, theirs])),
             (
@@ -860,10 +1103,13 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             lines[0].starts_with("NAME") && lines[0].ends_with("OWNER"),
             "{output}"
         );
+        assert!(lines[0].contains(" TYPE    DISK "), "{output}");
         assert!(
             lines[1].starts_with("box ") && lines[1].ends_with("you"),
             "{output}"
         );
+        assert!(lines[1].contains(" DEV1-S  40 GB "), "{output}");
+        assert!(lines[2].contains(" DEV1-S  -  "), "{output}");
         assert!(
             lines[2].starts_with("bobs ") && lines[2].ends_with("Bob"),
             "{output}"
@@ -970,6 +1216,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 .env("PATH", path)
                 .env("FAKE_LOG", setup.log_path())
                 .env("FAKE_FORWARD", "hold")
+                .env("FAKE_PORTS", setup.ports_json())
                 .env("FED_TOKEN", "fed_test-token")
                 .env("FED_CLOUD_URL", "http://127.0.0.1:9")
                 .stdout(std::fs::File::create(&output_path).unwrap())
@@ -1029,6 +1276,13 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 "{signal}: {text}"
             );
             assert!(text.contains("Connected."), "{signal}: {text}");
+            // Every port is forwarded to the same number on this machine.
+            for port in [setup.ports.0, setup.ports.1] {
+                assert!(
+                    text.contains(&format!("localhost:{port} -> box:{port}")),
+                    "{signal}: {text}"
+                );
+            }
             if signal != "KILL" {
                 assert!(text.contains("Disconnected."), "{signal}: {text}");
             }

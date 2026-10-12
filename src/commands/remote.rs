@@ -26,9 +26,6 @@ const SSH_WAIT: Duration = Duration::from_secs(300);
 const IDLE_MINUTES: u32 = 5;
 /// How long an environment lives in any case.
 const LIFETIME_HOURS: u32 = 6;
-/// Remote port P is forwarded from local P + PORT_OFFSET, so the same stack can
-/// run on this machine at the same time.
-const PORT_OFFSET: u16 = 10_000;
 /// How long `connect` waits before it reports the forwards as up. A forward
 /// whose local port is taken fails within this time.
 const FORWARD_SETTLE: Duration = Duration::from_secs(1);
@@ -374,11 +371,6 @@ pub(crate) fn known_hosts_line(ip: &str, port: u16, host_public_key: &str) -> Re
     Ok(format!("[{ip}]:{port} {kind} {key}\n"))
 }
 
-/// The local port that forwards to remote port `remote`.
-pub(crate) fn local_port(remote: u16) -> u16 {
-    remote.checked_add(PORT_OFFSET).unwrap_or(remote)
-}
-
 /// The ports in the JSON of `fed ports list --json` (`{"PARAM": port}`), each
 /// with the parameters that use it, sorted by port.
 pub(crate) fn parse_ports(json: &str) -> Result<Vec<(u16, Vec<String>)>> {
@@ -389,6 +381,70 @@ pub(crate) fn parse_ports(json: &str) -> Result<Vec<(u16, Vec<String>)>> {
         by_port.entry(port).or_default().push(param);
     }
     Ok(by_port.into_iter().collect())
+}
+
+/// Whether a program on this machine uses `port`, so a forward from it would
+/// not reach the environment. A dual-stack listener on `[::]` lets a
+/// 127.0.0.1 bind succeed on macOS, so the wildcard and `::1` count too.
+pub(crate) fn taken_here(port: u16) -> bool {
+    use std::net::{Ipv6Addr, TcpListener};
+    if TcpListener::bind(("127.0.0.1", port)).is_err()
+        || TcpListener::bind(("0.0.0.0", port)).is_err()
+    {
+        return true;
+    }
+    matches!(
+        TcpListener::bind((Ipv6Addr::LOCALHOST, port)),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
+    )
+}
+
+/// The error for ports of the stack that programs on this machine use.
+/// Each entry is a port, its parameters, and the program, when known.
+pub(crate) fn taken_ports_message(
+    name: &str,
+    taken: &[(u16, Vec<String>, Option<String>)],
+) -> String {
+    let mut message = format!(
+        "fed remote connect cannot forward every port of {name}, because programs on this machine use these ports:"
+    );
+    for (port, params, holder) in taken {
+        let holder = holder.as_deref().unwrap_or("an unknown program");
+        message.push_str(&format!("\n  {port} ({}): {holder}", params.join(", ")));
+    }
+    message.push_str(&format!(
+        "\nStop those programs, then run `fed remote connect {name}` again."
+    ));
+    message
+}
+
+/// The error for forwards that stopped, after which fed ended all the
+/// others. Each entry is a port, its parameters and why its ssh stopped.
+/// Before the connection was up, the likely cause is a program that took the
+/// port on this machine.
+pub(crate) fn stopped_forwards_message(
+    name: &str,
+    stopped: &[(u16, String, String)],
+    connected: bool,
+) -> String {
+    let mut message =
+        format!("fed remote connect ended every forward to {name}, because these stopped:");
+    for (port, params, why) in stopped {
+        message.push_str(&format!("\n  {port} ({params}): ssh {why}"));
+    }
+    message.push('\n');
+    if !connected {
+        message.push_str("A program on this machine may have taken the port. ");
+    }
+    message.push_str(&format!("Run `fed remote connect {name}` again."));
+    message
+}
+
+/// The program on `port` on this machine, as `name (PID n)`.
+fn program_on(port: u16) -> Option<String> {
+    let conflict = fed::port::PortConflict::check(port)?;
+    let process = conflict.processes.first()?;
+    Some(format!("{} (PID {})", process.name, process.pid))
 }
 
 /// Seconds from `now` until `deadline`, as a vault token lifetime. Capped at
@@ -1151,10 +1207,19 @@ pub async fn run_remote(
     let root = state_root()?;
     match cmd {
         RemoteCommands::Forward { args } => supervise_forward(args).await,
-        RemoteCommands::Up { name, kind } => {
+        RemoteCommands::Up { name, kind, disk } => {
+            let disk = disk
+                .as_deref()
+                .map(api::parse_root_volume_gb)
+                .transpose()
+                .map_err(|e| anyhow!(e))?;
             let checkout = checkout_root(workdir)?;
             check_tools("fed remote up", true).await?;
-            up(&root, &checkout, name.as_deref(), kind.as_deref(), out).await
+            let machine = Machine {
+                kind: kind.as_deref(),
+                root_volume_gb: disk,
+            };
+            up(&root, &checkout, name.as_deref(), machine, out).await
         }
         RemoteCommands::Ls => {
             let checkout = checkout_root(workdir)?;
@@ -1258,11 +1323,19 @@ fn read_trimmed(path: &Path) -> Result<String> {
         .to_string())
 }
 
+/// The server type and disk `fed remote up` asks for. `None` leaves the
+/// choice to the cloud.
+#[derive(Debug, Clone, Copy)]
+struct Machine<'a> {
+    kind: Option<&'a str>,
+    root_volume_gb: Option<u32>,
+}
+
 async fn up(
     root: &Path,
     checkout: &Path,
     name: Option<&str>,
-    kind: Option<&str>,
+    machine: Machine<'_>,
     out: &dyn UserOutput,
 ) -> Result<()> {
     let creds = credentials()?;
@@ -1284,7 +1357,16 @@ async fn up(
     remove_stale_staging(root, std::time::SystemTime::now());
     let staging = root.join(format!("{STAGING_PREFIX}{:016x}", rand::random::<u64>()));
     create_private_dir(&staging)?;
-    let created = create(&creds, &project, &staging, &name, kind, &mut interrupt, out).await;
+    let created = create(
+        &creds,
+        &project,
+        &staging,
+        &name,
+        machine,
+        &mut interrupt,
+        out,
+    )
+    .await;
     let env = match created {
         Ok(env) => env,
         Err(e) => {
@@ -1419,7 +1501,7 @@ async fn create(
     project: &api::ProjectRef,
     staging: &Path,
     name: &str,
-    kind: Option<&str>,
+    machine: Machine<'_>,
     interrupt: &mut tokio::signal::unix::Signal,
     out: &dyn UserOutput,
 ) -> Result<api::Environment> {
@@ -1436,13 +1518,18 @@ async fn create(
     let client_public = read_trimmed(&staging.join("client_key.pub"))?;
     let host_public = read_trimmed(&staging.join("host_key.pub"))?;
     let host_private = std::fs::read_to_string(staging.join("host_key"))?;
+    let disk = machine
+        .root_volume_gb
+        .map(|gb| format!(", {gb} GB disk"))
+        .unwrap_or_default();
     out.progress(&format!(
-        "Creating {name} ({}) in {project} ",
-        kind.unwrap_or(api::DEFAULT_TYPE)
+        "Creating {name} ({}{disk}) in {project} ",
+        machine.kind.unwrap_or(api::DEFAULT_TYPE)
     ));
     let body = api::CreateEnvironment {
         name,
-        kind,
+        kind: machine.kind,
+        root_volume_gb: machine.root_volume_gb,
         client_public_key: &client_public,
         host_private_key: &host_private,
         host_public_key: &host_public,
@@ -1526,7 +1613,12 @@ async fn ls(root: &Path, checkout: &Path, out: &dyn UserOutput) -> Result<()> {
     let me = my_user_id(&creds, &list).await;
     let show_owner = list.iter().any(|e| !e.is_owned_by(me.as_deref()));
     let now = chrono::Utc::now();
-    let mut header = vec!["NAME", "TYPE", "STATE", "ADDRESS", "LEFT"];
+    let show_disk = list.iter().any(|e| e.root_volume_gb.is_some());
+    let mut header = vec!["NAME", "TYPE"];
+    if show_disk {
+        header.push("DISK");
+    }
+    header.extend(["STATE", "ADDRESS", "LEFT"]);
     if show_owner {
         header.push("OWNER");
     }
@@ -1534,16 +1626,21 @@ async fn ls(root: &Path, checkout: &Path, out: &dyn UserOutput) -> Result<()> {
     let rows: Vec<Vec<String>> = list
         .iter()
         .map(|e| {
-            let mut row = vec![
-                e.name.clone(),
-                e.kind.clone(),
+            let mut row = vec![e.name.clone(), e.kind.clone()];
+            if show_disk {
+                row.push(
+                    e.root_volume_gb
+                        .map_or("-".to_string(), |gb| format!("{gb} GB")),
+                );
+            }
+            row.extend([
                 e.state.clone(),
                 match (&e.ip, e.port) {
                     (Some(ip), Some(port)) => format!("{ip}:{port}"),
                     _ => "-".to_string(),
                 },
                 minutes_left(&e.deadline, now),
-            ];
+            ]);
             if show_owner {
                 row.push(match &e.owner {
                     _ if e.is_owned_by(me.as_deref()) => "you".to_string(),
@@ -1842,6 +1939,14 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
             "/srv/{ws} on {name} has no ports to forward. Its services publish none, or `fed remote start {name}` has not run."
         );
     }
+    let taken: Vec<_> = ports
+        .iter()
+        .filter(|(port, _)| taken_here(*port))
+        .map(|(port, params)| (*port, params.clone(), program_on(*port)))
+        .collect();
+    if !taken.is_empty() {
+        bail!(taken_ports_message(name, &taken));
+    }
 
     // One listener per signal for the whole command, so a signal between two
     // rounds is kept. Each forward is a logged-in session, so a forward left
@@ -1856,7 +1961,7 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
     // in the terminal reaches only fed, which then ends them.
     let mut forwards = Vec::new();
     for (port, params) in &ports {
-        let local = local_port(*port);
+        let local = *port;
         let mut child = Command::new(std::env::current_exe()?)
             .args(["remote", "forward-supervisor", "--"])
             .args(remote.base_args())
@@ -1888,74 +1993,78 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
         _ = hangup.recv() => true,
         _ = tokio::time::sleep(FORWARD_SETTLE) => false,
     };
-    if !stop_requested {
-        let mut alive = Vec::new();
-        for (local, port, params, mut child) in forwards {
-            match child.try_wait() {
-                Ok(None) => {
-                    out.status(&format!("  localhost:{local} -> {name}:{port}  ({params})"));
-                    alive.push((local, child));
-                }
-                Ok(Some(status)) => out.warning(&format!(
-                    "The forward from localhost:{local} to {name}:{port} stopped ({status})."
-                )),
-                Err(e) => out.warning(&format!(
-                    "The forward from localhost:{local} to {name}:{port} failed: {e}"
-                )),
-            }
-        }
-        let mut forwards = alive;
-        if forwards.is_empty() {
-            return Err(every_forward_stopped(remote).await);
-        }
-        out.status(&format!(
-            "Connected. Press Ctrl-C to disconnect. {name} powers off after {IDLE_MINUTES} minutes without an SSH session; cloud cleanup follows automatically."
-        ));
-        loop {
-            let stopped = {
-                let waits = forwards
-                    .iter_mut()
-                    .map(|(_, child)| Box::pin(child.wait()))
-                    .collect::<Vec<_>>();
-                tokio::select! {
-                    biased;
-                    _ = interrupt.recv() => None,
-                    _ = terminate.recv() => None,
-                    _ = hangup.recv() => None,
-                    (status, index, _) = futures::future::select_all(waits) => Some((
-                        index,
-                        status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()),
-                    )),
-                }
-            };
-            let Some((index, status)) = stopped else {
-                break;
-            };
-            let (local, _) = forwards.remove(index);
-            out.warning(&format!(
-                "The forward from localhost:{local} stopped ({status})."
-            ));
-            if forwards.is_empty() {
-                return Err(every_forward_stopped(remote).await);
-            }
-        }
-        for (_, child) in &mut forwards {
-            let _ = child.kill().await;
-        }
-    } else {
+    if stop_requested {
         for (_, _, _, child) in &mut forwards {
             let _ = child.kill().await;
         }
+        out.status("Disconnected.");
+        return Ok(());
+    }
+
+    let mut stopped = Vec::new();
+    for (_, port, params, child) in &mut forwards {
+        match child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => stopped.push((*port, params.clone(), status.to_string())),
+            Err(e) => stopped.push((*port, params.clone(), e.to_string())),
+        }
+    }
+    if !stopped.is_empty() {
+        // Some ports would reach the environment and others whatever took
+        // them here, which is worse than no connection.
+        return Err(end_forwards(remote, &mut forwards, &stopped, false).await);
+    }
+    for (local, port, params, _) in &forwards {
+        out.status(&format!("  localhost:{local} -> {name}:{port}  ({params})"));
+    }
+    out.status(&format!(
+        "Connected. Press Ctrl-C to disconnect. {name} powers off after {IDLE_MINUTES} minutes without an SSH session; cloud cleanup follows automatically."
+    ));
+
+    // A forward that stops later ends the whole connection too.
+    let stopped = {
+        let waits = forwards
+            .iter_mut()
+            .map(|(_, _, _, child)| Box::pin(child.wait()))
+            .collect::<Vec<_>>();
+        tokio::select! {
+            biased;
+            _ = interrupt.recv() => None,
+            _ = terminate.recv() => None,
+            _ = hangup.recv() => None,
+            (status, index, _) = futures::future::select_all(waits) => Some((
+                index,
+                status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()),
+            )),
+        }
+    };
+    if let Some((index, why)) = stopped {
+        let (_, port, params, _) = forwards.remove(index);
+        return Err(end_forwards(remote, &mut forwards, &[(port, params, why)], true).await);
+    }
+    for (_, _, _, child) in &mut forwards {
+        let _ = child.kill().await;
     }
     out.status("Disconnected.");
     Ok(())
 }
 
-async fn every_forward_stopped(remote: &Remote) -> anyhow::Error {
+/// End and reap the forwards still running, and return the error for the
+/// ones that `stopped`: that the environment no longer exists, when the cloud
+/// deleted it, or else which forwards stopped and why.
+async fn end_forwards(
+    remote: &Remote,
+    forwards: &mut [(u16, u16, String, OwnedForward)],
+    stopped: &[(u16, String, String)],
+    connected: bool,
+) -> anyhow::Error {
+    for (_, _, _, child) in forwards.iter_mut() {
+        let _ = child.kill().await;
+    }
     if let Some(gone) = remote.deleted().await {
         return gone;
     }
-    anyhow!("every port forward to {} stopped.", remote.name())
+    anyhow!(stopped_forwards_message(remote.name(), stopped, connected))
 }
 
 /// The caller's environment called `name` in `project`, from the cloud list.
@@ -2215,15 +2324,6 @@ mod tests {
     }
 
     #[test]
-    fn local_ports_are_offset_unless_that_overflows() {
-        assert_eq!(local_port(5432), 15432);
-        assert_eq!(local_port(18743), 28743);
-        assert_eq!(local_port(55535), 65535);
-        assert_eq!(local_port(55536), 55536);
-        assert_eq!(local_port(65535), 65535);
-    }
-
-    #[test]
     fn ports_json_is_grouped_and_sorted_by_port() {
         let json = r#"{"WEB_PORT": 18080, "DB_PORT": 15432, "ALSO_WEB": 18080}"#;
         assert_eq!(
@@ -2234,7 +2334,48 @@ mod tests {
             ]
         );
         assert_eq!(parse_ports("{}\n").unwrap(), vec![]);
-        assert!(parse_ports("Port Allocations").is_err());
+        let error = parse_ports("Port Allocations").unwrap_err();
+        assert!(
+            error.to_string().contains("`fed ports list --json`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_port_in_use_here_is_reported_with_its_program() {
+        let message = taken_ports_message(
+            "box",
+            &[
+                (3000, vec!["WEB_PORT".into()], Some("node (PID 42)".into())),
+                (5432, vec!["DB_PORT".into(), "PG_PORT".into()], None),
+            ],
+        );
+        assert_eq!(
+            message,
+            "fed remote connect cannot forward every port of box, because programs on this machine use these ports:\n  3000 (WEB_PORT): node (PID 42)\n  5432 (DB_PORT, PG_PORT): an unknown program\nStop those programs, then run `fed remote connect box` again."
+        );
+    }
+
+    #[test]
+    fn stopped_forwards_are_listed_with_what_ssh_said() {
+        let stopped = [(3000, "WEB_PORT".to_string(), "exit status: 255".to_string())];
+        assert_eq!(
+            stopped_forwards_message("box", &stopped, false),
+            "fed remote connect ended every forward to box, because these stopped:\n  3000 (WEB_PORT): ssh exit status: 255\nA program on this machine may have taken the port. Run `fed remote connect box` again."
+        );
+        assert_eq!(
+            stopped_forwards_message("box", &stopped, true),
+            "fed remote connect ended every forward to box, because these stopped:\n  3000 (WEB_PORT): ssh exit status: 255\nRun `fed remote connect box` again."
+        );
+    }
+
+    #[test]
+    fn a_listening_port_is_taken_here() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(taken_here(port));
+        drop(listener);
+        assert!(!taken_here(port));
     }
 
     #[test]

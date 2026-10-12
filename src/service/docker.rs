@@ -118,6 +118,31 @@ pub(crate) fn fnv1a_32(data: &[u8]) -> u32 {
     hash
 }
 
+/// What maps `host.docker.internal` to the machine that runs the container.
+const HOST_ALIAS: &str = "host.docker.internal:host-gateway";
+
+/// The `docker run` arguments that let a container reach the machine as
+/// `host.docker.internal`. Docker Desktop and Podman provide that name
+/// themselves. Docker on Linux needs the mapping.
+pub(crate) fn host_alias_args(linux: bool, podman: bool) -> Vec<String> {
+    if linux && !podman {
+        vec!["--add-host".to_string(), HOST_ALIAS.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Whether the runtime is Podman, by its binary name or, for a Podman that
+/// answers as `docker`, by what `docker version` prints. Only asked on
+/// Linux, the one place the answer changes the arguments.
+async fn runtime_is_podman(client: &DockerClient) -> bool {
+    use crate::docker::registry_auth::RuntimeFlavor;
+    if RuntimeFlavor::of_binary(crate::docker::runtime_binary()) == RuntimeFlavor::Podman {
+        return true;
+    }
+    client.reports_podman(DOCKER_INSPECT_TIMEOUT).await
+}
+
 // Docker operation timeouts (normalized for consistency)
 const DOCKER_REMOVE_TIMEOUT: Duration = Duration::from_secs(10); // Remove container
 const DOCKER_START_TIMEOUT: Duration = Duration::from_secs(30); // Start container
@@ -689,12 +714,16 @@ impl ServiceManager for DockerService {
             args.push(scoped_volume);
         }
 
-        // Add ports with validation
         for port in &self.config.ports {
             Self::validate_port_spec(port).map_err(|e| match e {
                 Error::Config(msg) => Error::Config(format!("Service '{}': {}", self.name, msg)),
                 other => other,
             })?;
+        }
+        if cfg!(target_os = "linux") {
+            args.extend(host_alias_args(true, runtime_is_podman(&self.client).await));
+        }
+        for port in &self.config.ports {
             args.push("-p".to_string());
             args.push(port.clone());
         }
@@ -1603,6 +1632,16 @@ mod tests {
     // ========================================================================
     // Port Conflict Parsing Tests
     // ========================================================================
+
+    #[test]
+    fn only_docker_on_linux_gets_the_host_alias() {
+        assert_eq!(
+            host_alias_args(true, false),
+            vec!["--add-host", "host.docker.internal:host-gateway"]
+        );
+        assert!(host_alias_args(true, true).is_empty());
+        assert!(host_alias_args(false, false).is_empty());
+    }
 
     #[test]
     fn test_parse_port_conflict_ipv4() {

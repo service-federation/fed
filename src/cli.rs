@@ -372,6 +372,9 @@ pub enum RemoteCommands {
         /// Server type (defaults to DEV1-S)
         #[arg(long = "type", value_name = "TYPE")]
         kind: Option<String>,
+        /// Root disk size in GB, from 10 to 200 (defaults to the server type's disk)
+        #[arg(long = "disk", value_name = "GB")]
+        disk: Option<String>,
     },
     /// List your remote environments in the linked project
     #[command(alias = "list")]

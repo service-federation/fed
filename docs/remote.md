@@ -29,7 +29,8 @@ fed remote down box       # delete it when you are done
 ```
 
 `connect` prints where each port went, for example
-`localhost:15432 -> box:5432  (DB_PORT)`.
+`localhost:5432 -> box:5432  (DB_PORT)`. Each port keeps its number, so a
+`localhost:{{DB_PORT}}` value in fed.yaml works in your browser too.
 
 ## Local development and syncing
 
@@ -43,11 +44,16 @@ the VM before it is deleted; remote-only files are temporary.
 
 ## Commands
 
-### `fed remote up [NAME] [--type TYPE]`
+### `fed remote up [NAME] [--type TYPE] [--disk GB]`
 
 Creates a machine for the linked project and waits until it answers SSH and
 has finished setting up. Without a name, it is called `env-HHMMSS`. Names use
 1 to 31 lowercase letters, digits and `-`. The default type is `DEV1-S`.
+
+`--disk` sets the size of the machine's disk, a whole number of GB from 10 to
+200. Use it when the stack's images and data need more room:
+`fed remote up box --disk 60`. Without it, the machine gets the type's default
+disk.
 
 The create can take a few minutes. If it takes more than 5, or you press Ctrl-C,
 fed stops waiting and tells you whether the machine exists.
@@ -55,7 +61,7 @@ fed stops waiting and tells you whether the machine exists.
 ### `fed remote ls`
 
 Lists your machines in the linked project, with their address and the time
-they have left. Org admins see everyone's machines, with an OWNER column.
+they have left. When the cloud reports disk sizes, a DISK column shows them. Org admins see everyone's machines, with an OWNER column.
 
 `ls` also forgets this machine's keys for every environment the cloud has
 deleted, in any project.
@@ -85,12 +91,24 @@ Pushes, then runs `fed start` in the workspace. Before that it does two things:
 
 ### `fed remote connect NAME [--as WORKSPACE]`
 
-Forwards every port the workspace's stack uses to this machine until you press
-Ctrl-C. Remote port P is on local port P + 10000, so the same stack can also
-run on your laptop. Ports above 55535 keep their number.
+Forwards every port the workspace's stack uses to the same port on this
+machine until you press Ctrl-C. Values such as `http://localhost:{{WEB_PORT}}`
+are then right on both machines.
 
-A port that is taken on your laptop gets a warning, and the other ports still
-work.
+The ports must be free on your laptop. When a program on your laptop uses one
+of them, `connect` forwards nothing. It lists each such port with its
+parameter and, when fed can find it, the program. Stop that program, then run
+`fed remote connect NAME` again. A program can also take a port in the moment
+between that check and the forward. Then the forward fails, and `connect`
+ends the other forwards too and says which port failed.
+
+`connect` is all or nothing for the whole session. When any forward stops,
+at any time, `connect` ends every other forward and fails. It says which port
+stopped and why, or that the machine no longer exists. Run
+`fed remote connect NAME` again to reconnect.
+
+Running the same stack on your laptop and on the machine at once is not
+supported, because both use the same ports. Stop the local stack first.
 
 ### `fed remote ssh NAME [--as WORKSPACE] [-- COMMAND...]`
 
@@ -145,6 +163,19 @@ project's secrets, and nothing else.
   it is in `/run/fedenv/tokens/<workspace>`, readable only by root, in memory.
 - fed on the machine uses it for commands run inside `/srv/<workspace>`.
 
+## Docker services on the machine
+
+The machine runs Linux. There, fed starts each Docker container with
+`--add-host host.docker.internal:host-gateway`, so `host.docker.internal`
+reaches the machine as it does on Docker Desktop. A container can use
+`postgresql://...@host.docker.internal:{{DB_PORT}}/app` to reach another
+service's published port. The same applies when you run fed with Docker on a
+Linux laptop. Podman provides the name itself, so fed adds nothing there.
+
+Ports are published as Docker publishes them by default. On the machine, the
+cloud's firewall blocks them from outside. You reach them through
+`fed remote connect`.
+
 ## Files on your laptop
 
 fed keeps each machine's SSH keys and address in `~/.fed/remote/<id>/`,
@@ -173,8 +204,9 @@ The machine exists but does not answer. Check your network. A firewall that
 blocks outgoing SSH on high ports also causes this. The error ends with what
 ssh said.
 
-**A port is taken.** `connect` warns about each forward that stopped. Free the
-local port, or stop the local stack, and run `connect` again.
+**"fed remote connect cannot forward every port of box"**
+A program on your laptop uses a port of the remote stack, often the same
+stack running locally. Stop it, then run `fed remote connect box` again.
 
 **"fed X has no release to install"**
 You run a fed built from source that is newer than the machine's. Commands on

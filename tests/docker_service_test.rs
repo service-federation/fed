@@ -943,3 +943,79 @@ async fn live_container_with_failing_probe_is_not_a_liveness_failure() {
         "a failed configured probe must be subject to retries, not treated as container death"
     );
 }
+
+#[cfg(target_os = "linux")]
+fn busybox(name: &str, script: &str, ports: Vec<String>, work_dir: &str) -> DockerService {
+    let config = ServiceConfig {
+        image: Some("busybox:1.36".into()),
+        command: Some(fed::config::DockerCommand::List(vec![
+            "sh".into(),
+            "-c".into(),
+            script.into(),
+        ])),
+        ports,
+        ..Default::default()
+    };
+    DockerService::new(name.into(), config, HashMap::new(), work_dir.into(), None)
+}
+
+/// On Linux, a container resolves `host.docker.internal` and reaches another
+/// service's published port through it, as on Docker Desktop.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
+async fn a_container_reaches_a_published_port_through_host_docker_internal() {
+    require_docker!();
+    let _docker_guard = DOCKER_TEST_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let work_dir = dir.path().to_string_lossy().into_owned();
+    let port = std::net::TcpListener::bind("0.0.0.0:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+
+    let mut server = busybox(
+        "hdi-server",
+        "mkdir -p /www && echo reached-the-server > /www/index.html && exec httpd -f -p 8080 -h /www",
+        vec![format!("{port}:8080")],
+        &work_dir,
+    );
+    server.start().await.unwrap();
+    let mut client = busybox(
+        "hdi-client",
+        &format!(
+            "grep host.docker.internal /etc/hosts; for i in $(seq 1 30); do wget -qO- http://host.docker.internal:{port}/ && break; sleep 1; done; exec sleep 300"
+        ),
+        vec![],
+        &work_dir,
+    );
+    client.start().await.unwrap();
+
+    let client_name = resolve_container_name("hdi-client").await;
+    let mut logs = String::new();
+    for _ in 0..40 {
+        let out = tokio::process::Command::new("docker")
+            .args(["logs", &client_name])
+            .output()
+            .await
+            .expect("docker logs");
+        logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if logs.contains("reached-the-server") {
+            break;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    client.stop().await.unwrap();
+    server.stop().await.unwrap();
+    assert!(
+        logs.lines()
+            .any(|line| line.ends_with("host.docker.internal") && !line.starts_with('#')),
+        "no host entry in the client's /etc/hosts: {logs}"
+    );
+    assert!(logs.contains("reached-the-server"), "client logs: {logs}");
+}
