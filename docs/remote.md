@@ -228,9 +228,9 @@ only that key gets in.
 
 ## Installing the remote beta
 
-The `v8.4.0-beta.1` prerelease includes remote commands for Linux and macOS.
+The `v8.4.0-beta.2` prerelease includes remote commands for Linux and macOS.
 Download the archive for your platform from the
-[beta release](https://github.com/service-federation/fed/releases/tag/v8.4.0-beta.1),
+[beta release](https://github.com/service-federation/fed/releases/tag/v8.4.0-beta.2),
 verify its published checksum, and run the extracted `fed` binary. Stable
 Homebrew installations remain on the stable release.
 
@@ -240,5 +240,5 @@ platform admin. Installing the CLI does not enable compute access or allocate a 
 To build the same version from source:
 
 ```sh
-cargo install --git https://github.com/service-federation/fed --tag v8.4.0-beta.1 --features remote-beta
+cargo install --git https://github.com/service-federation/fed --tag v8.4.0-beta.2 --features remote-beta
 ```
