@@ -23,17 +23,17 @@ The browser runs on the laptop at `localhost:13000`. Login callbacks redirect to
 
 Option 3.
 
-1. Before the remote stack starts, `fed remote start` asks the VM which ports the stack will use. The VM resolves them and saves them, without starting anything.
-2. The client tries to bind each of those ports on the laptop's loopback.
-3. For each port that is taken on the laptop, the client picks one that is free on the laptop and pins it on the VM. A pin is an exact value, stored like any resolved port, so later `fed remote start` runs keep it.
-4. `fed remote start` then starts the stack. Every resolved port is one the laptop can bind.
+1. Before the remote stack starts, `fed remote start` asks the VM which ports the stack would use (`fed ports resolve --json`). The VM saves nothing, and reports a port that a program there uses as taken.
+2. The client tries to bind each of those ports on the laptop.
+3. For each port that is taken on the laptop or on the VM, the client picks one that is free on the laptop. It runs `fed start --pin PARAM=PORT` on the VM. That one command, under the start lock, checks that each pin is free, stops the services that use a moved parameter, saves the pins and starts the stack. A pin is stored like any resolved port, so later starts keep it. A pin that a program on the VM uses fails with exit status 75, and the client picks another port, up to three times.
+4. Every port of the started stack is one the laptop can bind.
 5. `fed remote connect` forwards each port to the same number. If a port became taken on the laptop since `start`, `connect` stops with a message that names the port and, when it can, the process. It says to stop that process or to run `fed remote start` again, which pins a new port and restarts the services that use it.
 
 `PORT_OFFSET` goes away.
 
 ## What it costs
 
-- Two ssh round trips before `start` (resolve, then pin), about a second.
+- One ssh round trip before `start` (resolve), about half a second.
 - A port the laptop takes between `start` and `connect` means a restart of the services that use it. That is rare, and the message says what to do.
 - Running the same project locally and remotely at the same time still works. The local stack holds its ports, so the remote stack gets other ones, and URLs on each side are correct for that side.
 

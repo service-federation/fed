@@ -18,85 +18,180 @@ pub async fn run_ports(
             let work_dir = resolve_work_dir(workdir, config_path.as_deref())?;
             list_ports(&work_dir, *json, out).await
         }
-        PortsCommands::Resolve { pins } => {
-            let pins = pins
-                .iter()
-                .map(|pin| parse_pin(pin))
-                .collect::<anyhow::Result<Vec<_>>>()?;
+        PortsCommands::Resolve { json } => {
             let work_dir = resolve_work_dir(workdir, config_path.as_deref())?;
-            resolve_ports(&work_dir, config_path, &pins, ctx, out).await
+            resolve_ports(&work_dir, config_path, *json, ctx, out).await
         }
     }
 }
 
-/// A `--pin` value: `PARAM=PORT`.
-pub(crate) fn parse_pin(pin: &str) -> anyhow::Result<(String, u16)> {
+/// A `--pin` value of `fed start`: `PARAM=PORT`.
+pub fn parse_pin(pin: &str) -> anyhow::Result<(String, u16)> {
     let Some((param, port)) = pin.split_once('=').filter(|(p, _)| !p.is_empty()) else {
         anyhow::bail!(
-            "fed ports resolve --pin needs PARAM=PORT, such as WEB_PORT=3000. It received `{pin}`."
+            "fed start --pin needs PARAM=PORT, such as WEB_PORT=3000. It received `{pin}`."
         );
     };
     match port.parse::<u16>() {
         Ok(port) if port > 0 => Ok((param.to_string(), port)),
-        _ => anyhow::bail!("fed ports resolve --pin {pin} needs a port from 1 to 65535."),
+        _ => anyhow::bail!("fed start --pin {pin} needs a port from 1 to 65535."),
     }
 }
 
-/// Pin `pins`, resolve every port parameter the way `fed start` does and
-/// save the result, without starting anything. Prints the saved ports as
-/// one line of JSON (`{"PARAM": port}`).
+/// How `fed ports resolve` describes the port a parameter would get:
+/// `kept` when `fed start` keeps it, `random` when `fed start` would pick
+/// another random port, `taken` when a program outside the stack uses it.
+fn port_state(reason: &fed::parameter::PortResolutionReason) -> &'static str {
+    use fed::parameter::PortResolutionReason as Reason;
+    match reason {
+        Reason::Taken => "taken",
+        Reason::Random | Reason::ConflictAutoResolved { .. } => "random",
+        Reason::Explicit | Reason::DefaultAvailable | Reason::Cached | Reason::Pinned => "kept",
+    }
+}
+
+/// Work out the port of every port parameter the way `fed start` would, and
+/// print it with its state. Saves nothing and moves nothing: a port that
+/// another program uses is reported as `taken`.
 async fn resolve_ports(
     work_dir: &std::path::Path,
     config_path: Option<PathBuf>,
-    pins: &[(String, u16)],
+    json: bool,
     ctx: RunContext,
     out: &dyn UserOutput,
 ) -> anyhow::Result<()> {
+    let mut config = load_config(config_path, ctx.offline).await?;
+    let tracker = StateTracker::new(work_dir.to_path_buf()).await?;
+    let (enabled, isolation_id) = tracker.get_isolation_mode().await;
+    let scope = if enabled { isolation_id } else { None };
+    let port_params: std::collections::HashSet<String> = config
+        .get_effective_parameters()
+        .iter()
+        .filter(|(_, p)| p.is_port_type())
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    let mut resolver = fed::parameter::Resolver::new();
+    resolver.set_work_dir(work_dir);
+    resolver.set_isolation_id(scope.clone());
+    resolver.set_offline(ctx.offline);
+    resolver.set_secret_cache(ctx.secret_cache);
+    // Ports never depend on secrets, so no vault value is needed.
+    resolver.set_required_names(Some(port_params));
+    resolver.set_port_store(Box::new(fed::port::SqlitePortStore::with_pins(
+        tracker.get_global_port_allocations(scope.as_deref()).await,
+        tracker.get_pinned_ports(scope.as_deref()).await,
+    )));
+    resolver.set_prefer_config_defaults(scope.is_none());
+    resolver.set_report_taken(true);
+    let tracker = std::sync::Arc::new(tokio::sync::RwLock::new(tracker));
+    fed::orchestrator::collect_managed_ports(&mut resolver, &tracker, scope.as_deref()).await;
+    resolver.resolve_parameters(&mut config)?;
+
+    let ports: std::collections::BTreeMap<&str, serde_json::Value> = resolver
+        .get_port_resolutions()
+        .iter()
+        .map(|r| {
+            let state = port_state(&r.reason);
+            (
+                r.param_name.as_str(),
+                serde_json::json!({ "port": r.resolved_port, "state": state }),
+            )
+        })
+        .collect();
+    if json {
+        out.status(&serde_json::to_string(&ports)?);
+    } else {
+        for (param, port) in &ports {
+            out.status(&format!(
+                "  {:>5}  {param} ({})",
+                port["port"], port["state"]
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn load_config(
+    config_path: Option<PathBuf>,
+    offline: bool,
+) -> anyhow::Result<fed::config::Config> {
     let parser = ConfigParser::new();
     let config_file = match config_path {
         Some(path) => path,
         None => parser.find_config_file()?,
     };
     let config = parser
-        .load_config_with_packages_offline(&config_file, ctx.offline)
+        .load_config_with_packages_offline(&config_file, offline)
         .await?;
     config.validate()?;
+    Ok(config)
+}
+
+/// Prepare `fed start --pin` under the start lock, before anything is
+/// resolved or saved. Fails when a pin names no port parameter, or when a
+/// program outside the stack uses a pinned port. Then stops the running
+/// services that use a parameter whose port changes, so they start on the
+/// new port.
+pub async fn prepare_pins(
+    work_dir: &std::path::Path,
+    config: &fed::config::Config,
+    pins: &std::collections::HashMap<String, u16>,
+    out: &dyn UserOutput,
+) -> anyhow::Result<()> {
     let params = config.get_effective_parameters();
     for (param, port) in pins {
         if !params.get(param).is_some_and(|p| p.is_port_type()) {
             anyhow::bail!(
-                "fed ports resolve --pin {param}={port} needs a port parameter, and fed.yaml has no port parameter called {param}."
+                "fed start --pin {param}={port} needs a port parameter, and fed.yaml has no port parameter called {param}."
             );
         }
     }
 
-    // The same lock as `fed start`, so a start cannot resolve between the
-    // pin and this resolution.
-    let _lock = fed::orchestrator::StartLock::acquire(work_dir).await?;
-    let scope = {
-        let mut tracker = StateTracker::new(work_dir.to_path_buf()).await?;
-        tracker.initialize().await?;
-        let (enabled, isolation_id) = tracker.get_isolation_mode().await;
-        let scope = if enabled { isolation_id } else { None };
-        tracker.pin_ports(pins, scope.as_deref()).await?;
-        scope
-    };
+    let tracker = StateTracker::new(work_dir.to_path_buf()).await?;
+    let (enabled, isolation_id) = tracker.get_isolation_mode().await;
+    let scope = if enabled { isolation_id } else { None };
+    let current = tracker.get_global_port_allocations(scope.as_deref()).await;
+    let changed: std::collections::HashSet<String> = pins
+        .iter()
+        .filter(|(param, port)| current.get(*param) != Some(*port))
+        .map(|(param, _)| param.clone())
+        .collect();
+    for param in &changed {
+        let port = pins[param];
+        if !fed::port::PortConflict::is_port_available(port) {
+            return Err(fed::Error::PinnedPortTaken {
+                param: param.clone(),
+                port,
+            }
+            .into());
+        }
+    }
 
-    let orchestrator = fed::Orchestrator::builder()
-        .config(config)
-        .work_dir(work_dir.to_path_buf())
-        .run_context(ctx)
-        .auto_resolve_conflicts(true)
-        .build()
-        .await?;
-    let ports = orchestrator
-        .state_tracker
-        .read()
+    let using = fed::parameter::scanner::services_using(config, &changed);
+    let mut running: Vec<String> = tracker
+        .get_services()
         .await
-        .get_global_port_allocations(scope.as_deref())
-        .await;
-    out.status(&serde_json::to_string(&ports)?);
-    Ok(())
+        .into_iter()
+        .filter(|(name, state)| {
+            using.contains(name)
+                && matches!(
+                    state.status,
+                    Status::Running | Status::Healthy | Status::Starting | Status::Failing
+                )
+        })
+        .map(|(name, _)| name)
+        .collect();
+    drop(tracker);
+    if running.is_empty() {
+        return Ok(());
+    }
+    running.sort();
+    out.status(&format!(
+        "Stopping {} so that they start on their new ports",
+        running.join(", ")
+    ));
+    super::run_stop_from_state(work_dir, running, out).await
 }
 
 pub(super) fn resolve_work_dir(
@@ -230,10 +325,7 @@ mod tests {
             "WEB_PORT=x",
         ] {
             let error = parse_pin(bad).unwrap_err().to_string();
-            assert!(
-                error.starts_with("fed ports resolve --pin"),
-                "{bad}: {error}"
-            );
+            assert!(error.starts_with("fed start --pin"), "{bad}: {error}");
         }
     }
 }

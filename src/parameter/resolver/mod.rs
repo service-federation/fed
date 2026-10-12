@@ -82,7 +82,8 @@ pub fn compute_project_id(work_dir: &Path, isolation_id: Option<&str>) -> String
 /// 1. Explicit `value:` field (validated and reserved exactly)
 /// 2. Preferred port from `default:` (if available and defaults are
 ///    preferred — normal, non-isolated `fed start`), unless the persisted
-///    port is pinned (`fed ports resolve --pin`)
+///    port is pinned (`fed start --pin`). A pinned port is reserved exactly:
+///    when another program uses it, resolution fails instead of moving it.
 /// 3. Persisted port from previous run (if available)
 /// 4. Random available port (fallback)
 ///
@@ -165,6 +166,13 @@ pub struct Resolver {
     /// any service or external service referencing one is dropped from the
     /// resolved config. See `compute_deferred_params` and `service_should_defer`.
     deferred_params: HashSet<String>,
+    /// Port parameters pinned by `fed start --pin`, with their ports. A pin is
+    /// reserved exactly and never moved.
+    pins: HashMap<String, u16>,
+    /// When true, a port that a program outside the stack uses is reported as
+    /// `PortResolutionReason::Taken` instead of being moved or failing. For
+    /// `fed ports resolve`, which only reports.
+    report_taken: bool,
     /// Names of sensitive parameters: declared `type: secret` plus everything
     /// transitively derived from one (see [`super::sensitivity`]). Computed in
     /// `resolve_parameters` and consumed by [`Self::get_parameter_views`] so
@@ -196,7 +204,20 @@ impl Resolver {
             isolation_id: None,
             deferred_params: HashSet::new(),
             sensitive_params: HashSet::new(),
+            pins: HashMap::new(),
+            report_taken: false,
         }
+    }
+
+    /// Pin port parameters to exact ports, as `fed start --pin` does.
+    pub fn set_pins(&mut self, pins: HashMap<String, u16>) {
+        self.pins = pins;
+    }
+
+    /// Report a port that a program outside the stack uses instead of moving
+    /// it. See `report_taken`.
+    pub fn set_report_taken(&mut self, report: bool) {
+        self.report_taken = report;
     }
 
     /// Set the port store backend.
@@ -396,6 +417,11 @@ impl Resolver {
             }
 
             if let Some(ref value) = param.value {
+                if let Some(pin) = self.pins.get(name) {
+                    return Err(Error::TemplateResolution(format!(
+                        "fed start --pin {name}={pin} cannot move {name}, because fed.yaml or .env sets its value to {value}."
+                    )));
+                }
                 // Validate port values if parameter is port type
                 if param.is_port_type() {
                     let port_num = value.parse::<u16>().map_err(|_| {
@@ -448,16 +474,19 @@ impl Resolver {
                 // Port resolution via unified PortStore.
                 // The store may be SQLite-backed or no-op (isolated).
                 // One lookup path, one save path — no dual-cache priority chain.
-                let (port, reason) = if let Some(cached_port) = self.port_store.get_port(name) {
+                let cached = self.port_store.get_port(name);
+                let (port, reason) = if let Some(&pin) = self.pins.get(name) {
+                    self.reserve_pin(pin, name, cached == Some(pin))?
+                } else if let Some(cached_port) = cached {
                     // A config default that's available supersedes the cached port
                     // (normal mode only) — otherwise editing `default:` in the
-                    // config would silently have no effect. A pinned port stays.
-                    let reclaimed = if self.port_store.is_pinned(name) {
-                        None
-                    } else {
+                    // config would silently have no effect. A pinned port stays,
+                    // even when the config default is free.
+                    if self.port_store.is_pinned(name) {
+                        self.reserve_pin(cached_port, name, true)?
+                    } else if let Some(reclaimed) =
                         self.try_reclaim_config_default(param, cached_port)
-                    };
-                    if let Some(reclaimed) = reclaimed {
+                    {
                         reclaimed
                     } else {
                         // Port store has a cached value — validate it's still usable

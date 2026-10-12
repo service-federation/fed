@@ -89,11 +89,13 @@ Pushes, then runs `fed start` in the workspace. Before that it does three things
 - If the checkout uses the team vault, it gives the workspace read access to
   it. See [Secrets](#secrets).
 - It picks the stack's ports. The machine works out which ports the stack
-  uses, without starting anything. When a program on your laptop uses one of
-  them, fed moves that parameter to a port your laptop has free, and says so:
+  would use, without changing anything. When a program on your laptop or on
+  the machine uses one of them, fed moves that parameter to a port your
+  laptop has free, and says so:
   `Port 3000 is taken on this machine, so NEXT_PORT uses port 52114 on box.`
-  The machine keeps the new port for later starts. When a port moves, the
-  stack restarts so that every service uses it.
+  The machine keeps the new port for later starts. The services that use a
+  moved port restart on it. If a program on the machine takes the new port
+  first, fed picks another one, up to three times.
 
 ### `fed remote connect NAME [--as WORKSPACE]`
 

@@ -53,7 +53,7 @@ pub use isolate::run_isolate;
 pub use link::run_link;
 pub use logs::run_logs;
 pub use package::run_package;
-pub use ports::run_ports;
+pub use ports::{parse_pin, prepare_pins, run_ports};
 pub use prune::run_prune;
 #[cfg(feature = "remote-beta")]
 pub use remote::run_remote;

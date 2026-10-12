@@ -136,9 +136,12 @@ mod with_feature {
     /// in `up`. `FAKE_FORWARD=hold` keeps a port forward running
     /// and writes its pid to `<log>.forward.<pid>`, except the forward from
     /// the port in `FAKE_FORWARD_FAIL`, which fails. `FAKE_PORTS` is the JSON
-    /// that `fed ports resolve` prints, with each `--pin` applied. The last
-    /// one printed is what `fed ports list --json` prints. `FAKE_NO_RESOLVE`
-    /// makes the machine's fed one without `fed ports resolve`.
+    /// the machine's `fed ports list --json` prints until a `fed start` applies
+    /// its `--pin`s to it. `fed ports resolve --json` prints the same ports as
+    /// kept, except the parameter in `FAKE_TAKEN_THERE`, which is taken.
+    /// The first `FAKE_START_TAKEN` runs of `fed start` fail as for a pinned
+    /// port taken on the machine. `FAKE_NO_RESOLVE` makes the machine's fed
+    /// one without `fed ports resolve`.
     const FAKE_SSH: &str = r#"#!/bin/sh
 line=ssh; for a in "$@"; do line="$line [$a]"; done
 printf '%s\n' "$line" >> "$FAKE_LOG"
@@ -180,13 +183,24 @@ case "$last" in
     printf 'status: error\nerrors:\n\t- (%s)\nrecoverable_errors: {}\n' "'init', RuntimeError('disk full')" ;;
   *"fed ports resolve"*)
     if [ -n "$FAKE_NO_RESOLVE" ]; then exit 4; fi
-    json="$FAKE_PORTS"
+    if [ -f "$FAKE_LOG.ports" ]; then json=$(cat "$FAKE_LOG.ports"); else json="$FAKE_PORTS"; fi
+    json=$(printf '%s' "$json" | sed 's/: *\([0-9][0-9]*\)/: {"port": \1, "state": "kept"}/g')
+    if [ -n "$FAKE_TAKEN_THERE" ]; then
+      json=$(printf '%s' "$json" | sed "s/\"$FAKE_TAKEN_THERE\": {\"port\": \([0-9]*\), \"state\": \"kept\"}/\"$FAKE_TAKEN_THERE\": {\"port\": \1, \"state\": \"taken\"}/")
+    fi
+    echo "Resolving ports"
+    echo "$json" ;;
+  *"fed start"*)
+    echo start >> "$FAKE_LOG.starts"
+    if [ "$(wc -l < "$FAKE_LOG.starts")" -le "${FAKE_START_TAKEN:-0}" ]; then
+      echo "Error: WEB_PORT is pinned to port 1, but another program uses that port." >&2
+      exit 75
+    fi
+    if [ -f "$FAKE_LOG.ports" ]; then json=$(cat "$FAKE_LOG.ports"); else json="$FAKE_PORTS"; fi
     for pin in $(printf '%s\n' "$last" | grep -o "pin '[A-Z_0-9]*=[0-9]*" | sed "s/^pin '//"); do
       json=$(printf '%s' "$json" | sed "s/\"${pin%%=*}\": *[0-9]*/\"${pin%%=*}\": ${pin#*=}/")
     done
-    printf '%s' "$json" > "$FAKE_LOG.ports"
-    echo "Resolving ports"
-    echo "$json" ;;
+    printf '%s' "$json" > "$FAKE_LOG.ports" ;;
   *"fed ports list --json"*)
     if [ -f "$FAKE_LOG.ports" ]; then cat "$FAKE_LOG.ports"; else echo "$FAKE_PORTS"; fi ;;
   *) cat > "$FAKE_LOG.stdin.$$" ;;
@@ -789,13 +803,12 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         let calls = setup.calls();
         let resolve = position(
             &calls,
-            "cd /srv/app && { fed ports resolve --help >/dev/null 2>&1 || exit 4; } && fed ports resolve",
+            "cd /srv/app && { fed ports resolve --help >/dev/null 2>&1 || exit 4; } && fed ports resolve --json",
         )
         .unwrap_or_else(|| panic!("{calls:#?}"));
         let start = position(&calls, "cd /srv/app && fed start").unwrap();
         assert!(resolve < start, "{calls:#?}");
         assert!(calls.iter().all(|c| !c.contains("--pin")), "{calls:#?}");
-        assert!(position(&calls, "cd /srv/app && fed stop").is_none());
     }
 
     /// A port of the stack that a program here uses moves to a port this
@@ -828,9 +841,11 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             )),
             "{output}"
         );
-        let stop = position(&calls, "cd /srv/app && fed stop").unwrap();
-        let start = position(&calls, "cd /srv/app && fed start").unwrap();
-        assert!(stop < start, "{calls:#?}");
+        assert_eq!(
+            calls.iter().filter(|c| c.contains("&& fed start")).count(),
+            1,
+            "one fed start moves the port and starts: {calls:#?}"
+        );
 
         let (_, output) = setup.fed(&cloud.url, &["remote", "connect", "box"], &[]);
         assert!(!output.contains("cannot forward"), "{output}");
@@ -845,6 +860,83 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 "{port}: {forwards:#?}"
             );
         }
+    }
+
+    fn pinned_port(calls: &[String], param: &str) -> Vec<u16> {
+        calls
+            .iter()
+            .filter_map(|c| c.split(&format!("--pin '{param}=")).nth(1))
+            .map(|rest| rest.split('\'').next().unwrap().parse().unwrap())
+            .collect()
+    }
+
+    /// A port that a program on the machine uses moves to a port that both
+    /// machines have free.
+    #[test]
+    fn start_moves_a_port_taken_on_the_machine() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (_, db) = setup.ports;
+        let cloud = token_route();
+        let (ok, output) = setup.fed(
+            &cloud.url,
+            &["remote", "start", "box"],
+            &[("FAKE_TAKEN_THERE", "DB_PORT")],
+        );
+        assert!(ok, "{output}");
+        let moved = pinned_port(&setup.calls(), "DB_PORT");
+        assert_eq!(moved.len(), 1, "{:#?}", setup.calls());
+        assert_ne!(moved[0], db);
+        assert!(
+            output.contains(&format!(
+                "Port {db} is taken on box, so DB_PORT uses port {}.",
+                moved[0]
+            )),
+            "{output}"
+        );
+    }
+
+    /// When a program on the machine takes a pinned port before `fed start`
+    /// reserves it, `start` picks another port and tries again, up to three
+    /// times.
+    #[test]
+    fn start_tries_another_port_when_a_pin_is_taken_on_the_machine() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (web, _) = setup.ports;
+        let _here = std::net::TcpListener::bind(("127.0.0.1", web)).unwrap();
+        let cloud = token_route();
+        let (ok, output) = setup.fed(
+            &cloud.url,
+            &["remote", "start", "box"],
+            &[("FAKE_START_TAKEN", "2")],
+        );
+        assert!(ok, "{output}");
+        let tried = pinned_port(&setup.calls(), "WEB_PORT");
+        assert_eq!(tried.len(), 3, "{:#?}", setup.calls());
+        assert!(
+            tried[0] != tried[1] && tried[1] != tried[2] && tried[0] != tried[2],
+            "{tried:?}"
+        );
+        assert!(
+            output.contains("Picking other ports, because a program on box took one."),
+            "{output}"
+        );
+
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (web, _) = setup.ports;
+        let _here = std::net::TcpListener::bind(("127.0.0.1", web)).unwrap();
+        let (ok, output) = setup.fed(
+            &cloud.url,
+            &["remote", "start", "box"],
+            &[("FAKE_START_TAKEN", "3")],
+        );
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains("Error: fed remote start picked ports 3 times, and each time a program on box took one."),
+            "{output}"
+        );
     }
 
     /// A port taken here after `start` stops `connect` before any forward,

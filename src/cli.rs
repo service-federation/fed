@@ -94,6 +94,17 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
 
+        /// Pin a port parameter to an exact port. Services that use it and
+        /// run on another port restart on this one. Fails, with exit status
+        /// 75, when another program uses the port. For `fed remote start`.
+        #[arg(
+            long = "pin",
+            value_name = "PARAM=PORT",
+            hide = true,
+            conflicts_with = "dry_run"
+        )]
+        pins: Vec<String>,
+
         /// Enable isolation mode before starting (persisted)
         #[arg(long)]
         isolate: bool,
@@ -502,15 +513,14 @@ pub enum PortsCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Resolve and save the port of every port parameter without starting
-    /// anything, then print them as JSON. `fed remote start` runs this on the
-    /// remote environment.
+    /// Print the port each port parameter would get from `fed start`, with
+    /// whether it is kept, random or taken by another program. Saves nothing.
+    /// `fed remote start` runs this on the remote environment.
     #[command(hide = true)]
     Resolve {
-        /// Pin a port parameter to an exact port before resolving. A free
-        /// config `default:` does not replace a pinned port.
-        #[arg(long = "pin", value_name = "PARAM=PORT")]
-        pins: Vec<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 

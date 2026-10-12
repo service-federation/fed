@@ -410,58 +410,117 @@ fn free_port_here() -> Result<u16> {
     Ok(port)
 }
 
-/// A port of the stack that this machine uses, and the port its parameters
-/// move to.
+/// A port parameter as `fed ports resolve --json` on the environment
+/// describes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub(crate) struct ResolvedPort {
+    pub port: u16,
+    pub state: PortState,
+}
+
+/// Whether `fed start` on the environment keeps a port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PortState {
+    /// `fed start` uses this port.
+    Kept,
+    /// `fed start` would pick another random port.
+    Random,
+    /// A program on the environment uses this port.
+    Taken,
+}
+
+/// The ports in the last JSON line that `fed ports resolve --json` printed.
+pub(crate) fn parse_resolved_ports(
+    stdout: &str,
+) -> Result<std::collections::BTreeMap<String, ResolvedPort>> {
+    let json = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .unwrap_or("");
+    serde_json::from_str(json.trim())
+        .context("`fed ports resolve --json` on the environment printed something unexpected")
+}
+
+/// Why `fed remote start` pins a port parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinReason {
+    /// A program on this machine uses its port.
+    TakenHere,
+    /// A program on the environment uses its port.
+    TakenThere,
+    /// Its port is random, and `fed start` would pick another one.
+    Random,
+}
+
+/// A port parameter that `fed start --pin` moves from one port to another,
+/// or keeps on a random port.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PortMove {
+pub(crate) struct Pin {
+    pub param: String,
     pub from: u16,
     pub to: u16,
-    pub params: Vec<String>,
+    pub reason: PinReason,
 }
 
-/// A move for each port in `ports` that is `taken` on this machine. The new
-/// port comes from `free`, and is neither taken nor another port of the stack.
-pub(crate) fn plan_moves(
-    ports: &[(u16, Vec<String>)],
+/// The pins that give every port parameter a port that this machine has
+/// free and that `fed start` keeps. A new port comes from `free`, and is not
+/// `taken` here, not another port of the stack, and not one in `tried`.
+pub(crate) fn plan_pins(
+    ports: &std::collections::BTreeMap<String, ResolvedPort>,
     taken: impl Fn(u16) -> bool,
     mut free: impl FnMut() -> Result<u16>,
-) -> Result<Vec<PortMove>> {
-    let mut used: std::collections::HashSet<u16> = ports.iter().map(|(p, _)| *p).collect();
-    let mut moves = Vec::new();
-    for (port, params) in ports {
-        if !taken(*port) {
-            continue;
-        }
-        let mut to = None;
-        for _ in 0..32 {
-            let candidate = free()?;
-            if !used.contains(&candidate) && !taken(candidate) {
-                to = Some(candidate);
-                break;
+    tried: &std::collections::HashSet<u16>,
+) -> Result<Vec<Pin>> {
+    let mut used: std::collections::HashSet<u16> = ports.values().map(|p| p.port).collect();
+    used.extend(tried);
+    let mut pins = Vec::new();
+    for (param, resolved) in ports {
+        let reason = match resolved.state {
+            PortState::Taken => PinReason::TakenThere,
+            _ if taken(resolved.port) => PinReason::TakenHere,
+            PortState::Random => PinReason::Random,
+            PortState::Kept => continue,
+        };
+        let to = if reason == PinReason::Random {
+            resolved.port
+        } else {
+            let mut to = None;
+            for _ in 0..32 {
+                let candidate = free()?;
+                if !used.contains(&candidate) && !taken(candidate) {
+                    to = Some(candidate);
+                    break;
+                }
             }
-        }
-        let to = to.context("finding a free port on this machine")?;
+            to.context("finding a free port on this machine")?
+        };
         used.insert(to);
-        moves.push(PortMove {
-            from: *port,
+        pins.push(Pin {
+            param: param.clone(),
+            from: resolved.port,
             to,
-            params: params.clone(),
+            reason,
         });
     }
-    Ok(moves)
+    Ok(pins)
 }
 
-/// The `fed ports resolve` command that pins each parameter of `moves` to
-/// its new port. Without moves, it only resolves.
-pub(crate) fn resolve_command(ws: &str, moves: &[PortMove]) -> String {
-    let mut command = format!(
-        "cd /srv/{ws} && {{ fed ports resolve --help >/dev/null 2>&1 || exit {NO_PORTS_RESOLVE}; }} && fed ports resolve"
-    );
-    for m in moves {
-        for param in &m.params {
-            command.push_str(" --pin ");
-            command.push_str(&shell_words::quote(&format!("{param}={}", m.to)));
-        }
+/// The command that prints the ports of the stack in `/srv/{ws}`. It exits
+/// with `NO_PORTS_RESOLVE` when fed there has no `fed ports resolve`.
+pub(crate) fn resolve_command(ws: &str) -> String {
+    format!(
+        "cd /srv/{ws} && {{ fed ports resolve --help >/dev/null 2>&1 || exit {NO_PORTS_RESOLVE}; }} && fed ports resolve --json"
+    )
+}
+
+/// The `fed start` command that applies `pins`.
+pub(crate) fn start_command(ws: &str, pins: &[Pin]) -> String {
+    let mut command = format!("cd /srv/{ws} && fed start");
+    for pin in pins {
+        command.push_str(" --pin ");
+        command.push_str(&shell_words::quote(&format!("{}={}", pin.param, pin.to)));
     }
     command
 }
@@ -469,6 +528,10 @@ pub(crate) fn resolve_command(ws: &str, moves: &[PortMove]) -> String {
 /// Exit status of `resolve_command` when fed on the machine has no
 /// `fed ports resolve`.
 const NO_PORTS_RESOLVE: i32 = 4;
+
+/// How often `fed remote start` picks new ports when the environment
+/// reports that a program there took a pinned one.
+const PIN_ATTEMPTS: usize = 3;
 
 /// The error for ports of the stack that programs on this machine use.
 /// Each entry is a port, its parameters, and the program, when known.
@@ -1310,15 +1373,7 @@ pub async fn run_remote(
             if let Some(project) = linked_project(&checkout) {
                 give_vault_token(&remote, &project, &ws, out).await?;
             }
-            if pick_ports(&remote, &ws, out).await? {
-                // A running service keeps the port it started with.
-                remote
-                    .run_checked(&format!("cd /srv/{ws} && fed stop"), "fed stop")
-                    .await?;
-            }
-            remote
-                .run_checked(&format!("cd /srv/{ws} && fed start"), "fed start")
-                .await?;
+            start_stack(&remote, &ws, out).await?;
             out.success(&format!(
                 "Started /srv/{ws} on {name}. Next: `fed remote connect {name}`"
             ));
@@ -1999,12 +2054,14 @@ async fn supervise_forward(args: &[OsString]) -> Result<()> {
     std::process::exit(code);
 }
 
-/// Ask the environment for the ports of the stack in `/srv/{ws}`, after
-/// pinning the parameters of `moves`. The environment saves them, so
-/// `fed start` there uses the same ports.
-async fn resolve_remote_ports(remote: &Remote, ws: &str, moves: &[PortMove]) -> Result<StackPorts> {
+/// Ask the environment which ports `fed start` would give the stack in
+/// `/srv/{ws}`. Nothing changes there.
+async fn resolve_remote_ports(
+    remote: &Remote,
+    ws: &str,
+) -> Result<std::collections::BTreeMap<String, ResolvedPort>> {
     let name = remote.name();
-    let out = remote.capture(&resolve_command(ws, moves)).await?;
+    let out = remote.capture(&resolve_command(ws)).await?;
     if out.status.code() == Some(NO_PORTS_RESOLVE) {
         bail!(
             "fed remote start needs a newer fed on {name}. The fed there has no `fed ports resolve`, which picks ports that this machine can forward. Install a fed release that has it on {name}, for example with `fed remote ssh {name}`."
@@ -2018,45 +2075,58 @@ async fn resolve_remote_ports(remote: &Remote, ws: &str, moves: &[PortMove]) -> 
             )
             .await);
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let json = stdout
-        .lines()
-        .rev()
-        .find(|line| line.trim_start().starts_with('{'))
-        .unwrap_or("");
-    parse_ports(json, "fed ports resolve")
+    parse_resolved_ports(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Make every port of the stack one that this machine has free, so each one
-/// is forwarded to the same number and `localhost:{{PORT}}` values work on
-/// both machines. A port this machine uses is pinned to a free one on the
-/// environment. Returns whether a port moved.
-async fn pick_ports(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<bool> {
+/// Start the stack in `/srv/{ws}` on ports that this machine has free, so
+/// each one is forwarded to the same number and `localhost:{{PORT}}` values
+/// work on both machines. A port that is taken here or there, or that
+/// `fed start` would pick at random, is pinned with `fed start --pin`. That
+/// one command restarts what moves and saves the ports only when it starts.
+/// When a program there takes a pinned port first, the next attempt picks
+/// another one.
+async fn start_stack(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> {
     let name = remote.name();
-    let ports = resolve_remote_ports(remote, ws, &[]).await?;
-    let moves = plan_moves(&ports, taken_here, free_port_here)?;
-    if moves.is_empty() {
-        return Ok(false);
-    }
-    let ports = resolve_remote_ports(remote, ws, &moves).await?;
-    for m in &moves {
-        let now = ports
-            .iter()
-            .find(|(_, params)| params.contains(&m.params[0]))
-            .map_or(m.to, |(port, _)| *port);
-        if taken_here(now) {
-            bail!(
-                "fed remote start cannot move {} off port {now}, which a program on this machine uses. A value in fed.yaml or .env may fix the port. Stop the program on port {now} here, then run `fed remote start {name}` again.",
-                m.params.join(", ")
-            );
+    let mut tried = std::collections::HashSet::new();
+    for attempt in 1..=PIN_ATTEMPTS {
+        let ports = resolve_remote_ports(remote, ws).await?;
+        let pins = plan_pins(&ports, taken_here, free_port_here, &tried)?;
+        tried.extend(pins.iter().map(|pin| pin.to));
+        let status = remote.run(&start_command(ws, &pins)).await?;
+        if status.success() {
+            for pin in &pins {
+                let Pin {
+                    param, from, to, ..
+                } = pin;
+                match pin.reason {
+                    PinReason::TakenHere => out.status(&format!(
+                        "Port {from} is taken on this machine, so {param} uses port {to} on {name}."
+                    )),
+                    PinReason::TakenThere => out.status(&format!(
+                        "Port {from} is taken on {name}, so {param} uses port {to}."
+                    )),
+                    PinReason::Random => {}
+                }
+            }
+            return Ok(());
         }
-        out.status(&format!(
-            "Port {} is taken on this machine, so {} uses port {now} on {name}.",
-            m.from,
-            m.params.join(", ")
-        ));
+        if status.code() != Some(fed::error::PINNED_PORT_TAKEN_EXIT) {
+            return Err(remote
+                .failure(
+                    format!("fed start failed on {name} ({status})."),
+                    ssh_lost(status),
+                )
+                .await);
+        }
+        if attempt < PIN_ATTEMPTS {
+            out.status(&format!(
+                "Picking other ports, because a program on {name} took one."
+            ));
+        }
     }
-    Ok(true)
+    bail!(
+        "fed remote start picked ports {PIN_ATTEMPTS} times, and each time a program on {name} took one. See what runs there with `fed remote ssh {name}`, then run `fed remote start {name}` again."
+    )
 }
 
 async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> {
@@ -2483,56 +2553,94 @@ mod tests {
         );
     }
 
-    fn stack(ports: &[(u16, &str)]) -> StackPorts {
+    fn resolved(
+        ports: &[(&str, u16, PortState)],
+    ) -> std::collections::BTreeMap<String, ResolvedPort> {
         ports
             .iter()
-            .map(|(port, param)| (*port, vec![param.to_string()]))
+            .map(|(param, port, state)| {
+                (
+                    param.to_string(),
+                    ResolvedPort {
+                        port: *port,
+                        state: *state,
+                    },
+                )
+            })
             .collect()
     }
 
     #[test]
-    fn only_ports_taken_here_move_to_free_ports_outside_the_stack() {
-        let ports = stack(&[(3000, "WEB_PORT"), (3001, "SOCKET_PORT"), (5432, "DB_PORT")]);
-        let taken = |p: u16| p == 3000 || p == 5432 || p == 40000;
-        // 3001 belongs to the stack and 40000 is taken, so both are skipped.
-        let mut offers = vec![3001, 40000, 40001, 40001, 40002].into_iter();
-        let moves = plan_moves(&ports, taken, || Ok(offers.next().unwrap())).unwrap();
+    fn resolved_ports_are_read_from_the_last_json_line() {
+        let stdout = "Resolving\n{\"DB_PORT\":{\"port\":5432,\"state\":\"taken\"}}\n";
         assert_eq!(
-            moves,
+            parse_resolved_ports(stdout).unwrap(),
+            resolved(&[("DB_PORT", 5432, PortState::Taken)])
+        );
+        assert!(parse_resolved_ports("Port Allocations").is_err());
+    }
+
+    #[test]
+    fn ports_taken_here_or_there_move_and_random_ports_are_kept() {
+        let ports = resolved(&[
+            ("WEB_PORT", 3000, PortState::Kept),
+            ("SOCKET_PORT", 3001, PortState::Kept),
+            ("DB_PORT", 5432, PortState::Taken),
+            ("MODEL_PORT", 41000, PortState::Random),
+            ("CACHE_PORT", 6379, PortState::Kept),
+        ]);
+        let taken = |p: u16| p == 3000 || p == 40000;
+        let tried = [40001].into();
+        // 3001 belongs to the stack, 40000 is taken here and 40001 was tried.
+        let mut offers = vec![3001, 40000, 40001, 40002, 40003].into_iter();
+        let pins = plan_pins(&ports, taken, || Ok(offers.next().unwrap()), &tried).unwrap();
+        assert_eq!(
+            pins,
             vec![
-                PortMove {
-                    from: 3000,
-                    to: 40001,
-                    params: vec!["WEB_PORT".into()]
-                },
-                PortMove {
+                Pin {
+                    param: "DB_PORT".into(),
                     from: 5432,
                     to: 40002,
-                    params: vec!["DB_PORT".into()]
+                    reason: PinReason::TakenThere
+                },
+                Pin {
+                    param: "MODEL_PORT".into(),
+                    from: 41000,
+                    to: 41000,
+                    reason: PinReason::Random
+                },
+                Pin {
+                    param: "WEB_PORT".into(),
+                    from: 3000,
+                    to: 40003,
+                    reason: PinReason::TakenHere
                 },
             ]
         );
+        let kept = resolved(&[("WEB_PORT", 3000, PortState::Kept)]);
         assert!(
-            plan_moves(&ports, |_| false, || unreachable!())
+            plan_pins(&kept, |_| false, || unreachable!(), &tried)
                 .unwrap()
                 .is_empty()
         );
     }
 
     #[test]
-    fn resolve_command_checks_for_the_command_and_pins_each_parameter() {
+    fn the_commands_check_for_resolve_and_pin_each_parameter() {
         assert_eq!(
-            resolve_command("app", &[]),
-            "cd /srv/app && { fed ports resolve --help >/dev/null 2>&1 || exit 4; } && fed ports resolve"
+            resolve_command("app"),
+            "cd /srv/app && { fed ports resolve --help >/dev/null 2>&1 || exit 4; } && fed ports resolve --json"
         );
-        let moves = [PortMove {
+        assert_eq!(start_command("app", &[]), "cd /srv/app && fed start");
+        let pins = [Pin {
+            param: "WEB_PORT".into(),
             from: 3000,
             to: 40001,
-            params: vec!["ALSO_WEB".into(), "WEB_PORT".into()],
+            reason: PinReason::TakenHere,
         }];
-        assert!(
-            resolve_command("app", &moves)
-                .ends_with("fed ports resolve --pin 'ALSO_WEB=40001' --pin 'WEB_PORT=40001'")
+        assert_eq!(
+            start_command("app", &pins),
+            "cd /srv/app && fed start --pin 'WEB_PORT=40001'"
         );
     }
 

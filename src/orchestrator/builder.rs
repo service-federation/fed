@@ -51,6 +51,7 @@ pub struct OrchestratorBuilder {
     isolation_id: Option<String>,
     startup_timeout: Option<Duration>,
     stop_timeout: Option<Duration>,
+    port_pins: std::collections::HashMap<String, u16>,
 }
 
 impl OrchestratorBuilder {
@@ -67,6 +68,7 @@ impl OrchestratorBuilder {
             readonly: false,
             supervisor_attach: false,
             isolation_id: None,
+            port_pins: Default::default(),
             startup_timeout: None,
             stop_timeout: None,
         }
@@ -195,6 +197,14 @@ impl OrchestratorBuilder {
         self
     }
 
+    /// Pin port parameters to exact ports, as `fed start --pin` does. A pinned
+    /// port that another program uses fails the build with
+    /// `Error::PinnedPortTaken`.
+    pub fn port_pins(mut self, pins: std::collections::HashMap<String, u16>) -> Self {
+        self.port_pins = pins;
+        self
+    }
+
     /// Build the orchestrator and initialize it.
     ///
     /// This method performs the following steps:
@@ -263,6 +273,7 @@ impl OrchestratorBuilder {
         if self.replace_mode {
             orchestrator.set_replace_mode(true);
         }
+        orchestrator.set_port_pins(self.port_pins);
         // Must precede initialize(): see isolation_id()'s doc comment.
         if let Some(id) = self.isolation_id {
             orchestrator.set_isolation_id(id);

@@ -20,5 +20,6 @@ pub use lifecycle::ServiceLifecycleCommands;
 /// doc comment on the function itself (in the private `monitoring` module)
 /// for the union-scope formula.
 pub use monitoring::supervised_service_names;
+pub use ports::collect_managed_ports;
 pub use run_context::{RunContext, SecretCacheMode};
 pub use start_lock::StartLock;

@@ -339,6 +339,12 @@ impl Orchestrator {
     }
 
     /// Enable auto-resolve mode for port conflicts (use in TUI mode to avoid interactive prompts)
+    /// Pin port parameters to exact ports for the next initialization, as
+    /// `fed start --pin` does.
+    pub fn set_port_pins(&mut self, pins: HashMap<String, u16>) {
+        self.resolver.set_pins(pins);
+    }
+
     pub fn set_auto_resolve_conflicts(&mut self, auto_resolve: bool) {
         self.resolver.set_auto_resolve_conflicts(auto_resolve);
     }
@@ -1050,17 +1056,25 @@ impl Orchestrator {
         // Persist resolved port parameters globally so that on next `fed start`,
         // collect_managed_ports can detect ports owned by process/Gradle services
         // (not just Docker).
-        let port_resolutions: Vec<(String, u16)> = self
-            .resolver
-            .get_port_resolutions()
+        let resolutions = self.resolver.get_port_resolutions();
+        let port_resolutions: Vec<(String, u16)> = resolutions
             .iter()
             .map(|r| (r.param_name.clone(), r.resolved_port))
+            .collect();
+        let pinned: HashSet<String> = resolutions
+            .iter()
+            .filter(|r| r.reason == crate::parameter::PortResolutionReason::Pinned)
+            .map(|r| r.param_name.clone())
             .collect();
         if !port_resolutions.is_empty() {
             self.state_tracker
                 .write()
                 .await
-                .save_port_resolutions(&port_resolutions, self.isolation_id.as_deref())
+                .save_pinned_port_resolutions(
+                    &port_resolutions,
+                    &pinned,
+                    self.isolation_id.as_deref(),
+                )
                 .await?;
         }
 

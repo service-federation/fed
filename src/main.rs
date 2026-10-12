@@ -57,6 +57,10 @@ async fn main() {
         if let Some(FedError::ScriptFailed { exit_code, .. }) = e.downcast_ref::<FedError>() {
             std::process::exit(*exit_code);
         }
+        if let Some(taken @ FedError::PinnedPortTaken { .. }) = e.downcast_ref::<FedError>() {
+            eprintln!("Error: {taken}");
+            std::process::exit(fed::error::PINNED_PORT_TAKEN_EXIT);
+        }
 
         // All other errors: print with suggestions
         if let Some(fed_error) = e.downcast_ref::<FedError>() {
@@ -597,6 +601,14 @@ async fn run() -> anyhow::Result<()> {
     // start --dry-run should resolve configuration without mutating persisted state
     let dry_run = matches!(&cli.command, Commands::Start { dry_run: true, .. });
 
+    let port_pins: std::collections::HashMap<String, u16> = match &cli.command {
+        Commands::Start { pins, .. } => pins
+            .iter()
+            .map(|pin| commands::parse_pin(pin))
+            .collect::<anyhow::Result<_>>()?,
+        _ => Default::default(),
+    };
+
     // For script commands, check if the script has isolated: true
     // If so, set auto_resolve_conflicts to avoid prompts for ports that will be re-allocated anyway
     let auto_resolve = match &cli.command {
@@ -701,6 +713,11 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let result = async {
+        // Still under the start lock: the services that move stop here, and
+        // the pins are saved only once resolution succeeds.
+        if !port_pins.is_empty() {
+            commands::prepare_pins(&work_dir, &config, &port_pins, &out).await?;
+        }
         // Build orchestrator with all settings applied and initialized
         let mut orchestrator = Orchestrator::builder()
             .config(config.clone())
@@ -711,6 +728,7 @@ async fn run() -> anyhow::Result<()> {
             .dry_run(dry_run)
             .auto_resolve_conflicts(auto_resolve)
             .readonly(readonly)
+            .port_pins(port_pins)
             .build()
             .await?;
 
@@ -725,6 +743,7 @@ async fn run() -> anyhow::Result<()> {
                 dry_run,
                 isolate: _,
                 jobs,
+                pins: _,
             } => {
                 let exit_code = commands::run_start(
                     &mut orchestrator,
