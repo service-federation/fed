@@ -449,6 +449,76 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         assert!(cloud.requests().is_empty(), "{:?}", cloud.requests());
     }
 
+    /// The cloud's own sentence reaches the user, without the characters a
+    /// terminal would act on.
+    #[test]
+    fn up_prints_the_cloud_message_for_a_refusal() {
+        let setup = Setup::new();
+        let cloud = Cloud::start(vec![(
+            "POST /api/v1/orgs/acme/projects/web/environments ",
+            "403 Forbidden",
+            r#"{"error":"user_held","message":"Your account is on hold.\u001b[2J Contact support.\n"}"#
+                .to_string(),
+        )]);
+        let (ok, output) = setup.fed(&cloud.url, &["remote", "up", "box"], &[]);
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains("Error: Your account is on hold. [2J Contact support.\n"),
+            "{output}"
+        );
+        assert!(!output.contains('\u{1b}'), "{output:?}");
+    }
+
+    /// A refusal for the disk size keeps fed's hint after the cloud's message.
+    #[test]
+    fn up_adds_the_disk_hint_to_the_cloud_message() {
+        let setup = Setup::new();
+        let cloud = Cloud::start(vec![(
+            "POST /api/v1/orgs/acme/projects/web/environments ",
+            "422 Unprocessable Entity",
+            r#"{"error":"limit","limit":"root_volume_gb","message":"acme may use disks of at most 100 GB."}"#
+                .to_string(),
+        )]);
+        let (ok, output) = setup.fed(&cloud.url, &["remote", "up", "box", "--disk", "150"], &[]);
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains(
+                "Error: acme may use disks of at most 100 GB. Pick another size with `--disk`.\n"
+            ),
+            "{output}"
+        );
+    }
+
+    /// Without a message, fed's own wording stays.
+    #[test]
+    fn ls_prints_the_cloud_message_or_its_own_wording() {
+        let setup = Setup::new();
+        let cloud = Cloud::start(vec![(
+            WEB,
+            "403 Forbidden",
+            r#"{"error":"user_not_approved","message":"An admin of acme has not approved you yet."}"#
+                .to_string(),
+        )]);
+        let (ok, output) = setup.fed(&cloud.url, &["remote", "ls"], &[]);
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains("Error: An admin of acme has not approved you yet.\n"),
+            "{output}"
+        );
+
+        let cloud = Cloud::start(vec![(
+            WEB,
+            "422 Unprocessable Entity",
+            r#"{"error":"limit","limit":"org_limit"}"#.to_string(),
+        )]);
+        let (ok, output) = setup.fed(&cloud.url, &["remote", "ls"], &[]);
+        assert!(!ok, "{output}");
+        assert!(
+            output.contains("Error: acme has reached a limit for remote environments.\n"),
+            "{output}"
+        );
+    }
+
     #[test]
     fn up_refuses_a_bad_name_before_any_request() {
         let setup = Setup::new();

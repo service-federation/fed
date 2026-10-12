@@ -3,7 +3,7 @@
 //!
 //! Every request goes through `client_builder()`, so it carries the version
 //! headers, and every refusal ends in `api_error` or a message built from the
-//! status and the server's error code. Tokens and key material travel only in
+//! status, the server's error code and the server's own sentence. Tokens and key material travel only in
 //! JSON bodies and never reach an error message.
 
 use super::{Credentials, api_error, api_url, bad_response, client_builder, unreachable};
@@ -198,6 +198,10 @@ struct ErrorBody {
     error: Option<String>,
     #[serde(default)]
     limit: Option<String>,
+    /// A sentence for the user. It comes from the network, so it goes
+    /// through `clean_server_message` before it is printed.
+    #[serde(default)]
+    message: Option<String>,
 }
 
 async fn send(req: reqwest::RequestBuilder, creds: &Credentials) -> Result<reqwest::Response> {
@@ -227,13 +231,45 @@ pub enum EnvironmentRequest<'a> {
     RevokeToken,
 }
 
-/// The message for a refused environment or env token request. Built from the
-/// status and the server's `{"error", "limit"}` only. Known error codes are
-/// matched first, because the server may move one to another status.
+/// The longest server message fed prints, in characters.
+const MAX_SERVER_MESSAGE: usize = 300;
+
+/// The server's `message` as fed prints it, or `None` when nothing is left.
+/// It comes from the network, so control and bidirectional formatting
+/// characters become spaces, runs of white space become one, and a long
+/// message is cut at `MAX_SERVER_MESSAGE` characters.
+pub fn clean_server_message(raw: &str) -> Option<String> {
+    let visible: String = raw
+        .chars()
+        .map(|c| {
+            let hidden = c.is_control()
+                || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}');
+            if hidden { ' ' } else { c }
+        })
+        .collect();
+    let words = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+    if words.is_empty() {
+        return None;
+    }
+    if words.chars().count() <= MAX_SERVER_MESSAGE {
+        return Some(words);
+    }
+    let cut: String = words.chars().take(MAX_SERVER_MESSAGE - 1).collect();
+    Some(format!("{}…", cut.trim_end()))
+}
+
+/// The message for a refused environment or env token request, from the
+/// status and the server's `{"error", "limit", "message"}`. Known error codes
+/// are matched first, because the server may move one to another status.
+///
+/// The server's `message` replaces fed's own wording, except where fed knows
+/// what to do next: a command to run, a flag to change, or when to try again.
+/// A flag hint follows the server's message.
 pub fn environment_error(
     status: reqwest::StatusCode,
     code: Option<&str>,
     limit: Option<&str>,
+    message: Option<&str>,
     request: EnvironmentRequest<'_>,
     project: &ProjectRef,
 ) -> Error {
@@ -246,45 +282,61 @@ pub fn environment_error(
         Some("limit") => Some(limit.unwrap_or("")),
         _ => None,
     };
+    let server = message.and_then(clean_server_message);
+    let server_or = |fallback: String| server.clone().unwrap_or(fallback);
+    let server_with = |fallback: String, hint: &str| match &server {
+        Some(server) => format!("{server} {hint}"),
+        None => fallback,
+    };
     let message = match (status.as_u16(), code, limit) {
         (401, _, _) => "your login is missing, expired or revoked. Run `fed login`.".to_string(),
-        (_, Some("compute_not_enabled"), _) => format!(
+        (_, Some("compute_not_enabled"), _) => server_or(format!(
             "Remote environments are not enabled for {org}. Ask a Service Federation admin to turn them on."
-        ),
-        (_, Some("payments_unavailable"), _) => "compute payment verification is temporarily unavailable. New allocations are paused; existing environments can still be deleted.".to_string(),
-        (_, Some("compute_permission"), _) => format!("this login cannot spend compute credit for {org}. An org admin must enable it on the dashboard's Compute credit page."),
-        (_, Some("credit_required"), _) => format!("{org} does not have enough available compute credit for a full environment lifetime. Add credit or wait for existing reservations to settle."),
-        (_, Some("credit_blocked"), _) => format!("compute spending is paused for {org}. Check the dashboard or contact support. Existing environments can still be deleted."),
+        )),
+        (_, Some("payments_unavailable"), _) => server_or("compute payment verification is temporarily unavailable. New allocations are paused; existing environments can still be deleted.".to_string()),
+        (_, Some("compute_permission"), _) => server_or(format!("this login cannot spend compute credit for {org}. An org admin must enable it on the dashboard's Compute credit page.")),
+        (_, Some("credit_required"), _) => server_or(format!("{org} does not have enough available compute credit for a full environment lifetime. Add credit or wait for existing reservations to settle.")),
+        (_, Some("credit_blocked"), _) => server_or(format!("compute spending is paused for {org}. Check the dashboard or contact support. Existing environments can still be deleted.")),
         (_, Some("tariff_unavailable"), _) => "compute pricing is not available for this machine type. Try again later or check the dashboard.".to_string(),
         (_, Some("token_scope"), _) => "this login cannot manage remote environments. Run `fed login` on this machine to get one that can.".to_string(),
         (_, Some("cleanup_unavailable"), _) => "Service Federation Cloud has paused new remote environments for a moment. Try again in a few minutes.".to_string(),
         (_, Some("capacity"), _) => "Service Federation Cloud has no room for new remote environments right now. Try again in a few minutes.".to_string(),
         (_, Some("compute_unavailable"), _) => "Service Federation Cloud cannot create remote environments right now. Try again later, or ask a Service Federation admin.".to_string(),
-        (_, _, Some("create_rate")) => "you have reached the hourly remote environment creation limit, including failed attempts. Wait before trying again.".to_string(),
-        (_, _, Some("user_environments")) => "you already have as many remote environments as one person may have. Delete one with `fed remote down NAME`, or wait until one deletes itself.".to_string(),
-        (_, _, Some("max_environments")) => format!(
-            "{org} already has as many remote environments as it may have. Delete one with `fed remote down NAME`, or wait until one deletes itself."
+        (_, _, Some("create_rate")) => server_or("you have reached the hourly remote environment creation limit, including failed attempts. Wait before trying again.".to_string()),
+        (_, _, Some("user_environments")) => server_with(
+            "you already have as many remote environments as one person may have. Delete one with `fed remote down NAME`, or wait until one deletes itself.".to_string(),
+            "Delete one with `fed remote down NAME`, or wait until one deletes itself.",
+        ),
+        (_, _, Some("max_environments")) => server_with(
+            format!("{org} already has as many remote environments as it may have. Delete one with `fed remote down NAME`, or wait until one deletes itself."),
+            "Delete one with `fed remote down NAME`, or wait until one deletes itself.",
         ),
         (_, _, Some("allowed_types")) => {
             let kind = match request {
                 EnvironmentRequest::Create { kind, .. } => kind.unwrap_or(DEFAULT_TYPE),
                 _ => "this type of",
             };
-            format!("{org} may not create {kind} environments. Pick another type with `--type`.")
+            server_with(
+                format!("{org} may not create {kind} environments. Pick another type with `--type`."),
+                "Pick another type with `--type`.",
+            )
         }
-        (_, _, Some("root_volume_gb")) => match request {
-            EnvironmentRequest::Create {
-                root_volume_gb: Some(gb),
-                ..
-            } => format!(
-                "{org} may not create environments with a {gb} GB disk. Pick another size with `--disk`."
-            ),
-            _ => format!("{org} may not create environments with this disk size."),
-        },
-        (_, _, Some("monthly_hours")) => format!(
+        (_, _, Some("root_volume_gb")) => {
+            let fallback = match request {
+                EnvironmentRequest::Create {
+                    root_volume_gb: Some(gb),
+                    ..
+                } => format!(
+                    "{org} may not create environments with a {gb} GB disk. Pick another size with `--disk`."
+                ),
+                _ => format!("{org} may not create environments with this disk size."),
+            };
+            server_with(fallback, "Pick another size with `--disk`.")
+        }
+        (_, _, Some("monthly_hours")) => server_or(format!(
             "{org} does not have enough unreserved remote environment hours for another full lifetime this month."
-        ),
-        (_, _, Some(_)) => format!("{org} has reached a limit for remote environments."),
+        )),
+        (_, _, Some(_)) => server_or(format!("{org} has reached a limit for remote environments.")),
         (409, Some("name_taken"), _) => match created {
             Some(name) => format!(
                 "{project} already has an environment called {name}. Pick another name, or delete it with `fed remote down {name}`."
@@ -321,16 +373,20 @@ pub fn environment_error(
             EnvironmentRequest::MintToken => "Service Federation Cloud could not create a vault token. Try again in a minute.".to_string(),
             EnvironmentRequest::RevokeToken => "Service Federation Cloud could not revoke a vault token. Try again in a minute.".to_string(),
         },
-        _ => {
-            let context = match request {
-                EnvironmentRequest::Create { .. } => "creating the environment",
-                EnvironmentRequest::List => "listing environments",
-                EnvironmentRequest::Delete => "deleting the environment",
-                EnvironmentRequest::MintToken => "creating a vault token",
-                EnvironmentRequest::RevokeToken => "revoking a vault token",
-            };
-            return api_error(status, context);
-        }
+        // 426 keeps the upgrade hint that `api_error` gives every request.
+        _ => match &server {
+            Some(server) if status.as_u16() != 426 => server.clone(),
+            _ => {
+                let context = match request {
+                    EnvironmentRequest::Create { .. } => "creating the environment",
+                    EnvironmentRequest::List => "listing environments",
+                    EnvironmentRequest::Delete => "deleting the environment",
+                    EnvironmentRequest::MintToken => "creating a vault token",
+                    EnvironmentRequest::RevokeToken => "revoking a vault token",
+                };
+                return api_error(status, context);
+            }
+        },
     };
     Error::Cloud(message)
 }
@@ -345,6 +401,7 @@ async fn into_error(
         status,
         body.error.as_deref(),
         body.limit.as_deref(),
+        body.message.as_deref(),
         request,
         project,
     )
@@ -427,6 +484,7 @@ pub async fn delete_environment(
             status,
             body.error.as_deref(),
             body.limit.as_deref(),
+            body.message.as_deref(),
             EnvironmentRequest::Delete,
             project,
         ));
@@ -836,6 +894,63 @@ mod tests {
         }
     }
 
+    /// The server's message replaces fed's generic wording, keeps fed's
+    /// hints, and never replaces a retry hint or the upgrade hint.
+    #[tokio::test]
+    async fn create_prints_the_server_message_where_fed_knows_no_better() {
+        let said = "Your account is on hold. Contact support@example.com.";
+        let cases: &[(&str, &str, String)] = &[
+            ("403 Forbidden", "user_held", said.to_string()),
+            ("403 Forbidden", "compute_not_enabled", said.to_string()),
+            ("422 Unprocessable Entity", "limit\",\"limit\":\"org_limit", said.to_string()),
+            (
+                "422 Unprocessable Entity",
+                "limit\",\"limit\":\"root_volume_gb",
+                format!("{said} Pick another size with `--disk`."),
+            ),
+            (
+                "422 Unprocessable Entity",
+                "limit\",\"limit\":\"allowed_types",
+                format!("{said} Pick another type with `--type`."),
+            ),
+            (
+                "503 Service Unavailable",
+                "capacity",
+                "Service Federation Cloud has no room for new remote environments right now. Try again in a few minutes.".to_string(),
+            ),
+            (
+                "401 Unauthorized",
+                "unauthenticated",
+                "your login is missing, expired or revoked. Run `fed login`.".to_string(),
+            ),
+            (
+                "426 Upgrade Required",
+                "unsupported_api_version",
+                "creating the environment failed: Service Federation Cloud answered 426 Upgrade Required. This version of fed is too old for the server. Upgrade fed (`brew upgrade fed`) and try again.".to_string(),
+            ),
+        ];
+        for (status, code, expected) in cases {
+            let body = format!(r#"{{"error":"{code}","message":"{said}"}}"#);
+            let (url, _rx) = spawn_answering(status, body.clone());
+            let err = create_environment(&creds(url), &project(), &create_body())
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), *expected, "{status} {body}");
+        }
+    }
+
+    #[test]
+    fn a_server_message_loses_hidden_characters_and_length() {
+        assert_eq!(
+            clean_server_message("  Line one.\n\tLine\u{1b}[31m two.\u{202e} ").as_deref(),
+            Some("Line one. Line [31m two.")
+        );
+        assert_eq!(clean_server_message(" \n\u{7} "), None);
+        let long = clean_server_message(&"word ".repeat(200)).unwrap();
+        assert_eq!(long.chars().count(), MAX_SERVER_MESSAGE);
+        assert!(long.ends_with("word…") || long.ends_with('…'), "{long}");
+    }
+
     #[tokio::test]
     async fn an_unreachable_cloud_is_a_plain_sentence() {
         let err = list_environments(&creds("http://127.0.0.1:9".into()), &project())
@@ -867,7 +982,7 @@ mod tests {
     fn a_bad_gateway_names_the_request_it_failed() {
         let status = reqwest::StatusCode::BAD_GATEWAY;
         let message =
-            |request| environment_error(status, None, None, request, &project()).to_string();
+            |request| environment_error(status, None, None, None, request, &project()).to_string();
         assert_eq!(
             message(EnvironmentRequest::List),
             "Service Federation Cloud could not list the environments. Try again in a minute."
