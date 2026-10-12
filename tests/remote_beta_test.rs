@@ -135,7 +135,8 @@ mod with_feature {
     /// noticed yet. `FAKE_CLOUD_INIT` is the exit status of the setup wait
     /// in `up`. `FAKE_FORWARD=hold` keeps a port forward running
     /// and writes its pid to `<log>.forward.<pid>`, except the forward from
-    /// the port in `FAKE_FORWARD_FAIL`, which fails. `FAKE_PORTS` is what the
+    /// the port in `FAKE_FORWARD_FAIL`, which fails after `FAKE_FORWARD_DELAY`
+    /// seconds, at once by default. `FAKE_PORTS` is what the
     /// machine's `fed ports list --json` prints.
     const FAKE_SSH: &str = r#"#!/bin/sh
 line=ssh; for a in "$@"; do line="$line [$a]"; done
@@ -163,7 +164,7 @@ case "$opts " in
   *" -f -N "*) exit 0 ;;
   *" -L "*)
     if [ -n "$FAKE_FORWARD_FAIL" ]; then
-      case "$opts " in *" $FAKE_FORWARD_FAIL:127.0.0.1:"*) exit 255 ;; esac
+      case "$opts " in *" $FAKE_FORWARD_FAIL:127.0.0.1:"*) sleep "${FAKE_FORWARD_DELAY:-0}"; exit 255 ;; esac
     fi
     if [ "$FAKE_FORWARD" = hold ]; then
       echo $$ > "$FAKE_LOG.forward.$$"
@@ -718,7 +719,9 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         let (ok, output) = setup.fed(&cloud.url, &["remote", "connect", "box"], &[]);
         assert!(!ok, "{output}");
         assert!(
-            output.contains("Error: every port forward to box stopped."),
+            output.contains(
+                "Error: fed remote connect ended every forward to box, because these stopped:"
+            ),
             "{output}"
         );
         assert!(!output.contains("Connected."), "{output}");
@@ -782,10 +785,10 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         assert!(calls.iter().all(|c| !c.contains(" [-L] ")), "{calls:#?}");
     }
 
-    /// When one forward fails to start, `connect` ends the others and fails,
-    /// so no port reaches whatever took it on this machine.
-    #[test]
-    fn connect_ends_every_forward_when_one_fails() {
+    /// Run `connect` with the forward of WEB_PORT failing after `delay`
+    /// seconds and the other one held, and check that `connect` fails, names
+    /// the port, and leaves no forward running. Returns the output.
+    fn connect_with_a_failing_forward(delay: &str) -> String {
         let setup = Setup::new();
         setup.save("env-1", "box", "web");
         let (web, _) = setup.ports;
@@ -793,20 +796,27 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         let (ok, output) = setup.fed(
             "http://127.0.0.1:9",
             &["remote", "connect", "box"],
-            &[("FAKE_FORWARD", "hold"), ("FAKE_FORWARD_FAIL", &web)],
+            &[
+                ("FAKE_FORWARD", "hold"),
+                ("FAKE_FORWARD_FAIL", &web),
+                ("FAKE_FORWARD_DELAY", delay),
+            ],
         );
         assert!(!ok, "{output}");
         assert!(
             output.contains(
-                "Error: fed remote connect stopped every forward to box, because these did not start:"
+                "Error: fed remote connect ended every forward to box, because these stopped:"
             ),
             "{output}"
         );
         assert!(
-            output.contains(&format!("  {web} (WEB_PORT): ")),
+            output.contains(&format!("  {web} (WEB_PORT): ssh exit status: 255")),
             "{output}"
         );
-        assert!(!output.contains("Connected."), "{output}");
+        assert!(
+            output.contains("Run `fed remote connect box` again."),
+            "{output}"
+        );
         let held: Vec<i32> = std::fs::read_dir(setup.home())
             .unwrap()
             .flatten()
@@ -819,14 +829,31 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             .filter_map(|pid| pid.trim().parse().ok())
             .collect();
         assert_eq!(held.len(), 1, "{held:?}");
-        let start = std::time::Instant::now();
-        while held.iter().any(|pid| alive(*pid)) {
-            assert!(
-                start.elapsed() < std::time::Duration::from_secs(5),
-                "the other forward still runs"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        assert!(
+            held.iter().all(|pid| !alive(*pid)),
+            "the other forward still runs after connect ended"
+        );
+        output
+    }
+
+    /// When one forward fails to start, `connect` ends the others and fails,
+    /// so no port reaches whatever took it on this machine.
+    #[test]
+    fn connect_ends_every_forward_when_one_fails_to_start() {
+        let output = connect_with_a_failing_forward("0");
+        assert!(!output.contains("Connected."), "{output}");
+        assert!(
+            output.contains("A program on this machine may have taken the port."),
+            "{output}"
+        );
+    }
+
+    /// A forward that stops after the connection is up ends the whole
+    /// connection too.
+    #[test]
+    fn connect_ends_every_forward_when_one_stops_later() {
+        let output = connect_with_a_failing_forward("2");
+        assert!(output.contains("Connected."), "{output}");
     }
 
     /// An environment deleted under the user: the first SSH fails, the cloud

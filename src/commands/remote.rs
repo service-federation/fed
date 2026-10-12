@@ -418,17 +418,25 @@ pub(crate) fn taken_ports_message(
     message
 }
 
-/// The error for forwards that stopped while the others started. Each entry
-/// is a port, its parameters and what ssh's exit said.
-pub(crate) fn failed_forwards_message(name: &str, failed: &[(u16, String, String)]) -> String {
+/// The error for forwards that stopped, after which fed ended all the
+/// others. Each entry is a port, its parameters and why its ssh stopped.
+/// Before the connection was up, the likely cause is a program that took the
+/// port on this machine.
+pub(crate) fn stopped_forwards_message(
+    name: &str,
+    stopped: &[(u16, String, String)],
+    connected: bool,
+) -> String {
     let mut message =
-        format!("fed remote connect stopped every forward to {name}, because these did not start:");
-    for (port, params, why) in failed {
-        message.push_str(&format!("\n  {port} ({params}): {why}"));
+        format!("fed remote connect ended every forward to {name}, because these stopped:");
+    for (port, params, why) in stopped {
+        message.push_str(&format!("\n  {port} ({params}): ssh {why}"));
     }
-    message.push_str(&format!(
-        "\nA program on this machine may have taken the port. Run `fed remote connect {name}` again."
-    ));
+    message.push('\n');
+    if !connected {
+        message.push_str("A program on this machine may have taken the port. ");
+    }
+    message.push_str(&format!("Run `fed remote connect {name}` again."));
     message
 }
 
@@ -1985,83 +1993,78 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
         _ = hangup.recv() => true,
         _ = tokio::time::sleep(FORWARD_SETTLE) => false,
     };
-    if !stop_requested {
-        let mut alive = Vec::new();
-        let mut failed = Vec::new();
-        let mut up = Vec::new();
-        for (local, port, params, mut child) in forwards {
-            match child.try_wait() {
-                Ok(None) => {
-                    up.push(format!("  localhost:{local} -> {name}:{port}  ({params})"));
-                    alive.push((local, child));
-                }
-                Ok(Some(status)) => failed.push((port, params, status.to_string())),
-                Err(e) => failed.push((port, params, e.to_string())),
-            }
-        }
-        let mut forwards = alive;
-        if !failed.is_empty() {
-            // Some ports reach the environment and others reach whatever
-            // took them here, which is worse than no connection.
-            for (_, child) in &mut forwards {
-                let _ = child.kill().await;
-            }
-            if forwards.is_empty() {
-                return Err(every_forward_stopped(remote).await);
-            }
-            bail!(failed_forwards_message(name, &failed));
-        }
-        for line in up {
-            out.status(&line);
-        }
-        out.status(&format!(
-            "Connected. Press Ctrl-C to disconnect. {name} powers off after {IDLE_MINUTES} minutes without an SSH session; cloud cleanup follows automatically."
-        ));
-        loop {
-            let stopped = {
-                let waits = forwards
-                    .iter_mut()
-                    .map(|(_, child)| Box::pin(child.wait()))
-                    .collect::<Vec<_>>();
-                tokio::select! {
-                    biased;
-                    _ = interrupt.recv() => None,
-                    _ = terminate.recv() => None,
-                    _ = hangup.recv() => None,
-                    (status, index, _) = futures::future::select_all(waits) => Some((
-                        index,
-                        status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()),
-                    )),
-                }
-            };
-            let Some((index, status)) = stopped else {
-                break;
-            };
-            let (local, _) = forwards.remove(index);
-            out.warning(&format!(
-                "The forward from localhost:{local} stopped ({status})."
-            ));
-            if forwards.is_empty() {
-                return Err(every_forward_stopped(remote).await);
-            }
-        }
-        for (_, child) in &mut forwards {
-            let _ = child.kill().await;
-        }
-    } else {
+    if stop_requested {
         for (_, _, _, child) in &mut forwards {
             let _ = child.kill().await;
         }
+        out.status("Disconnected.");
+        return Ok(());
+    }
+
+    let mut stopped = Vec::new();
+    for (_, port, params, child) in &mut forwards {
+        match child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => stopped.push((*port, params.clone(), status.to_string())),
+            Err(e) => stopped.push((*port, params.clone(), e.to_string())),
+        }
+    }
+    if !stopped.is_empty() {
+        // Some ports would reach the environment and others whatever took
+        // them here, which is worse than no connection.
+        return Err(end_forwards(remote, &mut forwards, &stopped, false).await);
+    }
+    for (local, port, params, _) in &forwards {
+        out.status(&format!("  localhost:{local} -> {name}:{port}  ({params})"));
+    }
+    out.status(&format!(
+        "Connected. Press Ctrl-C to disconnect. {name} powers off after {IDLE_MINUTES} minutes without an SSH session; cloud cleanup follows automatically."
+    ));
+
+    // A forward that stops later ends the whole connection too.
+    let stopped = {
+        let waits = forwards
+            .iter_mut()
+            .map(|(_, _, _, child)| Box::pin(child.wait()))
+            .collect::<Vec<_>>();
+        tokio::select! {
+            biased;
+            _ = interrupt.recv() => None,
+            _ = terminate.recv() => None,
+            _ = hangup.recv() => None,
+            (status, index, _) = futures::future::select_all(waits) => Some((
+                index,
+                status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()),
+            )),
+        }
+    };
+    if let Some((index, why)) = stopped {
+        let (_, port, params, _) = forwards.remove(index);
+        return Err(end_forwards(remote, &mut forwards, &[(port, params, why)], true).await);
+    }
+    for (_, _, _, child) in &mut forwards {
+        let _ = child.kill().await;
     }
     out.status("Disconnected.");
     Ok(())
 }
 
-async fn every_forward_stopped(remote: &Remote) -> anyhow::Error {
+/// End and reap the forwards still running, and return the error for the
+/// ones that `stopped`: that the environment no longer exists, when the cloud
+/// deleted it, or else which forwards stopped and why.
+async fn end_forwards(
+    remote: &Remote,
+    forwards: &mut [(u16, u16, String, OwnedForward)],
+    stopped: &[(u16, String, String)],
+    connected: bool,
+) -> anyhow::Error {
+    for (_, _, _, child) in forwards.iter_mut() {
+        let _ = child.kill().await;
+    }
     if let Some(gone) = remote.deleted().await {
         return gone;
     }
-    anyhow!("every port forward to {} stopped.", remote.name())
+    anyhow!(stopped_forwards_message(remote.name(), stopped, connected))
 }
 
 /// The caller's environment called `name` in `project`, from the cloud list.
@@ -2354,13 +2357,15 @@ mod tests {
     }
 
     #[test]
-    fn failed_forwards_are_listed_with_what_ssh_said() {
+    fn stopped_forwards_are_listed_with_what_ssh_said() {
+        let stopped = [(3000, "WEB_PORT".to_string(), "exit status: 255".to_string())];
         assert_eq!(
-            failed_forwards_message(
-                "box",
-                &[(3000, "WEB_PORT".into(), "exit status: 255".into())]
-            ),
-            "fed remote connect stopped every forward to box, because these did not start:\n  3000 (WEB_PORT): exit status: 255\nA program on this machine may have taken the port. Run `fed remote connect box` again."
+            stopped_forwards_message("box", &stopped, false),
+            "fed remote connect ended every forward to box, because these stopped:\n  3000 (WEB_PORT): ssh exit status: 255\nA program on this machine may have taken the port. Run `fed remote connect box` again."
+        );
+        assert_eq!(
+            stopped_forwards_message("box", &stopped, true),
+            "fed remote connect ended every forward to box, because these stopped:\n  3000 (WEB_PORT): ssh exit status: 255\nRun `fed remote connect box` again."
         );
     }
 

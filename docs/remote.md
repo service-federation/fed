@@ -102,6 +102,11 @@ parameter and, when fed can find it, the program. Stop that program, then run
 between that check and the forward. Then the forward fails, and `connect`
 ends the other forwards too and says which port failed.
 
+`connect` is all or nothing for the whole session. When any forward stops,
+at any time, `connect` ends every other forward and fails. It says which port
+stopped and why, or that the machine no longer exists. Run
+`fed remote connect NAME` again to reconnect.
+
 Running the same stack on your laptop and on the machine at once is not
 supported, because both use the same ports. Stop the local stack first.
 
