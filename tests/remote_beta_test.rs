@@ -387,6 +387,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         let json = json_body(&request);
         assert_eq!(json["name"], "box");
         assert!(json.get("type").is_none(), "{json}");
+        assert!(json.get("root_volume_gb").is_none(), "{json}");
         assert!(
             json["client_public_key"]
                 .as_str()
@@ -413,6 +414,39 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             0o700
         );
         assert!(setup.remote_dirs().is_empty(), "{:?}", setup.remote_dirs());
+    }
+
+    #[test]
+    fn up_sends_the_disk_size() {
+        let setup = Setup::new();
+        let cloud = Cloud::start(vec![(
+            "POST /api/v1/orgs/acme/projects/web/environments ",
+            "403 Forbidden",
+            r#"{"error":"compute_not_enabled"}"#.to_string(),
+        )]);
+        let (ok, output) = setup.fed(&cloud.url, &["remote", "up", "box", "--disk", "40"], &[]);
+        assert!(!ok, "{output}");
+        let request = cloud
+            .request("POST /api/v1/orgs/acme/projects/web/environments ")
+            .unwrap();
+        assert_eq!(json_body(&request)["root_volume_gb"], 40);
+    }
+
+    #[test]
+    fn up_refuses_a_bad_disk_size_before_any_request() {
+        let setup = Setup::new();
+        let cloud = Cloud::start(vec![]);
+        for bad in ["5", "201", "40.5", "big"] {
+            let (ok, output) = setup.fed(&cloud.url, &["remote", "up", "box", "--disk", bad], &[]);
+            assert!(!ok, "{output}");
+            assert!(
+                output.contains(&format!(
+                    "Error: fed remote up --disk needs a whole number of GB from 10 to 200, such as --disk 40. It received `{bad}`."
+                )),
+                "{output}"
+            );
+        }
+        assert!(cloud.requests().is_empty(), "{:?}", cloud.requests());
     }
 
     #[test]
@@ -1013,6 +1047,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         theirs["owner"] = serde_json::json!({"id": "u-bob", "name": "Bob"});
         let mut mine = environment("env-live", "box");
         mine["owner"] = serde_json::json!({"id": "u-me", "name": "Me"});
+        mine["root_volume_gb"] = 40.into();
         let cloud = Cloud::start(vec![
             (WEB, "200 OK", list(&[mine, theirs])),
             (
@@ -1033,10 +1068,13 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             lines[0].starts_with("NAME") && lines[0].ends_with("OWNER"),
             "{output}"
         );
+        assert!(lines[0].contains(" TYPE    DISK "), "{output}");
         assert!(
             lines[1].starts_with("box ") && lines[1].ends_with("you"),
             "{output}"
         );
+        assert!(lines[1].contains(" DEV1-S  40 GB "), "{output}");
+        assert!(lines[2].contains(" DEV1-S  -  "), "{output}");
         assert!(
             lines[2].starts_with("bobs ") && lines[2].ends_with("Bob"),
             "{output}"

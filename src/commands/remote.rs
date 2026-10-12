@@ -1261,10 +1261,19 @@ pub async fn run_remote(
     let root = state_root()?;
     match cmd {
         RemoteCommands::Forward { args } => supervise_forward(args).await,
-        RemoteCommands::Up { name, kind } => {
+        RemoteCommands::Up { name, kind, disk } => {
+            let disk = disk
+                .as_deref()
+                .map(api::parse_root_volume_gb)
+                .transpose()
+                .map_err(|e| anyhow!(e))?;
             let checkout = checkout_root(workdir)?;
             check_tools("fed remote up", true).await?;
-            up(&root, &checkout, name.as_deref(), kind.as_deref(), out).await
+            let machine = Machine {
+                kind: kind.as_deref(),
+                root_volume_gb: disk,
+            };
+            up(&root, &checkout, name.as_deref(), machine, out).await
         }
         RemoteCommands::Ls => {
             let checkout = checkout_root(workdir)?;
@@ -1374,11 +1383,19 @@ fn read_trimmed(path: &Path) -> Result<String> {
         .to_string())
 }
 
+/// The server type and disk `fed remote up` asks for. `None` leaves the
+/// choice to the cloud.
+#[derive(Debug, Clone, Copy)]
+struct Machine<'a> {
+    kind: Option<&'a str>,
+    root_volume_gb: Option<u32>,
+}
+
 async fn up(
     root: &Path,
     checkout: &Path,
     name: Option<&str>,
-    kind: Option<&str>,
+    machine: Machine<'_>,
     out: &dyn UserOutput,
 ) -> Result<()> {
     let creds = credentials()?;
@@ -1400,7 +1417,16 @@ async fn up(
     remove_stale_staging(root, std::time::SystemTime::now());
     let staging = root.join(format!("{STAGING_PREFIX}{:016x}", rand::random::<u64>()));
     create_private_dir(&staging)?;
-    let created = create(&creds, &project, &staging, &name, kind, &mut interrupt, out).await;
+    let created = create(
+        &creds,
+        &project,
+        &staging,
+        &name,
+        machine,
+        &mut interrupt,
+        out,
+    )
+    .await;
     let env = match created {
         Ok(env) => env,
         Err(e) => {
@@ -1535,7 +1561,7 @@ async fn create(
     project: &api::ProjectRef,
     staging: &Path,
     name: &str,
-    kind: Option<&str>,
+    machine: Machine<'_>,
     interrupt: &mut tokio::signal::unix::Signal,
     out: &dyn UserOutput,
 ) -> Result<api::Environment> {
@@ -1552,13 +1578,18 @@ async fn create(
     let client_public = read_trimmed(&staging.join("client_key.pub"))?;
     let host_public = read_trimmed(&staging.join("host_key.pub"))?;
     let host_private = std::fs::read_to_string(staging.join("host_key"))?;
+    let disk = machine
+        .root_volume_gb
+        .map(|gb| format!(", {gb} GB disk"))
+        .unwrap_or_default();
     out.progress(&format!(
-        "Creating {name} ({}) in {project} ",
-        kind.unwrap_or(api::DEFAULT_TYPE)
+        "Creating {name} ({}{disk}) in {project} ",
+        machine.kind.unwrap_or(api::DEFAULT_TYPE)
     ));
     let body = api::CreateEnvironment {
         name,
-        kind,
+        kind: machine.kind,
+        root_volume_gb: machine.root_volume_gb,
         client_public_key: &client_public,
         host_private_key: &host_private,
         host_public_key: &host_public,
@@ -1642,7 +1673,12 @@ async fn ls(root: &Path, checkout: &Path, out: &dyn UserOutput) -> Result<()> {
     let me = my_user_id(&creds, &list).await;
     let show_owner = list.iter().any(|e| !e.is_owned_by(me.as_deref()));
     let now = chrono::Utc::now();
-    let mut header = vec!["NAME", "TYPE", "STATE", "ADDRESS", "LEFT"];
+    let show_disk = list.iter().any(|e| e.root_volume_gb.is_some());
+    let mut header = vec!["NAME", "TYPE"];
+    if show_disk {
+        header.push("DISK");
+    }
+    header.extend(["STATE", "ADDRESS", "LEFT"]);
     if show_owner {
         header.push("OWNER");
     }
@@ -1650,16 +1686,21 @@ async fn ls(root: &Path, checkout: &Path, out: &dyn UserOutput) -> Result<()> {
     let rows: Vec<Vec<String>> = list
         .iter()
         .map(|e| {
-            let mut row = vec![
-                e.name.clone(),
-                e.kind.clone(),
+            let mut row = vec![e.name.clone(), e.kind.clone()];
+            if show_disk {
+                row.push(
+                    e.root_volume_gb
+                        .map_or("-".to_string(), |gb| format!("{gb} GB")),
+                );
+            }
+            row.extend([
                 e.state.clone(),
                 match (&e.ip, e.port) {
                     (Some(ip), Some(port)) => format!("{ip}:{port}"),
                     _ => "-".to_string(),
                 },
                 minutes_left(&e.deadline, now),
-            ];
+            ]);
             if show_owner {
                 row.push(match &e.owner {
                     _ if e.is_owned_by(me.as_deref()) => "you".to_string(),

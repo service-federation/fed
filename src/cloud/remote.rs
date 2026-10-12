@@ -43,6 +43,9 @@ pub struct Environment {
     pub port: Option<u16>,
     pub created_at: String,
     pub deadline: String,
+    /// Root disk size in GB. Older servers leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_volume_gb: Option<u32>,
     /// Who created it. An org admin's list holds everyone's environments in
     /// the project. `None` when the server leaves it out or the user is gone.
     #[serde(default)]
@@ -83,6 +86,20 @@ pub fn valid_environment_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
+/// Smallest and largest root disk, in GB, that `fed remote up --disk` accepts.
+pub const MIN_ROOT_VOLUME_GB: u32 = 10;
+pub const MAX_ROOT_VOLUME_GB: u32 = 200;
+
+/// The root disk size given to `fed remote up --disk`, in GB.
+pub fn parse_root_volume_gb(text: &str) -> std::result::Result<u32, String> {
+    match text.trim().parse::<u32>() {
+        Ok(gb) if (MIN_ROOT_VOLUME_GB..=MAX_ROOT_VOLUME_GB).contains(&gb) => Ok(gb),
+        _ => Err(format!(
+            "fed remote up --disk needs a whole number of GB from {MIN_ROOT_VOLUME_GB} to {MAX_ROOT_VOLUME_GB}, such as --disk 40. It received `{text}`."
+        )),
+    }
+}
+
 pub const INVALID_ENVIRONMENT_NAME: &str = "invalid environment name. Use 1 to 31 lowercase letters, digits and -, starting with a letter or digit.";
 
 /// What `fed remote up` sends to create an environment. The host private key
@@ -92,6 +109,9 @@ pub struct CreateEnvironment<'a> {
     pub name: &'a str,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'a str>,
+    /// Root disk size in GB. Left out, the cloud picks the type's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_volume_gb: Option<u32>,
     pub client_public_key: &'a str,
     pub host_private_key: &'a str,
     pub host_public_key: &'a str,
@@ -102,6 +122,7 @@ impl std::fmt::Debug for CreateEnvironment<'_> {
         f.debug_struct("CreateEnvironment")
             .field("name", &self.name)
             .field("type", &self.kind)
+            .field("root_volume_gb", &self.root_volume_gb)
             .finish_non_exhaustive()
     }
 }
@@ -198,6 +219,7 @@ pub enum EnvironmentRequest<'a> {
     Create {
         name: &'a str,
         kind: Option<&'a str>,
+        root_volume_gb: Option<u32>,
     },
     List,
     Delete,
@@ -250,6 +272,15 @@ pub fn environment_error(
             };
             format!("{org} may not create {kind} environments. Pick another type with `--type`.")
         }
+        (_, _, Some("root_volume_gb")) => match request {
+            EnvironmentRequest::Create {
+                root_volume_gb: Some(gb),
+                ..
+            } => format!(
+                "{org} may not create environments with a {gb} GB disk. Pick another size with `--disk`."
+            ),
+            _ => format!("{org} may not create environments with this disk size."),
+        },
         (_, _, Some("monthly_hours")) => format!(
             "{org} does not have enough unreserved remote environment hours for another full lifetime this month."
         ),
@@ -340,6 +371,7 @@ pub async fn create_environment(
         let request = EnvironmentRequest::Create {
             name: body.name,
             kind: body.kind,
+            root_volume_gb: body.root_volume_gb,
         };
         return Err(into_error(res, request, project).await);
     }
@@ -527,6 +559,7 @@ mod tests {
         CreateEnvironment {
             name: "box",
             kind: None,
+            root_volume_gb: None,
             client_public_key: "ssh-ed25519 AAAAclient fed-remote box client",
             host_private_key: HOST_PRIVATE,
             host_public_key: "ssh-ed25519 AAAAhost fed-remote box host",
@@ -592,6 +625,45 @@ mod tests {
             .unwrap();
         let (_, json) = split(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
         assert_eq!(json["type"], "DEV1-M");
+    }
+
+    #[tokio::test]
+    async fn create_sends_the_disk_size_when_given() {
+        let (url, rx) = spawn_answering("201 Created", environment_json());
+        let body = CreateEnvironment {
+            root_volume_gb: Some(40),
+            ..create_body()
+        };
+        create_environment(&creds(url), &project(), &body)
+            .await
+            .unwrap();
+        let (_, json) = split(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert_eq!(json["root_volume_gb"], 40);
+    }
+
+    #[test]
+    fn a_disk_size_is_a_whole_number_of_gb_from_10_to_200() {
+        assert_eq!(parse_root_volume_gb("10").unwrap(), 10);
+        assert_eq!(parse_root_volume_gb("200").unwrap(), 200);
+        for bad in ["9", "201", "40.5", "-20", "forty", ""] {
+            let error = parse_root_volume_gb(bad).unwrap_err();
+            assert!(
+                error.contains(&format!(
+                    "fed remote up --disk needs a whole number of GB from 10 to 200, such as --disk 40. It received `{bad}`."
+                )),
+                "{bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listed_environment_may_have_a_disk_size() {
+        let env: Environment = serde_json::from_str(&environment_json()).unwrap();
+        assert_eq!(env.root_volume_gb, None);
+        let mut json: serde_json::Value = serde_json::from_str(&environment_json()).unwrap();
+        json["root_volume_gb"] = 40.into();
+        let env: Environment = serde_json::from_value(json).unwrap();
+        assert_eq!(env.root_volume_gb, Some(40));
     }
 
     #[test]

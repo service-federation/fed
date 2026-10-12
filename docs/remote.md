@@ -44,11 +44,16 @@ the VM before it is deleted; remote-only files are temporary.
 
 ## Commands
 
-### `fed remote up [NAME] [--type TYPE]`
+### `fed remote up [NAME] [--type TYPE] [--disk GB]`
 
 Creates a machine for the linked project and waits until it answers SSH and
 has finished setting up. Without a name, it is called `env-HHMMSS`. Names use
 1 to 31 lowercase letters, digits and `-`. The default type is `DEV1-S`.
+
+`--disk` sets the size of the machine's disk, a whole number of GB from 10 to
+200. Use it when the stack's images and data need more room:
+`fed remote up box --disk 60`. Without it, the machine gets the type's default
+disk.
 
 The create can take a few minutes. If it takes more than 5, or you press Ctrl-C,
 fed stops waiting and tells you whether the machine exists.
@@ -56,7 +61,7 @@ fed stops waiting and tells you whether the machine exists.
 ### `fed remote ls`
 
 Lists your machines in the linked project, with their address and the time
-they have left. Org admins see everyone's machines, with an OWNER column.
+they have left. When the cloud reports disk sizes, a DISK column shows them. Org admins see everyone's machines, with an OWNER column.
 
 `ls` also forgets this machine's keys for every environment the cloud has
 deleted, in any project.
