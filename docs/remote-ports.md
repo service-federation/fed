@@ -1,6 +1,6 @@
 # Decision: the same port on the laptop and on the remote environment
 
-Status: accepted and built, 2026-10-12.
+Status: accepted, 2026-10-12. Changed the same day from pinning to refusing, see "Why not pinning".
 
 ## Problem
 
@@ -17,25 +17,30 @@ The browser runs on the laptop at `localhost:13000`. Login callbacks redirect to
 
 1. **The same port when it is free, else +10000.** Simple, and right in the common case. When a port is taken on the laptop, the URLs break silently. That is the worst kind of failure.
 2. **Override the URL parameters on the remote side.** Each project would need to list which parameters are URLs and rewrite them. That is fragile, and it leaks into every fed.yaml.
-3. **Resolve every port so it is free on both machines, and forward it to the same number.** The VM is fresh, so almost any port is free there. The laptop is the constraint. If the remote stack only uses ports that are free on the laptop, every `{{PORT}}` value is correct on both sides, and no URL needs rewriting.
+3. **Resolve every port so it is free on both machines, and forward it to the same number.** Before `fed start` on the VM, the client works out the stack's ports there, and pins each one the laptop uses to a port the laptop has free.
+4. **The same port, and refuse loudly when a laptop port is taken.** `fed remote connect` forwards remote port P to local port P. When the laptop uses one of the ports, it forwards nothing and says which port, which parameter and which program.
 
 ## Decision
 
-Option 3.
+Option 4. Option 3 was accepted first and built, then dropped.
 
-1. Before the remote stack starts, `fed remote start` asks the VM which ports the stack would use (`fed ports resolve --json`). The VM saves nothing, and reports a port that a program there uses as taken.
-2. The client tries to bind each of those ports on the laptop.
-3. For each port that is taken on the laptop or on the VM, the client picks one that is free on the laptop. It runs `fed start --pin PARAM=PORT` on the VM. That one command, under the start lock, checks that each pin is free, stops the services that use a moved parameter, saves the pins and starts the stack. A pin is stored like any resolved port, so later starts keep it. A pin that a program on the VM uses fails with exit status 75, and the client picks another port, up to three times.
-4. Every port of the started stack is one the laptop can bind.
-5. `fed remote connect` forwards each port to the same number. If a port became taken on the laptop since `start`, `connect` stops with a message that names the port and, when it can, the process. It says to stop that process or to run `fed remote start` again, which pins a new port and restarts the services that use it.
+- `fed remote start` runs plain `fed start` on the VM.
+- `fed remote connect` forwards each port to the same number. Before it forwards anything, it checks every port on the laptop. When one is taken, it forwards nothing and lists each taken port with its parameter and, when fed can find it, the program. It says to stop that program and run `fed remote connect` again.
+- A program can take a port between that check and the forward. Then that forward fails, and `connect` ends every other forward and fails too. A partial connection would send some requests to the VM and others to the program on the laptop.
 
 `PORT_OFFSET` goes away.
 
+## Why not pinning
+
+Pinning (option 3) needed a new command on the VM to work out ports without starting anything, and one to move a port and restart only the services that use it. Each review found new edge cases: fixed values from `.env`, secrets and generators that the dry run must not touch, Compose imports, which services own a port, and two runs at once. All of that served one rare case: a port the laptop already uses.
+
+That case comes mostly from running the same stack locally and remotely at once, and that is now unsupported. Stop the local stack before `fed remote connect`.
+
 ## What it costs
 
-- One ssh round trip before `start` (resolve), about half a second.
-- A port the laptop takes between `start` and `connect` means a restart of the services that use it. That is rare, and the message says what to do.
-- Running the same project locally and remotely at the same time still works. The local stack holds its ports, so the remote stack gets other ones, and URLs on each side are correct for that side.
+- Running the same project locally and remotely at the same time no longer works. `connect` refuses and names the ports.
+- Another program on a laptop port of the stack must stop before `connect`.
+- The VM needs no new fed command, so any fed with `fed ports list --json` works there.
 
 ## Not covered
 
