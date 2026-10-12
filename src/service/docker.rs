@@ -119,6 +119,84 @@ pub(crate) fn fnv1a_32(data: &[u8]) -> u32 {
 }
 
 // Docker operation timeouts (normalized for consistency)
+/// How `docker run` publishes ports and gives containers
+/// `host.docker.internal` on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostNetwork {
+    /// Docker Desktop, and runtimes other than Docker. Ports are published as
+    /// written, and the runtime provides `host.docker.internal` itself.
+    AsWritten,
+    /// Docker on Linux. A container resolves `host.docker.internal` only when
+    /// `docker run` maps it to the bridge gateway, and a port published
+    /// without an address is open to other machines. So a port is published
+    /// on 127.0.0.1 and on the `gateway`, where containers reach it through
+    /// `host.docker.internal`. Other machines reach neither address.
+    Linux { gateway: Option<String> },
+}
+
+/// The bridge gateway, looked up once per process.
+static BRIDGE_GATEWAY: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
+
+async fn host_network(client: &DockerClient) -> HostNetwork {
+    use crate::docker::registry_auth::RuntimeFlavor;
+    let docker = RuntimeFlavor::of_binary(crate::docker::runtime_binary()) == RuntimeFlavor::Docker;
+    if !cfg!(target_os = "linux") || !docker {
+        return HostNetwork::AsWritten;
+    }
+    let gateway = BRIDGE_GATEWAY
+        .get_or_init(|| async {
+            let gateway = client.bridge_gateway(DOCKER_INSPECT_TIMEOUT).await;
+            if gateway.is_none() {
+                tracing::warn!(
+                    "Docker has no bridge network gateway, so containers cannot reach published ports through host.docker.internal"
+                );
+            }
+            gateway
+        })
+        .await
+        .clone();
+    HostNetwork::Linux { gateway }
+}
+
+/// The `docker run` arguments that publish `ports` and, on Linux, map
+/// `host.docker.internal`. A port that names a host address is published
+/// as written.
+pub(crate) fn network_args(ports: &[String], host: &HostNetwork) -> Vec<String> {
+    let HostNetwork::Linux { gateway } = host else {
+        return ports
+            .iter()
+            .flat_map(|p| ["-p".to_string(), p.clone()])
+            .collect();
+    };
+    let mut args = vec![
+        "--add-host".to_string(),
+        "host.docker.internal:host-gateway".to_string(),
+    ];
+    for port in ports {
+        let mapping = port.split('/').next().unwrap_or(port);
+        // `CONTAINER` and `HOST:CONTAINER` name no address. A random host
+        // port would differ per address, so `CONTAINER` gets loopback only.
+        let addresses: Vec<&str> = if mapping.starts_with('[') {
+            vec![]
+        } else {
+            match mapping.matches(':').count() {
+                0 => vec!["127.0.0.1:"],
+                1 => std::iter::once("127.0.0.1")
+                    .chain(gateway.as_deref())
+                    .collect(),
+                _ => vec![],
+            }
+        };
+        if addresses.is_empty() {
+            args.extend(["-p".to_string(), port.clone()]);
+        }
+        for address in addresses {
+            args.extend(["-p".to_string(), format!("{address}:{port}")]);
+        }
+    }
+    args
+}
+
 const DOCKER_REMOVE_TIMEOUT: Duration = Duration::from_secs(10); // Remove container
 const DOCKER_START_TIMEOUT: Duration = Duration::from_secs(30); // Start container
 const DOCKER_PULL_TIMEOUT: Duration = Duration::from_secs(300); // Pull image (5 minutes)
@@ -689,15 +767,16 @@ impl ServiceManager for DockerService {
             args.push(scoped_volume);
         }
 
-        // Add ports with validation
         for port in &self.config.ports {
             Self::validate_port_spec(port).map_err(|e| match e {
                 Error::Config(msg) => Error::Config(format!("Service '{}': {}", self.name, msg)),
                 other => other,
             })?;
-            args.push("-p".to_string());
-            args.push(port.clone());
         }
+        args.extend(network_args(
+            &self.config.ports,
+            &host_network(&self.client).await,
+        ));
 
         // Add image name
         args.push(image.clone());
@@ -1603,6 +1682,68 @@ mod tests {
     // ========================================================================
     // Port Conflict Parsing Tests
     // ========================================================================
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn ports_are_published_as_written_off_linux() {
+        let ports = strings(&["5432:5432", "8080"]);
+        assert_eq!(
+            network_args(&ports, &HostNetwork::AsWritten),
+            strings(&["-p", "5432:5432", "-p", "8080"])
+        );
+    }
+
+    #[test]
+    fn on_linux_ports_are_published_on_loopback_and_the_gateway() {
+        let linux = HostNetwork::Linux {
+            gateway: Some("172.17.0.1".to_string()),
+        };
+        let ports = strings(&[
+            "5432:5432",
+            "4566:4566/tcp",
+            "8080",
+            "127.0.0.1:9000:9000",
+            "[::1]:9001:9001",
+        ]);
+        assert_eq!(
+            network_args(&ports, &linux),
+            strings(&[
+                "--add-host",
+                "host.docker.internal:host-gateway",
+                "-p",
+                "127.0.0.1:5432:5432",
+                "-p",
+                "172.17.0.1:5432:5432",
+                "-p",
+                "127.0.0.1:4566:4566/tcp",
+                "-p",
+                "172.17.0.1:4566:4566/tcp",
+                "-p",
+                "127.0.0.1::8080",
+                "-p",
+                "127.0.0.1:9000:9000",
+                "-p",
+                "[::1]:9001:9001",
+            ])
+        );
+    }
+
+    #[test]
+    fn on_linux_without_a_gateway_ports_stay_on_loopback() {
+        let linux = HostNetwork::Linux { gateway: None };
+        assert_eq!(
+            network_args(&strings(&["5432:5432"]), &linux),
+            strings(&[
+                "--add-host",
+                "host.docker.internal:host-gateway",
+                "-p",
+                "127.0.0.1:5432:5432",
+            ])
+        );
+    }
 
     #[test]
     fn test_parse_port_conflict_ipv4() {

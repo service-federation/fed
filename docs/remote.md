@@ -154,6 +154,21 @@ project's secrets, and nothing else.
   it is in `/run/fedenv/tokens/<workspace>`, readable only by root, in memory.
 - fed on the machine uses it for commands run inside `/srv/<workspace>`.
 
+## Docker services on the machine
+
+The machine runs Linux. On Linux, fed starts each Docker service so that it
+works as on Docker Desktop:
+
+- **`host.docker.internal` reaches the machine.** A container can use
+  `postgresql://...@host.docker.internal:{{DB_PORT}}/app` to reach another
+  service's published port.
+- **Published ports stay on the machine.** A port such as `"{{DB_PORT}}:5432"`
+  is published on 127.0.0.1 and on Docker's bridge address, where containers
+  reach it. Other machines cannot reach it. A port that gives its own address,
+  such as `"127.0.0.1:{{DB_PORT}}:5432"`, is published as written.
+
+The same applies when you run fed with Docker on a Linux laptop.
+
 ## Files on your laptop
 
 fed keeps each machine's SSH keys and address in `~/.fed/remote/<id>/`,

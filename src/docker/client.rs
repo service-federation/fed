@@ -46,6 +46,13 @@ pub struct BuildOptions {
     pub failure_message: Option<String>,
 }
 
+/// The first IPv4 address among the words of `text`.
+fn first_ipv4(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|word| word.parse::<std::net::Ipv4Addr>().is_ok())
+        .map(String::from)
+}
+
 /// Centralized client for Docker CLI operations.
 ///
 /// Wraps all `docker` subprocess invocations with consistent timeout handling
@@ -394,6 +401,28 @@ impl DockerClient {
             Ok(o) => !o.stdout.is_empty(),
             Err(_) => false,
         }
+    }
+
+    /// The gateway address of the default bridge network, such as
+    /// `172.17.0.1`. On Linux, `--add-host NAME:host-gateway` maps NAME to it.
+    pub async fn bridge_gateway(&self, timeout: Duration) -> Option<String> {
+        let output = self
+            .run(
+                &[
+                    "network",
+                    "inspect",
+                    "bridge",
+                    "--format",
+                    "{{range .IPAM.Config}}{{.Gateway}} {{end}}",
+                ],
+                timeout,
+            )
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        first_ipv4(&String::from_utf8_lossy(&output.stdout))
     }
 
     /// Get port mappings for a container.
@@ -854,7 +883,20 @@ impl Default for DockerClient {
 
 #[cfg(test)]
 mod image_platform_tests {
-    use super::{platform_inspect_args, platform_matches};
+    use super::{first_ipv4, platform_inspect_args, platform_matches};
+
+    #[test]
+    fn the_bridge_gateway_is_its_ipv4_address() {
+        assert_eq!(
+            first_ipv4("172.17.0.1 fd00::1 \n").as_deref(),
+            Some("172.17.0.1")
+        );
+        assert_eq!(
+            first_ipv4("fd00::1 172.18.0.1").as_deref(),
+            Some("172.18.0.1")
+        );
+        assert_eq!(first_ipv4("\n"), None);
+    }
 
     #[test]
     fn the_inspect_asks_for_the_platform_and_prints_it() {
