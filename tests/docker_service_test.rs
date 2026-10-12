@@ -959,9 +959,8 @@ fn busybox(name: &str, script: &str, ports: Vec<String>, work_dir: &str) -> Dock
     DockerService::new(name.into(), config, HashMap::new(), work_dir.into(), None)
 }
 
-/// On Linux, a container reaches another service's published port through
-/// `host.docker.internal`, as on Docker Desktop. The port is published on
-/// loopback and the bridge gateway only, so other machines cannot reach it.
+/// On Linux, a container resolves `host.docker.internal` and reaches another
+/// service's published port through it, as on Docker Desktop.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[cfg_attr(not(feature = "docker-tests"), ignore)] // Requires Docker
@@ -986,7 +985,7 @@ async fn a_container_reaches_a_published_port_through_host_docker_internal() {
     let mut client = busybox(
         "hdi-client",
         &format!(
-            "for i in $(seq 1 30); do wget -qO- http://host.docker.internal:{port}/ && break; sleep 1; done; exec sleep 300"
+            "grep host.docker.internal /etc/hosts; for i in $(seq 1 30); do wget -qO- http://host.docker.internal:{port}/ && break; sleep 1; done; exec sleep 300"
         ),
         vec![],
         &work_dir,
@@ -1011,21 +1010,12 @@ async fn a_container_reaches_a_published_port_through_host_docker_internal() {
         }
         sleep(Duration::from_secs(1)).await;
     }
-    let server_name = resolve_container_name("hdi-server").await;
-    let published = tokio::process::Command::new("docker")
-        .args(["port", &server_name, "8080"])
-        .output()
-        .await
-        .expect("docker port");
-    let published = String::from_utf8_lossy(&published.stdout).into_owned();
-
     client.stop().await.unwrap();
     server.stop().await.unwrap();
-    assert!(logs.contains("reached-the-server"), "client logs: {logs}");
     assert!(
-        published.contains(&format!("127.0.0.1:{port}")),
-        "{published}"
+        logs.lines()
+            .any(|line| line.ends_with("host.docker.internal") && !line.starts_with('#')),
+        "no host entry in the client's /etc/hosts: {logs}"
     );
-    assert!(!published.contains("0.0.0.0"), "{published}");
-    assert!(!published.contains("[::]"), "{published}");
+    assert!(logs.contains("reached-the-server"), "client logs: {logs}");
 }

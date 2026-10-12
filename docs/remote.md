@@ -161,18 +161,16 @@ project's secrets, and nothing else.
 
 ## Docker services on the machine
 
-The machine runs Linux. On Linux, fed starts each Docker service so that it
-works as on Docker Desktop:
+The machine runs Linux. There, fed starts each Docker container with
+`--add-host host.docker.internal:host-gateway`, so `host.docker.internal`
+reaches the machine as it does on Docker Desktop. A container can use
+`postgresql://...@host.docker.internal:{{DB_PORT}}/app` to reach another
+service's published port. The same applies when you run fed with Docker on a
+Linux laptop. Podman provides the name itself, so fed adds nothing there.
 
-- **`host.docker.internal` reaches the machine.** A container can use
-  `postgresql://...@host.docker.internal:{{DB_PORT}}/app` to reach another
-  service's published port.
-- **Published ports stay on the machine.** A port such as `"{{DB_PORT}}:5432"`
-  is published on 127.0.0.1 and on Docker's bridge address, where containers
-  reach it. Other machines cannot reach it. A port that gives its own address,
-  such as `"127.0.0.1:{{DB_PORT}}:5432"`, is published as written.
-
-The same applies when you run fed with Docker on a Linux laptop.
+Ports are published as Docker publishes them by default. On the machine, the
+cloud's firewall blocks them from outside. You reach them through
+`fed remote connect`.
 
 ## Files on your laptop
 
