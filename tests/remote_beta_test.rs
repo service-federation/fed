@@ -253,6 +253,8 @@ for spec in sys.argv[1:]:
             s.close()
             continue
         socks.append(s)
+        with open(os.environ["FAKE_LOG"] + ".listening", "a") as listening:
+            listening.write("%s %d %d\n" % (host, port, os.getpid()))
         bound += 1
     if not bound:
         sys.stderr.write("channel_setup_fwd_listener_tcpip: cannot listen to port: %d\n" % port)
@@ -289,6 +291,22 @@ while time.time() - start < 600:
 if [ -n "$FAKE_LOG" ]; then printf 'lsof %s\n' "$*" >> "$FAKE_LOG"; fi
 sleep "${FAKE_LSOF_DELAY:-0}"
 exec "REAL_LSOF" "$@"
+"#;
+
+    /// `ss -Hltnp` for the sockets the fake tunnel listens on, from the
+    /// `<log>.listening` file it writes. `FAKE_SS_FORM=mapped` shows
+    /// 127.0.0.1 as `[::ffff:127.0.0.1]`, as ss does for a dual-stack socket.
+    const FAKE_SS: &str = r#"#!/bin/sh
+if [ -n "$FAKE_LOG" ]; then printf 'ss %s\n' "$*" >> "$FAKE_LOG"; fi
+[ -f "$FAKE_LOG.listening" ] || exit 0
+while read -r host port pid; do
+  case "$host" in
+    127.0.0.1) if [ "$FAKE_SS_FORM" = mapped ]; then addr="[::ffff:127.0.0.1]"; else addr="127.0.0.1"; fi ;;
+    ::1) addr="[::1]" ;;
+    *) addr="$host" ;;
+  esac
+  printf 'LISTEN 0      64      %s:%s      0.0.0.0:*    users:(("python3",pid=%s,fd=3))\n' "$addr" "$port" "$pid"
+done < "$FAKE_LOG.listening"
 "#;
 
     /// Where the real `lsof` is on this machine.
@@ -1264,7 +1282,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         assert!(!output.contains("Connected."), "{output}");
         assert!(
             output.contains(
-                "Error: The tunnels to box did not open within 2 seconds. These ports never accepted a connection:"
+                "Error: The tunnels to box did not open within 2 seconds. fed could not confirm that ssh listens on these ports:"
             ),
             "{output}"
         );
@@ -1629,6 +1647,86 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             "{output}"
         );
         assert_no_leftovers(&setup);
+    }
+
+    /// A PATH for fed with the fake `ssh` and the few programs it needs, and
+    /// no `lsof`. With `ss`, the fake `ss` is on it too.
+    fn path_without_lsof(setup: &Setup, ss: bool) -> String {
+        let tools = setup.home().join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        for tool in ["sleep", "dirname", "cat", "python3", "git"] {
+            let found = ["/bin", "/usr/bin"]
+                .iter()
+                .map(|dir| Path::new(dir).join(tool))
+                .find(|path| path.exists())
+                .unwrap_or_else(|| panic!("no {tool}"));
+            std::os::unix::fs::symlink(found, tools.join(tool)).unwrap();
+        }
+        if ss {
+            let path = tools.join("ss");
+            std::fs::write(&path, FAKE_SS).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = std::fs::remove_file(setup.home().join("bin/lsof"));
+        format!("{}:{}", setup.home().join("bin").display(), tools.display())
+    }
+
+    /// On a Linux laptop without `lsof`, fed checks the tunnel with `ss`,
+    /// including the forms ss prints for IPv4 on a dual-stack socket.
+    #[test]
+    fn connect_checks_the_tunnel_with_ss_when_lsof_is_missing() {
+        for form in ["plain", "mapped"] {
+            let setup = Setup::new();
+            setup.save("env-1", "box", "web");
+            let path = path_without_lsof(&setup, true);
+            let fed = Background::connect(
+                &setup,
+                &[
+                    ("PATH", &path),
+                    ("FAKE_FORWARD", "hold"),
+                    ("FAKE_SS_FORM", form),
+                    ("FED_TEST_TUNNEL_WAIT_SECS", "10"),
+                ],
+            );
+            fed.wait_for("Connected.");
+            assert!(
+                setup.calls().iter().any(|c| c.starts_with("ss ")),
+                "{form}: ss was not used"
+            );
+            fed.signal("INT");
+            let (ok, output) = fed.finish();
+            assert!(ok, "{form}: {output}");
+            assert_no_leftovers(&setup);
+        }
+    }
+
+    /// Without `lsof` and `ss`, fed cannot check the tunnel. It says what to
+    /// install at once, before it starts ssh.
+    #[test]
+    fn connect_without_lsof_or_ss_says_what_to_install() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let path = path_without_lsof(&setup, false);
+        let start = std::time::Instant::now();
+        let (ok, output) = setup.fed(
+            "http://127.0.0.1:9",
+            &["remote", "connect", "box"],
+            &[("PATH", &path), ("FAKE_FORWARD", "hold")],
+        );
+        assert!(!ok, "{output}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}: {output}",
+            start.elapsed()
+        );
+        assert!(
+            output.contains(
+                "Error: fed remote connect needs lsof or ss to check that ssh listens on the ports. Install lsof, or iproute2 for ss, then run `fed remote connect box` again."
+            ),
+            "{output}"
+        );
+        let calls = setup.calls();
+        assert!(calls.iter().all(|c| !c.contains(" [-L] ")), "{calls:#?}");
     }
 
     /// An environment deleted under the user: the first SSH fails, the cloud

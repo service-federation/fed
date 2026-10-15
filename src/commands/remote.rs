@@ -12,6 +12,7 @@ use crate::cli::RemoteCommands;
 use crate::output::UserOutput;
 use anyhow::{Context, Result, anyhow, bail};
 use fed::cloud::{self, remote as api};
+use fed::port::listeners::ListenerTool;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -474,8 +475,8 @@ pub(crate) fn tunnel_ended_message(
     )
 }
 
-/// The error for a tunnel whose `closed` ports did not accept a connection
-/// within `waited`.
+/// The error for a tunnel whose `closed` ports fed could not see ssh listen
+/// on within `waited`.
 pub(crate) fn tunnel_not_open_message(
     name: &str,
     waited: Duration,
@@ -483,7 +484,7 @@ pub(crate) fn tunnel_not_open_message(
     lines: &[String],
 ) -> String {
     let mut message = format!(
-        "The tunnels to {name} did not open within {} seconds. These ports never accepted a connection:",
+        "The tunnels to {name} did not open within {} seconds. fed could not confirm that ssh listens on these ports:",
         waited.as_secs()
     );
     for (port, params) in closed {
@@ -2130,20 +2131,22 @@ pub(crate) fn port_state(
     }
 }
 
-/// The TCP listeners on `ports`, from one `lsof`. None when `lsof` fails or
-/// takes longer than [`LISTENERS_TIMEOUT`]. Dropping the future kills `lsof`.
-async fn tcp_listeners(ports: &[u16]) -> Option<Vec<fed::port::listeners::TcpListenerInfo>> {
-    let mut lsof = Command::from(fed::port::listeners::lsof_command(ports));
-    lsof.stdin(Stdio::null())
+/// The TCP listeners on `ports`, from one call of `tool`. None when the
+/// call fails or takes longer than [`LISTENERS_TIMEOUT`]. Dropping the
+/// future kills the call.
+async fn tcp_listeners(
+    tool: ListenerTool,
+    ports: &[u16],
+) -> Option<Vec<fed::port::listeners::TcpListenerInfo>> {
+    let mut call = Command::from(tool.command(ports));
+    call.stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(LISTENERS_TIMEOUT, lsof.output())
+    let output = tokio::time::timeout(LISTENERS_TIMEOUT, call.output())
         .await
         .ok()?
         .ok()?;
-    Some(fed::port::listeners::parse_lsof(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
+    Some(tool.parse(&String::from_utf8_lossy(&output.stdout), ports))
 }
 
 /// Whether the process `pid` still exists.
@@ -2226,6 +2229,11 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
     if !taken.is_empty() {
         bail!(taken_ports_message(name, &taken));
     }
+    let Some(tool) = ListenerTool::find() else {
+        bail!(
+            "fed remote connect needs lsof or ss to check that ssh listens on the ports. Install lsof, or iproute2 for ss, then run `fed remote connect {name}` again."
+        );
+    };
 
     // One listener per signal for the whole command, so a signal between two
     // rounds is kept. The tunnel is a logged-in session, so a tunnel left
@@ -2310,7 +2318,7 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
                     Round::Pid(line.trim().parse().ok().filter(|pid| *pid != 0))
                 }
                 Some(_) => {
-                    let listeners = tcp_listeners(&pending).await;
+                    let listeners = tcp_listeners(tool, &pending).await;
                     tokio::time::sleep(TUNNEL_POLL).await;
                     Round::Checked(listeners)
                 }
@@ -2861,7 +2869,7 @@ mod tests {
         let closed = [(3000, vec!["WEB_PORT".to_string()])];
         assert_eq!(
             tunnel_not_open_message("box", Duration::from_secs(30), &closed, &[]),
-            "The tunnels to box did not open within 30 seconds. These ports never accepted a connection:\n  3000 (WEB_PORT)\nbox may be slow to answer. Run `fed remote connect box` again."
+            "The tunnels to box did not open within 30 seconds. fed could not confirm that ssh listens on these ports:\n  3000 (WEB_PORT)\nbox may be slow to answer. Run `fed remote connect box` again."
         );
     }
 

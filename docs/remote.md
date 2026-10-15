@@ -103,12 +103,14 @@ between that check and the forward. Then `connect` fails and says which port
 it could not forward.
 
 All ports go through one SSH connection. Before it prints "Connected.",
-`connect` asks `lsof` who listens on the ports. It waits until ssh listens on
-each port at 127.0.0.1, and at ::1 when your laptop has it. When `lsof` shows
-another program of yours on a port, `connect` fails and shows that program.
-`lsof` cannot see programs of other users, and fed checks only until
-"Connected.". When the tunnels do not open within 30 seconds, `connect` gives
-up and says which ports stayed closed.
+`connect` asks `lsof` who listens on the ports, or `ss` when `lsof` is
+missing. With neither, `connect` stops at once and says what to install.
+`connect` waits until ssh listens on each port at 127.0.0.1, and at ::1 when
+your laptop has it. When `lsof` or `ss` shows another program of yours on a
+port, `connect` fails and shows that program. Neither tool can see programs
+of other users, and fed checks only until "Connected.". When fed cannot
+confirm the tunnels within 30 seconds, `connect` gives up and lists the ports
+it could not confirm.
 What ssh prints while the connection runs shows in your terminal, with the
 environment's name in front.
 
