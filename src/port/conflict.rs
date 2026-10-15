@@ -67,12 +67,11 @@ impl PortConflict {
 
     #[cfg(target_os = "macos")]
     fn find_processes_macos(port: u16) -> Vec<ProcessInfo> {
-        // Use lsof to find LISTENING processes on macOS
-        // -sTCP:LISTEN filters to only show listeners, not clients
+        // Use lsof to find LISTENING processes on macOS. -iTCP leaves out
+        // UDP sockets on the same number, which -sTCP:LISTEN does not filter.
         let output = match Command::new("lsof")
             .args([
-                "-i",
-                &format!(":{}", port),
+                &format!("-iTCP:{}", port),
                 "-P",
                 "-n",
                 "-sTCP:LISTEN",
@@ -205,8 +204,7 @@ impl PortConflict {
         // -sTCP:LISTEN filters to only show listeners, not clients
         let output = match Command::new("lsof")
             .args([
-                "-i",
-                &format!(":{}", port),
+                &format!("-iTCP:{}", port),
                 "-P",
                 "-n",
                 "-sTCP:LISTEN",
@@ -482,6 +480,16 @@ impl PortConflict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_udp_socket_is_no_tcp_listener() {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = udp.local_addr().unwrap().port();
+        assert!(
+            PortConflict::find_processes_on_port(port).is_empty(),
+            "a UDP socket on {port} was listed as a TCP listener"
+        );
+    }
 
     #[test]
     fn test_is_docker_process_macos() {

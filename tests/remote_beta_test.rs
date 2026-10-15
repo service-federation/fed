@@ -5,11 +5,22 @@
 
 use std::process::Command;
 
+/// Rust on macOS creates a socket and marks it close-on-exec in two steps.
+/// A child spawned between the two inherits the socket and holds its port,
+/// so another test finds that port taken. Every child spawn and every socket
+/// the tests open hold this lock.
+static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn fed_binary() -> &'static str {
     env!("CARGO_BIN_EXE_fed")
 }
 
 fn help_text(args: &[&str]) -> String {
+    let _spawning = spawn_lock();
     let output = Command::new(fed_binary()).args(args).output().unwrap();
     format!(
         "{}{}",
@@ -58,7 +69,10 @@ mod with_feature {
 
     impl Cloud {
         fn start(routes: Vec<(&'static str, &'static str, String)>) -> Self {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let listener = {
+                let _spawning = spawn_lock();
+                std::net::TcpListener::bind("127.0.0.1:0").unwrap()
+            };
             let url = format!("http://{}", listener.local_addr().unwrap());
             let requests = Arc::new(Mutex::new(Vec::new()));
             let seen = requests.clone();
@@ -133,11 +147,14 @@ mod with_feature {
     /// `<log>.stdin.<pid>`. `FAKE_SSH=dead` makes every connection fail as
     /// for a deleted machine, and `FAKE_SSH=stale` for a master that has not
     /// noticed yet. `FAKE_CLOUD_INIT` is the exit status of the setup wait
-    /// in `up`. `FAKE_FORWARD=hold` keeps a port forward running
-    /// and writes its pid to `<log>.forward.<pid>`, except the forward from
-    /// the port in `FAKE_FORWARD_FAIL`, which fails after `FAKE_FORWARD_DELAY`
-    /// seconds, at once by default. `FAKE_PORTS` is what the
-    /// machine's `fed ports list --json` prints.
+    /// in `up`. `FAKE_PORTS` is what the machine's `fed ports list --json`
+    /// prints.
+    ///
+    /// A call with `-L` is the tunnel. It writes its pid to
+    /// `<log>.forward.<pid>`, waits `FAKE_FORWARD_DELAY` seconds, prints
+    /// `FAKE_SAY` to stderr, and then exits 255. `FAKE_FORWARD=hold` makes it
+    /// listen on every `-L` port instead, through `FAKE_LISTEN`, and
+    /// `FAKE_FORWARD=never` makes it stay up without listening.
     const FAKE_SSH: &str = r#"#!/bin/sh
 line=ssh; for a in "$@"; do line="$line [$a]"; done
 printf '%s\n' "$line" >> "$FAKE_LOG"
@@ -163,13 +180,18 @@ case "$opts " in
   *" -O exit "*) exit 0 ;;
   *" -f -N "*) exit 0 ;;
   *" -L "*)
-    if [ -n "$FAKE_FORWARD_FAIL" ]; then
-      case "$opts " in *" $FAKE_FORWARD_FAIL:127.0.0.1:"*) sleep "${FAKE_FORWARD_DELAY:-0}"; exit 255 ;; esac
-    fi
-    if [ "$FAKE_FORWARD" = hold ]; then
-      echo $$ > "$FAKE_LOG.forward.$$"
-      exec sleep 600
-    fi
+    specs=""; prev=""
+    for a in "$@"; do
+      if [ "$prev" = -L ]; then specs="$specs $a"; fi
+      prev="$a"
+    done
+    echo $$ > "$FAKE_LOG.forward.$$"
+    sleep "${FAKE_FORWARD_DELAY:-0}"
+    if [ -n "$FAKE_SAY" ]; then printf '%s\n' "$FAKE_SAY" >&2; fi
+    case "$FAKE_FORWARD" in
+      hold) exec python3 "$(dirname "$0")/fake-listen.py" $specs ;;
+      never) exec sleep 600 ;;
+    esac
     exit 255 ;;
 esac
 case "$last" in
@@ -182,6 +204,118 @@ case "$last" in
 esac
 exit 0
 "#;
+
+    /// How many seconds a fake tunnel stays up before it exits, in tests that
+    /// need "Connected." first. fed checks who listens with `lsof`, which
+    /// takes seconds when many tests run it at once.
+    const UP_FOR: &str = "10";
+
+    /// The listening part of the fake tunnel. It binds each `-L` it receives
+    /// as OpenSSH does: the address given, or 127.0.0.1 and ::1 when the
+    /// forward has none. A forward fails only when no address binds. Then it
+    /// prints OpenSSH's lines and exits 255, as with ExitOnForwardFailure.
+    /// Otherwise it accepts and closes connections for at most 600 seconds.
+    /// `FAKE_SKIP_IPV6` makes it leave out the forwards from [::1], as if they
+    /// were never requested. `FAKE_EXIT_AFTER` makes it exit 255 after that
+    /// many seconds, or kill
+    /// itself with the signal number in `FAKE_EXIT_SIGNAL`. After one second,
+    /// `FAKE_STDERR_KB` makes it write that many 1 KB lines to stderr and
+    /// then create `<log>.noise-done`. A stderr that nobody reads blocks it
+    /// before that file appears.
+    const FAKE_LISTEN: &str = r#"import os, select, signal, socket, sys, time
+
+def addresses(spec):
+    if spec.startswith("["):
+        host, rest = spec[1:].split("]:", 1)
+        return [host], int(rest.split(":")[0])
+    parts = spec.split(":")
+    if len(parts) == 4:
+        return [parts[0]], int(parts[1])
+    return ["127.0.0.1", "::1"], int(parts[0])
+
+socks = []
+for spec in sys.argv[1:]:
+    if os.environ.get("FAKE_SKIP_IPV6") and spec.startswith("[::1]"):
+        continue
+    hosts, port = addresses(spec)
+    bound = 0
+    for host in hosts:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        s = socket.socket(family, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        try:
+            s.bind((host, port))
+            s.listen(64)
+        except OSError as e:
+            sys.stderr.write("bind [%s]:%d: %s\n" % (host, port, e.strerror))
+            s.close()
+            continue
+        socks.append(s)
+        with open(os.environ["FAKE_LOG"] + ".listening", "a") as listening:
+            listening.write("%s %d %d\n" % (host, port, os.getpid()))
+        bound += 1
+    if not bound:
+        sys.stderr.write("channel_setup_fwd_listener_tcpip: cannot listen to port: %d\n" % port)
+        sys.stderr.write("Could not request local forwarding.\n")
+        sys.stderr.flush()
+        sys.exit(255)
+sys.stderr.flush()
+start = time.time()
+exit_after = float(os.environ.get("FAKE_EXIT_AFTER", "0"))
+exit_signal = int(os.environ.get("FAKE_EXIT_SIGNAL", "0"))
+noise = int(os.environ.get("FAKE_STDERR_KB", "0"))
+while time.time() - start < 600:
+    if exit_after and time.time() - start >= exit_after:
+        if exit_signal:
+            os.kill(os.getpid(), exit_signal)
+        sys.exit(255)
+    if noise and time.time() - start >= 1:
+        line = "debug1: channel 3: noise " + "x" * 999 + "\n"
+        for _ in range(noise):
+            sys.stderr.write(line)
+        sys.stderr.flush()
+        open(os.environ["FAKE_LOG"] + ".noise-done", "w").close()
+        noise = 0
+    ready, _, _ = select.select(socks, [], [], 0.1)
+    for s in ready:
+        conn, _ = s.accept()
+        conn.close()
+"#;
+
+    /// The real `lsof`, slowed down by `FAKE_LSOF_DELAY` seconds. fed checks
+    /// who listens with it, and it takes seconds on a busy machine. Each
+    /// call is logged as `lsof <args>`.
+    const FAKE_LSOF: &str = r#"#!/bin/sh
+if [ -n "$FAKE_LOG" ]; then printf 'lsof %s\n' "$*" >> "$FAKE_LOG"; fi
+sleep "${FAKE_LSOF_DELAY:-0}"
+exec "REAL_LSOF" "$@"
+"#;
+
+    /// `ss -Hltnp` for the sockets the fake tunnel listens on, from the
+    /// `<log>.listening` file it writes. `FAKE_SS_FORM=mapped` shows
+    /// 127.0.0.1 as `[::ffff:127.0.0.1]`, as ss does for a dual-stack socket.
+    const FAKE_SS: &str = r#"#!/bin/sh
+if [ -n "$FAKE_LOG" ]; then printf 'ss %s\n' "$*" >> "$FAKE_LOG"; fi
+[ -f "$FAKE_LOG.listening" ] || exit 0
+while read -r host port pid; do
+  case "$host" in
+    127.0.0.1) if [ "$FAKE_SS_FORM" = mapped ]; then addr="[::ffff:127.0.0.1]"; else addr="127.0.0.1"; fi ;;
+    ::1) addr="[::1]" ;;
+    *) addr="$host" ;;
+  esac
+  printf 'LISTEN 0      64      %s:%s      0.0.0.0:*    users:(("python3",pid=%s,fd=3))\n' "$addr" "$port" "$pid"
+done < "$FAKE_LOG.listening"
+"#;
+
+    /// Where the real `lsof` is on this machine.
+    fn real_lsof() -> Option<String> {
+        ["/usr/sbin/lsof", "/usr/bin/lsof", "/bin/lsof", "/sbin/lsof"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .map(String::from)
+    }
 
     const FAKE_RSYNC: &str = r#"#!/bin/sh
 case " $* " in
@@ -203,10 +337,28 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         ports: (u16, u16),
     }
 
-    /// A port nothing on this machine uses right now.
+    /// A port nothing on this machine uses right now, and no other test of
+    /// this run receives. The ports lie below the range the OS gives to
+    /// outgoing connections (32768 and up on Linux, 49152 and up on macOS),
+    /// so a connection of another test cannot take one before fed checks it.
     fn free_port() -> u16 {
-        let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-        listener.local_addr().unwrap().port()
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let start = std::process::id().wrapping_mul(37) % 12000;
+        let _spawning = spawn_lock();
+        loop {
+            let n = NEXT.fetch_add(1, Ordering::SeqCst);
+            let port = (20000 + (start + n) % 12000) as u16;
+            if std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
+                && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+                && !matches!(
+                    std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)),
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
+                )
+            {
+                return port;
+            }
+        }
     }
 
     impl Setup {
@@ -220,18 +372,30 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             )
             .unwrap();
             std::fs::write(checkout.join("README.md"), "hello\n").unwrap();
-            let ok = Command::new("git")
-                .args(["init", "-q"])
-                .arg(&checkout)
-                .status()
-                .unwrap()
-                .success();
+            let ok = {
+                let _spawning = spawn_lock();
+                Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(&checkout)
+                    .status()
+                    .unwrap()
+                    .success()
+            };
             assert!(ok);
             let bin = home.path().join("bin");
             std::fs::create_dir_all(&bin).unwrap();
-            for (name, script) in [("ssh", FAKE_SSH), ("rsync", FAKE_RSYNC)] {
+            for (name, script) in [
+                ("ssh", FAKE_SSH),
+                ("rsync", FAKE_RSYNC),
+                ("fake-listen.py", FAKE_LISTEN),
+            ] {
                 let path = bin.join(name);
                 std::fs::write(&path, script).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            if let Some(lsof) = real_lsof() {
+                let path = bin.join("lsof");
+                std::fs::write(&path, FAKE_LSOF.replace("REAL_LSOF", &lsof)).unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
             let mut ports = (free_port(), free_port());
@@ -302,7 +466,8 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 self.home().join("bin").display(),
                 std::env::var("PATH").unwrap_or_default()
             );
-            let output = Command::new(fed_binary())
+            let mut output = Command::new(fed_binary());
+            output
                 .arg("--workdir")
                 .arg(&self.checkout)
                 .args(args)
@@ -313,8 +478,14 @@ exit "${FAKE_RSYNC_EXIT:-0}"
                 .env("FED_CLOUD_URL", url)
                 .env("FAKE_PORTS", self.ports_json())
                 .envs(env.iter().copied())
-                .output()
-                .unwrap();
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let child = {
+                let _spawning = spawn_lock();
+                output.spawn().unwrap()
+            };
+            let output = child.wait_with_output().unwrap();
             let combined = format!(
                 "{}{}",
                 String::from_utf8_lossy(&output.stdout),
@@ -709,10 +880,11 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         );
     }
 
-    /// Each port gets its own ssh with a local forward. When every forward
-    /// stops and the cloud still lists the environment, `connect` says so.
+    /// The tunnel is one ssh with a local forward per port. When it exits
+    /// at once and the cloud still lists the environment, `connect` says the
+    /// connection ended.
     #[test]
-    fn connect_forwards_each_port_and_reports_when_all_stop() {
+    fn connect_reports_an_ssh_that_exits_at_once() {
         let setup = Setup::new();
         setup.save("env-1", "box", "web");
         let cloud = Cloud::start(vec![(WEB, "200 OK", list(&[environment("env-1", "box")]))]);
@@ -720,7 +892,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         assert!(!ok, "{output}");
         assert!(
             output.contains(
-                "Error: fed remote connect ended every forward to box, because these stopped:"
+                "Error: The connection to box ended (ssh exit status 255).\nRun `fed remote connect box` again."
             ),
             "{output}"
         );
@@ -728,26 +900,91 @@ exit "${FAKE_RSYNC_EXIT:-0}"
 
         let calls = setup.calls();
         let forwards: Vec<&String> = calls.iter().filter(|c| c.contains(" [-L] ")).collect();
-        assert_eq!(forwards.len(), 2, "{calls:#?}");
-        for port in [setup.ports.0, setup.ports.1] {
-            let forward = forwards
-                .iter()
-                .find(|c| c.contains(&format!("[-L] [{port}:127.0.0.1:{port}]")))
-                .unwrap_or_else(|| panic!("no forward for {port}: {forwards:#?}"));
-            for option in [
-                "[BatchMode=yes]",
-                "[ExitOnForwardFailure=yes]",
-                "[ControlPath=none]",
-                "[-N]",
-            ] {
-                assert!(forward.contains(option), "{option}: {forward}");
-            }
+        assert_eq!(forwards.len(), 1, "{calls:#?}");
+        let mut ports = [setup.ports.0, setup.ports.1];
+        ports.sort();
+        let expected: Vec<String> = ports.iter().flat_map(|port| forwards_for(*port)).collect();
+        assert_eq!(local_forwards(forwards[0]), expected, "{}", forwards[0]);
+        for option in [
+            "[BatchMode=yes]",
+            "[ExitOnForwardFailure=yes]",
+            "[ControlPath=none]",
+            "[-N]",
+        ] {
+            assert!(forwards[0].contains(option), "{option}: {}", forwards[0]);
         }
         assert!(
             calls
                 .iter()
                 .any(|c| c.ends_with(" [cd /srv/app && fed ports list --json]")),
             "{calls:#?}"
+        );
+    }
+
+    /// `count` different ports that nothing on this machine uses right now.
+    fn free_ports(count: usize) -> Vec<u16> {
+        (0..count).map(|_| free_port()).collect()
+    }
+
+    /// The `-L` values `connect` passes for `port`: one per address, so
+    /// ExitOnForwardFailure covers each. ::1 only where this machine has it.
+    fn forwards_for(port: u16) -> Vec<String> {
+        let mut forwards = vec![format!("127.0.0.1:{port}:127.0.0.1:{port}")];
+        let ipv6 = {
+            let _spawning = spawn_lock();
+            std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).is_ok()
+        };
+        if ipv6 {
+            forwards.push(format!("[::1]:{port}:127.0.0.1:{port}"));
+        }
+        forwards
+    }
+
+    /// The `-L` values of one logged ssh call, in order.
+    fn local_forwards(call: &str) -> Vec<String> {
+        call.split(" [-L] [")
+            .skip(1)
+            .map(|rest| {
+                rest.split("] ")
+                    .next()
+                    .unwrap()
+                    .trim_end_matches(']')
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// sshd drops new connections past 10 by default, so every port goes
+    /// through one ssh: one `-L` per port, sorted by port.
+    #[test]
+    fn connect_forwards_twelve_ports_through_one_ssh() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let mut ports = free_ports(12);
+        let json = ports
+            .iter()
+            .enumerate()
+            .map(|(i, port)| format!(r#""PORT_{i}": {port}"#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cloud = Cloud::start(vec![(WEB, "200 OK", list(&[environment("env-1", "box")]))]);
+        let (ok, output) = setup.fed(
+            &cloud.url,
+            &["remote", "connect", "box"],
+            &[("FAKE_PORTS", &format!("{{{json}}}"))],
+        );
+        assert!(!ok, "{output}");
+
+        let calls = setup.calls();
+        let forwards: Vec<&String> = calls.iter().filter(|c| c.contains(" [-L] ")).collect();
+        assert_eq!(forwards.len(), 1, "{output}\n{forwards:#?}");
+        ports.sort();
+        let expected: Vec<String> = ports.iter().flat_map(|port| forwards_for(*port)).collect();
+        assert_eq!(local_forwards(forwards[0]), expected, "{}", forwards[0]);
+        assert!(
+            forwards[0].ends_with(" [root@203.0.113.7]"),
+            "{}",
+            forwards[0]
         );
     }
 
@@ -758,7 +995,10 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         let setup = Setup::new();
         setup.save("env-1", "box", "web");
         let (web, _) = setup.ports;
-        let _here = std::net::TcpListener::bind(("127.0.0.1", web)).unwrap();
+        let _here = {
+            let _spawning = spawn_lock();
+            std::net::TcpListener::bind(("127.0.0.1", web)).unwrap()
+        };
         let (ok, output) = setup.fed("http://127.0.0.1:9", &["remote", "connect", "box"], &[]);
         assert!(!ok, "{output}");
         assert!(
@@ -785,39 +1025,9 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         assert!(calls.iter().all(|c| !c.contains(" [-L] ")), "{calls:#?}");
     }
 
-    /// Run `connect` with the forward of WEB_PORT failing after `delay`
-    /// seconds and the other one held, and check that `connect` fails, names
-    /// the port, and leaves no forward running. Returns the output.
-    fn connect_with_a_failing_forward(delay: &str) -> String {
-        let setup = Setup::new();
-        setup.save("env-1", "box", "web");
-        let (web, _) = setup.ports;
-        let web = web.to_string();
-        let (ok, output) = setup.fed(
-            "http://127.0.0.1:9",
-            &["remote", "connect", "box"],
-            &[
-                ("FAKE_FORWARD", "hold"),
-                ("FAKE_FORWARD_FAIL", &web),
-                ("FAKE_FORWARD_DELAY", delay),
-            ],
-        );
-        assert!(!ok, "{output}");
-        assert!(
-            output.contains(
-                "Error: fed remote connect ended every forward to box, because these stopped:"
-            ),
-            "{output}"
-        );
-        assert!(
-            output.contains(&format!("  {web} (WEB_PORT): ssh exit status: 255")),
-            "{output}"
-        );
-        assert!(
-            output.contains("Run `fed remote connect box` again."),
-            "{output}"
-        );
-        let held: Vec<i32> = std::fs::read_dir(setup.home())
+    /// The pids the fake tunnel wrote.
+    fn tunnel_pids(setup: &Setup) -> Vec<i32> {
+        std::fs::read_dir(setup.home())
             .unwrap()
             .flatten()
             .filter(|e| {
@@ -827,33 +1037,696 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             })
             .filter_map(|e| std::fs::read_to_string(e.path()).ok())
             .filter_map(|pid| pid.trim().parse().ok())
-            .collect();
-        assert_eq!(held.len(), 1, "{held:?}");
-        assert!(
-            held.iter().all(|pid| !alive(*pid)),
-            "the other forward still runs after connect ended"
-        );
-        output
+            .collect()
     }
 
-    /// When one forward fails to start, `connect` ends the others and fails,
-    /// so no port reaches whatever took it on this machine.
-    #[test]
-    fn connect_ends_every_forward_when_one_fails_to_start() {
-        let output = connect_with_a_failing_forward("0");
+    /// The fake tunnel and every process whose command line holds the
+    /// test's home, such as the supervisor. Those still alive.
+    fn leftovers(setup: &Setup) -> Vec<i32> {
+        let mut pids = tunnel_pids(setup);
+        let found = {
+            let _spawning = spawn_lock();
+            Command::new("pgrep")
+                .arg("-f")
+                .arg(setup.home())
+                .output()
+                .unwrap()
+        };
+        pids.extend(
+            String::from_utf8_lossy(&found.stdout)
+                .lines()
+                .filter_map(|pid| pid.trim().parse::<i32>().ok()),
+        );
+        pids.into_iter().filter(|pid| alive(*pid)).collect()
+    }
+
+    /// Wait until no process of the test is alive, for at most 5 seconds.
+    fn assert_no_leftovers(setup: &Setup) {
+        let start = std::time::Instant::now();
+        while !leftovers(setup).is_empty() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "still running: {:?}",
+                leftovers(setup)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// OpenSSH's lines for a local port it could not listen on at all.
+    fn cannot_listen(port: u16) -> String {
+        format!(
+            "bind [127.0.0.1]:{port}: Address already in use\nchannel_setup_fwd_listener_tcpip: cannot listen to port: {port}\nCould not request local forwarding."
+        )
+    }
+
+    /// Run `connect` with ssh failing to listen on WEB_PORT after `delay`
+    /// seconds, and check that `connect` fails, names the port and leaves
+    /// no process running.
+    fn connect_with_a_port_ssh_cannot_listen_on(delay: &str) {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (web, _) = setup.ports;
+        let (ok, output) = setup.fed(
+            "http://127.0.0.1:9",
+            &["remote", "connect", "box"],
+            &[
+                ("FAKE_SAY", &cannot_listen(web)),
+                ("FAKE_FORWARD_DELAY", delay),
+            ],
+        );
+        assert!(!ok, "{output}");
         assert!(!output.contains("Connected."), "{output}");
         assert!(
-            output.contains("A program on this machine may have taken the port."),
+            output.contains(&format!(
+                "Error: fed remote connect could not forward port {web} (WEB_PORT) of box, because ssh could not listen on it here. A program on this machine may have taken the port.\nRun `fed remote connect box` again."
+            )),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "box: channel_setup_fwd_listener_tcpip: cannot listen to port: {web}"
+            )),
+            "{output}"
+        );
+        assert_no_leftovers(&setup);
+    }
+
+    /// A program can take a port between the check and the tunnel. Then ssh
+    /// exits, and `connect` names the port, so no port reaches whatever took
+    /// it on this machine.
+    #[test]
+    fn connect_names_the_port_ssh_cannot_listen_on() {
+        connect_with_a_port_ssh_cannot_listen_on("0");
+    }
+
+    /// The same when ssh needs 2 seconds to log in first. A fixed wait
+    /// before "Connected." missed this case.
+    #[test]
+    fn connect_names_the_port_ssh_cannot_listen_on_after_a_slow_login() {
+        connect_with_a_port_ssh_cannot_listen_on("2");
+    }
+
+    /// Whether `port` on 127.0.0.1 accepts a connection.
+    fn accepts(port: u16) -> bool {
+        let _spawning = spawn_lock();
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+    }
+
+    /// `fed remote connect box` in the background, with stdout and stderr in
+    /// files, so a full pipe never stops it. With `stuck_stderr`, stderr is a
+    /// pipe that nobody reads instead.
+    struct Background {
+        child: std::process::Child,
+        stdout: PathBuf,
+        stderr: PathBuf,
+    }
+
+    impl Background {
+        fn connect(setup: &Setup, env: &[(&str, &str)]) -> Self {
+            Self::spawn(setup, env, false)
+        }
+
+        fn connect_with_stuck_stderr(setup: &Setup, env: &[(&str, &str)]) -> Self {
+            Self::spawn(setup, env, true)
+        }
+
+        fn spawn(setup: &Setup, env: &[(&str, &str)], stuck_stderr: bool) -> Self {
+            let path = format!(
+                "{}:{}",
+                setup.home().join("bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let stdout = setup.home().join("connect-stdout");
+            let stderr = setup.home().join("connect-stderr");
+            let mut child = Command::new(fed_binary());
+            child
+                .arg("--workdir")
+                .arg(&setup.checkout)
+                .args(["remote", "connect", "box"])
+                .env("HOME", setup.home())
+                .env("PATH", path)
+                .env("FAKE_LOG", setup.log_path())
+                .env("FAKE_PORTS", setup.ports_json())
+                .env("FED_TOKEN", "fed_test-token")
+                .env("FED_CLOUD_URL", "http://127.0.0.1:9")
+                .envs(env.iter().copied())
+                .stdout(std::fs::File::create(&stdout).unwrap());
+            if stuck_stderr {
+                // The pipe stays open in `child.stderr` and is never read.
+                child.stderr(std::process::Stdio::piped());
+            } else {
+                child.stderr(std::fs::File::create(&stderr).unwrap());
+            }
+            let child = {
+                let _spawning = spawn_lock();
+                child.spawn().unwrap()
+            };
+            Self {
+                child,
+                stdout,
+                stderr,
+            }
+        }
+
+        fn output(&self) -> String {
+            format!(
+                "{}{}",
+                std::fs::read_to_string(&self.stdout).unwrap_or_default(),
+                std::fs::read_to_string(&self.stderr).unwrap_or_default()
+            )
+        }
+
+        /// Wait until the output holds `text`, for at most 20 seconds.
+        fn wait_for(&self, text: &str) {
+            let start = std::time::Instant::now();
+            while !self.output().contains(text) {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(20),
+                    "no {text:?} in: {}",
+                    self.output()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        fn signal(&self, signal: &str) {
+            let _spawning = spawn_lock();
+            let ok = Command::new("kill")
+                .args([&format!("-{signal}"), &self.child.id().to_string()])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        }
+
+        /// Wait for fed to exit. Returns whether it succeeded, and its
+        /// output.
+        fn finish(mut self) -> (bool, String) {
+            let status = self.child.wait().unwrap();
+            (status.success(), self.output())
+        }
+    }
+
+    /// A test that fails before `finish` still ends fed. Its supervisor then
+    /// ends the fake tunnel.
+    impl Drop for Background {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// A slow login: ssh listens only after 3 seconds. "Connected." waits
+    /// until every port accepts.
+    #[test]
+    fn connect_waits_until_every_port_accepts() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let start = std::time::Instant::now();
+        let fed = Background::connect(
+            &setup,
+            &[("FAKE_FORWARD", "hold"), ("FAKE_FORWARD_DELAY", "3")],
+        );
+        fed.wait_for("Connected.");
+        assert!(
+            start.elapsed() >= std::time::Duration::from_secs(3),
+            "{}",
+            fed.output()
+        );
+        for port in [setup.ports.0, setup.ports.1] {
+            assert!(accepts(port), "{port} does not accept: {}", fed.output());
+        }
+        fed.signal("INT");
+        let (ok, output) = fed.finish();
+        assert!(ok, "{output}");
+        assert!(output.contains("Disconnected."), "{output}");
+        assert_no_leftovers(&setup);
+    }
+
+    /// An ssh that never listens: `connect` gives up after the wait, says
+    /// the tunnels did not open, and ends ssh.
+    #[test]
+    fn connect_gives_up_when_the_tunnels_do_not_open() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (ok, output) = setup.fed(
+            "http://127.0.0.1:9",
+            &["remote", "connect", "box"],
+            &[
+                ("FAKE_FORWARD", "never"),
+                ("FED_TEST_TUNNEL_WAIT_SECS", "2"),
+            ],
+        );
+        assert!(!ok, "{output}");
+        assert!(!output.contains("Connected."), "{output}");
+        assert!(
+            output.contains(
+                "Error: The tunnels to box did not open within 2 seconds. fed could not confirm that ssh listens on these ports:"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("  {} (WEB_PORT)", setup.ports.0)),
+            "{output}"
+        );
+        assert_no_leftovers(&setup);
+    }
+
+    /// OpenSSH prints a `bind` line when one address of a port fails, such
+    /// as `[::1]`, and goes on. When ssh exits later for another reason, the
+    /// error does not blame that port.
+    #[test]
+    fn a_lone_bind_line_does_not_blame_its_port() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (web, _) = setup.ports;
+        let (ok, output) = setup.fed(
+            "http://127.0.0.1:9",
+            &["remote", "connect", "box"],
+            &[
+                ("FAKE_FORWARD", "hold"),
+                (
+                    "FAKE_SAY",
+                    &format!("bind [::1]:{web}: Cannot assign requested address"),
+                ),
+                ("FAKE_EXIT_AFTER", UP_FOR),
+            ],
+        );
+        assert!(!ok, "{output}");
+        assert!(output.contains("Connected."), "{output}");
+        assert!(
+            output.contains("box: bind [::1]:"),
+            "the bind line did not reach the terminal: {output}"
+        );
+        assert!(
+            output.contains("Error: The connection to box ended (ssh exit status 255)."),
+            "{output}"
+        );
+        assert!(!output.contains("could not forward port"), "{output}");
+        assert_no_leftovers(&setup);
+    }
+
+    /// A connection that ends after "Connected." gets one line, not one
+    /// line per port.
+    #[test]
+    fn a_connection_that_ends_later_is_reported_once() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (ok, output) = setup.fed(
+            "http://127.0.0.1:9",
+            &["remote", "connect", "box"],
+            &[("FAKE_FORWARD", "hold"), ("FAKE_EXIT_AFTER", UP_FOR)],
+        );
+        assert!(!ok, "{output}");
+        assert!(output.contains("Connected."), "{output}");
+        assert!(
+            output.contains(
+                "Error: The connection to box ended (ssh exit status 255).\nRun `fed remote connect box` again."
+            ),
+            "{output}"
+        );
+        for port in [setup.ports.0, setup.ports.1] {
+            assert!(
+                !output.contains(&format!("{port} (")),
+                "a line for {port}: {output}"
+            );
+        }
+        assert_no_leftovers(&setup);
+    }
+
+    /// ssh keeps printing while the tunnel runs, such as one line per
+    /// refused channel. fed reads all of it, through the supervisor, so the
+    /// pipe never fills and the tunnel stays up.
+    #[test]
+    fn connect_keeps_reading_what_ssh_prints() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let fed = Background::connect(
+            &setup,
+            &[("FAKE_FORWARD", "hold"), ("FAKE_STDERR_KB", "200")],
+        );
+        fed.wait_for("Connected.");
+        let done = setup.home().join("calls.log.noise-done");
+        let start = std::time::Instant::now();
+        while !done.exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(20),
+                "ssh blocked on its stderr: {}",
+                fed.output().len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        fed.wait_for("box: debug1: channel 3: noise ");
+        let lines = || {
+            fed.output()
+                .lines()
+                .filter(|l| l.starts_with("box: debug1: channel 3: noise "))
+                .count()
+        };
+        let start = std::time::Instant::now();
+        while lines() < 200 {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(20),
+                "{} of 200 lines",
+                lines()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        for port in [setup.ports.0, setup.ports.1] {
+            assert!(accepts(port), "{port} stopped accepting");
+        }
+        fed.signal("INT");
+        let (ok, output) = fed.finish();
+        assert!(ok, "{}", output.len());
+        assert!(output.contains("Disconnected."), "{}", output.len());
+        assert_no_leftovers(&setup);
+    }
+
+    /// Run `connect` with ssh logging in for 2 seconds, while a program of
+    /// this test binds WEB_PORT on `address` after the check. `connect` must
+    /// not say "Connected." for a port that may reach that program, and the
+    /// error names the program.
+    fn connect_with_a_competitor(address: &str) {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (web, _) = setup.ports;
+        let fed = Background::connect(
+            &setup,
+            &[("FAKE_FORWARD", "hold"), ("FAKE_FORWARD_DELAY", "2")],
+        );
+        let start = std::time::Instant::now();
+        while !setup.calls().iter().any(|c| c.contains(" [-L] ")) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(20),
+                "no tunnel: {}",
+                fed.output()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _competitor = {
+            let _spawning = spawn_lock();
+            std::net::TcpListener::bind((address, web)).unwrap()
+        };
+        let (ok, output) = fed.finish();
+        assert!(!ok, "{output}");
+        assert!(!output.contains("Connected."), "{output}");
+        assert!(output.contains(&format!("{web} (WEB_PORT)")), "{output}");
+        assert!(
+            output.contains(&format!("(PID {})", std::process::id())),
+            "the competitor is not named: {output}"
+        );
+        assert_no_leftovers(&setup);
+    }
+
+    /// A program on 127.0.0.1 while ssh gets only ::1 is no tunnel: a
+    /// browser at localhost reaches the program.
+    #[test]
+    fn connect_refuses_a_port_another_program_takes_on_ipv4() {
+        connect_with_a_competitor("127.0.0.1");
+    }
+
+    /// A program on the wildcard address shares the port with ssh on macOS.
+    #[test]
+    fn connect_refuses_a_port_another_program_takes_on_every_address() {
+        connect_with_a_competitor("0.0.0.0");
+    }
+
+    /// A terminal that does not read fed's stderr must not stop the tunnel
+    /// or Ctrl-C. fed and ssh end within 2 seconds.
+    #[test]
+    fn ctrl_c_works_while_nobody_reads_feds_stderr() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let mut fed = Background::connect_with_stuck_stderr(
+            &setup,
+            &[("FAKE_FORWARD", "hold"), ("FAKE_STDERR_KB", "200")],
+        );
+        fed.wait_for("Connected.");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        fed.signal("INT");
+        let start = std::time::Instant::now();
+        loop {
+            let exited = fed.child.try_wait().unwrap().is_some();
+            let tunnel_alive = tunnel_pids(&setup).iter().any(|pid| alive(*pid));
+            if exited && !tunnel_alive {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "fed exited: {exited}, tunnel alive: {tunnel_alive}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(fed.output().contains("Disconnected."), "{}", fed.output());
+        assert_no_leftovers(&setup);
+    }
+
+    /// An ssh killed by a signal is reported with the signal.
+    #[test]
+    fn an_ssh_killed_by_a_signal_is_reported_with_it() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (ok, output) = setup.fed(
+            "http://127.0.0.1:9",
+            &["remote", "connect", "box"],
+            &[
+                ("FAKE_FORWARD", "hold"),
+                ("FAKE_EXIT_AFTER", UP_FOR),
+                ("FAKE_EXIT_SIGNAL", "9"),
+            ],
+        );
+        assert!(!ok, "{output}");
+        assert!(output.contains("Connected."), "{output}");
+        assert!(
+            output.contains("Error: The connection to box ended (ssh was killed by SIGKILL)."),
+            "{output}"
+        );
+        assert_no_leftovers(&setup);
+    }
+
+    /// The test-only wait is clamped, so a huge value cannot crash fed.
+    #[test]
+    fn a_huge_test_wait_does_not_crash_connect() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (ok, output) = setup.fed(
+            "http://127.0.0.1:9",
+            &["remote", "connect", "box"],
+            &[("FED_TEST_TUNNEL_WAIT_SECS", &u64::MAX.to_string())],
+        );
+        assert!(!ok, "{output}");
+        assert!(!output.contains("panicked"), "{output}");
+        assert!(
+            output.contains("Error: The connection to box ended (ssh exit status 255)."),
             "{output}"
         );
     }
 
-    /// A forward that stops after the connection is up ends the whole
-    /// connection too.
+    /// The JSON of `fed ports list --json` for `ports`, as PORT_0, PORT_1...
+    fn ports_json(ports: &[u16]) -> String {
+        let entries: Vec<String> = ports
+            .iter()
+            .enumerate()
+            .map(|(i, port)| format!(r#""PORT_{i}": {port}"#))
+            .collect();
+        format!("{{{}}}", entries.join(", "))
+    }
+
+    /// A 12-port tunnel opens, even when each `lsof` takes 2.5 seconds and
+    /// the wait is 20 seconds. One `lsof` per port and round would need 30.
     #[test]
-    fn connect_ends_every_forward_when_one_stops_later() {
-        let output = connect_with_a_failing_forward("2");
-        assert!(output.contains("Connected."), "{output}");
+    fn connect_opens_twelve_ports_with_a_slow_lsof() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let ports = free_ports(12);
+        let json = ports_json(&ports);
+        let fed = Background::connect(
+            &setup,
+            &[
+                ("FAKE_PORTS", &json),
+                ("FAKE_FORWARD", "hold"),
+                ("FAKE_LSOF_DELAY", "2.5"),
+                ("FED_TEST_TUNNEL_WAIT_SECS", "20"),
+            ],
+        );
+        fed.wait_for("Connected.");
+        for port in &ports {
+            assert!(accepts(*port), "{port} does not accept: {}", fed.output());
+            assert!(
+                fed.output()
+                    .contains(&format!("localhost:{port} -> box:{port}")),
+                "{}",
+                fed.output()
+            );
+        }
+        fed.signal("INT");
+        let (ok, output) = fed.finish();
+        assert!(ok, "{output}");
+        assert!(output.contains("Disconnected."), "{output}");
+        assert_no_leftovers(&setup);
+    }
+
+    /// Ctrl-C during a slow `lsof` ends fed and ssh at once.
+    #[test]
+    fn ctrl_c_does_not_wait_for_a_slow_lsof() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let fed = Background::connect(
+            &setup,
+            &[("FAKE_FORWARD", "hold"), ("FAKE_LSOF_DELAY", "20")],
+        );
+        let start = std::time::Instant::now();
+        while !setup.calls().iter().any(|c| c.starts_with("lsof ")) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(20),
+                "fed never checked the ports: {}",
+                fed.output()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        fed.signal("INT");
+        let mut fed = fed;
+        let start = std::time::Instant::now();
+        loop {
+            let exited = fed.child.try_wait().unwrap().is_some();
+            let tunnel_alive = tunnel_pids(&setup).iter().any(|pid| alive(*pid));
+            if exited && !tunnel_alive {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "fed exited: {exited}, tunnel alive: {tunnel_alive}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(fed.output().contains("Disconnected."), "{}", fed.output());
+    }
+
+    /// A UDP socket on a port is no TCP listener, so it does not stop the
+    /// tunnel.
+    #[test]
+    fn a_udp_socket_on_a_port_does_not_stop_connect() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (web, _) = setup.ports;
+        let _udp = {
+            let _spawning = spawn_lock();
+            std::net::UdpSocket::bind(("127.0.0.1", web)).unwrap()
+        };
+        let fed = Background::connect(&setup, &[("FAKE_FORWARD", "hold")]);
+        fed.wait_for("Connected.");
+        fed.signal("INT");
+        let (ok, output) = fed.finish();
+        assert!(ok, "{output}");
+        assert_no_leftovers(&setup);
+    }
+
+    /// Where this machine has ::1, ssh must listen there too. A browser that
+    /// resolves localhost to ::1 would get "connection refused" otherwise.
+    #[test]
+    fn connect_waits_for_the_ipv6_listener_too() {
+        let setup = Setup::new();
+        if forwards_for(setup.ports.0).len() < 2 {
+            return;
+        }
+        setup.save("env-1", "box", "web");
+        let (ok, output) = setup.fed(
+            "http://127.0.0.1:9",
+            &["remote", "connect", "box"],
+            &[
+                ("FAKE_FORWARD", "hold"),
+                ("FAKE_SKIP_IPV6", "1"),
+                ("FED_TEST_TUNNEL_WAIT_SECS", "4"),
+            ],
+        );
+        assert!(!ok, "{output}");
+        assert!(!output.contains("Connected."), "{output}");
+        assert!(
+            output.contains("Error: The tunnels to box did not open within 4 seconds."),
+            "{output}"
+        );
+        assert_no_leftovers(&setup);
+    }
+
+    /// A PATH for fed with the fake `ssh` and the few programs it needs, and
+    /// no `lsof`. With `ss`, the fake `ss` is on it too.
+    fn path_without_lsof(setup: &Setup, ss: bool) -> String {
+        let tools = setup.home().join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        for tool in ["sleep", "dirname", "cat", "python3", "git"] {
+            let found = ["/bin", "/usr/bin"]
+                .iter()
+                .map(|dir| Path::new(dir).join(tool))
+                .find(|path| path.exists())
+                .unwrap_or_else(|| panic!("no {tool}"));
+            std::os::unix::fs::symlink(found, tools.join(tool)).unwrap();
+        }
+        if ss {
+            let path = tools.join("ss");
+            std::fs::write(&path, FAKE_SS).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = std::fs::remove_file(setup.home().join("bin/lsof"));
+        format!("{}:{}", setup.home().join("bin").display(), tools.display())
+    }
+
+    /// On a Linux laptop without `lsof`, fed checks the tunnel with `ss`,
+    /// including the forms ss prints for IPv4 on a dual-stack socket.
+    #[test]
+    fn connect_checks_the_tunnel_with_ss_when_lsof_is_missing() {
+        for form in ["plain", "mapped"] {
+            let setup = Setup::new();
+            setup.save("env-1", "box", "web");
+            let path = path_without_lsof(&setup, true);
+            let fed = Background::connect(
+                &setup,
+                &[
+                    ("PATH", &path),
+                    ("FAKE_FORWARD", "hold"),
+                    ("FAKE_SS_FORM", form),
+                    ("FED_TEST_TUNNEL_WAIT_SECS", "10"),
+                ],
+            );
+            fed.wait_for("Connected.");
+            assert!(
+                setup.calls().iter().any(|c| c.starts_with("ss ")),
+                "{form}: ss was not used"
+            );
+            fed.signal("INT");
+            let (ok, output) = fed.finish();
+            assert!(ok, "{form}: {output}");
+            assert_no_leftovers(&setup);
+        }
+    }
+
+    /// Without `lsof` and `ss`, fed cannot check the tunnel. It says what to
+    /// install at once, before it starts ssh.
+    #[test]
+    fn connect_without_lsof_or_ss_says_what_to_install() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let path = path_without_lsof(&setup, false);
+        let start = std::time::Instant::now();
+        let (ok, output) = setup.fed(
+            "http://127.0.0.1:9",
+            &["remote", "connect", "box"],
+            &[("PATH", &path), ("FAKE_FORWARD", "hold")],
+        );
+        assert!(!ok, "{output}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}: {output}",
+            start.elapsed()
+        );
+        assert!(
+            output.contains(
+                "Error: fed remote connect needs lsof or ss to check that ssh listens on the ports. Install lsof, or iproute2 for ss, then run `fed remote connect box` again."
+            ),
+            "{output}"
+        );
+        let calls = setup.calls();
+        assert!(calls.iter().all(|c| !c.contains(" [-L] ")), "{calls:#?}");
     }
 
     /// An environment deleted under the user: the first SSH fails, the cloud
@@ -1188,94 +2061,31 @@ exit "${FAKE_RSYNC_EXIT:-0}"
     }
 
     fn alive(pid: i32) -> bool {
+        let _spawning = spawn_lock();
         Command::new("kill")
             .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
             .status()
             .unwrap()
             .success()
     }
 
-    /// A port forward is a logged-in session that keeps the machine awake.
-    /// Signals and uncatchable owner death must end every forward.
+    /// The tunnel is a logged-in session that keeps the machine awake.
+    /// Signals and uncatchable owner death must end it.
     #[test]
-    fn connect_ends_its_forwards_even_when_the_owner_is_killed() {
+    fn connect_ends_its_tunnel_even_when_the_owner_is_killed() {
         for signal in ["TERM", "HUP", "KILL"] {
             let setup = Setup::new();
             setup.save("env-1", "box", "web");
-            let path = format!(
-                "{}:{}",
-                setup.home().join("bin").display(),
-                std::env::var("PATH").unwrap_or_default()
-            );
-            let output_path = setup.home().join("connect-output");
-            let child = Command::new(fed_binary())
-                .arg("--workdir")
-                .arg(&setup.checkout)
-                .args(["remote", "connect", "box"])
-                .env("HOME", setup.home())
-                .env("PATH", path)
-                .env("FAKE_LOG", setup.log_path())
-                .env("FAKE_FORWARD", "hold")
-                .env("FAKE_PORTS", setup.ports_json())
-                .env("FED_TOKEN", "fed_test-token")
-                .env("FED_CLOUD_URL", "http://127.0.0.1:9")
-                .stdout(std::fs::File::create(&output_path).unwrap())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
+            let fed = Background::connect(&setup, &[("FAKE_FORWARD", "hold")]);
+            fed.wait_for("Connected.");
+            let tunnel = tunnel_pids(&setup);
+            assert_eq!(tunnel.len(), 1, "{signal}: {tunnel:?}");
+            assert!(alive(tunnel[0]), "{signal}: the tunnel is not running");
 
-            let pid_files = || -> Vec<i32> {
-                std::fs::read_dir(setup.home())
-                    .unwrap()
-                    .flatten()
-                    .filter(|e| {
-                        e.file_name()
-                            .to_string_lossy()
-                            .starts_with("calls.log.forward.")
-                    })
-                    .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-                    .filter_map(|pid| pid.trim().parse().ok())
-                    .collect()
-            };
-            let start = std::time::Instant::now();
-            while pid_files().len() < 2 {
-                assert!(
-                    start.elapsed() < std::time::Duration::from_secs(20),
-                    "the forwards did not start"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            while !std::fs::read_to_string(&output_path)
-                .unwrap()
-                .contains("Connected.")
-            {
-                assert!(
-                    start.elapsed() < std::time::Duration::from_secs(20),
-                    "connect did not become ready"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            let forwards = pid_files();
-            assert!(forwards.iter().all(|pid| alive(*pid)), "{forwards:?}");
-
-            let ok = Command::new("kill")
-                .args([&format!("-{signal}"), &child.id().to_string()])
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok);
-            let output = child.wait_with_output().unwrap();
-            let text = format!(
-                "{}{}",
-                std::fs::read_to_string(&output_path).unwrap(),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert_eq!(
-                output.status.success(),
-                signal != "KILL",
-                "{signal}: {text}"
-            );
-            assert!(text.contains("Connected."), "{signal}: {text}");
+            fed.signal(signal);
+            let (ok, text) = fed.finish();
+            assert_eq!(ok, signal != "KILL", "{signal}: {text}");
             // Every port is forwarded to the same number on this machine.
             for port in [setup.ports.0, setup.ports.1] {
                 assert!(
@@ -1286,14 +2096,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             if signal != "KILL" {
                 assert!(text.contains("Disconnected."), "{signal}: {text}");
             }
-            let start = std::time::Instant::now();
-            while forwards.iter().any(|pid| alive(*pid)) {
-                assert!(
-                    start.elapsed() < std::time::Duration::from_secs(5),
-                    "{signal} left forwards running: {forwards:?}"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            assert_no_leftovers(&setup);
         }
     }
 
@@ -1315,7 +2118,8 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             setup.home().join("bin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let child = Command::new(fed_binary())
+        let mut child = Command::new(fed_binary());
+        child
             .arg("--workdir")
             .arg(&setup.checkout)
             .args(["remote", "up", "box"])
@@ -1325,9 +2129,11 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             .env("FED_TOKEN", "fed_test-token")
             .env("FED_CLOUD_URL", &cloud.url)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(std::process::Stdio::piped());
+        let child = {
+            let _spawning = spawn_lock();
+            child.spawn().unwrap()
+        };
         let wait_for = |prefix: &str| {
             let start = std::time::Instant::now();
             while cloud.request(prefix).is_none() {
@@ -1339,6 +2145,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             }
         };
         let interrupt = || {
+            let _spawning = spawn_lock();
             let ok = Command::new("kill")
                 .args(["-INT", &child.id().to_string()])
                 .status()

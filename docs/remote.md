@@ -99,12 +99,24 @@ The ports must be free on your laptop. When a program on your laptop uses one
 of them, `connect` forwards nothing. It lists each such port with its
 parameter and, when fed can find it, the program. Stop that program, then run
 `fed remote connect NAME` again. A program can also take a port in the moment
-between that check and the forward. Then the forward fails, and `connect`
-ends the other forwards too and says which port failed.
+between that check and the forward. Then `connect` fails and says which port
+it could not forward.
 
-`connect` is all or nothing for the whole session. When any forward stops,
-at any time, `connect` ends every other forward and fails. It says which port
-stopped and why, or that the machine no longer exists. Run
+All ports go through one SSH connection. Before it prints "Connected.",
+`connect` asks `lsof` who listens on the ports, or `ss` when `lsof` is
+missing. With neither, `connect` stops at once and says what to install.
+`connect` waits until ssh listens on each port at 127.0.0.1, and at ::1 when
+your laptop has it. When `lsof` or `ss` shows another program of yours on a
+port, `connect` fails and shows that program. Neither tool can see programs
+of other users, and fed checks only until "Connected.". When fed cannot
+confirm the tunnels within 30 seconds, `connect` gives up and lists the ports
+it could not confirm.
+What ssh prints while the connection runs shows in your terminal, with the
+environment's name in front.
+
+`connect` is all or nothing for the whole session. When the connection ends,
+at any time, every port stops and `connect` fails. It prints one line with
+ssh's exit status, or says that the machine no longer exists. Run
 `fed remote connect NAME` again to reconnect.
 
 Running the same stack on your laptop and on the machine at once is not
