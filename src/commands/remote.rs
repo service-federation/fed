@@ -36,6 +36,8 @@ const TUNNEL_WAIT_VAR: &str = "FED_TEST_TUNNEL_WAIT_SECS";
 const TUNNEL_POLL: Duration = Duration::from_millis(100);
 /// How many of ssh's last stderr lines `connect` keeps for its error.
 const SSH_LINES_KEPT: usize = 20;
+/// How many of ssh's lines may wait for the terminal before fed drops lines.
+const SSH_LINES_QUEUED: usize = 1000;
 /// How long a connection may take before fed asks the cloud whether the
 /// environment still exists.
 const SLOW_CONNECT: Duration = Duration::from_secs(2);
@@ -438,11 +440,13 @@ pub(crate) fn port_ssh_could_not_listen_on(lines: &[String]) -> Option<u16> {
 
 /// The error for a tunnel whose ssh exited with `status`, from the last
 /// `lines` ssh printed. `ports` are the tunnel's ports with their parameters.
+/// `holder` is the program on the port ssh could not listen on, when known.
 pub(crate) fn tunnel_ended_message(
     name: &str,
     ports: &[(u16, Vec<String>)],
     status: &str,
     lines: &[String],
+    holder: Option<&str>,
 ) -> String {
     if let Some(port) = port_ssh_could_not_listen_on(lines) {
         let params = ports
@@ -450,8 +454,15 @@ pub(crate) fn tunnel_ended_message(
             .find(|(p, _)| *p == port)
             .map(|(_, params)| format!(" ({})", params.join(", ")))
             .unwrap_or_default();
+        let why = match holder {
+            Some(holder) => format!("{holder} uses it on this machine"),
+            None => {
+                "ssh could not listen on it here. A program on this machine may have taken the port"
+                    .to_string()
+            }
+        };
         return format!(
-            "fed remote connect could not forward port {port}{params} of {name}, because ssh could not listen on it here. A program on this machine may have taken the port.\nRun `fed remote connect {name}` again."
+            "fed remote connect could not forward port {port}{params} of {name}, because {why}.\nRun `fed remote connect {name}` again."
         );
     }
     format!(
@@ -1948,6 +1959,7 @@ impl OwnedForward {
 }
 
 async fn supervise_forward(args: &[OsString]) -> Result<()> {
+    use std::io::Write;
     use tokio::io::AsyncReadExt;
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate())?;
@@ -1956,26 +1968,51 @@ async fn supervise_forward(args: &[OsString]) -> Result<()> {
     let mut child = Command::new("ssh")
         .args(args)
         .stdin(Stdio::null())
+        .stdout(Stdio::null())
         .kill_on_drop(true)
         .spawn()?;
+    // fed reads ssh's PID from the first line, to check that ssh owns every
+    // listener of the tunnel.
+    let mut stdout = std::io::stdout();
+    writeln!(stdout, "{}", child.id().unwrap_or(0))?;
+    stdout.flush()?;
     let mut stdin = tokio::io::stdin();
     let mut byte = [0];
-    let code = tokio::select! {
-        status = child.wait() => status?.code().unwrap_or(1),
-        _ = stdin.read(&mut byte) => { child.kill().await?; 0 },
-        _ = term.recv() => { child.kill().await?; 0 },
-        _ = hup.recv() => { child.kill().await?; 0 },
-        _ = interrupt.recv() => { child.kill().await?; 0 },
+    let status = tokio::select! {
+        status = child.wait() => Some(status?),
+        _ = stdin.read(&mut byte) => { child.kill().await?; None },
+        _ = term.recv() => { child.kill().await?; None },
+        _ = hup.recv() => { child.kill().await?; None },
+        _ = interrupt.recv() => { child.kill().await?; None },
     };
     // Tokio's blocking stdin reader may still wait when SSH exits first. SSH
     // has been reaped; do not wait for that unrelated reader at runtime exit.
-    std::process::exit(code);
+    match status {
+        Some(status) => exit_as(status),
+        None => std::process::exit(0),
+    }
+}
+
+/// Exit the way `status` says a child ended, so fed sees the same: with its
+/// code, or killed by its signal.
+fn exit_as(status: ExitStatus) -> ! {
+    use nix::sys::signal::{SigHandler, Signal, raise, signal};
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(Ok(sig)) = status.signal().map(Signal::try_from) {
+        // SAFETY: the process exits right after, and no other code relies on
+        // the handler.
+        let _ = unsafe { signal(sig, SigHandler::SigDfl) };
+        let _ = raise(sig);
+    }
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// ssh's stderr, read for the whole life of the tunnel. A pipe that nobody
 /// reads fills, and ssh then blocks on its next write, which stops every
-/// forward. Each line goes to the terminal with the environment's name in
-/// front, and the last few are kept for the error.
+/// forward. The reader never waits for the terminal: it hands each line,
+/// with the environment's name in front, to a writer thread through a
+/// bounded queue, and drops lines while the queue is full. It keeps the last
+/// few lines for the error.
 struct SshStderr {
     kept: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     reader: tokio::task::JoinHandle<()>,
@@ -1983,16 +2020,26 @@ struct SshStderr {
 
 impl SshStderr {
     fn read(pipe: tokio::process::ChildStderr, name: &str) -> Self {
-        use std::io::Write;
+        use std::sync::mpsc::TrySendError;
         use tokio::io::AsyncBufReadExt;
         let kept = std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::with_capacity(SSH_LINES_KEPT),
         ));
         let lines = kept.clone();
         let prefix = format!("{name}: ");
+        let (queue, queued) = std::sync::mpsc::sync_channel::<String>(SSH_LINES_QUEUED);
+        // A plain thread, not a tokio task: a terminal that does not read
+        // blocks it, and fed exits without waiting for it.
+        std::thread::spawn(move || {
+            use std::io::Write;
+            for line in queued {
+                let _ = writeln!(std::io::stderr(), "{line}");
+            }
+        });
         let reader = tokio::spawn(async move {
             let mut pipe = tokio::io::BufReader::new(pipe);
             let mut raw = Vec::new();
+            let mut dropped = 0usize;
             loop {
                 raw.clear();
                 match pipe.read_until(b'\n', &mut raw).await {
@@ -2003,65 +2050,131 @@ impl SshStderr {
                 if line.is_empty() {
                     continue;
                 }
-                let _ = writeln!(std::io::stderr(), "{prefix}{line}");
+                if dropped > 0 && queue.try_send(dropped_notice(&prefix, dropped)).is_ok() {
+                    dropped = 0;
+                }
+                if let Err(TrySendError::Full(_)) = queue.try_send(format!("{prefix}{line}")) {
+                    dropped += 1;
+                }
                 let mut lines = lines.lock().unwrap_or_else(|e| e.into_inner());
                 if lines.len() == SSH_LINES_KEPT {
                     lines.pop_front();
                 }
                 lines.push_back(line);
             }
+            if dropped > 0 {
+                let _ = queue.try_send(dropped_notice(&prefix, dropped));
+            }
         });
         Self { kept, reader }
     }
 
     /// The kept lines, after ssh has exited. The pipe closes when the
-    /// supervisor and ssh are gone, so the reader ends soon after.
-    async fn finish(self) -> Vec<String> {
-        let _ = tokio::time::timeout(Duration::from_secs(1), self.reader).await;
+    /// supervisor and ssh are gone, so the reader ends soon after. A reader
+    /// that does not end in time is stopped.
+    async fn finish(mut self) -> Vec<String> {
+        let _ = tokio::time::timeout(Duration::from_secs(1), &mut self.reader).await;
+        self.reader.abort();
         let lines = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         lines.iter().cloned().collect()
     }
 }
 
-/// The ports among `ports` that do not accept a TCP connection on this
-/// machine yet. The preflight showed every port was free here, so a port
-/// that accepts means ssh listens on it. Each check opens a channel to the
-/// remote port and closes it at once. So a service that is down makes ssh
-/// print one `channel N: open failed` line, and Postgres logs one incomplete
-/// startup packet.
-async fn closed_ports(ports: &[u16]) -> Vec<u16> {
-    let mut closed = Vec::new();
-    for &port in ports {
-        let accepted = tokio::time::timeout(
-            TUNNEL_POLL,
-            tokio::net::TcpStream::connect(("127.0.0.1", port)),
-        )
-        .await;
-        if !matches!(accepted, Ok(Ok(_))) {
-            closed.push(port);
-        }
-    }
-    closed
+/// The line that stands for `dropped` lines of ssh the terminal did not take.
+fn dropped_notice(prefix: &str, dropped: usize) -> String {
+    format!(
+        "{prefix}{dropped} lines from ssh were not shown, because the terminal did not keep up."
+    )
 }
 
-/// How long `connect` waits for the tunnel to open.
-fn tunnel_wait() -> Duration {
-    std::env::var(TUNNEL_WAIT_VAR)
-        .ok()
+/// Who listens on a port of the tunnel.
+enum Listener {
+    /// Nobody yet, or nobody fed can see.
+    Nobody,
+    /// Only ssh.
+    Ssh,
+    /// Other programs, as `name (PID n)`.
+    Others(Vec<String>),
+}
+
+/// Who listens on `port` on this machine, given ssh's `ssh_pid`. A
+/// connection to the port is no proof: a program that took the port after
+/// the check would accept it too.
+fn listener_on(port: u16, ssh_pid: u32) -> Listener {
+    let Some(conflict) = fed::port::PortConflict::check(port) else {
+        return Listener::Nobody;
+    };
+    let others: Vec<String> = conflict
+        .processes
+        .iter()
+        .filter(|p| p.pid != ssh_pid)
+        .map(|p| format!("{} (PID {})", p.name, p.pid))
+        .collect();
+    if !others.is_empty() {
+        Listener::Others(others)
+    } else if conflict.processes.is_empty() {
+        Listener::Nobody
+    } else {
+        Listener::Ssh
+    }
+}
+
+/// Whether the process `pid` still exists.
+fn alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
+/// Whether ::1 works on this machine. Then each port also gets a forward
+/// from [::1], so a browser that resolves localhost to ::1 reaches it.
+fn ipv6_loopback() -> bool {
+    std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).is_ok()
+}
+
+/// How long `connect` waits for the tunnel to open. Debug builds take a
+/// shorter wait from `value`, for tests.
+pub(crate) fn tunnel_wait(value: Option<&str>) -> Duration {
+    if !cfg!(debug_assertions) {
+        return TUNNEL_WAIT;
+    }
+    value
         .and_then(|secs| secs.parse().ok())
         .map(Duration::from_secs)
-        .unwrap_or(TUNNEL_WAIT)
+        .map_or(TUNNEL_WAIT, |wait| wait.min(TUNNEL_WAIT))
 }
 
-/// `exit status <n>`, or how the process ended when no code is known.
+/// `exit status <n>`, or the signal that killed the process.
 fn exit_status(status: &std::io::Result<ExitStatus>) -> String {
+    use std::os::unix::process::ExitStatusExt;
     match status {
-        Ok(status) => match status.code() {
-            Some(code) => format!("exit status {code}"),
-            None => status.to_string(),
+        Ok(status) => match (status.code(), status.signal()) {
+            (Some(code), _) => format!("exit status {code}"),
+            (None, Some(sig)) => match nix::sys::signal::Signal::try_from(sig) {
+                Ok(signal) => format!("was killed by {}", signal.as_str()),
+                Err(_) => format!("was killed by signal {sig}"),
+            },
+            (None, None) => status.to_string(),
         },
         Err(e) => e.to_string(),
     }
+}
+
+/// How the wait for the tunnel ended.
+enum Opening {
+    Ready,
+    Stopped,
+    Exited(std::io::Result<ExitStatus>),
+    TimedOut(Vec<u16>),
+    Taken(u16, Vec<String>),
+}
+
+/// One round of the wait: ssh's PID from the supervisor's first line, or
+/// which of the `pending` ports only ssh listens on now.
+enum Round {
+    Pid(Option<u32>),
+    Checked(Vec<(u16, Listener)>),
 }
 
 async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> {
@@ -2097,9 +2210,11 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
 
     // One ssh carries every port, outside the shared connection. sshd drops
     // new connections past 10 by default, so the port count must not change
-    // the connection count. ExitOnForwardFailure makes ssh exit when a local port
-    // cannot listen. The supervisor runs in its own process group, so Ctrl-C
-    // in the terminal reaches only fed, which then ends it. ssh inherits the
+    // the connection count. ssh counts a forward as working when any of its
+    // addresses listens, so each address gets its own forward, and
+    // ExitOnForwardFailure makes ssh exit when any of them cannot listen.
+    // The supervisor runs in its own process group, so Ctrl-C in the
+    // terminal reaches only fed, which then ends it. ssh inherits the
     // supervisor's stderr, so its lines come straight into fed's pipe.
     let mut supervisor = Command::new(std::env::current_exe()?);
     supervisor
@@ -2110,32 +2225,113 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
         .args(opt("ControlPath=none"))
         .args(opt("ExitOnForwardFailure=yes"))
         .arg("-N");
+    let ipv6 = ipv6_loopback();
     for (port, _) in &ports {
-        supervisor.arg("-L").arg(format!("{port}:127.0.0.1:{port}"));
+        supervisor
+            .arg("-L")
+            .arg(format!("127.0.0.1:{port}:127.0.0.1:{port}"));
+        if ipv6 {
+            supervisor
+                .arg("-L")
+                .arg(format!("[::1]:{port}:127.0.0.1:{port}"));
+        }
     }
     let mut child = supervisor
         .arg(remote.target())
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
         .context("running ssh")?;
     let lease = child.stdin.take();
     let stderr = SshStderr::read(child.stderr.take().context("reading ssh's output")?, name);
+    let mut first_line = tokio::io::BufReader::new(
+        child
+            .stdout
+            .take()
+            .context("reading the supervisor's output")?,
+    );
     let mut tunnel = OwnedForward { child, lease };
 
-    let waited = tunnel_wait();
-    let deadline = Instant::now() + waited;
-    let mut closed: Vec<u16> = ports.iter().map(|(port, _)| *port).collect();
-    loop {
-        closed = closed_ports(&closed).await;
-        if closed.is_empty() {
-            break;
+    let waited = tunnel_wait(std::env::var(TUNNEL_WAIT_VAR).ok().as_deref());
+    let deadline = tokio::time::Instant::now() + waited;
+    let mut ssh_pid = None;
+    let mut pending: Vec<u16> = ports.iter().map(|(port, _)| *port).collect();
+    let opening = loop {
+        if let Some(pid) = ssh_pid
+            && pending.is_empty()
+        {
+            // ssh may have exited since the last round, and the ports with
+            // it.
+            match tunnel.child.try_wait() {
+                Ok(None) if alive(pid) => break Opening::Ready,
+                _ => break Opening::Exited(tunnel.wait().await),
+            }
         }
-        if Instant::now() >= deadline {
+        let round = async {
+            match ssh_pid {
+                None => {
+                    use tokio::io::AsyncBufReadExt;
+                    let mut line = String::new();
+                    let _ = first_line.read_line(&mut line).await;
+                    Round::Pid(line.trim().parse().ok().filter(|pid| *pid != 0))
+                }
+                Some(pid) => {
+                    let ports = pending.clone();
+                    let checked = tokio::task::spawn_blocking(move || {
+                        ports
+                            .into_iter()
+                            .map(|port| (port, listener_on(port, pid)))
+                            .collect()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    tokio::time::sleep(TUNNEL_POLL).await;
+                    Round::Checked(checked)
+                }
+            }
+        };
+        let round = tokio::select! {
+            biased;
+            _ = interrupt.recv() => break Opening::Stopped,
+            _ = terminate.recv() => break Opening::Stopped,
+            _ = hangup.recv() => break Opening::Stopped,
+            status = tunnel.wait() => break Opening::Exited(status),
+            _ = tokio::time::sleep_until(deadline) => break Opening::TimedOut(pending),
+            round = round => round,
+        };
+        match round {
+            Round::Pid(Some(pid)) => ssh_pid = Some(pid),
+            // The supervisor could not start ssh, and exits.
+            Round::Pid(None) => break Opening::Exited(tunnel.wait().await),
+            Round::Checked(checked) => {
+                if let Some((port, others)) = checked.iter().find_map(|(port, l)| match l {
+                    Listener::Others(others) => Some((*port, others.clone())),
+                    _ => None,
+                }) {
+                    break Opening::Taken(port, others);
+                }
+                pending.retain(|port| {
+                    !checked
+                        .iter()
+                        .any(|(p, l)| p == port && matches!(l, Listener::Ssh))
+                });
+            }
+        }
+    };
+    match opening {
+        Opening::Ready => {}
+        Opening::Stopped => {
+            let _ = tunnel.kill().await;
+            out.status("Disconnected.");
+            return Ok(());
+        }
+        Opening::Exited(status) => return Err(ended(remote, &ports, tunnel, stderr, status).await),
+        Opening::TimedOut(pending) => {
             let closed: Vec<_> = ports
                 .iter()
-                .filter(|(port, _)| closed.contains(port))
+                .filter(|(port, _)| pending.contains(port))
                 .cloned()
                 .collect();
             return Err(end_tunnel(remote, &mut tunnel, stderr, |lines| {
@@ -2143,24 +2339,17 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
             })
             .await);
         }
-        let exited = tokio::select! {
-            biased;
-            _ = interrupt.recv() => None,
-            _ = terminate.recv() => None,
-            _ = hangup.recv() => None,
-            status = tunnel.wait() => Some(status),
-            _ = tokio::time::sleep(TUNNEL_POLL) => continue,
-        };
-        let Some(status) = exited else {
-            let _ = tunnel.kill().await;
-            out.status("Disconnected.");
-            return Ok(());
-        };
-        let status = exit_status(&status);
-        return Err(end_tunnel(remote, &mut tunnel, stderr, |lines| {
-            tunnel_ended_message(name, &ports, &status, lines)
-        })
-        .await);
+        Opening::Taken(port, others) => {
+            let params = ports
+                .iter()
+                .find(|(p, _)| *p == port)
+                .map(|(_, params)| params.clone())
+                .unwrap_or_default();
+            return Err(end_tunnel(remote, &mut tunnel, stderr, |_| {
+                taken_ports_message(name, &[(port, params, Some(others.join(", ")))])
+            })
+            .await);
+        }
     }
     for (port, params) in &ports {
         out.status(&format!(
@@ -2180,15 +2369,27 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
         status = tunnel.wait() => Some(status),
     };
     if let Some(status) = exited {
-        let status = exit_status(&status);
-        return Err(end_tunnel(remote, &mut tunnel, stderr, |lines| {
-            tunnel_ended_message(name, &ports, &status, lines)
-        })
-        .await);
+        return Err(ended(remote, &ports, tunnel, stderr, status).await);
     }
     let _ = tunnel.kill().await;
     out.status("Disconnected.");
     Ok(())
+}
+
+/// The error for a tunnel whose ssh exited with `status`.
+async fn ended(
+    remote: &Remote,
+    ports: &[(u16, Vec<String>)],
+    mut tunnel: OwnedForward,
+    stderr: SshStderr,
+    status: std::io::Result<ExitStatus>,
+) -> anyhow::Error {
+    let status = exit_status(&status);
+    end_tunnel(remote, &mut tunnel, stderr, |lines| {
+        let holder = port_ssh_could_not_listen_on(lines).and_then(program_on);
+        tunnel_ended_message(remote.name(), ports, &status, lines, holder.as_deref())
+    })
+    .await
 }
 
 /// End the tunnel when it still runs, and return the error: that the
@@ -2511,8 +2712,52 @@ mod tests {
         .map(String::from)
         .into();
         assert_eq!(
-            tunnel_ended_message("box", &ports, "exit status 255", &lines),
+            tunnel_ended_message("box", &ports, "exit status 255", &lines, None),
             "fed remote connect could not forward port 5432 (DB_PORT, PG_PORT) of box, because ssh could not listen on it here. A program on this machine may have taken the port.\nRun `fed remote connect box` again."
+        );
+    }
+
+    #[test]
+    fn the_program_on_a_port_ssh_cannot_listen_on_is_named() {
+        let ports = [(3000, vec!["WEB_PORT".to_string()])];
+        let lines =
+            vec!["channel_setup_fwd_listener_tcpip: cannot listen to port: 3000".to_string()];
+        assert_eq!(
+            tunnel_ended_message(
+                "box",
+                &ports,
+                "exit status 255",
+                &lines,
+                Some("node (PID 42)")
+            ),
+            "fed remote connect could not forward port 3000 (WEB_PORT) of box, because node (PID 42) uses it on this machine.\nRun `fed remote connect box` again."
+        );
+    }
+
+    #[test]
+    fn the_test_wait_is_clamped_to_the_real_one() {
+        assert_eq!(tunnel_wait(None), TUNNEL_WAIT);
+        assert_eq!(tunnel_wait(Some("nonsense")), TUNNEL_WAIT);
+        assert_eq!(tunnel_wait(Some(&u64::MAX.to_string())), TUNNEL_WAIT);
+        // Release builds ignore the test value.
+        let short = if cfg!(debug_assertions) {
+            Duration::from_secs(2)
+        } else {
+            TUNNEL_WAIT
+        };
+        assert_eq!(tunnel_wait(Some("2")), short);
+    }
+
+    #[test]
+    fn a_signal_is_reported_by_name() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            exit_status(&Ok(ExitStatus::from_raw(9))),
+            "was killed by SIGKILL"
+        );
+        assert_eq!(
+            exit_status(&Ok(ExitStatus::from_raw(255 << 8))),
+            "exit status 255"
         );
     }
 
@@ -2527,11 +2772,11 @@ mod tests {
         .into();
         assert_eq!(port_ssh_could_not_listen_on(&lines), None);
         assert_eq!(
-            tunnel_ended_message("box", &ports, "exit status 255", &lines),
+            tunnel_ended_message("box", &ports, "exit status 255", &lines, None),
             "The connection to box ended (ssh exit status 255). ssh said: Connection to 203.0.113.7 closed by remote host.\nRun `fed remote connect box` again."
         );
         assert_eq!(
-            tunnel_ended_message("box", &ports, "exit status 255", &[]),
+            tunnel_ended_message("box", &ports, "exit status 255", &[], None),
             "The connection to box ended (ssh exit status 255).\nRun `fed remote connect box` again."
         );
     }

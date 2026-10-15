@@ -103,8 +103,10 @@ between that check and the forward. Then `connect` fails and says which port
 it could not forward.
 
 All ports go through one SSH connection. `connect` prints "Connected." once
-every port accepts a connection on your laptop. When the tunnels do not open
-within 30 seconds, `connect` gives up and says which ports stayed closed.
+ssh listens on every port on your laptop, and nothing else does. When another
+program also listens on a port, `connect` fails and names that program. When
+the tunnels do not open within 30 seconds, `connect` gives up and says which
+ports stayed closed.
 What ssh prints while the connection runs shows in your terminal, with the
 environment's name in front.
 
