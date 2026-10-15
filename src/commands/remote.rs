@@ -32,7 +32,10 @@ const LIFETIME_HOURS: u32 = 6;
 const TUNNEL_WAIT: Duration = Duration::from_secs(30);
 /// Tests set a shorter wait, in seconds, in this variable.
 const TUNNEL_WAIT_VAR: &str = "FED_TEST_TUNNEL_WAIT_SECS";
-/// How often `connect` checks whether the local ports accept.
+/// How long one check of the listeners may take. `lsof` takes seconds on a
+/// busy machine.
+const LISTENERS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often `connect` checks who listens on the local ports.
 const TUNNEL_POLL: Duration = Duration::from_millis(100);
 /// How many of ssh's last stderr lines `connect` keeps for its error.
 const SSH_LINES_KEPT: usize = 20;
@@ -2087,36 +2090,60 @@ fn dropped_notice(prefix: &str, dropped: usize) -> String {
     )
 }
 
-/// Who listens on a port of the tunnel.
-enum Listener {
-    /// Nobody yet, or nobody fed can see.
-    Nobody,
-    /// Only ssh.
-    Ssh,
-    /// Other programs, as `name (PID n)`.
-    Others(Vec<String>),
+/// What the listeners on one port of the tunnel show.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PortState {
+    /// ssh does not listen on every address yet.
+    Waiting,
+    /// ssh listens on every address, and no other process listens.
+    Ready,
+    /// Other programs listen too, as `name (PID n)`.
+    Taken(Vec<String>),
 }
 
-/// Who listens on `port` on this machine, given ssh's `ssh_pid`. A
-/// connection to the port is no proof: a program that took the port after
-/// the check would accept it too.
-fn listener_on(port: u16, ssh_pid: u32) -> Listener {
-    let Some(conflict) = fed::port::PortConflict::check(port) else {
-        return Listener::Nobody;
-    };
-    let others: Vec<String> = conflict
-        .processes
+/// The state of `port`, where ssh (`ssh_pid`) must listen on every one of
+/// the `addresses`. A connection to the port is no proof: a program that
+/// took the port after the check would accept it too.
+pub(crate) fn port_state(
+    port: u16,
+    addresses: &[&str],
+    ssh_pid: u32,
+    listeners: &[fed::port::listeners::TcpListenerInfo],
+) -> PortState {
+    let on_port: Vec<_> = listeners.iter().filter(|l| l.port == port).collect();
+    let mut others: Vec<String> = on_port
         .iter()
-        .filter(|p| p.pid != ssh_pid)
-        .map(|p| format!("{} (PID {})", p.name, p.pid))
+        .filter(|l| l.pid != ssh_pid)
+        .map(|l| format!("{} (PID {})", l.name, l.pid))
         .collect();
+    others.dedup();
     if !others.is_empty() {
-        Listener::Others(others)
-    } else if conflict.processes.is_empty() {
-        Listener::Nobody
-    } else {
-        Listener::Ssh
+        return PortState::Taken(others);
     }
+    let listening = addresses
+        .iter()
+        .all(|address| on_port.iter().any(|l| l.address == *address));
+    if listening {
+        PortState::Ready
+    } else {
+        PortState::Waiting
+    }
+}
+
+/// The TCP listeners on `ports`, from one `lsof`. None when `lsof` fails or
+/// takes longer than [`LISTENERS_TIMEOUT`]. Dropping the future kills `lsof`.
+async fn tcp_listeners(ports: &[u16]) -> Option<Vec<fed::port::listeners::TcpListenerInfo>> {
+    let mut lsof = Command::from(fed::port::listeners::lsof_command(ports));
+    lsof.stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(LISTENERS_TIMEOUT, lsof.output())
+        .await
+        .ok()?
+        .ok()?;
+    Some(fed::port::listeners::parse_lsof(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 /// Whether the process `pid` still exists.
@@ -2171,10 +2198,10 @@ enum Opening {
 }
 
 /// One round of the wait: ssh's PID from the supervisor's first line, or
-/// which of the `pending` ports only ssh listens on now.
+/// the listeners on the `pending` ports, when `lsof` gave them.
 enum Round {
     Pid(Option<u32>),
-    Checked(Vec<(u16, Listener)>),
+    Checked(Option<Vec<fed::port::listeners::TcpListenerInfo>>),
 }
 
 async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> {
@@ -2226,6 +2253,11 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
         .args(opt("ExitOnForwardFailure=yes"))
         .arg("-N");
     let ipv6 = ipv6_loopback();
+    let addresses: &[&str] = if ipv6 {
+        &["127.0.0.1", "::1"]
+    } else {
+        &["127.0.0.1"]
+    };
     for (port, _) in &ports {
         supervisor
             .arg("-L")
@@ -2277,18 +2309,10 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
                     let _ = first_line.read_line(&mut line).await;
                     Round::Pid(line.trim().parse().ok().filter(|pid| *pid != 0))
                 }
-                Some(pid) => {
-                    let ports = pending.clone();
-                    let checked = tokio::task::spawn_blocking(move || {
-                        ports
-                            .into_iter()
-                            .map(|port| (port, listener_on(port, pid)))
-                            .collect()
-                    })
-                    .await
-                    .unwrap_or_default();
+                Some(_) => {
+                    let listeners = tcp_listeners(&pending).await;
                     tokio::time::sleep(TUNNEL_POLL).await;
-                    Round::Checked(checked)
+                    Round::Checked(listeners)
                 }
             }
         };
@@ -2305,25 +2329,28 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
             Round::Pid(Some(pid)) => ssh_pid = Some(pid),
             // The supervisor could not start ssh, and exits.
             Round::Pid(None) => break Opening::Exited(tunnel.wait().await),
-            Round::Checked(checked) => {
-                if let Some((port, others)) = checked.iter().find_map(|(port, l)| match l {
-                    Listener::Others(others) => Some((*port, others.clone())),
-                    _ => None,
-                }) {
+            Round::Checked(None) => {}
+            Round::Checked(Some(listeners)) => {
+                let pid = ssh_pid.unwrap_or_default();
+                let mut taken = None;
+                pending.retain(|port| match port_state(*port, addresses, pid, &listeners) {
+                    PortState::Ready => false,
+                    PortState::Waiting => true,
+                    PortState::Taken(others) => {
+                        taken.get_or_insert((*port, others));
+                        true
+                    }
+                });
+                if let Some((port, others)) = taken {
                     break Opening::Taken(port, others);
                 }
-                pending.retain(|port| {
-                    !checked
-                        .iter()
-                        .any(|(p, l)| p == port && matches!(l, Listener::Ssh))
-                });
             }
         }
     };
     match opening {
         Opening::Ready => {}
         Opening::Stopped => {
-            let _ = tunnel.kill().await;
+            close(&mut tunnel, stderr).await;
             out.status("Disconnected.");
             return Ok(());
         }
@@ -2371,7 +2398,7 @@ async fn connect(remote: &Remote, ws: &str, out: &dyn UserOutput) -> Result<()> 
     if let Some(status) = exited {
         return Err(ended(remote, &ports, tunnel, stderr, status).await);
     }
-    let _ = tunnel.kill().await;
+    close(&mut tunnel, stderr).await;
     out.status("Disconnected.");
     Ok(())
 }
@@ -2392,6 +2419,13 @@ async fn ended(
     .await
 }
 
+/// End the tunnel when it still runs, and return the last lines ssh
+/// printed, after at most a short wait for them.
+async fn close(tunnel: &mut OwnedForward, stderr: SshStderr) -> Vec<String> {
+    let _ = tunnel.kill().await;
+    stderr.finish().await
+}
+
 /// End the tunnel when it still runs, and return the error: that the
 /// environment no longer exists, when the cloud deleted it, or else
 /// `message` for the last lines ssh printed.
@@ -2401,8 +2435,7 @@ async fn end_tunnel(
     stderr: SshStderr,
     message: impl FnOnce(&[String]) -> String,
 ) -> anyhow::Error {
-    let _ = tunnel.kill().await;
-    let lines = stderr.finish().await;
+    let lines = close(tunnel, stderr).await;
     if let Some(gone) = remote.deleted().await {
         return gone;
     }
@@ -2731,6 +2764,48 @@ mod tests {
                 Some("node (PID 42)")
             ),
             "fed remote connect could not forward port 3000 (WEB_PORT) of box, because node (PID 42) uses it on this machine.\nRun `fed remote connect box` again."
+        );
+    }
+
+    #[test]
+    fn a_port_is_ready_only_when_ssh_listens_on_every_address() {
+        let listener = |pid, address: &str| fed::port::listeners::TcpListenerInfo {
+            pid,
+            name: if pid == 42 { "ssh" } else { "node" }.into(),
+            address: address.into(),
+            port: 3000,
+        };
+        let both = ["127.0.0.1", "::1"];
+        assert_eq!(port_state(3000, &both, 42, &[]), PortState::Waiting);
+        assert_eq!(
+            port_state(3000, &both, 42, &[listener(42, "127.0.0.1")]),
+            PortState::Waiting
+        );
+        assert_eq!(
+            port_state(
+                3000,
+                &both,
+                42,
+                &[listener(42, "127.0.0.1"), listener(42, "::1")]
+            ),
+            PortState::Ready
+        );
+        assert_eq!(
+            port_state(
+                3000,
+                &both,
+                42,
+                &[
+                    listener(42, "127.0.0.1"),
+                    listener(42, "::1"),
+                    listener(7, "*")
+                ]
+            ),
+            PortState::Taken(vec!["node (PID 7)".into()])
+        );
+        assert_eq!(
+            port_state(3000, &["127.0.0.1"], 42, &[listener(42, "127.0.0.1")]),
+            PortState::Ready
         );
     }
 

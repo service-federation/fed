@@ -102,11 +102,13 @@ parameter and, when fed can find it, the program. Stop that program, then run
 between that check and the forward. Then `connect` fails and says which port
 it could not forward.
 
-All ports go through one SSH connection. `connect` prints "Connected." once
-ssh listens on every port on your laptop, and nothing else does. When another
-program also listens on a port, `connect` fails and names that program. When
-the tunnels do not open within 30 seconds, `connect` gives up and says which
-ports stayed closed.
+All ports go through one SSH connection. Before it prints "Connected.",
+`connect` asks `lsof` who listens on the ports. It waits until ssh listens on
+each port at 127.0.0.1, and at ::1 when your laptop has it. When `lsof` shows
+another program of yours on a port, `connect` fails and shows that program.
+`lsof` cannot see programs of other users, and fed checks only until
+"Connected.". When the tunnels do not open within 30 seconds, `connect` gives
+up and says which ports stayed closed.
 What ssh prints while the connection runs shows in your terminal, with the
 environment's name in front.
 

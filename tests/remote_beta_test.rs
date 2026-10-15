@@ -215,7 +215,9 @@ exit 0
     /// forward has none. A forward fails only when no address binds. Then it
     /// prints OpenSSH's lines and exits 255, as with ExitOnForwardFailure.
     /// Otherwise it accepts and closes connections for at most 600 seconds.
-    /// `FAKE_EXIT_AFTER` makes it exit 255 after that many seconds, or kill
+    /// `FAKE_SKIP_IPV6` makes it leave out the forwards from [::1], as if they
+    /// were never requested. `FAKE_EXIT_AFTER` makes it exit 255 after that
+    /// many seconds, or kill
     /// itself with the signal number in `FAKE_EXIT_SIGNAL`. After one second,
     /// `FAKE_STDERR_KB` makes it write that many 1 KB lines to stderr and
     /// then create `<log>.noise-done`. A stderr that nobody reads blocks it
@@ -233,6 +235,8 @@ def addresses(spec):
 
 socks = []
 for spec in sys.argv[1:]:
+    if os.environ.get("FAKE_SKIP_IPV6") and spec.startswith("[::1]"):
+        continue
     hosts, port = addresses(spec)
     bound = 0
     for host in hosts:
@@ -277,6 +281,23 @@ while time.time() - start < 600:
         conn, _ = s.accept()
         conn.close()
 "#;
+
+    /// The real `lsof`, slowed down by `FAKE_LSOF_DELAY` seconds. fed checks
+    /// who listens with it, and it takes seconds on a busy machine. Each
+    /// call is logged as `lsof <args>`.
+    const FAKE_LSOF: &str = r#"#!/bin/sh
+if [ -n "$FAKE_LOG" ]; then printf 'lsof %s\n' "$*" >> "$FAKE_LOG"; fi
+sleep "${FAKE_LSOF_DELAY:-0}"
+exec "REAL_LSOF" "$@"
+"#;
+
+    /// Where the real `lsof` is on this machine.
+    fn real_lsof() -> Option<String> {
+        ["/usr/sbin/lsof", "/usr/bin/lsof", "/bin/lsof", "/sbin/lsof"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .map(String::from)
+    }
 
     const FAKE_RSYNC: &str = r#"#!/bin/sh
 case " $* " in
@@ -352,6 +373,11 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             ] {
                 let path = bin.join(name);
                 std::fs::write(&path, script).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            if let Some(lsof) = real_lsof() {
+                let path = bin.join("lsof");
+                std::fs::write(&path, FAKE_LSOF.replace("REAL_LSOF", &lsof)).unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
             let mut ports = (free_port(), free_port());
@@ -1477,6 +1503,132 @@ exit "${FAKE_RSYNC_EXIT:-0}"
             output.contains("Error: The connection to box ended (ssh exit status 255)."),
             "{output}"
         );
+    }
+
+    /// The JSON of `fed ports list --json` for `ports`, as PORT_0, PORT_1...
+    fn ports_json(ports: &[u16]) -> String {
+        let entries: Vec<String> = ports
+            .iter()
+            .enumerate()
+            .map(|(i, port)| format!(r#""PORT_{i}": {port}"#))
+            .collect();
+        format!("{{{}}}", entries.join(", "))
+    }
+
+    /// A 12-port tunnel opens, even when each `lsof` takes 2.5 seconds and
+    /// the wait is 20 seconds. One `lsof` per port and round would need 30.
+    #[test]
+    fn connect_opens_twelve_ports_with_a_slow_lsof() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let ports = free_ports(12);
+        let json = ports_json(&ports);
+        let fed = Background::connect(
+            &setup,
+            &[
+                ("FAKE_PORTS", &json),
+                ("FAKE_FORWARD", "hold"),
+                ("FAKE_LSOF_DELAY", "2.5"),
+                ("FED_TEST_TUNNEL_WAIT_SECS", "20"),
+            ],
+        );
+        fed.wait_for("Connected.");
+        for port in &ports {
+            assert!(accepts(*port), "{port} does not accept: {}", fed.output());
+            assert!(
+                fed.output()
+                    .contains(&format!("localhost:{port} -> box:{port}")),
+                "{}",
+                fed.output()
+            );
+        }
+        fed.signal("INT");
+        let (ok, output) = fed.finish();
+        assert!(ok, "{output}");
+        assert!(output.contains("Disconnected."), "{output}");
+        assert_no_leftovers(&setup);
+    }
+
+    /// Ctrl-C during a slow `lsof` ends fed and ssh at once.
+    #[test]
+    fn ctrl_c_does_not_wait_for_a_slow_lsof() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let fed = Background::connect(
+            &setup,
+            &[("FAKE_FORWARD", "hold"), ("FAKE_LSOF_DELAY", "20")],
+        );
+        let start = std::time::Instant::now();
+        while !setup.calls().iter().any(|c| c.starts_with("lsof ")) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(20),
+                "fed never checked the ports: {}",
+                fed.output()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        fed.signal("INT");
+        let mut fed = fed;
+        let start = std::time::Instant::now();
+        loop {
+            let exited = fed.child.try_wait().unwrap().is_some();
+            let tunnel_alive = tunnel_pids(&setup).iter().any(|pid| alive(*pid));
+            if exited && !tunnel_alive {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "fed exited: {exited}, tunnel alive: {tunnel_alive}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(fed.output().contains("Disconnected."), "{}", fed.output());
+    }
+
+    /// A UDP socket on a port is no TCP listener, so it does not stop the
+    /// tunnel.
+    #[test]
+    fn a_udp_socket_on_a_port_does_not_stop_connect() {
+        let setup = Setup::new();
+        setup.save("env-1", "box", "web");
+        let (web, _) = setup.ports;
+        let _udp = {
+            let _spawning = spawn_lock();
+            std::net::UdpSocket::bind(("127.0.0.1", web)).unwrap()
+        };
+        let fed = Background::connect(&setup, &[("FAKE_FORWARD", "hold")]);
+        fed.wait_for("Connected.");
+        fed.signal("INT");
+        let (ok, output) = fed.finish();
+        assert!(ok, "{output}");
+        assert_no_leftovers(&setup);
+    }
+
+    /// Where this machine has ::1, ssh must listen there too. A browser that
+    /// resolves localhost to ::1 would get "connection refused" otherwise.
+    #[test]
+    fn connect_waits_for_the_ipv6_listener_too() {
+        let setup = Setup::new();
+        if forwards_for(setup.ports.0).len() < 2 {
+            return;
+        }
+        setup.save("env-1", "box", "web");
+        let (ok, output) = setup.fed(
+            "http://127.0.0.1:9",
+            &["remote", "connect", "box"],
+            &[
+                ("FAKE_FORWARD", "hold"),
+                ("FAKE_SKIP_IPV6", "1"),
+                ("FED_TEST_TUNNEL_WAIT_SECS", "4"),
+            ],
+        );
+        assert!(!ok, "{output}");
+        assert!(!output.contains("Connected."), "{output}");
+        assert!(
+            output.contains("Error: The tunnels to box did not open within 4 seconds."),
+            "{output}"
+        );
+        assert_no_leftovers(&setup);
     }
 
     /// An environment deleted under the user: the first SSH fails, the cloud
