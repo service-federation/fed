@@ -70,8 +70,8 @@ fn on_path(name: &str) -> bool {
 /// (`%lo`). An IPv4 address in IPv6 form (`::ffff:127.0.0.1`) is the IPv4
 /// address.
 fn plain_address(address: &str) -> String {
-    let address = address.trim_start_matches('[').trim_end_matches(']');
     let address = address.split('%').next().unwrap_or(address);
+    let address = address.trim_start_matches('[').trim_end_matches(']');
     match address.strip_prefix("::ffff:") {
         Some(ipv4) if ipv4.parse::<std::net::Ipv4Addr>().is_ok() => ipv4.to_string(),
         _ => address.to_string(),
@@ -228,6 +228,8 @@ LISTEN 0      128      127.0.0.53%lo:7000       0.0.0.0:*
         assert_eq!(plain_address("[::ffff:127.0.0.1]"), "127.0.0.1");
         assert_eq!(plain_address("127.0.0.53%lo"), "127.0.0.53");
         assert_eq!(plain_address("[fe80::1%eth0]"), "fe80::1");
+        assert_eq!(plain_address("[::1]%lo"), "::1");
+        assert_eq!(plain_address("[::ffff:127.0.0.1]%lo"), "127.0.0.1");
         assert_eq!(plain_address("*"), "*");
     }
 
