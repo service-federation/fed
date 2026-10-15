@@ -244,10 +244,27 @@ exit "${FAKE_RSYNC_EXIT:-0}"
         ports: (u16, u16),
     }
 
-    /// A port nothing on this machine uses right now.
+    /// A port nothing on this machine uses right now, and no other test of
+    /// this run receives. The ports lie below the range the OS gives to
+    /// outgoing connections (32768 and up on Linux, 49152 and up on macOS),
+    /// so a connection of another test cannot take one before fed checks it.
     fn free_port() -> u16 {
-        let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-        listener.local_addr().unwrap().port()
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let start = std::process::id().wrapping_mul(37) % 12000;
+        loop {
+            let n = NEXT.fetch_add(1, Ordering::SeqCst);
+            let port = (20000 + (start + n) % 12000) as u16;
+            if std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
+                && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+                && !matches!(
+                    std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)),
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
+                )
+            {
+                return port;
+            }
+        }
     }
 
     impl Setup {
@@ -800,12 +817,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
 
     /// `count` different ports that nothing on this machine uses right now.
     fn free_ports(count: usize) -> Vec<u16> {
-        let held: Vec<_> = (0..count)
-            .map(|_| std::net::TcpListener::bind("0.0.0.0:0").unwrap())
-            .collect();
-        held.iter()
-            .map(|l| l.local_addr().unwrap().port())
-            .collect()
+        (0..count).map(|_| free_port()).collect()
     }
 
     /// The `-L` values of one logged ssh call, in order.
@@ -839,7 +851,7 @@ exit "${FAKE_RSYNC_EXIT:-0}"
 
         let calls = setup.calls();
         let forwards: Vec<&String> = calls.iter().filter(|c| c.contains(" [-L] ")).collect();
-        assert_eq!(forwards.len(), 1, "{forwards:#?}");
+        assert_eq!(forwards.len(), 1, "{output}\n{forwards:#?}");
         ports.sort();
         let expected: Vec<String> = ports
             .iter()
