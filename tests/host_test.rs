@@ -428,8 +428,11 @@ fn blocked_service_input_does_not_block_output_or_exit() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_failed_log_sink_reports_once_and_keeps_client_output_working() {
-    let (_dir, mut spec) = fixture("read -r line; echo first; sleep 0.1; echo second");
-    spec.log_path = "/dev/full".into();
+    let (_dir, spec) = fixture("read -r line; echo first; sleep 0.1; echo second");
+    // Keep rotation's sidecar lock in the writable fixture directory while
+    // making writes to the active log fail with ENOSPC.
+    std::fs::create_dir_all(spec.log_path.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/dev/full", &spec.log_path).unwrap();
     let mut host = Host::spawn(&spec);
     host.ready();
     let (mut socket, mut frames) = connect(&spec, 0);
