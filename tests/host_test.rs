@@ -263,8 +263,14 @@ fn no_stdin_client_cannot_type_and_protocol_mismatch_is_rejected() {
 
 #[test]
 fn nonreading_client_cannot_stall_logging_or_another_client() {
-    let (_dir, spec) =
-        fixture("read -r go; head -c 4194304 /dev/zero; echo finished; read -r stop");
+    // Pace the producer by the reading client. An unpaced 4 MiB burst can
+    // fill even that client's bounded queue before its writer gets scheduled.
+    let (_dir, spec) = fixture(concat!(
+        "stty -echo; ",
+        "for ((i = 0; i < 64; i++)); do ",
+        "read -r go; head -c 65536 /dev/zero; ",
+        "done; echo finished; read -r stop"
+    ));
     let mut host = Host::spawn(&spec);
     host.ready();
     let (_slow, mut slow_frames) = connect(&spec, 0);
@@ -274,11 +280,22 @@ fn nonreading_client_cannot_stall_logging_or_another_client() {
     ));
     let (mut socket, mut frames) = connect(&spec, 0);
     assert!(matches!(frames.read_frame().unwrap(), Frame::Scrollback(_)));
-    socket
-        .write_all(&encode(&Frame::Input(b"go\n".to_vec())))
-        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut seen = Vec::new();
+    let mut zeroes = 0;
+    for round in 1..=64 {
+        socket
+            .write_all(&encode(&Frame::Input(b"go\n".to_vec())))
+            .unwrap();
+        while zeroes < round * 65536 {
+            let Frame::Output(bytes) = frames.read_frame().unwrap() else {
+                panic!("expected output")
+            };
+            zeroes += bytes.iter().filter(|&&byte| byte == 0).count();
+            seen.extend(bytes);
+            assert!(Instant::now() < deadline, "a slow peer stalled output");
+        }
+    }
     while !seen.ends_with(b"finished\r\n") {
         let Frame::Output(bytes) = frames.read_frame().unwrap() else {
             panic!("expected output")
