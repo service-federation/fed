@@ -282,25 +282,19 @@ impl Orchestrator {
 
         let log_file_path = if output_mode.is_file() {
             let logs_dir = crate::fed_dir::fed_dir(self.work_dir()).join("logs");
-            if let Err(e) = crate::fed_dir::ensure_fed_dir(self.work_dir()) {
-                tracing::warn!("Failed to create .fed directory: {}", e);
-            }
-            if let Err(e) = std::fs::create_dir_all(&logs_dir) {
-                tracing::warn!("Failed to create logs directory {:?}: {}", logs_dir, e);
-                None
-            } else {
-                let sanitized_name = name
-                    .chars()
-                    .map(|c| {
-                        if c.is_alphanumeric() || c == '-' || c == '_' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect::<String>();
-                Some(logs_dir.join(format!("{}.log", sanitized_name)))
-            }
+            let sanitized_name = name
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            // Pass the intended path even when its directory is inaccessible.
+            // The writer's preflight then returns a service-start error.
+            Some(logs_dir.join(format!("{}.log", sanitized_name)))
         } else {
             None
         };
@@ -314,11 +308,19 @@ impl Orchestrator {
             log_file_path,
         );
         if foreground {
-            Box::new(process_service.run_in_foreground())
+            Box::new(
+                process_service
+                    .with_logging(self.config.logging)
+                    .run_in_foreground(),
+            )
         } else if service.tty {
-            Box::new(process_service.run_hosted())
+            Box::new(
+                process_service
+                    .with_logging(self.config.logging)
+                    .run_hosted(),
+            )
         } else {
-            Box::new(process_service)
+            Box::new(process_service.with_logging(self.config.logging))
         }
     }
 
@@ -656,6 +658,7 @@ mod tests {
             HashMap::new(),
             dir.path().to_string_lossy().into_owned(),
         );
+        std::fs::create_dir_all(dir.path().join(".fed/logs")).unwrap();
         std::fs::write(dir.path().join(".fed/logs/repl.log"), "terminal-output\n").unwrap();
         assert_eq!(manager.logs(None).await.unwrap(), vec!["terminal-output"]);
     }

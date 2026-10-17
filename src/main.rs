@@ -22,15 +22,15 @@ use fed::{
 /// `current_dir()`. Returns None on any failure; the caller treats
 /// None as "can't tell, be conservative."
 fn detect_current_workspace() -> Option<PathBuf> {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         if arg == "-w" || arg == "--workdir" {
             if let Some(path) = args.next() {
                 return Some(PathBuf::from(path));
             }
-        } else if let Some(rest) = arg.strip_prefix("--workdir=") {
+        } else if let Some(rest) = arg.to_str().and_then(|arg| arg.strip_prefix("--workdir=")) {
             return Some(PathBuf::from(rest));
-        } else if let Some(rest) = arg.strip_prefix("-w=") {
+        } else if let Some(rest) = arg.to_str().and_then(|arg| arg.strip_prefix("-w=")) {
             return Some(PathBuf::from(rest));
         }
     }
@@ -49,8 +49,48 @@ fn canonicalize_eq(a: &str, b: &PathBuf) -> bool {
     }
 }
 
+fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("log-writer")) {
+        if let Err(error) = run_log_writer() {
+            eprintln!("Error: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    async_main();
+}
+
+fn run_log_writer() -> anyhow::Result<()> {
+    let Cli {
+        command:
+            Commands::LogWriter {
+                path,
+                max_size,
+                max_files,
+            },
+        ..
+    } = Cli::parse()
+    else {
+        unreachable!("only called for log-writer")
+    };
+    #[cfg(unix)]
+    nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0))?;
+    let limits = fed::config::LoggingConfig {
+        max_size,
+        max_files,
+    };
+    let mut writer = fed::log_rotation::RotatingWriter::open(&path, limits)
+        .inspect_err(|error| fed::log_rotation::record_failure(&path, error))?;
+    fed::log_rotation::clear_failure(&path);
+    if let Err(error) = std::io::copy(&mut std::io::stdin().lock(), &mut writer) {
+        fed::log_rotation::record_failure(&path, &error);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 #[tokio::main]
-async fn main() {
+async fn async_main() {
     if let Err(e) = run().await {
         // Script failures: the script's own stderr is the user feedback.
         // Just propagate the exit code without printing a redundant error.
@@ -129,7 +169,7 @@ async fn run() -> anyhow::Result<()> {
     }
 
     // Check if help is requested - we'll add scripts after standard help
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<_> = std::env::args_os().collect();
     // Only intercept top-level help (e.g., `fed --help`, `fed -h`, `fed help`).
     // Subcommand help like `fed docker build --help` is handled by clap.
     let wants_help = if args.len() == 2 {
@@ -163,6 +203,9 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let cli = Cli::parse();
+    if matches!(cli.command, Commands::LogWriter { .. }) {
+        anyhow::bail!("the internal log-writer command must be invoked directly");
+    }
 
     // The detached commands (`fed supervise`, `fed host`) ignore SIGHUP at
     // the very start, before anything else runs — this is what lets them
@@ -910,6 +953,7 @@ async fn run() -> anyhow::Result<()> {
             | Commands::Supervise => {
                 unreachable!("handled in earlier dispatch tiers");
             }
+            Commands::LogWriter { .. } => unreachable!("handled before tracing"),
             #[cfg(unix)]
             Commands::Host { .. } => {
                 unreachable!("handled in earlier dispatch tiers");
@@ -998,13 +1042,9 @@ fn init_tracing(
         // to the current directory, same as every other command.
         let work_dir = workdir.unwrap_or_else(|| PathBuf::from("."));
         let log_dir = work_dir.join(".fed").join("logs");
-        std::fs::create_dir_all(&log_dir)?;
-
+        let limits = fed::config::LoggingConfig::load_global()?;
         let log_path = log_dir.join(daemon_log);
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
+        let log_file = fed::log_rotation::RotatingWriter::open(&log_path, limits)?;
 
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -1020,13 +1060,9 @@ fn init_tracing(
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join(".fed")
             .join("logs");
-        std::fs::create_dir_all(&log_dir)?;
-
+        let limits = fed::config::LoggingConfig::load_global()?;
         let log_path = log_dir.join("tui.log");
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
+        let log_file = fed::log_rotation::RotatingWriter::open(&log_path, limits)?;
 
         tracing_subscriber::fmt()
             .with_env_filter(

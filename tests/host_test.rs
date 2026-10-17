@@ -102,6 +102,7 @@ fn fixture(command: &str) -> (tempfile::TempDir, LaunchSpec) {
         cwd: root.clone(),
         environment: HashMap::new(),
         log_path: root.join("logs/repl.log"),
+        logging: fed::config::LoggingConfig::default(),
         socket_path: root.join("attach/repl.sock"),
         resources: None,
     };
@@ -481,13 +482,13 @@ fn host_diagnostics_use_safe_bounded_service_filenames() {
             .unwrap()
             .collect::<std::io::Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].file_type().unwrap().is_file());
-        assert!(
-            entries[0]
-                .file_name()
-                .to_string_lossy()
-                .ends_with("-host.log")
-        );
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            assert!(entry.file_type().unwrap().is_file());
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(name.ends_with("-host.log") || name.ends_with("-host.log.lock"));
+            assert!(name.len() <= 255);
+        }
     }
 }

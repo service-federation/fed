@@ -329,6 +329,14 @@ pub enum Commands {
         /// Service whose terminal this process owns
         service: String,
     },
+
+    /// Internal: drain a detached service's output into a rotating log.
+    #[command(hide = true)]
+    LogWriter {
+        path: std::path::PathBuf,
+        max_size: u64,
+        max_files: usize,
+    },
 }
 
 #[derive(Subcommand)]

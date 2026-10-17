@@ -15,7 +15,14 @@ pub async fn run_logs(
         ));
         out.status(&format!("{:-<50}", ""));
 
-        let mut last_line_count = 0;
+        let mut previous = Vec::<String>::new();
+        #[cfg(unix)]
+        let mut file_follower = match orchestrator.log_file_path(service).await {
+            Ok(path) => {
+                path.map(|path| fed::log_follow::FileFollower::new(path, tail.unwrap_or(10_000)))
+            }
+            Err(error) => return Err(logs_error(orchestrator, service, error).await),
+        };
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
         tokio::spawn(async move {
@@ -30,14 +37,32 @@ pub async fn run_logs(
                     break;
                 }
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(500)) => {
+                    #[cfg(unix)]
+                    if let Some(mut follower) = file_follower.take() {
+                        let (next, batch) = tokio::task::spawn_blocking(move || {
+                            let batch = follower.poll();
+                            (follower, batch)
+                        }).await?;
+                        file_follower = Some(next);
+                        let batch = batch?;
+                        if batch.history_lost {
+                            out.status("Some log history expired before it could be read.");
+                        }
+                        for line in batch.lines {
+                            out.status(&line);
+                        }
+                        continue;
+                    }
                     match orchestrator.get_logs(service, None).await {
                         Ok(logs) => {
-                            if logs.len() > last_line_count {
-                                for line in logs.iter().skip(last_line_count) {
-                                    out.status(line);
-                                }
-                                last_line_count = logs.len();
+                            let overlap = (0..=previous.len().min(logs.len()))
+                                .rev()
+                                .find(|&count| previous[previous.len() - count..] == logs[..count])
+                                .unwrap_or(0);
+                            for line in logs.iter().skip(overlap) {
+                                out.status(line);
                             }
+                            previous = logs;
                         }
                         Err(e) => {
                             return Err(logs_error(orchestrator, service, e).await);

@@ -137,6 +137,22 @@ fed starts that service's dependencies in the background as usual, hands it your
 
 When `fed start -i` doesn't receive a service, it uses the entrypoint. Just like `fed start`. That works when the entrypoint is itself a process service. An entrypoint that only groups other services (a `depends_on:` list with no `process:`) has nothing to hand the terminal to, so fed asks you to pass one of them.
 
+### Log retention
+
+Service logs rotate at 10 MiB and retain three files by default, including the active log. Set `logs.max_size` and `logs.max_files` in `fed.yaml` to change either limit for the project, or put the same `logs:` block in `$XDG_CONFIG_HOME/fed/config.yaml` (normally `~/.config/fed/config.yaml`) for all projects. Each project setting overrides the corresponding global setting. For example:
+
+```yaml
+logs:
+  max_size: 20MiB
+  max_files: 5
+```
+
+`max_size` accepts `B`, `KiB`, `MiB`, `GiB`, and `TiB` suffixes. The limits are 1 byte to 1 TiB and 1 to 1000 files.
+
+Changes to `logs:` apply when a service restarts. At startup, fed trims oversized existing log files and removes backups beyond the new limit; `fed logs` reads the retained files in order, including archives. The same global limits bound supervisor, host, and TUI diagnostics. Docker logs remain managed by Docker.
+
+If `XDG_CONFIG_HOME` is unset, empty, or relative, fed uses `~/.config`. Reading an absent global config does not create a directory or file.
+
 ### Attach to a running service
 
 Give a process service `tty: true`, then run `fed start <service>` and

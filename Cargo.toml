@@ -87,6 +87,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # File system operations
 walkdir = "2.5"
 dirs = "5.0"
+xdg = "3.0"
 fs2 = "0.4"
 notify = "6.1"
 notify-debouncer-full = "0.3"

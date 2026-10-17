@@ -124,17 +124,8 @@ pub async fn launch(spec: &LaunchSpec) -> Result<(u32, u32)> {
         }
         Ok(Startup::Exited { status }) => {
             pending.cleanup().await;
-            let log = tokio::fs::read_to_string(&spec.log_path)
-                .await
-                .unwrap_or_default();
-            let preview = log
-                .lines()
-                .rev()
-                .take(15)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
+            let preview = crate::log_rotation::tail(&spec.log_path, spec.logging, 15)
+                .unwrap_or_default()
                 .join("\n");
             Err(failure(format!(
                 "Service '{}' exited with code {} right after starting.\n\n{}",

@@ -157,12 +157,6 @@ pub struct App {
     /// Log buffers per service
     pub log_buffers: HashMap<String, VecDeque<LogLine>>,
 
-    /// Last seen log count per service (for deduplication)
-    log_seen_count: HashMap<String, usize>,
-
-    /// Previous service statuses (for detecting status changes)
-    previous_status: HashMap<String, Status>,
-
     /// Current filter
     pub filter: String,
 
@@ -318,8 +312,6 @@ impl App {
             services: Vec::new(),
             selected_service: Some(0),
             log_buffers: HashMap::new(),
-            log_seen_count: HashMap::new(),
-            previous_status: HashMap::new(),
             filter: String::new(),
             follow_logs: HashMap::new(),
             show_help: false,
@@ -1000,18 +992,6 @@ impl App {
         self.services = status_map
             .into_iter()
             .map(|(name, status)| {
-                // Detect status change from stopped to starting/running (restart)
-                if let Some(&prev_status) = self.previous_status.get(&name)
-                    && matches!(prev_status, Status::Stopped | Status::Failing)
-                    && matches!(status, Status::Starting | Status::Running | Status::Healthy)
-                {
-                    // Service is restarting, reset log counter
-                    self.log_seen_count.insert(name.clone(), 0);
-                }
-
-                // Update previous status
-                self.previous_status.insert(name.clone(), status);
-
                 let facts = service_states.get(&name).cloned().unwrap_or_default();
 
                 ServiceInfo {
@@ -1046,26 +1026,29 @@ impl App {
                 .entry(service_name.clone())
                 .or_insert_with(|| VecDeque::with_capacity(LOG_BUFFER_SIZE));
 
-            // Only append new logs (those we haven't seen before)
-            let prev_count = self.log_seen_count.get(&service_name).copied().unwrap_or(0);
-            if logs.len() > prev_count {
-                // Skip the logs we've already seen and add only new ones
-                for line in logs.iter().skip(prev_count) {
-                    let log_line = LogLine {
-                        timestamp: chrono::Utc::now(),
+            // The fetched logs are a sliding snapshot. A line count cannot
+            // identify new output after either disk rotation or ring-buffer
+            // eviction, so keep the visible buffer synchronized with that view.
+            let start = logs.len().saturating_sub(LOG_BUFFER_SIZE);
+            let previous = std::mem::take(buffer);
+            *buffer = logs
+                .into_iter()
+                .skip(start)
+                .enumerate()
+                .map(|(index, message)| {
+                    let timestamp = previous
+                        .get(index)
+                        .filter(|line| line.message == message)
+                        .map(|line| line.timestamp)
+                        .unwrap_or_else(chrono::Utc::now);
+                    LogLine {
+                        timestamp,
                         service: service_name.clone(),
-                        level: Self::parse_log_level(line),
-                        message: line.clone(),
-                    };
-
-                    buffer.push_back(log_line);
-                    if buffer.len() > LOG_BUFFER_SIZE {
-                        buffer.pop_front();
+                        level: Self::parse_log_level(&message),
+                        message,
                     }
-                }
-                // Update the seen count for this service
-                self.log_seen_count.insert(service_name.clone(), logs.len());
-            }
+                })
+                .collect();
         }
     }
 
@@ -1361,7 +1344,6 @@ impl App {
         if let Some(service) = self.current_log_service() {
             let service = service.to_string();
             self.log_buffers.remove(&service);
-            self.log_seen_count.remove(&service);
             self.log_scroll.remove(&service);
         }
     }

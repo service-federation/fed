@@ -1,8 +1,11 @@
+mod support;
+
 use std::fs;
 use std::process::Command;
 use std::time::Duration;
 
 fn create_test_config(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    support::parse_checked(content);
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("test-config.yaml");
     fs::write(&config_path, content).expect("Failed to write test config");
@@ -86,6 +89,68 @@ services:
       echo "Process started"
       sleep 300
 "#;
+
+#[test]
+fn detached_writer_rotates_after_start_exits() {
+    let config = r#"
+logs:
+  max_size: 64B
+  max_files: 3
+services:
+  emitter:
+    process: |
+      sleep 1
+      for i in $(seq 1 60); do printf 'line-%02d\n' "$i"; done
+      sleep 30
+"#;
+    let (dir, config_path) = create_test_config(config);
+    let workdir = dir.path().to_str().unwrap();
+    let output = fed_start(&config_path, workdir, "emitter");
+    assert_start_success(&output);
+
+    let path = dir.path().join(".fed/logs/emitter.log");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if fed_logs(&config_path, workdir, "emitter").contains("line-59") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let logs = fed_logs(&config_path, workdir, "emitter");
+    assert!(
+        logs.contains("line-59"),
+        "writer did not survive fed start: {logs}"
+    );
+    for path in [
+        &path,
+        &path.with_extension("log.1"),
+        &path.with_extension("log.2"),
+    ] {
+        assert!(
+            path.metadata().unwrap().len() <= 64,
+            "oversized {}",
+            path.display()
+        );
+    }
+    assert!(!path.with_extension("log.3").exists());
+    fed_stop(&config_path, workdir);
+}
+
+#[test]
+fn inaccessible_log_directory_fails_service_start() {
+    let (dir, config_path) = create_test_config(LONG_RUNNING_CONFIG);
+    let fed_dir = dir.path().join(".fed");
+    fs::create_dir_all(&fed_dir).unwrap();
+    fs::write(fed_dir.join("logs"), "occupied").unwrap();
+
+    let output = fed_start(&config_path, dir.path().to_str().unwrap(), "long-running");
+    assert!(!output.status.success());
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("logs") && message.contains("directory"),
+        "{message}"
+    );
+}
 
 #[test]
 fn test_start_and_status() {
