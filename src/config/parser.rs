@@ -71,6 +71,8 @@ impl Parser {
         })?;
 
         let mut config = self.parse_config(&content)?;
+        config.logging =
+            super::LoggingConfig::merge_project(&content, super::LoggingConfig::load_global()?)?;
         // Resolve local template extensions here so every loader — including
         // the synchronous one behind `fed validate` — sees merged services.
         crate::package::ServiceMerger::merge_local_templates(&mut config)?;

@@ -6,7 +6,7 @@
 // Allow deprecated PackageAuth - we define it here for backward compatibility
 #![allow(deprecated)]
 
-use super::{Dependency, Metadata, Parameter, Script, Service};
+use super::{Dependency, LoggingConfig, Metadata, Parameter, Script, Service};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -46,6 +46,11 @@ impl ComposeImport {
 /// Root configuration structure for fed.yaml (or service-federation.yaml)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
+    /// Rotation limits for service logs, after global and project overrides.
+    #[serde(default)]
+    #[serde(rename = "logs")]
+    pub logging: LoggingConfig,
+
     /// Variables/parameters declared for this config.
     #[serde(default)]
     pub parameters: HashMap<String, Parameter>,
@@ -192,6 +197,7 @@ impl Config {
             "metadata",
             "env_file",
             "registry_auth",
+            "logs",
         ]
     }
 

@@ -427,7 +427,12 @@ pub trait ServiceManager: Send + Sync {
         )))
     }
 
-    /// Get service logs (if available)
+    /// Backing file for services whose logs can be followed by byte offset.
+    fn log_file_path(&self) -> Option<&std::path::Path> {
+        None
+    }
+
+    /// Get service logs (if available).
     async fn logs(&self, _tail: Option<usize>) -> Result<Vec<String>> {
         // Default implementation returns empty logs
         Ok(Vec::new())

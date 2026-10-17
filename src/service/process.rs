@@ -14,6 +14,28 @@ use tokio::process::{Child, Command};
 /// Health check cache TTL: 500ms - short enough to be responsive but reduces load
 const HEALTH_CACHE_TTL: Duration = Duration::from_millis(500);
 
+fn log_writer_executable() -> std::io::Result<std::path::PathBuf> {
+    let current = std::env::current_exe()?;
+    // Unit and integration test harnesses live under target/.../deps. Their
+    // own executable cannot dispatch the internal log-writer subcommand.
+    if let Some(deps) = current.parent()
+        && deps.file_name().is_some_and(|name| name == "deps")
+    {
+        let binary = deps.parent().unwrap().join("fed");
+        if binary.is_file() {
+            return Ok(binary);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "fed log writer executable not found at {}",
+                binary.display()
+            ),
+        ));
+    }
+    Ok(current)
+}
+
 /// Synchronous mutex for fields that are never held across await points.
 /// Uses parking_lot for better performance in uncontended cases.
 ///
@@ -54,6 +76,7 @@ pub struct ProcessService {
     process_group_id: Arc<SyncMutex<Option<u32>>>,
     /// Log capture and management (encapsulates log buffer, file path, tasks, and shutdown).
     log_capture: LogCapture,
+    logging: crate::config::LoggingConfig,
     /// Cached health check result with timestamp.
     /// Uses tokio::sync::Mutex - serializes async health checks to prevent duplicate work.
     health_cache: Arc<tokio::sync::Mutex<(Option<bool>, Instant)>>,
@@ -92,6 +115,7 @@ impl ProcessService {
             pid: Arc::new(SyncMutex::new(None)),
             process_group_id: Arc::new(SyncMutex::new(None)),
             log_capture: LogCapture::new(name, log_file_path, output_mode),
+            logging: crate::config::LoggingConfig::default(),
             health_cache: Arc::new(tokio::sync::Mutex::new((None, Instant::now()))),
             grace_period,
             started_at: Arc::new(SyncMutex::new(None)),
@@ -100,6 +124,12 @@ impl ProcessService {
             host_pid: None,
             attach_socket: None,
         }
+    }
+
+    pub fn with_logging(mut self, logging: crate::config::LoggingConfig) -> Self {
+        self.logging = logging;
+        self.log_capture.set_logging(logging);
+        self
     }
 
     /// Run this service in the foreground: inherited stdio, no log capture,
@@ -159,6 +189,7 @@ impl ProcessService {
                     log_path: self.log_capture.log_file_path().cloned().ok_or_else(|| {
                         Error::Config("Hosted service requires a log file".into())
                     })?,
+                    logging: self.logging,
                     socket_path: crate::fed_dir::attach_socket_path(&work_dir, &self.name),
                     work_dir,
                     resources: self.config.resources.clone(),
@@ -298,6 +329,20 @@ impl ProcessService {
 
         // In File mode, wrap command with nohup to truly detach from terminal
         if self.output_mode.is_file() {
+            let log_settings = self.logging;
+            let log_path = self
+                .log_capture
+                .log_file_path()
+                .ok_or_else(|| Error::Config("File output requires a service log path".into()))?;
+            // Fail startup while the caller can still report an I/O error.
+            crate::log_rotation::RotatingWriter::open(log_path.clone(), log_settings).map_err(
+                |error| {
+                    Error::Filesystem(format!(
+                        "opening service log {}: {error}",
+                        log_path.display()
+                    ))
+                },
+            )?;
             // PID Capture Strategy:
             // The inner bash first prints its own PID ($$) to stdout, then redirects stdout/stderr
             // to the log file. This ensures we capture the PID of the actual long-running process,
@@ -322,20 +367,18 @@ impl ProcessService {
             // (forwarded as "$1") as its entire script.
             // Note: The PGID may differ from the PID due to how nohup/backgrounding works.
             // The stop() method looks up the actual PGID to ensure all children are killed.
-            let outer_script: &str = if self.log_capture.log_file_path().is_some() {
-                // "$2" carries the log path (append mode, to preserve logs across restarts).
-                r#"nohup bash -c 'echo $$; exec 1>> "$2" 2>&1; exec bash -c "$1"' bash-wrapper "$1" "$2" &"#
-            } else {
-                r#"nohup bash -c 'echo $$; exec 1>/dev/null 2>&1; exec bash -c "$1"' bash-wrapper "$1" &"#
-            };
+            // Process substitution keeps the service PID unchanged. The
+            // fed sink leaves the service process group and drains to EOF.
+            let outer_script = r#"nohup bash -c 'echo $$; exec 1> >( "$3" log-writer "$2" "$4" "$5" ) 2>&1; exec bash -c "$1"' bash-wrapper "$1" "$2" "$3" "$4" "$5" &"#;
 
             cmd.arg("-ec")
                 .arg(outer_script)
                 .arg("fed-service") // $0 for the outer script, cosmetic (shows in error messages)
                 .arg(process_cmd); // $1 for the outer script
-            if let Some(log_path) = self.log_capture.log_file_path() {
-                cmd.arg(log_path.to_string_lossy().into_owned()); // $2 for the outer script
-            }
+            cmd.arg(log_path) // $2, native path bytes
+                .arg(log_writer_executable()?) // $3
+                .arg(log_settings.max_size.to_string()) // $4
+                .arg(log_settings.max_files.to_string()); // $5
         } else {
             // Non-detached: hand bash the command as written. For a single
             // simple command bash execs it in place, so the PID fed tracks
@@ -581,12 +624,9 @@ impl ServiceManager for ProcessService {
             let is_alive = self.health().await.unwrap_or(false);
             if !is_alive {
                 // Process crashed during startup - read logs from file
-                let log_preview = if let Some(ref log_path) = self.log_capture.log_file_path() {
-                    match tokio::fs::read_to_string(log_path).await {
-                        Ok(contents) => {
-                            let lines: Vec<&str> = contents.lines().collect();
-                            let last_lines: Vec<&str> =
-                                lines.iter().rev().take(15).rev().cloned().collect();
+                let log_preview = if let Some(log_path) = self.log_capture.log_file_path() {
+                    match crate::log_rotation::tail(log_path, self.logging, 15) {
+                        Ok(last_lines) => {
                             if last_lines.is_empty() {
                                 format!(
                                     "Log file is empty (process may have crashed before writing \
@@ -963,6 +1003,10 @@ impl ServiceManager for ProcessService {
 
     async fn logs(&self, tail: Option<usize>) -> Result<Vec<String>> {
         self.log_capture.read_logs(tail).await
+    }
+
+    fn log_file_path(&self) -> Option<&std::path::Path> {
+        self.log_capture.log_file_path().map(|path| path.as_path())
     }
 
     fn get_pid(&self) -> Option<u32> {
@@ -2162,7 +2206,15 @@ mod tests {
             log_path
         );
 
-        let contents = tokio::fs::read_to_string(&log_path).await.unwrap();
+        // The independent writer may still be draining the service pipe
+        // after the launcher reports its PID.
+        let contents = loop {
+            let contents = tokio::fs::read_to_string(&log_path).await.unwrap();
+            if contents.contains("hello-from-spaced-path") || Instant::now() >= deadline {
+                break contents;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
         assert!(
             contents.contains("hello-from-spaced-path"),
             "log content should be intact, got: {:?}",

@@ -65,15 +65,8 @@ pub struct LogCapture {
     log_shutdown: Arc<Notify>,
     /// Output capture mode.
     output_mode: OutputMode,
-    /// File-mode read cache keyed on (file size, tail count): pollers (the TUI
-    /// asks every tick) skip re-reading the file when it hasn't grown.
-    file_read_cache: Arc<Mutex<Option<FileReadCache>>>,
+    logging: crate::config::LoggingConfig,
 }
-
-/// Cached result of a file-mode log read:
-/// ((file size, mtime), tail count, lines). Size alone would serve stale
-/// content after a truncate-and-rewrite to the same length.
-type FileReadCache = ((u64, Option<std::time::SystemTime>), usize, Vec<String>);
 
 impl LogCapture {
     /// Create a new LogCapture instance with default maximum lines.
@@ -94,6 +87,10 @@ impl LogCapture {
             output_mode,
             DEFAULT_MAX_LOG_LINES,
         )
+    }
+
+    pub fn set_logging(&mut self, logging: crate::config::LoggingConfig) {
+        self.logging = logging;
     }
 
     /// Create a new LogCapture instance with custom maximum lines.
@@ -120,7 +117,7 @@ impl LogCapture {
             log_tasks: Arc::new(StdMutex::new(Vec::new())),
             log_shutdown: Arc::new(Notify::new()),
             output_mode,
-            file_read_cache: Arc::new(Mutex::new(None)),
+            logging: crate::config::LoggingConfig::default(),
         }
     }
 
@@ -287,92 +284,19 @@ impl LogCapture {
         }
     }
 
-    /// Read logs from file (detached mode).
+    /// Read the newest retained lines, including rotated backups.
     async fn read_logs_from_file(&self, tail: Option<usize>) -> Result<Vec<String>> {
-        let Some(ref log_path) = self.log_file_path else {
-            return Ok(vec![]);
+        let Some(path) = self.log_file_path.clone() else {
+            return Ok(Vec::new());
         };
-
-        if !log_path.exists() {
-            return Ok(vec![]);
-        }
-
-        let log_path = log_path.clone();
-        let tail_count = tail.unwrap_or(self.max_lines);
-
-        // Serve from cache while the file hasn't changed — pollers hit this
-        // every 250ms and the file usually hasn't changed between ticks
-        let current_key = match tokio::fs::metadata(&log_path).await {
-            Ok(m) => (m.len(), m.modified().ok()),
-            Err(_) => (0, None),
-        };
-        {
-            let cache = self.file_read_cache.lock().await;
-            if let Some((key, cached_tail, ref lines)) = *cache
-                && key == current_key
-                && cached_tail == tail_count
-            {
-                return Ok(lines.clone());
-            }
-        }
-
-        let result = tokio::task::spawn_blocking(move || {
-            use std::fs::File;
-            use std::io::{BufRead, BufReader, Seek, SeekFrom};
-
-            let file = File::open(&log_path)?;
-
-            // Acquire shared lock (allows concurrent reads, blocks writes)
-            // Use try_lock to avoid deadlocks - if we can't get lock, read anyway
-            use fs2::FileExt;
-            if FileExt::try_lock_shared(&file).is_err() {
-                tracing::debug!("Could not acquire shared lock on log file, reading without lock");
-            }
-
-            // For tail, we read from the end efficiently
-            let metadata = file.metadata()?;
-            let file_size = metadata.len();
-
-            // Estimate: assume ~200 bytes per line, read what we need
-            let estimated_bytes = (tail_count as u64) * 200;
-            let start_pos = file_size.saturating_sub(estimated_bytes);
-
-            let mut reader = BufReader::new(&file);
-            reader.seek(SeekFrom::Start(start_pos))?;
-
-            // If we seeked to middle of file, skip partial first line
-            if start_pos > 0 {
-                let mut partial = String::new();
-                let _ = reader.read_line(&mut partial);
-            }
-
-            // Read remaining lines
-            let mut lines: Vec<String> = Vec::new();
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => lines.push(l),
-                    Err(_) => break,
-                }
-            }
-
-            // Take only the last N lines
-            let result: Vec<String> = if lines.len() > tail_count {
-                let skip_count = lines.len() - tail_count;
-                lines.into_iter().skip(skip_count).collect()
-            } else {
-                lines
-            };
-
-            Ok::<Vec<String>, std::io::Error>(result)
+        let count = tail.unwrap_or(self.max_lines);
+        let limits = self.logging;
+        tokio::task::spawn_blocking(move || {
+            crate::log_rotation::tail(&path, limits, count)
+                .map_err(|error| Error::Filesystem(format!("reading {}: {error}", path.display())))
         })
         .await
-        .map_err(|e| Error::Filesystem(format!("Log read task failed: {}", e)))?;
-
-        let lines =
-            result.map_err(|e| Error::Filesystem(format!("Failed to read log file: {}", e)))?;
-
-        *self.file_read_cache.lock().await = Some((current_key, tail_count, lines.clone()));
-        Ok(lines)
+        .map_err(|error| Error::Filesystem(format!("log read task failed: {error}")))?
     }
 
     /// Shutdown log capture tasks gracefully.

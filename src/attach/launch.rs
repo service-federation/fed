@@ -30,6 +30,9 @@ pub struct LaunchSpec {
     pub environment: HashMap<String, String>,
     /// `.fed/logs/<service>.log`, opened for append.
     pub log_path: PathBuf,
+    /// Effective project/global log retention policy, resolved by the spawner.
+    #[serde(default)]
+    pub logging: crate::config::LoggingConfig,
     /// Where the host listens for clients.
     pub socket_path: PathBuf,
     /// Parsed in the host before the fork.
@@ -96,6 +99,7 @@ mod tests {
             cwd: PathBuf::from("/w/api"),
             environment: HashMap::from([("PORT".to_string(), "8080".to_string())]),
             log_path: PathBuf::from("/w/.fed/logs/repl.log"),
+            logging: crate::config::LoggingConfig::default(),
             socket_path: PathBuf::from("/tmp/fed-abc/repl.sock"),
             resources: None,
         }

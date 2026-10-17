@@ -106,6 +106,8 @@ impl Config {
 
     /// Validate the configuration
     pub fn validate(&self) -> Result<()> {
+        self.logging.validate()?;
+
         // `FED_PROJECT_ID` is a built-in template variable (a stable, cookie-safe
         // per-project identifier). It is injected automatically and must not be
         // declared as a user parameter.

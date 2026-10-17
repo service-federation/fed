@@ -13,6 +13,7 @@ use anyhow::Context;
 use fed::attach::launch::{HostEvent, LaunchSpec};
 use fed::attach::protocol::{FLAG_NO_STDIN, Frame, FrameReader, ProtocolError, VERSION, encode};
 use fed::attach::scrollback::Scrollback;
+use fed::log_rotation::RotatingWriter;
 use fed::service::{PtyLaunch, set_window_size, spawn_on_pty};
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
@@ -70,7 +71,7 @@ pub fn run_host(service: &str) -> anyhow::Result<()> {
     }
     let (listener, _socket_lock) =
         bind_socket(&spec.socket_path).unwrap_or_else(|error| give_up(error));
-    let log = open_log(&spec.log_path)
+    let log = open_log(&spec.log_path, spec.logging)
         .unwrap_or_else(|error| give_up_and_unlink(&spec.socket_path, error));
 
     let launch = PtyLaunch {
@@ -327,16 +328,8 @@ fn bind_socket(path: &Path) -> anyhow::Result<(UnixListener, File)> {
 
 /// The same append-mode file the nohup path writes, so `fed logs` works the
 /// same for a hosted service.
-fn open_log(path: &Path) -> anyhow::Result<File> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!("creating the directory {} failed: {}", parent.display(), e)
-        })?;
-    }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+fn open_log(path: &Path, limits: fed::config::LoggingConfig) -> anyhow::Result<RotatingWriter> {
+    RotatingWriter::open(path, limits)
         .map_err(|e| anyhow::anyhow!("opening the log file {} failed: {}", path.display(), e))
 }
 
@@ -344,7 +337,7 @@ fn open_log(path: &Path) -> anyhow::Result<File> {
 ///
 /// Append each chunk before broadcasting it. A failed log sink is disabled
 /// after one diagnostic; attached clients can still receive the output.
-fn pump_output(master: &File, log: File, session: &Mutex<Session>) {
+fn pump_output(master: &File, log: RotatingWriter, session: &Mutex<Session>) {
     let mut log = Some(log);
     let mut buf = [0u8; READ_CHUNK];
     loop {

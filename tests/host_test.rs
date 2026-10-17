@@ -102,6 +102,7 @@ fn fixture(command: &str) -> (tempfile::TempDir, LaunchSpec) {
         cwd: root.clone(),
         environment: HashMap::new(),
         log_path: root.join("logs/repl.log"),
+        logging: fed::config::LoggingConfig::default(),
         socket_path: root.join("attach/repl.sock"),
         resources: None,
     };
@@ -262,8 +263,14 @@ fn no_stdin_client_cannot_type_and_protocol_mismatch_is_rejected() {
 
 #[test]
 fn nonreading_client_cannot_stall_logging_or_another_client() {
-    let (_dir, spec) =
-        fixture("read -r go; head -c 4194304 /dev/zero; echo finished; read -r stop");
+    // Pace the producer by the reading client. An unpaced 4 MiB burst can
+    // fill even that client's bounded queue before its writer gets scheduled.
+    let (_dir, spec) = fixture(concat!(
+        "stty -echo; ",
+        "for ((i = 0; i < 64; i++)); do ",
+        "read -r go; head -c 65536 /dev/zero; ",
+        "done; echo finished; read -r stop"
+    ));
     let mut host = Host::spawn(&spec);
     host.ready();
     let (_slow, mut slow_frames) = connect(&spec, 0);
@@ -273,11 +280,22 @@ fn nonreading_client_cannot_stall_logging_or_another_client() {
     ));
     let (mut socket, mut frames) = connect(&spec, 0);
     assert!(matches!(frames.read_frame().unwrap(), Frame::Scrollback(_)));
-    socket
-        .write_all(&encode(&Frame::Input(b"go\n".to_vec())))
-        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut seen = Vec::new();
+    let mut zeroes = 0;
+    for round in 1..=64 {
+        socket
+            .write_all(&encode(&Frame::Input(b"go\n".to_vec())))
+            .unwrap();
+        while zeroes < round * 65536 {
+            let Frame::Output(bytes) = frames.read_frame().unwrap() else {
+                panic!("expected output")
+            };
+            zeroes += bytes.iter().filter(|&&byte| byte == 0).count();
+            seen.extend(bytes);
+            assert!(Instant::now() < deadline, "a slow peer stalled output");
+        }
+    }
     while !seen.ends_with(b"finished\r\n") {
         let Frame::Output(bytes) = frames.read_frame().unwrap() else {
             panic!("expected output")
@@ -427,8 +445,11 @@ fn blocked_service_input_does_not_block_output_or_exit() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_failed_log_sink_reports_once_and_keeps_client_output_working() {
-    let (_dir, mut spec) = fixture("read -r line; echo first; sleep 0.1; echo second");
-    spec.log_path = "/dev/full".into();
+    let (_dir, spec) = fixture("read -r line; echo first; sleep 0.1; echo second");
+    // Keep rotation's sidecar lock in the writable fixture directory while
+    // making writes to the active log fail with ENOSPC.
+    std::fs::create_dir_all(spec.log_path.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/dev/full", &spec.log_path).unwrap();
     let mut host = Host::spawn(&spec);
     host.ready();
     let (mut socket, mut frames) = connect(&spec, 0);
@@ -481,13 +502,13 @@ fn host_diagnostics_use_safe_bounded_service_filenames() {
             .unwrap()
             .collect::<std::io::Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].file_type().unwrap().is_file());
-        assert!(
-            entries[0]
-                .file_name()
-                .to_string_lossy()
-                .ends_with("-host.log")
-        );
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            assert!(entry.file_type().unwrap().is_file());
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(name.ends_with("-host.log") || name.ends_with("-host.log.lock"));
+            assert!(name.len() <= 255);
+        }
     }
 }

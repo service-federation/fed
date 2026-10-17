@@ -59,6 +59,9 @@ pub mod fed_dir;
 pub mod fsutil;
 pub mod healthcheck;
 pub mod lock_order;
+#[cfg(unix)]
+pub mod log_follow;
+pub mod log_rotation;
 pub mod markers;
 pub mod orchestrator;
 pub mod package;

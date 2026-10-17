@@ -2358,6 +2358,19 @@ impl Orchestrator {
         Arc::clone(&self.services)
     }
 
+    /// Return the backing file for services whose output is stored on disk.
+    pub async fn log_file_path(&self, service_name: &str) -> Result<Option<PathBuf>> {
+        let manager = {
+            let services = self.services.read().await;
+            services
+                .get(service_name)
+                .cloned()
+                .ok_or_else(|| Error::ServiceNotFound(service_name.to_string()))?
+        };
+        let manager = manager.lock().await;
+        Ok(manager.log_file_path().map(std::path::Path::to_path_buf))
+    }
+
     /// Get service logs
     pub async fn get_logs(&self, service_name: &str, tail: Option<usize>) -> Result<Vec<String>> {
         let manager_arc = {
