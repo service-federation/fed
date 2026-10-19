@@ -91,7 +91,5 @@ fn readme_host_access_config_is_valid() {
     config
         .validate()
         .expect("README host access YAML must pass fed validation");
-    assert!(
-        config.services["worker"].environment["DATABASE_URL"].contains("host.docker.internal")
-    );
+    assert!(config.services["worker"].environment["DATABASE_URL"].contains("host.docker.internal"));
 }
