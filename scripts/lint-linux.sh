@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-RUST_VERSION="${RUST_VERSION:-1.97}"
+RUST_VERSION="${RUST_VERSION:-1.99}"
 
 cd "$(dirname "$0")/.."
 

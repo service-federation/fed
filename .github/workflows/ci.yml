@@ -184,7 +184,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
           components: clippy
 
       - name: Cache cargo registry
