@@ -46,6 +46,16 @@ pub struct BuildOptions {
     pub failure_message: Option<String>,
 }
 
+/// Whether a runtime's output names Podman.
+fn mentions_podman(output: &Output) -> bool {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    text.to_ascii_lowercase().contains("podman")
+}
+
 /// Centralized client for Docker CLI operations.
 ///
 /// Wraps all `docker` subprocess invocations with consistent timeout handling
@@ -392,6 +402,15 @@ impl DockerClient {
             .await;
         match output {
             Ok(o) => !o.stdout.is_empty(),
+            Err(_) => false,
+        }
+    }
+
+    /// Whether `docker version` describes Podman, as it does when Podman
+    /// answers as `docker`. False when the command fails.
+    pub async fn reports_podman(&self, timeout: Duration) -> bool {
+        match self.run(&["version"], timeout).await {
+            Ok(output) => mentions_podman(&output),
             Err(_) => false,
         }
     }
@@ -854,7 +873,24 @@ impl Default for DockerClient {
 
 #[cfg(test)]
 mod image_platform_tests {
-    use super::{platform_inspect_args, platform_matches};
+    use super::{mentions_podman, platform_inspect_args, platform_matches};
+    use std::process::Output;
+
+    #[test]
+    fn podman_answering_as_docker_is_recognised() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |stdout: &str| Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+        assert!(mentions_podman(&output(
+            "Client:       Podman Engine\nVersion:      5.2.0\n"
+        )));
+        assert!(!mentions_podman(&output(
+            "Client: Docker Engine - Community\n Version: 27.3.1\n"
+        )));
+    }
 
     #[test]
     fn the_inspect_asks_for_the_platform_and_prints_it() {
