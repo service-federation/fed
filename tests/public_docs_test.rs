@@ -71,3 +71,27 @@ fn readme_image_platform_config_is_valid() {
         Some("linux/amd64")
     );
 }
+
+#[test]
+fn readme_host_access_config_is_valid() {
+    let readme = include_str!("../README.md");
+    let section = readme
+        .split_once("### Reaching the host from a container")
+        .expect("README must keep a 'Reaching the host from a container' section")
+        .1;
+    let yaml = section
+        .split_once("```yaml")
+        .expect("host access section must contain a YAML example")
+        .1
+        .split_once("```")
+        .expect("host access YAML block must be closed")
+        .0;
+
+    let config = support::parse_checked(yaml);
+    config
+        .validate()
+        .expect("README host access YAML must pass fed validation");
+    assert!(
+        config.services["worker"].environment["DATABASE_URL"].contains("host.docker.internal")
+    );
+}

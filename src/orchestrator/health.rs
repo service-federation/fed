@@ -489,21 +489,37 @@ impl<'a> HealthCheckRunner<'a> {
             };
             // manager lock released here
 
-            // Process/Gradle services: check PID liveness via signal 0
+            // Process/Gradle services: ask the manager. A bare signal-0 probe
+            // succeeds on a child that exited but is not reaped yet (a
+            // zombie), so a process that died here went unnoticed until the
+            // healthcheck timed out. The manager reaps it (`try_wait`) and
+            // reads `/proc` state; the signal probe stays as the fallback
+            // when the manager cannot answer.
             if let Some(pid) = pid {
-                let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
-                if nix::sys::signal::kill(nix_pid, None).is_err() {
+                let alive = match manager_arc.lock().await.liveness().await {
+                    Ok(alive) => alive,
+                    Err(_) => {
+                        let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+                        nix::sys::signal::kill(nix_pid, None).is_ok()
+                    }
+                };
+                if !alive {
                     tracing::warn!(
                         "Service '{}' (PID {}) died during healthcheck wait",
                         name,
                         pid
                     );
+                    // Before the tracker lock: state_tracker -> manager only.
+                    let output = stopped_service_output(manager_arc).await;
                     let mut tracker = self.orchestrator.state_tracker.write().await;
                     tracker.update_service_status(name, Status::Stopped).await?;
                     tracker.save().await?;
                     return Err(Error::ServiceStartFailed(
                         name.to_string(),
-                        format!("Service '{}' crashed during healthcheck wait", name),
+                        format!(
+                            "Service '{}' crashed during healthcheck wait{}",
+                            name, output
+                        ),
                     ));
                 }
             }
@@ -518,14 +534,16 @@ impl<'a> HealthCheckRunner<'a> {
                         name,
                         container_id
                     );
+                    // Before the tracker lock: state_tracker -> manager only.
+                    let output = stopped_service_output(manager_arc).await;
                     let mut tracker = self.orchestrator.state_tracker.write().await;
                     tracker.update_service_status(name, Status::Stopped).await?;
                     tracker.save().await?;
                     return Err(Error::ServiceStartFailed(
                         name.to_string(),
                         format!(
-                            "Service '{}' container stopped during healthcheck wait",
-                            name
+                            "Service '{}' container stopped during healthcheck wait{}",
+                            name, output
                         ),
                     ));
                 }
@@ -670,6 +688,25 @@ impl<'a> HealthCheckRunner<'a> {
             tokio::time::sleep(check_interval).await;
         }
     }
+}
+
+/// What a service that stopped wrote last, as ". Last N lines:\n…" to append
+/// to the error, or nothing when it wrote nothing. The reason a service
+/// stopped while fed waited for its healthcheck (a refused connection, an
+/// unresolvable host, a missing setting) is almost always there, and
+/// without it the error says only that it stopped.
+async fn stopped_service_output(
+    manager_arc: &Arc<tokio::sync::Mutex<Box<dyn ServiceManager>>>,
+) -> String {
+    let lines = manager_arc
+        .lock()
+        .await
+        .logs(Some(crate::service::FAILURE_OUTPUT_LINES))
+        .await
+        .unwrap_or_default();
+    crate::service::failure_output_preview(&lines)
+        .map(|preview| format!(". {preview}"))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

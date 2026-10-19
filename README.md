@@ -411,6 +411,26 @@ fed passes `--platform` to the pull and to `docker run`. Docker Desktop runs the
 
 `platform:` is valid only next to `image:`. In a service with variants, put it in the variant that sets the image. It does not change Dockerfile `build:` services or Compose services.
 
+### Reaching the host from a container
+
+A container reaches services on your machine, native processes and other services' published ports, at `host.docker.internal`:
+
+```yaml
+services:
+  worker:
+    image: example/worker:latest
+    environment:
+      DATABASE_URL: 'postgresql://app:secret@host.docker.internal:5432/app'
+```
+
+Docker Desktop and Podman define that name in every container. Docker Engine on Linux does not, so on Linux fed starts each container with `--add-host host.docker.internal:host-gateway`, which needs Docker Engine 20.10 or later.
+
+On Linux the traffic arrives on the Docker bridge (`docker0`), and a host firewall that denies incoming traffic drops it: the name resolves, but connections time out. With ufw, allow the bridge:
+
+```bash
+sudo ufw allow in on docker0
+```
+
 ## Documentation and examples
 
 - [Quickstart](https://www.service-federation.com/docs/)
