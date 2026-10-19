@@ -6,7 +6,7 @@
 # multiple times from exactly this pattern (see
 # src/orchestrator/run_context.rs and the RunContext consolidation plan).
 #
-# Confirmed against clippy 1.97 (the CI-pinned version): with the path
+# Confirmed against clippy 1.99 (the CI-pinned version): with the path
 # written as the item's *reachable* re-export (`fed::Orchestrator::new`,
 # matching src/lib.rs's `pub use orchestrator::Orchestrator;`), this fires
 # everywhere — the `fed` binary, integration tests under tests/*.rs, AND

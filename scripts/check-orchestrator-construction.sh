@@ -2,12 +2,10 @@
 #
 # CI gate: disallow raw Orchestrator construction inside src/orchestrator/**.
 #
-# clippy::disallowed_methods (see clippy.toml) catches bin-crate and
-# integration-test call sites, but not library-internal ones — a call from
-# one src/orchestrator/*.rs file to Orchestrator::new/new_ephemeral defined
-# in another file of the *same* crate doesn't cross a crate boundary, so
-# clippy doesn't see it (confirmed against clippy 1.97). This script closes
-# that gap with a plain text scan.
+# clippy::disallowed_methods (see clippy.toml) catches these call sites,
+# library-internal ones included (confirmed against clippy 1.99). This plain
+# text scan stays as a second gate that does not depend on which clippy
+# version runs or on the path written in clippy.toml.
 #
 # Allowed exceptions:
 #   - builder.rs itself (the one legitimate construction site)
