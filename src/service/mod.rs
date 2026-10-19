@@ -23,6 +23,7 @@
 mod compose;
 mod docker;
 mod external;
+mod failure_output;
 mod foreground;
 mod gradle;
 #[cfg(unix)]
@@ -42,6 +43,7 @@ pub use docker::hash_work_dir;
 pub(crate) use docker::sanitize_container_name_component;
 pub use docker::*;
 pub use external::*;
+pub(crate) use failure_output::{FAILURE_OUTPUT_LINES, failure_output_preview};
 pub use gradle::*;
 pub use log_capture::*;
 pub use oneshot::*;
