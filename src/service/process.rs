@@ -690,17 +690,13 @@ impl ServiceManager for ProcessService {
             let is_alive = self.health().await.unwrap_or(false);
             if !is_alive {
                 // Process crashed during startup - capture logs for error reporting
-                let logs = self.logs(Some(20)).await.unwrap_or_default();
-                let log_preview = if logs.is_empty() {
+                let logs = self
+                    .logs(Some(super::FAILURE_OUTPUT_LINES))
+                    .await
+                    .unwrap_or_default();
+                let log_preview = super::failure_output_preview(&logs).unwrap_or_else(|| {
                     "No logs captured (process may have crashed too quickly)".to_string()
-                } else {
-                    let preview_lines = logs.iter().take(10).cloned().collect::<Vec<_>>();
-                    format!(
-                        "Last {} lines:\n{}",
-                        preview_lines.len(),
-                        preview_lines.join("\n")
-                    )
-                };
+                });
 
                 let error_msg = format!("Process crashed during startup. {}", log_preview);
 
