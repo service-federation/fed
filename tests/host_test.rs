@@ -9,8 +9,24 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
+
+/// Held while a test creates a socket or starts a process.
+///
+/// On macOS, `UnixListener::bind` sets close-on-exec in a second step. When
+/// another test thread starts a process in between, that process inherits the
+/// listener. The stale socket then accepts connections for as long as the
+/// stranger lives, and a host correctly refuses to replace it.
+static FORK_LOCK: Mutex<()> = Mutex::new(());
+
+/// Leave a socket file that nothing listens on, like a killed host does.
+fn leave_stale_socket(path: &std::path::Path) {
+    let _guard = FORK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    drop(UnixListener::bind(path).unwrap());
+}
 
 struct Host {
     child: Child,
@@ -20,16 +36,19 @@ struct Host {
 
 impl Host {
     fn spawn(spec: &LaunchSpec) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_fed"))
-            .arg("--workdir")
-            .arg(&spec.work_dir)
-            .arg("host")
-            .arg(&spec.service)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = {
+            let _guard = FORK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            Command::new(env!("CARGO_BIN_EXE_fed"))
+                .arg("--workdir")
+                .arg(&spec.work_dir)
+                .arg("host")
+                .arg(&spec.service)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
         child
             .stdin
             .take()
@@ -199,8 +218,7 @@ fn immediate_exit_is_reported_on_stdout() {
 #[test]
 fn live_host_rejects_a_second_host_and_recovers_stale_sockets() {
     let (_dir, spec) = fixture("cat");
-    std::fs::create_dir_all(spec.socket_path.parent().unwrap()).unwrap();
-    drop(UnixListener::bind(&spec.socket_path).unwrap());
+    leave_stale_socket(&spec.socket_path);
     let mut first = Host::spawn(&spec);
     first.ready();
     let mut second = Host::spawn(&spec);
@@ -328,16 +346,19 @@ fn child_receives_hangup_even_though_host_ignores_it() {
 fn bare_terminal_invocation_fails_without_waiting_for_input() {
     let (_dir, spec) = fixture("unused");
     let pty = nix::pty::openpty(None, None).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_fed"))
-        .arg("--workdir")
-        .arg(&spec.work_dir)
-        .arg("host")
-        .arg("repl")
-        .stdin(Stdio::from(pty.slave))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child = {
+        let _guard = FORK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        Command::new(env!("CARGO_BIN_EXE_fed"))
+            .arg("--workdir")
+            .arg(&spec.work_dir)
+            .arg("host")
+            .arg("repl")
+            .stdin(Stdio::from(pty.slave))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
     let (_send, events) = channel();
     let mut host = Host {
         child,
@@ -377,8 +398,7 @@ fn terminating_the_host_reaps_a_service_that_ignores_term_and_hup() {
 #[test]
 fn competing_starts_cannot_both_own_a_stale_socket() {
     let (_dir, spec) = fixture("cat");
-    std::fs::create_dir_all(spec.socket_path.parent().unwrap()).unwrap();
-    drop(UnixListener::bind(&spec.socket_path).unwrap());
+    leave_stale_socket(&spec.socket_path);
     let mut first = Host::spawn(&spec);
     let mut second = Host::spawn(&spec);
     match (first.event(), second.event()) {

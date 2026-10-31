@@ -354,6 +354,11 @@ async fn http_preflight_still_rejects_an_existing_listener() {
     let server = std::thread::spawn(move || {
         while !server_done.load(std::sync::atomic::Ordering::SeqCst) {
             if let Ok((mut stream, _)) = listener.accept() {
+                // macOS hands out an accepted socket that is still
+                // non-blocking. Without this the read below can return before
+                // the request arrives, and closing with unread bytes resets
+                // the connection.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
