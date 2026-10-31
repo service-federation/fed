@@ -32,3 +32,15 @@ These warnings are left visible, without audit ignore rules. They should be
 removed when upgrading the ratatui/ansi-to-tui dependency family; a major TUI
 migration is separate from these cloud-client fixes. The reachability assessment
 must be revisited if the layout-cache implementation or its dependencies change.
+
+## Follow-up, 2026-10-31
+
+Upgrading ratatui to 0.30 and dropping the unused `tui-textarea` removed the
+`lru` and `paste` warnings. The `lru` in the tree is now 0.18.5, which includes
+the fixes for `RUSTSEC-2026-0002` and `RUSTSEC-2026-0253`. The layout-cache
+reachability assessment above no longer applies.
+
+One warning remains, `RUSTSEC-2024-0449` (`unsafe-libyaml`, behind
+`serde_yaml`). CI now also scans `Cargo.lock` with OSV, which includes GitHub
+advisories that RustSec lacks. `osv-scanner.toml` lists the accepted advisory
+with a reason and an expiry date.

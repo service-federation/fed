@@ -1,0 +1,14 @@
+# Advisories that CI accepts for Cargo.lock. Every entry needs a reason and an
+# expiry. When the date passes, the scan fails again and someone re-reads the
+# advisory. Run `osv-scanner scan source --lockfile Cargo.lock --config osv-scanner.toml`
+# to check locally. See .github/workflows/security.yml.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0449"
+ignoreUntil = 2027-02-28
+reason = """
+unsafe-libyaml is unmaintained. It is the YAML parser behind serde_yaml, which
+fed uses to read fed.yaml and is itself deprecated. No patched version exists.
+The advisory reports no vulnerability, only that nobody maintains the crate.
+Leaving it needs a switch to another YAML crate, which is a separate change.
+"""
