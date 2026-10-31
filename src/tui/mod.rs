@@ -121,12 +121,16 @@ fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
     Ok(())
 }
 
-async fn run_app<B: ratatui::backend::Backend>(
+async fn run_app<B>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     mut events: EventHandler,
     mut watch_mode: Option<crate::watch::WatchMode>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    B: ratatui::backend::Backend,
+    B::Error: Send + Sync + 'static,
+{
     // Data refreshes run in spawned tasks so a slow docker daemon can never
     // stall rendering or input. At most one refresh is in flight, tracked by
     // its JoinHandle: a panic surfaces as an immediate JoinError (and the
