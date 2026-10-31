@@ -2,10 +2,10 @@ name: Dependency security
 
 on:
   pull_request:
-    paths: [Cargo.toml, Cargo.lock, .github/workflows/security.yml]
+    paths: [Cargo.toml, Cargo.lock, osv-scanner.toml, .github/workflows/security.yml]
   push:
     branches: [main]
-    paths: [Cargo.toml, Cargo.lock, .github/workflows/security.yml]
+    paths: [Cargo.toml, Cargo.lock, osv-scanner.toml, .github/workflows/security.yml]
   schedule:
     - cron: '23 7 * * 1'
   workflow_dispatch:
@@ -24,6 +24,22 @@ jobs:
         with:
           toolchain: stable
       - run: cargo install cargo-audit --version 0.22.2 --locked
-      # Fail on vulnerability advisories; keep informational warnings visible.
-      # Current transitive lru/paste warnings are assessed in docs/security-review-2026-09-05.md.
+      # Fail on RustSec vulnerability advisories. Informational warnings stay visible.
       - run: cargo audit
+
+  # RustSec does not carry every GitHub advisory. For example, eight GHSA-only
+  # openssl advisories were open on a lockfile that `cargo audit` passed.
+  # OSV includes both databases. Accepted advisories live in osv-scanner.toml.
+  osv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install osv-scanner 2.7.0
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL -o osv-scanner \
+            https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64
+          echo "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b  osv-scanner" | sha256sum --check --strict
+          chmod +x osv-scanner
+      - run: ./osv-scanner scan source --lockfile Cargo.lock --config osv-scanner.toml
