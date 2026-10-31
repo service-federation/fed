@@ -1,6 +1,6 @@
 services:
   database:
-    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    image: postgres:17.11-alpine@sha256:266d3c257594e195b309ae9d1805e54c788f1d7b375f56bf6c367aac6c917e7b
     environment:
       POSTGRES_DB: example
       POSTGRES_PASSWORD: example
@@ -16,7 +16,7 @@ services:
       - database_data:/var/lib/postgresql/data
 
   cache:
-    image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    image: redis:7.4.12-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 1s
