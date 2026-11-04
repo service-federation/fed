@@ -680,7 +680,7 @@ impl Resolver {
         // run on a value it doesn't need. See `service_should_defer`.
         let mut deferred_services: Vec<String> = Vec::new();
         for (name, service) in &mut resolved.services {
-            if self.service_should_defer(service) {
+            if service.template_parameters.is_none() && self.service_should_defer(service) {
                 tracing::debug!(
                     "deferring out-of-scope service '{}': it references a deferred parameter (out-of-scope missing secret or a value derived from one)",
                     name
@@ -688,9 +688,15 @@ impl Resolver {
                 deferred_services.push(name.clone());
                 continue;
             }
+            // External imports carry their own explicit parameter mapping.
+            // Render their ORIGINAL templates here, once, through the same
+            // field-specific rules as local services. Unmapped external names
+            // must not accidentally resolve against the parent's private scope.
+            let imported_parameters = service.template_parameters.take();
+            let parameters = imported_parameters.as_ref().unwrap_or(&parameters);
             // Resolve templates in service environment
             service.environment = self
-                .resolve_environment(&service.environment, &parameters)
+                .resolve_environment(&service.environment, parameters)
                 .map_err(|e| {
                     Error::TemplateResolution(format!(
                         "Failed to resolve environment for service '{}': {}",
@@ -701,7 +707,7 @@ impl Resolver {
             // Resolve process command with shell escaping for security
             if let Some(ref process) = service.process {
                 service.process = Some(
-                    self.resolve_template_shell_safe(process, &parameters)
+                    self.resolve_template_shell_safe(process, parameters)
                         .map_err(|e| {
                             Error::TemplateResolution(format!(
                                 "Failed to resolve process for service '{}': {}",
@@ -714,7 +720,7 @@ impl Resolver {
             // Resolve install command with shell escaping for security
             if let Some(ref install) = service.install {
                 service.install = Some(
-                    self.resolve_template_shell_safe(install, &parameters)
+                    self.resolve_template_shell_safe(install, parameters)
                         .map_err(|e| {
                             Error::TemplateResolution(format!(
                                 "Failed to resolve install for service '{}': {}",
@@ -730,7 +736,7 @@ impl Resolver {
             // same way.)
             if let Some(ref migrate) = service.migrate {
                 service.migrate = Some(
-                    self.resolve_template_shell_safe(migrate, &parameters)
+                    self.resolve_template_shell_safe(migrate, parameters)
                         .map_err(|e| {
                             Error::TemplateResolution(format!(
                                 "Failed to resolve migrate for service '{}': {}",
@@ -744,7 +750,7 @@ impl Resolver {
             if !service.ports.is_empty() {
                 let mut resolved_ports = Vec::new();
                 for port in &service.ports {
-                    resolved_ports.push(self.resolve_template(port, &parameters).map_err(|e| {
+                    resolved_ports.push(self.resolve_template(port, parameters).map_err(|e| {
                         Error::TemplateResolution(format!(
                             "Failed to resolve port for service '{}': {}",
                             name, e
@@ -759,7 +765,7 @@ impl Resolver {
                 match healthcheck {
                     crate::config::HealthCheck::HttpGet { http_get, timing } => {
                         let resolved_url =
-                            self.resolve_template(http_get, &parameters).map_err(|e| {
+                            self.resolve_template(http_get, parameters).map_err(|e| {
                                 Error::TemplateResolution(format!(
                                     "Failed to resolve health check for service '{}': {}",
                                     name, e
@@ -771,8 +777,9 @@ impl Resolver {
                         });
                     }
                     crate::config::HealthCheck::CommandMap { command, timing } => {
-                        let resolved_cmd =
-                            self.resolve_template(command, &parameters).map_err(|e| {
+                        let resolved_cmd = self
+                            .resolve_template_shell_safe(command, parameters)
+                            .map_err(|e| {
                                 Error::TemplateResolution(format!(
                                     "Failed to resolve health check command for service '{}': {}",
                                     name, e
@@ -784,8 +791,9 @@ impl Resolver {
                         });
                     }
                     crate::config::HealthCheck::Command(cmd) => {
-                        let resolved_cmd =
-                            self.resolve_template(cmd, &parameters).map_err(|e| {
+                        let resolved_cmd = self
+                            .resolve_template_shell_safe(cmd, parameters)
+                            .map_err(|e| {
                                 Error::TemplateResolution(format!(
                                     "Failed to resolve health check command for service '{}': {}",
                                     name, e
@@ -801,13 +809,12 @@ impl Resolver {
             if !service.parameters.is_empty() {
                 let mut resolved_params = HashMap::new();
                 for (key, value) in &service.parameters {
-                    let resolved_value =
-                        self.resolve_template(value, &parameters).map_err(|e| {
-                            Error::TemplateResolution(format!(
-                                "Failed to resolve parameter '{}' for service '{}': {}",
-                                key, name, e
-                            ))
-                        })?;
+                    let resolved_value = self.resolve_template(value, parameters).map_err(|e| {
+                        Error::TemplateResolution(format!(
+                            "Failed to resolve parameter '{}' for service '{}': {}",
+                            key, name, e
+                        ))
+                    })?;
                     resolved_params.insert(key.clone(), resolved_value);
                 }
                 service.parameters = resolved_params;
@@ -816,7 +823,7 @@ impl Resolver {
             // Resolve startup_message template (display string, not shell-escaped)
             if let Some(ref msg) = service.startup_message {
                 service.startup_message =
-                    Some(self.resolve_template(msg, &parameters).map_err(|e| {
+                    Some(self.resolve_template(msg, parameters).map_err(|e| {
                         Error::TemplateResolution(format!(
                             "Failed to resolve startup_message for service '{}': {}",
                             name, e

@@ -49,6 +49,14 @@ pub struct DockerBuildResult {
 /// Service configuration for a single service in the federation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Service {
+    /// Runtime-only parameter scope for an imported service. `Some` (including
+    /// an empty map) keeps external templates bound to their explicit import
+    /// mapping until the normal resolver renders them once. Never accepted from
+    /// YAML or serialized into configuration output.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub template_parameters: Option<HashMap<String, String>>,
+
     // Package extension
     /// Reference to a package service to extend from (format: "package-alias.service-name")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -879,6 +887,7 @@ mod merge_completeness {
     /// default where this fixture put a value.
     fn fully_populated() -> Service {
         Service {
+            template_parameters: Some([("SCOPED".to_string(), "value".to_string())].into()),
             extends: Some("pkg.base".to_string()),
             cwd: Some("services/catalog".to_string()),
             install: Some("npm ci".to_string()),
@@ -945,6 +954,7 @@ mod merge_completeness {
         // Exhaustive destructuring: a new `Service` field fails to compile
         // here until it is both merged above and asserted below.
         let Service {
+            template_parameters,
             extends,
             cwd,
             install,
@@ -992,6 +1002,10 @@ mod merge_completeness {
         // instruction that produced this merge, and leaving it set would make
         // a second pass re-merge the same base.
         assert_eq!(extends, None, "extends must be cleared by a merge");
+        assert!(
+            template_parameters.is_none(),
+            "runtime import scope must not be inherited through configuration merging"
+        );
 
         assert_eq!(cwd.as_deref(), Some("services/catalog"));
         assert_eq!(install.as_deref(), Some("npm ci"));

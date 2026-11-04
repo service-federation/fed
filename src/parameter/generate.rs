@@ -95,7 +95,8 @@ pub fn topological_sort(params: &HashMap<String, Parameter>) -> Result<Vec<Strin
 /// from already-resolved values.
 pub fn run_generate_command(command: &str, resolved: &HashMap<String, String>) -> Result<String> {
     // Interpolate {{PARAM}} references.
-    let interpolated = crate::parameter::Resolver::resolve_template_static(command, resolved)?;
+    let interpolated =
+        crate::parameter::Resolver::resolve_template_shell_safe_static(command, resolved)?;
 
     // Run via sh -c, capture stdout.
     let output = std::process::Command::new("sh")
@@ -296,6 +297,22 @@ mod tests {
         resolved.insert("NAME".to_string(), "world".to_string());
         let value = run_generate_command("echo hello-{{NAME}}", &resolved).unwrap();
         assert_eq!(value, "hello-world");
+    }
+
+    #[test]
+    fn generated_values_treat_interpolated_parameters_as_literal_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("injected");
+        let payload = format!("$(printf injected > {}); 'quotes'", marker.display());
+        let resolved = HashMap::from([("SEED".to_string(), payload.clone())]);
+        for command in [
+            "printf '%s' {{SEED}}",
+            "printf '%s' '{{SEED}}'",
+            "printf '%s' \"{{SEED}}\"",
+        ] {
+            assert_eq!(run_generate_command(command, &resolved).unwrap(), payload);
+            assert!(!marker.exists());
+        }
     }
 
     #[test]
