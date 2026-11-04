@@ -235,11 +235,38 @@ LISTEN 0      128      127.0.0.53%lo:7000       0.0.0.0:*
 
     #[test]
     fn a_udp_socket_is_not_listed() {
-        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        use socket2::{Domain, Socket, Type};
+
+        // UDP and TCP have separate port spaces. Reserve the TCP endpoint
+        // without listening, so another process cannot claim the UDP fixture's
+        // number and make a correct TCP lookup fail this assertion.
+        let (_tcp_reservation, udp) = (0..32)
+            .find_map(|_| {
+                let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+                let address = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+                socket.bind(&address.into()).unwrap();
+                let port = socket.local_addr().unwrap().as_socket().unwrap().port();
+                match std::net::UdpSocket::bind(("127.0.0.1", port)) {
+                    Ok(udp) => Some((socket, udp)),
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+                    Err(error) => panic!("UDP fixture bind failed: {error}"),
+                }
+            })
+            .expect("could not reserve a port available to both TCP and UDP");
         let port = udp.local_addr().unwrap().port();
-        let output = lsof_command(&[port]).output().unwrap();
+        let tool = ListenerTool::find().expect("TCP listener tests require lsof or ss on PATH");
+        let output = tool.command(&[port]).output().unwrap();
+        // lsof returns 1 when there are no matching sockets; ss returns 0.
         assert!(
-            parse_lsof(&String::from_utf8_lossy(&output.stdout)).is_empty(),
+            output.status.success()
+                || (tool == ListenerTool::Lsof && output.status.code() == Some(1)),
+            "listener lookup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            tool.parse(&String::from_utf8_lossy(&output.stdout), &[port])
+                .iter()
+                .all(|listener| listener.address != "127.0.0.1"),
             "a UDP socket on {port} was listed as a TCP listener"
         );
     }
