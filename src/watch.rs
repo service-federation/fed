@@ -269,11 +269,23 @@ mod tests {
         );
         let mut watcher = WatchMode::new(&config, temp.path()).unwrap();
         std::fs::write(&source, "after").unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(5), watcher.next_event())
-            .await
-            .expect("source changes should reach the watch restart loop")
-            .unwrap();
-        assert_eq!(event.service_name, "app");
-        assert!(event.changed_paths.contains(&source));
+        let source = source.canonicalize().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = watcher.next_event().await.unwrap();
+                assert_eq!(event.service_name, "app");
+                // macOS can report /private/var for a fixture under /var.
+                // Other events may arrive before the changed source file.
+                if event
+                    .changed_paths
+                    .iter()
+                    .any(|path| path.canonicalize().ok().as_ref() == Some(&source))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("source changes should reach the watch restart loop");
     }
 }
