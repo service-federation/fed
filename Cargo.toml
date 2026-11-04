@@ -115,6 +115,7 @@ unicode-width = "0.1"
 
 [dev-dependencies]
 tempfile = "3.12"
+socket2 = "0.6"
 # For TUI boundary tests: rendering into a TestBackend and synthesizing key events.
 ratatui = "0.30"
 crossterm = "0.29"
