@@ -64,7 +64,7 @@ fn load_env_file_inner(path: &Path, env_vars: &mut HashMap<String, String>) -> R
                         return Err(Error::Config(format!(
                             "Failed to parse environment file {}: {}",
                             path.display(),
-                            e
+                            env_file_error_message(&e)
                         )));
                     }
                 }
@@ -74,7 +74,7 @@ fn load_env_file_inner(path: &Path, env_vars: &mut HashMap<String, String>) -> R
             return Err(Error::Filesystem(format!(
                 "Failed to read environment file {}: {}",
                 path.display(),
-                e
+                env_file_error_message(&e)
             )));
         }
     }
@@ -82,6 +82,18 @@ fn load_env_file_inner(path: &Path, env_vars: &mut HashMap<String, String>) -> R
     validate_and_sanitize_env(env_vars)?;
 
     Ok(())
+}
+
+/// Dotenv parse errors include the complete source line in their Display and
+/// Debug output. Keep its position for diagnosis without exposing any value.
+fn env_file_error_message(error: &dotenvy::Error) -> String {
+    match error {
+        dotenvy::Error::LineParse(_, position) => {
+            format!("invalid syntax at position {position}")
+        }
+        dotenvy::Error::Io(error) => error.to_string(),
+        _ => "invalid environment file".to_string(),
+    }
 }
 
 /// Load and merge multiple .env files.
@@ -332,6 +344,35 @@ mod tests {
 
         let result = load_env_file_optional(&env_path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn malformed_env_file_errors_do_not_expose_values() {
+        let temp_dir = TempDir::new().unwrap();
+        let env_path = temp_dir.path().join(".env");
+        let sentinel = "sentinel-secret-9f2c";
+
+        for contents in [
+            format!("API_KEY=\"{sentinel}\n"),
+            format!("INVALID-NAME={sentinel}\n"),
+            format!("API_KEY=\"first line\n{sentinel}\n"),
+        ] {
+            fs::write(&env_path, contents).unwrap();
+            for error in [
+                load_env_file(&env_path).unwrap_err(),
+                load_env_file_optional(&env_path).unwrap_err(),
+            ] {
+                let message = error.to_string();
+                assert!(message.contains("Failed to parse environment file"));
+                assert!(message.contains(env_path.to_str().unwrap()));
+                assert!(!message.contains(sentinel), "parse error exposed a value");
+                assert!(message.contains("position"));
+                assert!(
+                    !format!("{error:?}").contains(sentinel),
+                    "debug error exposed a value"
+                );
+            }
+        }
     }
 
     #[test]
