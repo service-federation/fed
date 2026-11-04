@@ -2,7 +2,6 @@ use crate::cli::PortsCommands;
 use crate::output::UserOutput;
 use fed::Parser as ConfigParser;
 use fed::RunContext;
-use fed::service::Status;
 use fed::state::StateTracker;
 use std::path::PathBuf;
 
@@ -98,11 +97,11 @@ pub(super) async fn ensure_services_stopped(
 
     let running: Vec<_> = services
         .iter()
+        // Failing and Stopping services can still own processes and ports.
+        // Match the state-based stop path, including terminal hosts that may
+        // outlive a completed child, before changing the isolation scope.
         .filter(|(_, state)| {
-            matches!(
-                state.status,
-                Status::Running | Status::Healthy | Status::Starting
-            )
+            super::stop::state_status_is_active(state.status) || state.host_pid.is_some()
         })
         .map(|(name, _)| name.clone())
         .collect();
