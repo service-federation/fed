@@ -1132,9 +1132,9 @@ impl ProcessService {
                 if let Ok(status_content) = tokio::fs::read_to_string(&proc_status_path).await {
                     // Look for "State:" line which contains single letter state code
                     for line in status_content.lines() {
-                        if line.starts_with("State:") {
+                        if let Some(state) = line.strip_prefix("State:") {
                             // Format: "State:\tZ (zombie)" or "State:\tT (stopped)"
-                            let state_char = line.chars().find(|c| c.is_alphabetic());
+                            let state_char = state.trim_start().chars().next();
                             if let Some(state) = state_char {
                                 match state {
                                     'Z' | 'T' | 'X' | 'x' => return Ok(false), // Zombie, stopped, or dead
@@ -1541,6 +1541,77 @@ pub mod resource_limits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_proc_state(pid: u32, expected: char) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = tokio::fs::read_to_string(format!("/proc/{pid}/status"))
+                    .await
+                    .expect("child process status should exist");
+                if status.lines().any(|line| {
+                    line.strip_prefix("State:")
+                        .and_then(|state| state.trim_start().chars().next())
+                        == Some(expected)
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("child should reach the requested process state");
+    }
+
+    #[cfg(target_os = "linux")]
+    struct TestChild(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn detached_health_rejects_zombie_process() {
+        // Keep a std Child unreaped: signal(0) succeeds for a zombie, so
+        // detached health must read the actual state from /proc.
+        let child = TestChild(std::process::Command::new("true").spawn().unwrap());
+        wait_for_proc_state(child.0.id(), 'Z').await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let service = file_mode_service("true", HashMap::new(), temp_dir.path());
+        service.set_pid(child.0.id());
+
+        assert!(!service.health().await.unwrap());
+        assert_eq!(service.status(), Status::Failing);
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn detached_health_rejects_stopped_process() {
+        let child = TestChild(
+            std::process::Command::new("sleep")
+                .arg("300")
+                .spawn()
+                .unwrap(),
+        );
+        let temp_dir = tempfile::tempdir().unwrap();
+        let service = file_mode_service("sleep 300", HashMap::new(), temp_dir.path());
+        service.set_pid(child.0.id());
+        assert!(service.check_health_internal().await.unwrap());
+
+        signal::kill(
+            nix::unistd::Pid::from_raw(child.0.id() as i32),
+            Signal::SIGSTOP,
+        )
+        .unwrap();
+        wait_for_proc_state(child.0.id(), 'T').await;
+        assert!(!service.health().await.unwrap());
+        assert_eq!(service.status(), Status::Failing);
+    }
 
     // ========================================================================
     // Process Group (PGID) Lookup Tests
