@@ -496,10 +496,10 @@ impl Resolver {
                 if self.deferred_params.contains(name) {
                     continue;
                 }
-                // Port parameters were already resolved by the allocator above;
-                // re-resolving their default here would overwrite the allocated
-                // port with an unchecked value.
-                if param.is_port_type() {
+                // Explicit and .env values take precedence over defaults.
+                // Ports were already resolved by the allocator above as well;
+                // re-resolving a default would overwrite the selected value.
+                if param.value.is_some() || param.is_port_type() {
                     continue;
                 }
                 if let Some(default_value) = param.default.as_ref() {
@@ -528,6 +528,11 @@ impl Resolver {
             // out-of-scope missing manual secrets this run never fetches — not a
             // failure. In-scope failures are not in the set and still error.
             if self.deferred_params.contains(name) {
+                continue;
+            }
+            // An overridden default is unused, even if the chosen value
+            // contains literal {{...}} text that must survive substitution.
+            if param.value.is_some() || param.is_port_type() {
                 continue;
             }
             if let Some(default_value) = param.default.as_ref() {
