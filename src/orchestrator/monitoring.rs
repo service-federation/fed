@@ -491,12 +491,21 @@ async fn restart_single_service(
 
     // Lock and restart the service
     let start_result = {
+        // LOCK ORDER: state_tracker before the service mutex. A separate
+        // `fed stop` changes persisted intent without changing this manager.
+        let tracker = state_tracker.read().await;
         let mut manager = manager_arc.lock().await;
 
         if cancel_token.is_cancelled() {
             tracing::info!("Restart of '{}' cancelled", name);
             return false;
         }
+
+        if !tracker.is_desired_running(name).await {
+            tracing::info!("Skipping restart of '{}': no longer desired running", name);
+            return false;
+        }
+        drop(tracker);
 
         // The user may have stopped the service while we were backing off —
         // resurrecting it here would leave a running process with no state
@@ -519,21 +528,46 @@ async fn restart_single_service(
         // Brief delay to ensure clean shutdown
         tokio::time::sleep(Duration::from_millis(500)).await;
 
+        // Stopping and the shutdown delay both yield. Recheck intent before
+        // spawning, releasing the manager first to preserve lock ordering.
+        drop(manager);
+        let tracker = state_tracker.read().await;
+        let mut manager = manager_arc.lock().await;
+        if cancel_token.is_cancelled() || !tracker.is_desired_running(name).await {
+            tracing::info!("Skipping restart of '{}': stopped during shutdown", name);
+            return false;
+        }
+        drop(tracker);
+
         // Start
         manager.start().await
     }; // manager lock released
 
     match start_result {
         Ok(_) => {
-            tracing::info!("Successfully restarted service '{}'", name);
-
             // Record the new PID/container ID — the old ones are dead, and a
             // future fed process restoring from the DB would otherwise treat
             // the restarted service as stale (or adopt a reused PID).
             // LOCK ORDER: state_tracker before service mutex (see lock_order.rs).
             let mut tracker = state_tracker.write().await;
             {
-                let manager = manager_arc.lock().await;
+                let mut manager = manager_arc.lock().await;
+                // Startup itself yields too. If a stop removed the row while
+                // we were spawning, reap the new process instead of leaving
+                // it running without a registration for later cleanup.
+                // Monitoring cancellation can hand off a still-wanted service;
+                // keep its new identity so the next supervisor can adopt it.
+                if !tracker.is_desired_running(name).await {
+                    drop(tracker);
+                    if let Err(error) = manager.stop().await {
+                        tracing::error!(
+                            "Failed to stop cancelled restart of '{}': {}",
+                            name,
+                            error
+                        );
+                    }
+                    return false;
+                }
                 if let Some(pid) = manager.get_pid()
                     && let Err(e) = tracker.update_service_pid(name, pid).await
                 {
@@ -562,6 +596,7 @@ async fn restart_single_service(
             if let Err(e) = tracker.save().await {
                 tracing::warn!("Failed to save state after restarting '{}': {}", name, e);
             }
+            tracing::info!("Successfully restarted service '{}'", name);
             true
         }
         Err(e) => {
@@ -1525,6 +1560,239 @@ mod tests {
         Arc::new(Mutex::new(
             Box::new(FakeManager { status, healthy }) as Box<dyn ServiceManager>
         ))
+    }
+
+    struct RestartManager {
+        starts: Arc<std::sync::atomic::AtomicUsize>,
+        stops: Arc<std::sync::atomic::AtomicUsize>,
+        start_gate: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+        stop_gate: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    }
+
+    #[async_trait::async_trait]
+    impl ServiceManager for RestartManager {
+        async fn start(&mut self) -> Result<()> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            if let Some((entered, release)) = self.start_gate.take() {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+            Ok(())
+        }
+        async fn stop(&mut self) -> Result<()> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            if let Some((entered, release)) = self.stop_gate.take() {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+            Ok(())
+        }
+        async fn kill(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<bool> {
+            Ok(false)
+        }
+        fn status(&self) -> Status {
+            // Another process's stop cannot update the supervisor's manager.
+            Status::Failing
+        }
+        fn name(&self) -> &str {
+            "worker"
+        }
+        fn get_pid(&self) -> Option<u32> {
+            Some(std::process::id())
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    async fn restart_tracker(path: &std::path::Path) -> StateTracker {
+        let mut tracker = StateTracker::new(path.to_path_buf()).await.unwrap();
+        tracker.initialize().await.unwrap();
+        tracker
+            .register_service(crate::state::ServiceState::new(
+                "worker".into(),
+                crate::config::ServiceType::Process,
+                "root".into(),
+            ))
+            .await
+            .unwrap();
+        tracker
+    }
+
+    #[tokio::test]
+    async fn restart_rechecks_cross_process_stop_after_backoff() {
+        for remove_row in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let tracker = Arc::new(RwLock::new(restart_tracker(dir.path()).await));
+            let mut other = StateTracker::new(dir.path().to_path_buf()).await.unwrap();
+            let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let manager: ServiceEntry = Arc::new(Mutex::new(Box::new(RestartManager {
+                starts: starts.clone(),
+                stops: stops.clone(),
+                start_gate: None,
+                stop_gate: None,
+            })));
+            let cancel = CancellationToken::new();
+            let restart = restart_single_service("worker", &manager, 1, &tracker, &cancel);
+            tokio::pin!(restart);
+            // Poll once to arm the real one-second backoff, then write through
+            // an independent DB connection while the restart is suspended.
+            assert!(futures::poll!(&mut restart).is_pending());
+            if remove_row {
+                other.unregister_service("worker").await.unwrap();
+            } else {
+                other
+                    .set_desired_state("worker", crate::state::DesiredState::Stopped)
+                    .await
+                    .unwrap();
+            }
+            assert!(!restart.await);
+            assert_eq!(starts.load(Ordering::SeqCst), 0);
+            assert_eq!(stops.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_rechecks_cross_process_stop_after_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(RwLock::new(restart_tracker(dir.path()).await));
+        let mut other = StateTracker::new(dir.path().to_path_buf()).await.unwrap();
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let manager: ServiceEntry = Arc::new(Mutex::new(Box::new(RestartManager {
+            starts: starts.clone(),
+            stops: stops.clone(),
+            start_gate: None,
+            stop_gate: Some((entered_tx, release_rx)),
+        })));
+        let cancel = CancellationToken::new();
+        let restart = restart_single_service("worker", &manager, 0, &tracker, &cancel);
+        let stop = async {
+            entered_rx.await.unwrap();
+            other
+                .set_desired_state("worker", crate::state::DesiredState::Stopped)
+                .await
+                .unwrap();
+            release_tx.send(()).unwrap();
+        };
+        let (restarted, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(restart, stop)
+        })
+        .await
+        .expect("restart and external stop should complete");
+        assert!(!restarted);
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_proceeds_when_still_desired_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(RwLock::new(restart_tracker(dir.path()).await));
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let manager: ServiceEntry = Arc::new(Mutex::new(Box::new(RestartManager {
+            starts: starts.clone(),
+            stops: stops.clone(),
+            start_gate: None,
+            stop_gate: None,
+        })));
+        assert!(
+            restart_single_service("worker", &manager, 0, &tracker, &CancellationToken::new())
+                .await
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_new_process_when_monitoring_is_cancelled_during_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(RwLock::new(restart_tracker(dir.path()).await));
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let manager: ServiceEntry = Arc::new(Mutex::new(Box::new(RestartManager {
+            starts: starts.clone(),
+            stops: stops.clone(),
+            start_gate: Some((entered_tx, release_rx)),
+            stop_gate: None,
+        })));
+        let cancel = CancellationToken::new();
+        let restart = restart_single_service("worker", &manager, 0, &tracker, &cancel);
+        let handoff = async {
+            entered_rx.await.unwrap();
+            cancel.cancel();
+            release_tx.send(()).unwrap();
+        };
+        let (restarted, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(restart, handoff)
+        })
+        .await
+        .expect("restart and supervisor handoff should complete");
+        assert!(restarted, "handoff must preserve a completed restart");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        let state = tracker.read().await.get_service("worker").await.unwrap();
+        assert_eq!(state.pid, Some(std::process::id()));
+    }
+
+    #[tokio::test]
+    async fn restart_cleans_up_when_stopped_during_startup() {
+        for remove_row in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let tracker = Arc::new(RwLock::new(restart_tracker(dir.path()).await));
+            let mut other = StateTracker::new(dir.path().to_path_buf()).await.unwrap();
+            let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let manager: ServiceEntry = Arc::new(Mutex::new(Box::new(RestartManager {
+                starts: starts.clone(),
+                stops: stops.clone(),
+                start_gate: Some((entered_tx, release_rx)),
+                stop_gate: None,
+            })));
+            let cancel = CancellationToken::new();
+            let restart = restart_single_service("worker", &manager, 0, &tracker, &cancel);
+            let stop = async {
+                entered_rx.await.unwrap();
+                if remove_row {
+                    other.unregister_service("worker").await.unwrap();
+                } else {
+                    other
+                        .set_desired_state("worker", crate::state::DesiredState::Stopped)
+                        .await
+                        .unwrap();
+                }
+                release_tx.send(()).unwrap();
+            };
+            let (restarted, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(restart, stop)
+            })
+            .await
+            .expect("restart and external stop should complete");
+            assert!(!restarted);
+            assert_eq!(starts.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                stops.load(Ordering::SeqCst),
+                2,
+                "new child must also be stopped"
+            );
+        }
     }
 
     /// `scope: None` must remain bit-identical to the pre-scope behavior:
