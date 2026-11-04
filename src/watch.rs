@@ -192,7 +192,7 @@ impl WatchMode {
 
 /// Check if a path should be ignored (common build artifacts, dependencies, etc.)
 fn should_ignore_path(path: &Path) -> bool {
-    let ignore_patterns = [
+    let ignored_names = [
         "node_modules",
         ".git",
         "target",
@@ -205,19 +205,15 @@ fn should_ignore_path(path: &Path) -> bool {
         ".venv",
         "venv",
         ".DS_Store",
-        "*.log",
-        "*.swp",
-        "*.swo",
-        "*~",
     ];
 
-    for pattern in &ignore_patterns {
-        if path.to_string_lossy().contains(pattern) {
-            return true;
-        }
-    }
-
-    false
+    path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        ignored_names.contains(&name.as_ref())
+            || [".log", ".swp", ".swo", "~"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+    })
 }
 
 #[cfg(test)]
@@ -231,5 +227,53 @@ mod tests {
         assert!(should_ignore_path(Path::new("/foo/target/debug/bar")));
         assert!(!should_ignore_path(Path::new("/foo/src/main.rs")));
         assert!(!should_ignore_path(Path::new("/foo/package.json")));
+    }
+
+    #[test]
+    fn ignore_patterns_match_names_and_suffixes() {
+        for path in [
+            "/foo/app.log",
+            "/foo/.main.rs.swp",
+            "/foo/.main.rs.swo",
+            "/foo/main.rs~",
+            "/foo/.next/server/app.js",
+        ] {
+            assert!(should_ignore_path(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/foo/.github/workflows/ci.yml",
+            "/foo/src/rebuild.rs",
+            "/foo/build-tools/config.json",
+            "/foo/targeting/main.rs",
+            "/foo/src/distinct.rs",
+            "/foo/app.log.rs",
+        ] {
+            assert!(!should_ignore_path(Path::new(path)), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn changes_in_similarly_named_source_paths_emit_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("build-tools");
+        std::fs::create_dir(&source_dir).unwrap();
+        let source = source_dir.join("rebuild.rs");
+        std::fs::write(&source, "before").unwrap();
+        let mut config = Config::default();
+        config.services.insert(
+            "app".into(),
+            crate::config::Service {
+                watch: vec!["build-tools".into()],
+                ..Default::default()
+            },
+        );
+        let mut watcher = WatchMode::new(&config, temp.path()).unwrap();
+        std::fs::write(&source, "after").unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), watcher.next_event())
+            .await
+            .expect("source changes should reach the watch restart loop")
+            .unwrap();
+        assert_eq!(event.service_name, "app");
+        assert!(event.changed_paths.contains(&source));
     }
 }
