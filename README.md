@@ -331,6 +331,7 @@ unhealthy at the threshold. A success resets the streak and restores healthy
 status. Process death bypasses probe retries. Healthchecks alone enable
 supervision; restarting still requires a restart policy.
 
+Shell-command parameters are inserted as literal values in unquoted, single-quoted, or double-quoted arguments. Bash syntax is parsed before substitution: placeholders must occupy ordinary command arguments, not command names, assignments, arithmetic operands, conditional expressions, loop bindings, declaration/evaluation builtins, or the unsupported `time`/`coproc` prefixes. Quoting alone does not make those evaluation contexts safe. This protects shell argument construction, not programs that deliberately interpret an argument as code (for example, an interpreter’s `-c` option or a custom evaluator). Commands that combine `{{PARAM}}` with nested shell expansions, dollar-quoted strings, or here-documents are rejected because those forms have different parsing rules. For those commands, put the parameter under `environment` and read it as `"$PARAM"` in the shell. Validate numeric or expression inputs first: environment variables and shell quoting do not make arbitrary code or arithmetic evaluation safe. Placeholders in comments or immediately after a backslash, dollar sign, or unbraced shell variable name are also rejected.
 
 ## Existing Docker Compose projects
 

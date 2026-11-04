@@ -60,6 +60,10 @@ regex = "1.10"
 # Shell-style tokenizing (quoted Docker `command:` strings)
 shell-words = "1"
 
+# Bash syntax validation for literal shell-argument templates
+tree-sitter = "0.27.1"
+tree-sitter-bash = "0.25.1"
+
 # Git operations
 # git2 0.21 makes its former default network transports opt-in.
 git2 = { version = "0.21", features = ["https", "ssh"] }
