@@ -185,6 +185,22 @@ pub async fn run_start(
             ));
         }
     }
+    {
+        let mut all_services: Vec<String> = Vec::new();
+        for service in &services_to_start {
+            for dep in dep_graph.get_dependencies(service) {
+                if !all_services.contains(&dep) {
+                    all_services.push(dep);
+                }
+            }
+            if !all_services.contains(service) {
+                all_services.push(service.clone());
+            }
+        }
+        for note in remembered_variant_notes(config, &all_services) {
+            out.status(&note);
+        }
+    }
     out.blank();
 
     // Pre-pull Docker images in parallel before starting services
@@ -1226,6 +1242,33 @@ fn start_warning_line(name: &str, health: &StartHealth) -> String {
         // fallback for completeness.
         _ => format!("{}: health unverified", name),
     }
+}
+
+/// One line for each of `services` whose variant was remembered from an
+/// earlier `fed start --variant`. That choice is out of sight when someone
+/// runs `fed start` without the flag, so the line says where it came from and
+/// how to undo it.
+fn remembered_variant_notes(config: &Config, services: &[String]) -> Vec<String> {
+    use fed::config::variants::VariantSource;
+
+    let mut notes = Vec::new();
+    for name in services {
+        let Some(service) = config.services.get(name) else {
+            continue;
+        };
+        let Some(variant) = service.variant.as_deref() else {
+            continue;
+        };
+        let undo = match service.variant_source {
+            Some(VariantSource::SessionPin) => format!("fed variant unset {name}"),
+            Some(VariantSource::SessionPrefer) => "fed variant clear".to_string(),
+            _ => continue,
+        };
+        notes.push(format!(
+            "Variant: {name} stays {variant}, as chosen by an earlier 'fed start --variant'. To undo: {undo}"
+        ));
+    }
+    notes
 }
 
 /// Print startup messages from services in a Unicode box.

@@ -19,10 +19,59 @@ use std::process::Output;
 use std::time::Duration;
 
 /// The label fed stamps on every Docker volume it creates. Ownership proof for `fed prune`,
-/// `fed doctor`, and isolated-script reaping: a `fed-`-named volume WITHOUT this label was not
+/// `fed doctor`, and isolated-script reaping (a label proves fed made a resource; the stack
+/// registry, not Docker, says whether its owner is gone): a `fed-`-named volume WITHOUT this label was not
 /// created by this fed (an older fed, or a user's own), so it is never auto-deleted.
 pub const FED_MANAGED_LABEL: &str = "com.service-federation.managed=true";
 const FED_MANAGED_LABEL_FILTER: &str = "label=com.service-federation.managed=true";
+
+/// A container fed created, as `docker ps -a` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FedContainer {
+    pub id: String,
+    pub name: String,
+    /// `docker ps` state: `running`, `exited`, `created`, `paused`, ...
+    pub state: String,
+    pub created: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl FedContainer {
+    pub fn is_running(&self) -> bool {
+        matches!(self.state.as_str(), "running" | "restarting" | "paused")
+    }
+}
+
+/// A volume fed created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FedVolume {
+    pub name: String,
+    pub created: Option<chrono::DateTime<chrono::Utc>>,
+    /// Referenced by no container, running or stopped.
+    pub dangling: bool,
+}
+
+/// Parse one `{{.ID}}\t{{.Names}}\t{{.State}}\t{{.CreatedAt}}` line of `docker ps`.
+fn parse_container_line(line: &str) -> Option<FedContainer> {
+    let mut parts = line.split('\t');
+    let id = parts.next()?.trim();
+    let name = parts.next()?.trim();
+    let state = parts.next()?.trim();
+    let created = parts.next().unwrap_or("").trim();
+    if id.is_empty() || name.is_empty() {
+        return None;
+    }
+    // "2026-11-18 16:20:11 +0100 CET": the zone name after the offset is noise.
+    let stamp: Vec<&str> = created.split_whitespace().take(3).collect();
+    let created = chrono::DateTime::parse_from_str(&stamp.join(" "), "%Y-%m-%d %H:%M:%S %z")
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc));
+    Some(FedContainer {
+        id: id.to_string(),
+        name: name.to_string(),
+        state: state.to_string(),
+        created,
+    })
+}
 
 /// Stderr text attributed to a build that exited non-zero. The runtime already
 /// printed the real diagnostics to the inherited stderr, so this is only a
@@ -752,24 +801,6 @@ impl DockerClient {
             .collect())
     }
 
-    /// The fed-managed volumes that are safe to reap: *dangling* (referenced by no
-    /// container, running or stopped — so a live or stopped stack's data is never touched)
-    /// AND carrying fed's ownership label ([`FED_MANAGED_LABEL`]) — proof fed created the
-    /// volume, not a guess from its name.
-    ///
-    /// Volumes created by a fed older than the labeling change are unlabeled and are left
-    /// alone on purpose: a user-made `fed-backup` must never be deleted. The `fed-` prefix
-    /// filter is kept as belt-and-suspenders (Docker's `name=` filter is an unanchored
-    /// substring match). Single source of truth for `fed prune` and `fed doctor`.
-    pub async fn orphaned_fed_volumes(&self) -> Result<Vec<String>, DockerError> {
-        Ok(self
-            .list_volumes(&["dangling=true", FED_MANAGED_LABEL_FILTER])
-            .await?
-            .into_iter()
-            .filter(|v| v.starts_with("fed-"))
-            .collect())
-    }
-
     /// Names of all volumes carrying fed's ownership label ([`FED_MANAGED_LABEL`]) — the
     /// volumes fed created. Used to gate destructive ops (like `fed clean`) so a user volume
     /// that merely matches fed's naming but lacks the label is never removed.
@@ -804,6 +835,130 @@ impl DockerClient {
             }
         }
         removed
+    }
+
+    // ========================================================================
+    // Inventory of fed's own resources (for `fed prune`)
+    // ========================================================================
+
+    /// Every container fed created (running or not): those carrying
+    /// [`FED_MANAGED_LABEL`]. A container without it was not made by a fed
+    /// that stamps ownership, and is not listed.
+    pub async fn list_fed_containers(&self) -> Result<Vec<FedContainer>, DockerError> {
+        let output = self
+            .run_success(
+                &[
+                    "ps",
+                    "-a",
+                    "--no-trunc",
+                    "--filter",
+                    FED_MANAGED_LABEL_FILTER,
+                    "--format",
+                    "{{.ID}}\t{{.Names}}\t{{.State}}\t{{.CreatedAt}}",
+                ],
+                Duration::from_secs(30),
+            )
+            .await?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(parse_container_line)
+            .collect())
+    }
+
+    /// Every volume fed created ([`FED_MANAGED_LABEL`]), with its creation time
+    /// and whether no container references it.
+    pub async fn list_fed_volumes(&self) -> Result<Vec<FedVolume>, DockerError> {
+        let names = self.list_volumes(&[FED_MANAGED_LABEL_FILTER]).await?;
+        let dangling: std::collections::HashSet<String> = self
+            .list_volumes(&["dangling=true", FED_MANAGED_LABEL_FILTER])
+            .await?
+            .into_iter()
+            .collect();
+        let mut created: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        for chunk in names.chunks(100) {
+            let mut args: Vec<&str> =
+                vec!["volume", "inspect", "--format", "{{.Name}}\t{{.CreatedAt}}"];
+            args.extend(chunk.iter().map(String::as_str));
+            // A volume removed between the listing and the inspect only costs
+            // its creation time.
+            let Ok(output) = self.run(&args, Duration::from_secs(30)).await else {
+                continue;
+            };
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let Some((name, at)) = line.split_once('\t')
+                    && let Ok(at) = chrono::DateTime::parse_from_rfc3339(at.trim())
+                {
+                    created.insert(name.to_string(), at.with_timezone(&chrono::Utc));
+                }
+            }
+        }
+        Ok(names
+            .into_iter()
+            .map(|name| FedVolume {
+                created: created.get(&name).copied(),
+                dangling: dangling.contains(&name),
+                name,
+            })
+            .collect())
+    }
+
+    /// Force-remove containers by id, with their anonymous volumes (`-v`).
+    /// Returns the ids that could not be removed, with docker's reason.
+    pub async fn rm_containers(&self, ids: &[String]) -> Vec<(String, String)> {
+        let mut failed = Vec::new();
+        for chunk in ids.chunks(50) {
+            let mut args: Vec<&str> = vec!["rm", "-f", "-v"];
+            args.extend(chunk.iter().map(String::as_str));
+            if matches!(self.run(&args, Duration::from_secs(120)).await, Ok(o) if o.status.success())
+            {
+                continue;
+            }
+            // Docker does not say which of several failed, so find out one by one.
+            for id in chunk {
+                match self
+                    .run(&["rm", "-f", "-v", id], Duration::from_secs(60))
+                    .await
+                {
+                    Ok(o) if o.status.success() => {}
+                    // The batch may already have removed it before failing on another.
+                    Ok(o)
+                        if stderr_indicates_missing_container(&String::from_utf8_lossy(
+                            &o.stderr,
+                        )) => {}
+                    Ok(o) => failed.push((
+                        id.clone(),
+                        String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                    )),
+                    Err(e) => failed.push((id.clone(), e.to_string())),
+                }
+            }
+        }
+        failed
+    }
+
+    /// True when Docker confirms no container and no fed volume of `scope`
+    /// remains, or when there is no container runtime to run at all (then
+    /// nothing of the scope can be in it). A daemon that is installed but
+    /// cannot answer is "not clean": the caller keeps the record that the
+    /// stack may still be there.
+    pub async fn scope_is_clean(&self, scope: &str) -> bool {
+        let prefix = format!("fed-{scope}-");
+        let name_filter = format!("name={prefix}");
+        let containers = match self.ps_names(&name_filter, Duration::from_secs(20)).await {
+            Ok(containers) => containers,
+            Err(DockerError::ExecFailed { .. }) => return true,
+            Err(_) => return false,
+        };
+        if containers.iter().any(|n| n.starts_with(&prefix)) {
+            return false;
+        }
+        match self
+            .list_volumes(&[FED_MANAGED_LABEL_FILTER, name_filter.as_str()])
+            .await
+        {
+            Ok(volumes) => !volumes.iter().any(|v| v.starts_with(&prefix)),
+            Err(_) => false,
+        }
     }
 
     // ========================================================================
@@ -963,5 +1118,29 @@ mod pull_args_tests {
             pull_args(&["--authfile".into(), "/tmp/a".into()], "app", None),
             ["pull", "--authfile", "/tmp/a", "app"]
         );
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_docker_ps_line() {
+        let c = parse_container_line(
+            "abc123\tfed-iso-2a09648b-redis\texited\t2026-11-18 16:20:11 +0100 CET",
+        )
+        .unwrap();
+        assert_eq!(c.name, "fed-iso-2a09648b-redis");
+        assert!(!c.is_running());
+        assert_eq!(c.created.unwrap().to_rfc3339(), "2026-11-18T15:20:11+00:00");
+    }
+
+    #[test]
+    fn an_unparseable_creation_time_only_loses_the_age() {
+        let c = parse_container_line("abc\tfed-x\trunning\tyesterday").unwrap();
+        assert!(c.created.is_none());
+        assert!(c.is_running());
+        assert!(parse_container_line("").is_none());
     }
 }

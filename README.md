@@ -181,6 +181,19 @@ Run `fed clean` before removing the worktree.
 
 No editor plugin or agent integration is required. The boundary is the checkout directory.
 
+### Cleaning up after deleted worktrees
+
+`fed stop` removes a stack's containers but keeps its named volumes, so a stopped stack still has its database when you start it again. A worktree deleted without `fed stop` leaves its containers and volumes behind. `fed prune` finds those:
+
+```bash
+fed prune          # list what it would remove, grouped by reason, with the checkout path and age
+fed prune --force  # remove it (without --force it asks, or in a script only lists)
+```
+
+Every fed command that starts, stops or restarts services or runs a script in a checkout records which directory owns its stack in `~/.fed/stacks/`. `fed prune` removes a stack only when it can show that its directory no longer exists, that the checkout has moved to another isolation id (`fed isolate rotate` or `disable`), or that it belonged to an `isolated: true` script run whose process is dead. A stopped stack in a checkout that still exists is kept. So is any stack created by fed 8.3.2 or earlier until a fed command runs in its checkout. If you move or rename a checkout, run any fed command in it before `fed prune`: until then the registry still points at the old path, which no longer exists. `fed prune --adopt ~/worktrees` registers the checkouts it finds below a directory so those stacks are recognised; adding `--unowned` also removes the stacks none of them claims, if nothing in them is running and their newest container or volume was created at least a week ago (`--unowned-min-age-days`; Docker records creation, not last use, so a stopped stack is as old as its volumes). That is you vouching that the `--adopt` directories hold every checkout you still use.
+
+An `isolated: true` script run removes its throwaway stack on Ctrl+C, SIGTERM and SIGHUP too. SIGKILL cannot be caught, so a killed run leaves its stack; the next fed command in any checkout notices that the run's process is gone and removes it, and `fed prune` lists it. `fed doctor` reports how many stacks are reclaimable.
+
 ## Project commands and integration tests
 
 Scripts declared in `fed.yaml` know which services they need:
@@ -233,7 +246,9 @@ fed start --variant catalog:java  # pin the odd one out
 fed variant set go,ts,rust        # persist it; fed variant list shows the result
 ```
 
-For each service, the first name in the list it offers wins; otherwise its `default_variant`. A name no service has produces a warning, so one list can serve several checkouts. Precedence, highest first: a `--variant` pin, the `--variant` list, `.fed/variants.yaml` (written by `fed variant set`), then `default_variant`. Persisting matters because `fed restart`, `fed status`, the TUI and the background supervisor all have to agree without the flag being repeated.
+For each service, the first name in the list it offers wins; otherwise its `default_variant`. A name no service has produces a warning, so one list can serve several checkouts. Precedence, highest first: a `--variant` pin, the `--variant` list, the choice remembered from an earlier `fed start --variant` or `fed restart --variant` (`.fed/variants.session.yaml`), `.fed/variants.yaml` (written by `fed variant set`), the variant a service is running as right now, then `default_variant`. Persisting matters because `fed start web`, `fed restart`, `fed status`, the TUI and the background supervisor all have to agree without the flag being repeated: after `fed start --variant catalog:java` the checkout keeps `java` for `fed start web`, `fed restart` and a stopped-and-restarted `catalog` until a later `--variant` replaces it, `fed variant set`, `unset` or `clear` says otherwise, or a whole-stack `fed stop` ends the stack.
+
+When the choice comes from an earlier `--variant`, `fed start` says so and prints the command that undoes it.
 
 Switching variant while the service runs is a `fed stop` and a `fed start` — the ports and container names are the same, so the two implementations can't coexist. A variant that needs a *different* port is a different service, not a variant: the contract lives on the outer service by design.
 

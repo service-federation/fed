@@ -66,6 +66,8 @@ pub mod parameter;
 pub mod port;
 pub mod progress;
 pub mod service;
+pub mod stack_cleanup;
+pub mod stack_registry;
 pub mod state;
 pub mod tui;
 pub mod watch;

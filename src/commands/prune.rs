@@ -1,57 +1,122 @@
-//! `fed prune` — reap orphaned fed-managed Docker volumes.
+//! `fed prune` — remove the Docker stacks of checkouts that are gone.
 //!
-//! Isolation and per-run containers accumulate Docker volumes that nothing else reaps:
-//! anonymous image volumes left by `docker rm` before the `-v` fix, retired isolation
-//! stacks, and deleted worktrees. This command removes the fed-managed volumes that are
-//! *dangling* — referenced by no container, running or stopped — so it can never delete a
-//! live stack's data, nor a stopped stack's (a stopped container still references its named
-//! volume, so that volume is not dangling and is left alone).
+//! Isolated checkouts and `isolated: true` script runs leave containers and
+//! volumes behind that nothing else reaps: a checkout deleted without `fed stop`
+//! (agents remove git worktrees), a script run that was killed. What is *not*
+//! abandoned is just as common: `fed stop` removes a stack's containers but keeps
+//! its named volumes on purpose, so a stopped stack in a checkout that still
+//! exists looks, to Docker, exactly like an orphan. The stack registry
+//! ([`fed::stack_registry`]) is what tells them apart, so prune removes a stack
+//! only when it can prove one of:
 //!
-//! Safety model: dry-run + confirm. In an interactive terminal it lists the volumes and
-//! prompts. In a non-interactive context (agent, CI, pipe) it lists them and does nothing
-//! unless `--force` is passed — so nothing is ever deleted unprompted.
+//! * its checkout directory no longer exists,
+//! * its checkout moved on to another isolation id (`fed isolate rotate`/`disable`),
+//! * it was the stack of an `isolated: true` script run whose process is dead.
+//!
+//! Stacks created by a fed that predates the registry have no owner on record
+//! and are left alone. `--adopt <dir>` registers every checkout under a
+//! directory, and `--unowned` (which requires `--adopt`) then also removes the
+//! stacks none of those checkouts claims: the user, not fed, vouches that the
+//! adopted directories hold all their checkouts. That removal still spares any
+//! stack with something running and any whose newest container or volume was
+//! created within `--unowned-min-age-days` (default 7). Docker records when a
+//! resource was created, not when it was last used: a stack stopped yesterday
+//! whose volumes are a month old counts as a month old.
+//!
+//! Safety model: dry-run + confirm. In an interactive terminal it lists what it
+//! would remove, grouped by reason, and prompts. In a non-interactive context
+//! (agent, CI, pipe) it lists and does nothing unless `--force` is passed.
 
 use crate::output::UserOutput;
+use chrono::{DateTime, Utc};
 use fed::docker::DockerClient;
+use fed::stack_cleanup::{self, Decision, Inventory, Keep, Owner, Plan, Remove, Verdict};
+use fed::stack_registry::{CheckoutState, StackRegistry};
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 
-pub async fn run_prune(force: bool, out: &dyn UserOutput) -> anyhow::Result<()> {
+/// How deep `--adopt` looks for checkouts below each directory it is given.
+const ADOPT_DEPTH: usize = 6;
+
+pub struct PruneOptions {
+    pub force: bool,
+    pub adopt: Vec<PathBuf>,
+    pub unowned: bool,
+    /// Minimum age, in days, of a stack removed under `unowned`.
+    pub unowned_min_age_days: u32,
+}
+
+pub async fn run_prune(opts: PruneOptions, out: &dyn UserOutput) -> anyhow::Result<()> {
     let docker = DockerClient::new();
 
     if !docker.daemon_healthy(Duration::from_secs(5)).await {
         anyhow::bail!("Docker daemon is not running — nothing to prune.");
     }
 
-    // Dangling (referenced by no container) AND prefixed `fed-`. See the helper for why the
-    // prefix is enforced in code rather than left to Docker's substring `name=` filter.
-    let orphans = docker.orphaned_fed_volumes().await?;
+    let registry = StackRegistry::default_location();
 
-    if orphans.is_empty() {
-        out.success("No orphaned fed volumes to prune.");
+    for root in &opts.adopt {
+        let Some(registry) = &registry else {
+            anyhow::bail!("--adopt needs a home directory to keep its registry in.");
+        };
+        if !root.is_dir() {
+            anyhow::bail!("--adopt {}: not a directory.", root.display());
+        }
+        let adopted = registry.adopt(root, ADOPT_DEPTH);
+        out.status(&format!(
+            "Adopted {} checkout(s) under {}.",
+            adopted.len(),
+            root.display()
+        ));
+    }
+
+    let owner = |scope: &str| match &registry {
+        Some(registry) => stack_cleanup::owner_of(registry, scope),
+        None => Owner::Unknown,
+    };
+    let policy = || {
+        opts.unowned.then(|| stack_cleanup::UnownedPolicy {
+            min_age: chrono::Duration::days(i64::from(opts.unowned_min_age_days)),
+            now: Utc::now(),
+        })
+    };
+    let inventory = Inventory::load(&docker).await?;
+    let total = inventory.groups.len();
+    let plan = stack_cleanup::plan(inventory, &owner, policy());
+
+    print_plan(
+        &plan,
+        total,
+        opts.unowned,
+        opts.unowned_min_age_days,
+        !opts.adopt.is_empty(),
+        out,
+    );
+
+    if plan.remove.is_empty() {
+        out.success("Nothing to remove.");
         return Ok(());
     }
 
-    out.status(&format!(
-        "{} orphaned fed volume(s) — referenced by no container:",
-        orphans.len()
-    ));
-    for v in &orphans {
-        out.status(&format!("  {v}"));
-    }
-
-    let proceed = if force {
+    let (containers, volumes) = (plan.container_count(), plan.volume_count());
+    let proceed = if opts.force {
         true
     } else if std::io::stdin().is_terminal() {
-        eprint!("\nRemove these {} volume(s)? [y/N] ", orphans.len());
+        eprint!(
+            "\nRemove these {} stack(s) ({containers} container(s), {volumes} volume(s))? [y/N] ",
+            plan.remove.len()
+        );
         std::io::stderr().flush().ok();
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
     } else {
         out.status(&format!(
-            "\nDry run (non-interactive): re-run with --force to remove these {} volume(s).",
-            orphans.len()
+            "\nDry run (non-interactive): re-run with --force to remove these {} stack(s) \
+             ({containers} container(s), {volumes} volume(s)).",
+            plan.remove.len()
         ));
         false
     };
@@ -61,18 +126,196 @@ pub async fn run_prune(force: bool, out: &dyn UserOutput) -> anyhow::Result<()> 
         return Ok(());
     }
 
-    let (mut removed, mut failed) = (0usize, 0usize);
-    for v in &orphans {
-        match docker.volume_rm(v).await {
-            Ok(o) if o.status.success() => removed += 1,
-            _ => failed += 1,
+    // Decide again on fresh state: the list above may have sat at a prompt
+    // while a stack was started or a checkout recreated. Only what is still
+    // to be removed, and was on the list the user agreed to, goes.
+    let agreed: std::collections::HashSet<String> =
+        plan.remove.iter().map(|d| d.group.scope.clone()).collect();
+    let fresh = stack_cleanup::plan(Inventory::load(&docker).await?, &owner, policy());
+    let present: std::collections::HashSet<String> = fresh
+        .keep
+        .iter()
+        .chain(&fresh.remove)
+        .map(|d| d.group.scope.clone())
+        .collect();
+    let still: Vec<Decision> = fresh
+        .remove
+        .into_iter()
+        .filter(|d| agreed.contains(&d.group.scope))
+        .collect();
+    let skipped = agreed.len() - still.len();
+    if skipped > 0 {
+        out.warning(&format!(
+            "{skipped} stack(s) changed since the list above and were left alone."
+        ));
+    }
+    let outcome = stack_cleanup::execute(&docker, registry.as_ref(), &still).await;
+    if let Some(registry) = &registry {
+        stack_cleanup::forget_stale_entries(registry, &present);
+    }
+    for failure in &outcome.failures {
+        out.warning(&format!("  could not remove {failure}"));
+    }
+    let summary = format!(
+        "Removed {} container(s) and {} volume(s) from {} stack(s).",
+        outcome.containers_removed, outcome.volumes_removed, outcome.scopes_cleared
+    );
+    if outcome.failures.is_empty() {
+        out.success(&summary);
+        Ok(())
+    } else {
+        out.warning(&summary);
+        anyhow::bail!(
+            "{} item(s) could not be removed; run `fed prune` again.",
+            outcome.failures.len()
+        )
+    }
+}
+
+fn print_plan(
+    plan: &Plan,
+    total: usize,
+    unowned_requested: bool,
+    unowned_min_age_days: u32,
+    adopted: bool,
+    out: &dyn UserOutput,
+) {
+    let now = Utc::now();
+
+    let mut by_reason: BTreeMap<Remove, Vec<&Decision>> = BTreeMap::new();
+    for d in &plan.remove {
+        if let Verdict::Remove(why) = &d.verdict {
+            by_reason.entry(*why).or_default().push(d);
+        }
+    }
+    for (why, decisions) in &by_reason {
+        let containers: usize = decisions.iter().map(|d| d.group.containers.len()).sum();
+        let volumes: usize = decisions.iter().map(|d| d.group.volumes.len()).sum();
+        out.status(&format!(
+            "\nWill remove — {}: {} stack(s), {containers} container(s), {volumes} volume(s)",
+            why.heading(),
+            decisions.len()
+        ));
+        for d in decisions {
+            out.status(&format!("  {}", describe(d, now)));
         }
     }
 
-    if failed > 0 {
-        out.warning(&format!("Removed {removed} volume(s); {failed} failed."));
-    } else {
-        out.success(&format!("Removed {removed} volume(s)."));
+    // What is staying, and why: the part a person reads to trust the list above.
+    let mut kept: BTreeMap<String, Vec<&Decision>> = BTreeMap::new();
+    for d in &plan.keep {
+        if let Verdict::Keep(why) = &d.verdict {
+            kept.entry(why.heading().to_string()).or_default().push(d);
+        }
     }
-    Ok(())
+    if !kept.is_empty() {
+        out.status("\nKeeping:");
+    }
+    for (heading, decisions) in &kept {
+        let containers: usize = decisions.iter().map(|d| d.group.containers.len()).sum();
+        let volumes: usize = decisions.iter().map(|d| d.group.volumes.len()).sum();
+        out.status(&format!(
+            "  {} stack(s), {containers} container(s), {volumes} volume(s) — {heading}",
+            decisions.len()
+        ));
+        // Reasons that need a person's attention are listed; the bulk is not.
+        if matches!(
+            decisions[0].verdict,
+            Verdict::Keep(Keep::Unverifiable(_)) | Verdict::Keep(Keep::SupersededButRunning)
+        ) {
+            for d in decisions {
+                out.status(&format!("      {}", describe(d, now)));
+            }
+        }
+    }
+
+    let unknown = plan
+        .keep
+        .iter()
+        .filter(|d| matches!(d.verdict, Verdict::Keep(Keep::UnknownOwner)))
+        .count();
+    if unknown > 0 {
+        out.status(&format!(
+            "\n{unknown} stack(s) have no owner on record (made by a fed without the stack registry, \
+             or in a checkout no fed command has run in since). They are never removed on a guess."
+        ));
+        if !adopted {
+            out.status(&format!(
+                "  To clean them up, name the directories that hold all your checkouts:\n    \
+                 fed prune --adopt <dir> [--adopt <dir>...]   (registers the checkouts it finds there)\n    \
+                 fed prune --adopt <dir> --unowned            (also removes stacks none of them uses, \
+                 created {unowned_min_age_days}+ days ago)"
+            ));
+        } else if !unowned_requested {
+            out.status(&format!(
+                "  None of the adopted checkouts uses them. To remove those created {unowned_min_age_days}+ \
+                 days ago, add --unowned (you are vouching that the --adopt directories hold every \
+                 checkout you still use)."
+            ));
+        }
+    }
+    if plan.unscoped_containers + plan.unscoped_volumes > 0 {
+        out.status(&format!(
+            "{} container(s) and {} volume(s) are labeled as fed's but not named after a stack; left alone.",
+            plan.unscoped_containers, plan.unscoped_volumes
+        ));
+    }
+    out.status(&format!("\n{total} stack(s) in Docker in total."));
+}
+
+fn describe(d: &Decision, now: DateTime<Utc>) -> String {
+    let running = d.group.containers.iter().filter(|c| c.is_running()).count();
+    let mut resources = format!(
+        "{} container(s){}, {} volume(s)",
+        d.group.containers.len(),
+        if running > 0 {
+            format!(" ({running} running)")
+        } else {
+            String::new()
+        },
+        d.group.volumes.len()
+    );
+    if let Some(newest) = d.group.newest() {
+        resources.push_str(&format!(", newest {}", ago(now, newest)));
+    }
+    let owner = match &d.owner {
+        Owner::Checkout { workdir, state } => match state {
+            CheckoutState::Unverifiable(why) => format!("{} ({why})", workdir.display()),
+            CheckoutState::Superseded { current } => format!(
+                "{} (now {})",
+                workdir.display(),
+                current.as_deref().unwrap_or("not isolated")
+            ),
+            _ => workdir.display().to_string(),
+        },
+        Owner::Script { workdir, .. } => format!("script run from {}", workdir.display()),
+        Owner::Unknown => "owner unknown".to_string(),
+    };
+    format!("{:<13} {owner}: {resources}", d.group.scope)
+}
+
+fn ago(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
+    let secs = (now - then).num_seconds().max(0);
+    match secs {
+        0..=89 => "just now".to_string(),
+        90..=5399 => format!("{} min ago", secs / 60),
+        5400..=172_799 => format!("{} h ago", secs / 3600),
+        _ => format!("{} days ago", secs / 86_400),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ages_read_naturally() {
+        let now = Utc::now();
+        let at = |secs: i64| now - chrono::Duration::seconds(secs);
+        assert_eq!(ago(now, at(10)), "just now");
+        assert_eq!(ago(now, at(600)), "10 min ago");
+        assert_eq!(ago(now, at(3 * 3600)), "3 h ago");
+        assert_eq!(ago(now, at(5 * 86_400)), "5 days ago");
+        assert_eq!(ago(now, now + chrono::Duration::seconds(30)), "just now");
+    }
 }

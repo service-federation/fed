@@ -418,7 +418,20 @@ fn classify_health_results(
         if result.is_healthy == Some(true) {
             healthy_names.push(result.name);
         } else if result.is_healthy == Some(false) {
-            tracing::warn!("Service '{}' failed health check", result.name);
+            // Say which kind of failure it was: a service that exited and one
+            // whose probe is merely failing look identical otherwise, and the
+            // first is final while the second often recovers by itself.
+            if result.alive {
+                tracing::warn!(
+                    "Service '{}' failed health check: still running, but its probe failed",
+                    result.name
+                );
+            } else {
+                tracing::warn!(
+                    "Service '{}' failed health check: its process or container is no longer running",
+                    result.name
+                );
+            }
             unhealthy.push((result.name, result.manager));
         }
     }
@@ -895,7 +908,9 @@ async fn handle_dependency_health_propagation(
                 match policy {
                     DependencyFailurePolicy::Stop => {
                         tracing::warn!(
-                            "Dependency '{}' failed - stopping dependent service '{}'",
+                            "Dependency '{}' failed - stopping dependent service '{}'. It stays stopped when '{}' recovers; run `fed start {}` to bring it back, or set `on_failure: ignore` on that dependency to keep it running.",
+                            failed_service,
+                            dependent_name,
                             failed_service,
                             dependent_name
                         );

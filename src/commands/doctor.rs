@@ -101,16 +101,51 @@ pub async fn run_doctor(out: &dyn UserOutput) -> anyhow::Result<()> {
         }
     }
 
-    // Orphaned fed volumes — isolation and per-run stacks accumulate these and nothing else
-    // reaps them. Surfacing the count here is the natural place to notice a growing graveyard.
+    // Abandoned stacks — deleted checkouts and dead isolated-script runs leave containers and
+    // volumes that nothing else reaps. Surfacing the count here is the natural place to notice
+    // a growing graveyard. Stopped stacks of checkouts that still exist are not counted.
     if daemon_running {
-        out.progress("Orphaned fed volumes: ");
-        match docker.orphaned_fed_volumes().await {
-            Ok(v) if v.is_empty() => out.finish_progress("none"),
-            Ok(v) => out.finish_progress(&format!(
-                "{} reclaimable — run `fed prune` to remove",
-                v.len()
-            )),
+        out.progress("Abandoned fed stacks: ");
+        match fed::stack_cleanup::Inventory::load(&docker).await {
+            Ok(inventory) => {
+                let registry = fed::stack_registry::StackRegistry::default_location();
+                let plan = fed::stack_cleanup::plan(
+                    inventory,
+                    &|scope| match &registry {
+                        Some(registry) => fed::stack_cleanup::owner_of(registry, scope),
+                        None => fed::stack_cleanup::Owner::Unknown,
+                    },
+                    None,
+                );
+                let unknown = plan
+                    .keep
+                    .iter()
+                    .filter(|d| {
+                        matches!(
+                            d.verdict,
+                            fed::stack_cleanup::Verdict::Keep(
+                                fed::stack_cleanup::Keep::UnknownOwner
+                            )
+                        )
+                    })
+                    .count();
+                let mut summary = if plan.remove.is_empty() {
+                    "none".to_string()
+                } else {
+                    format!(
+                        "{} ({} container(s), {} volume(s)) reclaimable — run `fed prune` to see why and remove",
+                        plan.remove.len(),
+                        plan.container_count(),
+                        plan.volume_count()
+                    )
+                };
+                if unknown > 0 {
+                    summary.push_str(&format!(
+                        "; {unknown} with no owner on record (see `fed prune --adopt`)"
+                    ));
+                }
+                out.finish_progress(&summary);
+            }
             Err(_) => out.finish_progress("(could not check)"),
         }
     }
