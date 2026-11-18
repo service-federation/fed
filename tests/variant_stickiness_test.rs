@@ -83,17 +83,18 @@ impl Drop for Stack {
 }
 
 #[test]
-fn start_next_after_a_full_stop_keeps_the_variant_chosen_at_start() {
+fn start_next_after_one_service_stopped_keeps_the_variant_chosen_at_start() {
     let stack = Stack::new();
     let dir = stack.path();
 
     ok(&dir, &["start", "--variant", "presentation:source", "next"]);
     assert_eq!(variant_of(&dir, "presentation").as_deref(), Some("source"));
 
-    // The whole stack goes away (an agent's `fed stop`), which forgets every
-    // per-service row. Bringing back only `next` must still pull presentation
-    // in as the variant the stack was started with, not as `image`.
-    ok(&dir, &["stop"]);
+    // `next` and `presentation` stop individually (a failing dependency, an
+    // agent's `fed stop presentation`) while the stack as a whole is still up.
+    // Their rows are forgotten, so only the remembered choice is left to
+    // bring `presentation` back as `source` when `next` pulls it in.
+    ok(&dir, &["stop", "next", "presentation"]);
     let started = ok(&dir, &["start", "next"]);
     assert_eq!(
         variant_of(&dir, "presentation").as_deref(),
@@ -104,6 +105,18 @@ fn start_next_after_a_full_stop_keeps_the_variant_chosen_at_start() {
         started.contains("earlier 'fed start --variant'"),
         "the start must say why presentation is not the default: {started}"
     );
+}
+
+#[test]
+fn a_whole_stack_stop_ends_the_remembered_choice() {
+    let stack = Stack::new();
+    let dir = stack.path();
+
+    ok(&dir, &["start", "--variant", "presentation:source", "next"]);
+    ok(&dir, &["stop"]);
+    assert!(!dir.join(".fed/variants.session.yaml").exists());
+    ok(&dir, &["start", "next"]);
+    assert_eq!(variant_of(&dir, "presentation").as_deref(), Some("image"));
 }
 
 #[test]
@@ -134,13 +147,13 @@ fn a_new_flag_replaces_the_choice_and_variant_clear_forgets_it() {
     let dir = stack.path();
 
     ok(&dir, &["start", "--variant", "presentation:source", "next"]);
-    ok(&dir, &["stop"]);
+    ok(&dir, &["stop", "next", "presentation"]);
     ok(&dir, &["start", "--variant", "presentation:image", "next"]);
     assert_eq!(variant_of(&dir, "presentation").as_deref(), Some("image"));
 
-    ok(&dir, &["stop"]);
+    ok(&dir, &["stop", "next", "presentation"]);
     ok(&dir, &["start", "--variant", "presentation:source", "next"]);
-    ok(&dir, &["stop"]);
+    ok(&dir, &["stop", "next", "presentation"]);
     ok(&dir, &["variant", "clear"]);
     ok(&dir, &["start", "next"]);
     assert_eq!(

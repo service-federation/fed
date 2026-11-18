@@ -28,8 +28,8 @@
 //! catalog`, `fed status`, the TUI and the background supervisor all agree on
 //! what is running without the user repeating the flag on every invocation.
 //! The session layer is what makes `fed start --variant catalog:java` stick:
-//! it is remembered for the checkout until a later `--variant` replaces it or
-//! `fed variant set`, `unset` or `clear` says otherwise.
+//! it is remembered until a later `--variant` replaces it, `fed variant set`,
+//! `unset` or `clear` says otherwise, or a whole-stack `fed stop` ends the stack.
 
 use super::{Config, Service};
 use crate::error::{Error, Result};

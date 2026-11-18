@@ -91,6 +91,13 @@ pub fn remember_session_variants(work_dir: &Path, entries: &[String]) -> anyhow:
     Ok(())
 }
 
+/// A whole-stack `fed stop` ends the stack, so the variants it was started with
+/// are forgotten: the next `fed start` is a new start and resolves from the
+/// flags, `fed variant set` and `default_variant` again.
+pub fn forget_session_variants(work_dir: &Path) {
+    let _ = PersistedVariants::default().save_session(work_dir);
+}
+
 fn unset(work_dir: &Path, services: &[String], out: &dyn UserOutput) -> anyhow::Result<()> {
     let mut persisted = PersistedVariants::load(work_dir)?;
     let mut session = PersistedVariants::load_session(work_dir)?;

@@ -47,6 +47,7 @@ pub async fn run_stop(
             .await;
 
         orchestrator.stop_all().await?;
+        super::forget_session_variants(orchestrator.work_dir());
 
         // If the config changed since services were started, some running services may
         // still exist in state but not in the current config (so stop_all won't see them).
@@ -259,6 +260,10 @@ pub async fn run_stop_from_state(
             std::time::Duration::from_secs(10),
         )
         .await;
+    }
+
+    if services.is_empty() {
+        super::forget_session_variants(work_dir);
     }
 
     let mut tracker = StateTracker::new(work_dir.to_path_buf()).await?;
