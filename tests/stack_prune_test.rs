@@ -385,7 +385,11 @@ fn prune_removes_only_what_it_can_prove_abandoned() {
 
     // 4. An isolated script run whose process was SIGKILLed.
     let run_scope = format!("iso-{}", id());
-    drop(registry.begin_script_run(tmp.path(), &run_scope).unwrap());
+    drop(
+        registry
+            .begin_script_run(tmp.path(), &run_scope, true)
+            .unwrap(),
+    );
     let run = make_stack(&run_scope);
 
     let report = prune(&registry_dir, &[]);

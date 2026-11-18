@@ -1459,6 +1459,17 @@ fn merging_start_choices_replaces_the_pin_and_keeps_the_others() {
         vec!["ts", "rust"],
         "a new list replaces the old"
     );
+    assert!(
+        session.pin.is_empty(),
+        "a new list also replaces remembered pins, which would otherwise outrank it next time"
+    );
+    session
+        .merge_entries(&["go".into(), "catalog:java".into()])
+        .unwrap();
+    assert_eq!(
+        session.pin["catalog"], "java",
+        "pins given with the list stay"
+    );
 }
 
 #[test]

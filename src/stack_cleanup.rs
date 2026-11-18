@@ -47,13 +47,16 @@ impl Group {
         self.containers.iter().any(FedContainer::is_running)
     }
 
-    /// When the newest of its resources was created.
+    /// When the newest of its resources was created, or `None` when any
+    /// resource's creation time is unknown (then the newest cannot be known).
     pub fn newest(&self) -> Option<DateTime<Utc>> {
-        self.containers
+        let times: Option<Vec<DateTime<Utc>>> = self
+            .containers
             .iter()
-            .filter_map(|c| c.created)
-            .chain(self.volumes.iter().filter_map(|v| v.created))
-            .max()
+            .map(|c| c.created)
+            .chain(self.volumes.iter().map(|v| v.created))
+            .collect();
+        times?.into_iter().max()
     }
 }
 
@@ -390,24 +393,33 @@ pub fn forget_stale_entries(
 /// up after itself; this is how the next fed command finishes the job.
 /// Best effort: every failure is swallowed, and the entry stays for the next try.
 pub async fn sweep_dead_script_runs(registry: &StackRegistry) -> usize {
-    let dead = registry.dead_script_runs();
+    let mut dead = registry.dead_script_runs();
     if dead.is_empty() {
         return 0;
     }
-    let docker = DockerClient::new();
-    let mut inventory = match Inventory::load(&docker).await {
-        Ok(inventory) => inventory,
-        // No container runtime on this machine: the dead runs cannot have
-        // left anything in it, so there is nothing to finish. Keeping their
-        // records would make every later command look for Docker again.
-        Err(crate::docker::DockerError::ExecFailed { .. }) => {
-            for entry in &dead {
-                registry.remove(&entry.scope);
-            }
-            return dead.len();
+    // A run whose stack had no Docker-backed service left nothing to remove.
+    let forgotten = dead.iter().filter(|e| !e.uses_docker).count();
+    dead.retain(|entry| {
+        if !entry.uses_docker {
+            registry.remove(&entry.scope);
         }
-        // Installed but not answering: try again next time.
-        Err(_) => return 0,
+        entry.uses_docker
+    });
+    if dead.is_empty() {
+        return forgotten;
+    }
+    let docker = DockerClient::new();
+    // Every orchestrated command comes through here while a dead run is on
+    // record, so a stopped or hung daemon must cost seconds, not the minutes
+    // of the inventory's own timeouts. The records stay for the next try.
+    if !docker
+        .daemon_healthy(std::time::Duration::from_secs(2))
+        .await
+    {
+        return forgotten;
+    }
+    let Ok(mut inventory) = Inventory::load(&docker).await else {
+        return forgotten;
     };
     let decisions: Vec<Decision> = dead
         .iter()
@@ -435,7 +447,7 @@ pub async fn sweep_dead_script_runs(registry: &StackRegistry) -> usize {
             decisions.len()
         );
     }
-    outcome.scopes_cleared
+    forgotten + outcome.scopes_cleared
 }
 
 #[cfg(test)]
@@ -679,7 +691,7 @@ mod tests {
         ));
 
         let run = registry
-            .begin_script_run(tmp.path(), "iso-cafef00d")
+            .begin_script_run(tmp.path(), "iso-cafef00d", true)
             .unwrap();
         assert!(matches!(
             owner_of(&registry, "iso-cafef00d"),
@@ -690,5 +702,34 @@ mod tests {
             owner_of(&registry, "iso-cafef00d"),
             Owner::Script { alive: false, .. }
         ));
+    }
+
+    #[test]
+    fn an_unknown_creation_time_keeps_an_unowned_stack() {
+        let mut group = one_scope(
+            &[("fed-iso-aaaaaaaa-pg", "exited")],
+            &["fed-iso-aaaaaaaa-pgdata"],
+        );
+        group.volumes[0].created = None;
+        assert_eq!(group.newest(), None);
+        assert_eq!(
+            decide(&group, &Owner::Unknown, policy(0)),
+            Verdict::Keep(Keep::UnknownOwner),
+            "one undated resource could be the recent one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_run_without_docker_services_is_forgotten_without_asking_docker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = StackRegistry::at(tmp.path().join("stacks"));
+        drop(
+            registry
+                .begin_script_run(tmp.path(), "iso-f00df00d", false)
+                .unwrap(),
+        );
+        assert_eq!(registry.dead_script_runs().len(), 1);
+        assert_eq!(sweep_dead_script_runs(&registry).await, 1);
+        assert!(registry.get("iso-f00df00d").is_none());
     }
 }

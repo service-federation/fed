@@ -72,21 +72,28 @@ pub async fn run_prune(opts: PruneOptions, out: &dyn UserOutput) -> anyhow::Resu
         ));
     }
 
-    let inventory = Inventory::load(&docker).await?;
-    let total = inventory.groups.len();
-    let plan = stack_cleanup::plan(
-        inventory,
-        &|scope| match &registry {
-            Some(registry) => stack_cleanup::owner_of(registry, scope),
-            None => Owner::Unknown,
-        },
+    let owner = |scope: &str| match &registry {
+        Some(registry) => stack_cleanup::owner_of(registry, scope),
+        None => Owner::Unknown,
+    };
+    let policy = || {
         opts.unowned.then(|| stack_cleanup::UnownedPolicy {
             min_age: chrono::Duration::days(i64::from(opts.unowned_min_age_days)),
             now: Utc::now(),
-        }),
-    );
+        })
+    };
+    let inventory = Inventory::load(&docker).await?;
+    let total = inventory.groups.len();
+    let plan = stack_cleanup::plan(inventory, &owner, policy());
 
-    print_plan(&plan, total, opts.unowned, !opts.adopt.is_empty(), out);
+    print_plan(
+        &plan,
+        total,
+        opts.unowned,
+        opts.unowned_min_age_days,
+        !opts.adopt.is_empty(),
+        out,
+    );
 
     if plan.remove.is_empty() {
         out.success("Nothing to remove.");
@@ -119,14 +126,31 @@ pub async fn run_prune(opts: PruneOptions, out: &dyn UserOutput) -> anyhow::Resu
         return Ok(());
     }
 
-    let outcome = stack_cleanup::execute(&docker, registry.as_ref(), &plan.remove).await;
+    // Decide again on fresh state: the list above may have sat at a prompt
+    // while a stack was started or a checkout recreated. Only what is still
+    // to be removed, and was on the list the user agreed to, goes.
+    let agreed: std::collections::HashSet<String> =
+        plan.remove.iter().map(|d| d.group.scope.clone()).collect();
+    let fresh = stack_cleanup::plan(Inventory::load(&docker).await?, &owner, policy());
+    let present: std::collections::HashSet<String> = fresh
+        .keep
+        .iter()
+        .chain(&fresh.remove)
+        .map(|d| d.group.scope.clone())
+        .collect();
+    let still: Vec<Decision> = fresh
+        .remove
+        .into_iter()
+        .filter(|d| agreed.contains(&d.group.scope))
+        .collect();
+    let skipped = agreed.len() - still.len();
+    if skipped > 0 {
+        out.warning(&format!(
+            "{skipped} stack(s) changed since the list above and were left alone."
+        ));
+    }
+    let outcome = stack_cleanup::execute(&docker, registry.as_ref(), &still).await;
     if let Some(registry) = &registry {
-        let present = plan
-            .keep
-            .iter()
-            .chain(&plan.remove)
-            .map(|d| d.group.scope.clone())
-            .collect();
         stack_cleanup::forget_stale_entries(registry, &present);
     }
     for failure in &outcome.failures {
@@ -138,19 +162,21 @@ pub async fn run_prune(opts: PruneOptions, out: &dyn UserOutput) -> anyhow::Resu
     );
     if outcome.failures.is_empty() {
         out.success(&summary);
+        Ok(())
     } else {
-        out.warning(&format!(
-            "{summary} {} item(s) failed; run `fed prune` again.",
+        out.warning(&summary);
+        anyhow::bail!(
+            "{} item(s) could not be removed; run `fed prune` again.",
             outcome.failures.len()
-        ));
+        )
     }
-    Ok(())
 }
 
 fn print_plan(
     plan: &Plan,
     total: usize,
     unowned_requested: bool,
+    unowned_min_age_days: u32,
     adopted: bool,
     out: &dyn UserOutput,
 ) {
@@ -210,20 +236,22 @@ fn print_plan(
         .count();
     if unknown > 0 {
         out.status(&format!(
-            "\n{unknown} stack(s) have no owner on record (made by a fed older than 8.4 or never started \
-             since). They are never removed on a guess."
+            "\n{unknown} stack(s) have no owner on record (made by a fed without the stack registry, \
+             or in a checkout no fed command has run in since). They are never removed on a guess."
         ));
         if !adopted {
-            out.status(
+            out.status(&format!(
                 "  To clean them up, name the directories that hold all your checkouts:\n    \
                  fed prune --adopt <dir> [--adopt <dir>...]   (registers the checkouts it finds there)\n    \
-                 fed prune --adopt <dir> --unowned            (also removes stacks none of them uses, created 7+ days ago)",
-            );
+                 fed prune --adopt <dir> --unowned            (also removes stacks none of them uses, \
+                 created {unowned_min_age_days}+ days ago)"
+            ));
         } else if !unowned_requested {
-            out.status(
-                "  None of the adopted checkouts uses them. To remove those created over a week ago, add --unowned \
-                 (you are vouching that the --adopt directories hold every checkout you still use).",
-            );
+            out.status(&format!(
+                "  None of the adopted checkouts uses them. To remove those created {unowned_min_age_days}+ \
+                 days ago, add --unowned (you are vouching that the --adopt directories hold every \
+                 checkout you still use)."
+            ));
         }
     }
     if plan.unscoped_containers + plan.unscoped_volumes > 0 {

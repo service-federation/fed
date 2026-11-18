@@ -105,14 +105,17 @@ impl PersistedVariants {
         self.save_to(work_dir, session_variants_file_path(work_dir))
     }
 
-    /// Layer `--variant` entries over this selection: a pin replaces the pin
-    /// for the same service, and a preference list replaces the stored list (an
-    /// ordering has no sensible merge). Returns whether anything changed.
+    /// Layer `--variant` entries over this selection. A pin replaces the pin for
+    /// the same service. A preference list replaces everything remembered: it
+    /// speaks for every service that offers its names, and an older remembered
+    /// pin would otherwise outrank it on the next run (session pins rank above
+    /// session lists). Returns whether anything changed.
     pub fn merge_entries(&mut self, entries: &[String]) -> Result<bool> {
         let (prefer, pin) = split_entries(entries)?;
         let before = (self.prefer.clone(), self.pin.clone());
         if !prefer.is_empty() {
             self.prefer = prefer;
+            self.pin.clear();
         }
         self.pin.extend(pin);
         Ok(before != (self.prefer.clone(), self.pin.clone()))
@@ -526,8 +529,11 @@ pub fn resolve_variants(
         merged.default_variant = None;
         merged.variant = Some(chosen);
         merged.variant_source = Some(source);
+        // Only a choice made for this invocation is worth a warning. A
+        // remembered or running variant is resolved on every command, and
+        // would warn each time the stack is used without that profile.
         if !is_active(&merged, active_profiles)
-            && !matches!(source, VariantSource::Default | VariantSource::OnlyVariant)
+            && matches!(source, VariantSource::CliPin | VariantSource::CliPrefer)
         {
             tracing::warn!(
                 "Variant selected for service '{}', but it is excluded by the active profiles and will not start.",

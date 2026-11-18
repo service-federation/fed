@@ -32,6 +32,7 @@
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -46,12 +47,31 @@ pub enum StackKind {
     Script,
 }
 
+/// A directory that uses a scope, with the device its parent was on when it
+/// registered (Unix), so a later "the directory is gone" can be told apart
+/// from "the drive it lives on is not mounted".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Claim {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_dev: Option<u64>,
+}
+
 /// One scope's record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StackEntry {
     pub scope: String,
     pub kind: StackKind,
+    /// The directory that registered the scope most recently.
     pub workdir: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_dev: Option<u64>,
+    /// Other directories that registered the same scope and still existed when
+    /// `workdir` took over: a copied checkout carries its `.fed/lock.db`, and
+    /// so its isolation id, with it. The stack is abandoned only when every
+    /// claim is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<Claim>,
     pub fed_version: String,
     /// Unix seconds.
     pub first_seen: i64,
@@ -60,6 +80,52 @@ pub struct StackEntry {
     /// The fed process that owns a script run (informational: liveness is the lock).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// Whether a script run's stack can have anything in Docker. A run of a
+    /// project without Docker-backed services has nothing for a sweep to clean.
+    #[serde(default = "yes")]
+    pub uses_docker: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl StackEntry {
+    /// Every directory that claims this scope, most recent first.
+    pub fn claims(&self) -> Vec<Claim> {
+        let mut claims = vec![Claim {
+            path: self.workdir.clone(),
+            parent_dev: self.parent_dev,
+        }];
+        claims.extend(self.also.iter().cloned());
+        claims
+    }
+}
+
+/// The device of `path`'s parent directory, where the platform has one.
+fn parent_device(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        path.parent()
+            .and_then(|parent| fs::metadata(parent).ok())
+            .map(|m| m.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Whether `path` exists, without following a final symlink, and without
+/// reading "permission denied" as "does not exist".
+fn path_presence(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// How a checkout stands relative to a registered scope.
@@ -176,35 +242,57 @@ impl StackRegistry {
     /// Record that `scope` belongs to the checkout at `workdir`.
     ///
     /// Cheap enough for every command: an unchanged entry seen in the last hour
-    /// is not rewritten. A script run's entry is never replaced by this.
+    /// is not rewritten. A script run's entry is never replaced by this. When
+    /// another directory that still exists already claims the scope (a copied
+    /// checkout), both claims are kept.
     pub fn register_checkout(&self, workdir: &Path, scope: &str) -> io::Result<()> {
         if !is_valid_scope(scope) {
             return Ok(());
         }
         let workdir = fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
         let now = now();
-        let first_seen = match self.get(scope) {
+        let (first_seen, also) = match self.get(scope) {
             Some(existing) if existing.kind == StackKind::Script => return Ok(()),
             Some(existing) if existing.workdir == workdir && now - existing.last_seen < 3600 => {
                 return Ok(());
             }
-            Some(existing) => existing.first_seen,
-            None => now,
+            Some(existing) => {
+                let mut seen = HashSet::new();
+                seen.insert(workdir.clone());
+                let also = existing
+                    .claims()
+                    .into_iter()
+                    .filter(|claim| seen.insert(claim.path.clone()))
+                    .filter(|claim| matches!(path_presence(&claim.path), Ok(true) | Err(_)))
+                    .collect();
+                (existing.first_seen, also)
+            }
+            None => (now, Vec::new()),
         };
         self.write_entry(&StackEntry {
             scope: scope.to_string(),
             kind: StackKind::Checkout,
+            parent_dev: parent_device(&workdir),
             workdir,
+            also,
             fed_version: env!("CARGO_PKG_VERSION").to_string(),
             first_seen,
             last_seen: now,
             pid: None,
+            uses_docker: true,
         })
     }
 
     /// Claim `scope` for one `isolated: true` script run: take the run's lock,
     /// then record the entry. Call before the first container is created.
-    pub fn begin_script_run(&self, workdir: &Path, scope: &str) -> io::Result<ScriptRun> {
+    ///
+    /// `uses_docker` says whether the run's stack can put anything in Docker.
+    pub fn begin_script_run(
+        &self,
+        workdir: &Path,
+        scope: &str,
+        uses_docker: bool,
+    ) -> io::Result<ScriptRun> {
         if !is_valid_scope(scope) {
             return Err(io::Error::other(format!("invalid stack scope '{scope}'")));
         }
@@ -220,15 +308,19 @@ impl StackRegistry {
         self.write_entry(&StackEntry {
             scope: scope.to_string(),
             kind: StackKind::Script,
+            parent_dev: parent_device(&workdir),
             workdir,
+            also: Vec::new(),
             fed_version: env!("CARGO_PKG_VERSION").to_string(),
             first_seen: now,
             last_seen: now,
             pid: Some(std::process::id()),
+            uses_docker,
         })?;
         Ok(ScriptRun {
             registry: self.clone(),
             scope: scope.to_string(),
+            uses_docker,
             _lock: lock,
         })
     }
@@ -263,11 +355,26 @@ impl StackRegistry {
     }
 
     /// Entries of script runs that no live process owns any more.
+    ///
+    /// Runs on every orchestrated command, so it looks only at the `.lock`
+    /// files (one per script run, however many checkouts are registered).
     pub fn dead_script_runs(&self) -> Vec<StackEntry> {
-        self.entries()
-            .into_iter()
-            .filter(|e| e.kind == StackKind::Script && !self.script_run_alive(&e.scope))
-            .collect()
+        let Ok(read) = fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut dead: Vec<StackEntry> = read
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name();
+                let scope = name.to_str()?.strip_suffix(".lock")?.to_string();
+                is_valid_scope(&scope).then_some(scope)
+            })
+            .filter(|scope| !self.script_run_alive(scope))
+            .filter_map(|scope| self.get(&scope))
+            .filter(|e| e.kind == StackKind::Script)
+            .collect();
+        dead.sort_by(|a, b| a.scope.cmp(&b.scope));
+        dead
     }
 
     /// Register every checkout found under `root` (see [`find_checkouts`]):
@@ -296,12 +403,17 @@ impl StackRegistry {
 pub struct ScriptRun {
     registry: StackRegistry,
     scope: String,
+    uses_docker: bool,
     _lock: File,
 }
 
 impl ScriptRun {
     pub fn scope(&self) -> &str {
         &self.scope
+    }
+
+    pub fn uses_docker(&self) -> bool {
+        self.uses_docker
     }
 
     /// Cleanup is verified complete: forget the run.
@@ -340,43 +452,87 @@ pub fn read_isolation_id(workdir: &Path) -> Result<Option<String>, String> {
     setting("isolation_id")
 }
 
-/// Where a registered scope stands now.
+/// Where a registered scope stands now: the best state of any directory that
+/// claims it. One current claim keeps the stack; it is gone only when every
+/// claim is.
 pub fn checkout_state(entry: &StackEntry) -> CheckoutState {
-    let dir = &entry.workdir;
-    if !dir.exists() {
-        return match dir.parent() {
-            Some(parent) if parent.exists() => CheckoutState::Gone,
-            _ => CheckoutState::Unverifiable(format!(
-                "{} and its parent directory are both missing (an unmounted drive?)",
-                dir.display()
-            )),
-        };
+    let states: Vec<CheckoutState> = entry
+        .claims()
+        .iter()
+        .map(|claim| claim_state(&entry.scope, claim))
+        .collect();
+    if states.contains(&CheckoutState::Current) {
+        return CheckoutState::Current;
     }
-    if entry.scope.starts_with("iso-") {
+    if let Some(unverifiable) = states
+        .iter()
+        .find(|s| matches!(s, CheckoutState::Unverifiable(_)))
+    {
+        return unverifiable.clone();
+    }
+    if let Some(superseded) = states
+        .iter()
+        .find(|s| matches!(s, CheckoutState::Superseded { .. }))
+    {
+        return superseded.clone();
+    }
+    CheckoutState::Gone
+}
+
+fn claim_state(scope: &str, claim: &Claim) -> CheckoutState {
+    let dir = &claim.path;
+    match path_presence(dir) {
+        Ok(true) => {}
+        Ok(false) => {
+            let Some(parent) = dir.parent() else {
+                return CheckoutState::Unverifiable(format!("{} has no parent", dir.display()));
+            };
+            return match path_presence(parent) {
+                Ok(true) => match (claim.parent_dev, parent_device(dir)) {
+                    (Some(then), Some(now)) if then != now => CheckoutState::Unverifiable(format!(
+                        "{} is now on a different filesystem than when fed last saw {} \
+                             (an unmounted drive?)",
+                        parent.display(),
+                        dir.display()
+                    )),
+                    _ => CheckoutState::Gone,
+                },
+                Ok(false) => CheckoutState::Unverifiable(format!(
+                    "{} and its parent directory are both missing (an unmounted drive?)",
+                    dir.display()
+                )),
+                Err(e) => CheckoutState::Unverifiable(format!("{}: {e}", parent.display())),
+            };
+        }
+        Err(e) => return CheckoutState::Unverifiable(format!("{}: {e}", dir.display())),
+    }
+    if scope.starts_with("iso-") {
         match read_isolation_id(dir) {
-            Ok(Some(id)) if id == entry.scope => CheckoutState::Current,
+            Ok(Some(id)) if id == scope => CheckoutState::Current,
             Ok(current) => CheckoutState::Superseded { current },
             Err(e) => CheckoutState::Unverifiable(e),
         }
-    } else if crate::service::hash_work_dir(dir) == entry.scope {
+    } else if crate::service::hash_work_dir(dir) == scope {
         CheckoutState::Current
     } else {
-        CheckoutState::Unverifiable(format!(
-            "{} no longer hashes to {}",
-            dir.display(),
-            entry.scope
-        ))
+        CheckoutState::Unverifiable(format!("{} no longer hashes to {}", dir.display(), scope))
     }
 }
 
 /// Directories under `root` (at most `max_depth` levels down) that hold a fed
-/// state database, i.e. checkouts fed has run in. Symlinks are not followed and
-/// dependency and build directories are skipped.
+/// state database, i.e. checkouts fed has run in. Symlinked directories are
+/// followed (a checkout is often reached through one) but each real directory
+/// is visited once; dependency and build directories are skipped.
 pub fn find_checkouts(root: &Path, max_depth: usize) -> Vec<PathBuf> {
     const SKIP: &[&str] = &["node_modules", ".git", "target", ".next", ".cache", ".fed"];
     let mut found = Vec::new();
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut stack = vec![(root, 0usize)];
     while let Some((dir, depth)) = stack.pop() {
+        if !visited.insert(dir.clone()) {
+            continue;
+        }
         if crate::fed_dir::fed_dir(&dir).join("lock.db").is_file() {
             found.push(dir.clone());
         }
@@ -391,8 +547,12 @@ pub fn find_checkouts(root: &Path, max_depth: usize) -> Vec<PathBuf> {
                 continue;
             };
             let name = entry.file_name();
-            if kind.is_dir() && !SKIP.iter().any(|s| name == *s) {
-                stack.push((entry.path(), depth + 1));
+            if SKIP.iter().any(|s| name == *s) {
+                continue;
+            }
+            let is_dir = kind.is_dir() || (kind.is_symlink() && entry.path().is_dir());
+            if is_dir && let Ok(real) = fs::canonicalize(entry.path()) {
+                stack.push((real, depth + 1));
             }
         }
     }
@@ -474,7 +634,7 @@ mod tests {
         let registry = StackRegistry::at(tmp.path().to_path_buf());
         let work = tempfile::tempdir().unwrap();
         let run = registry
-            .begin_script_run(work.path(), "iso-cafef00d")
+            .begin_script_run(work.path(), "iso-cafef00d", true)
             .unwrap();
         registry
             .register_checkout(work.path(), "iso-cafef00d")
@@ -497,13 +657,13 @@ mod tests {
             "no run, no owner"
         );
         let run = registry
-            .begin_script_run(work.path(), "iso-cafef00d")
+            .begin_script_run(work.path(), "iso-cafef00d", true)
             .unwrap();
         assert!(registry.script_run_alive("iso-cafef00d"));
         assert!(registry.dead_script_runs().is_empty());
         assert!(
             registry
-                .begin_script_run(work.path(), "iso-cafef00d")
+                .begin_script_run(work.path(), "iso-cafef00d", true)
                 .is_err(),
             "two runs cannot claim one scope"
         );
@@ -518,7 +678,7 @@ mod tests {
         assert_eq!(dead[0].pid, Some(std::process::id()));
 
         let run = registry
-            .begin_script_run(work.path(), "iso-cafef00d")
+            .begin_script_run(work.path(), "iso-cafef00d", true)
             .unwrap();
         run.finish_clean();
         assert!(registry.get("iso-cafef00d").is_none());
@@ -539,6 +699,9 @@ mod tests {
             first_seen: 0,
             last_seen: 0,
             pid: None,
+            parent_dev: None,
+            also: Vec::new(),
+            uses_docker: true,
         };
 
         assert_eq!(
@@ -602,6 +765,9 @@ mod tests {
             first_seen: 0,
             last_seen: 0,
             pid: None,
+            parent_dev: None,
+            also: Vec::new(),
+            uses_docker: true,
         };
         assert_eq!(
             checkout_state(&entry("iso-11111111")),
@@ -648,5 +814,103 @@ mod tests {
         assert!(registry.get(&crate::service::hash_work_dir(&b)).is_some());
 
         assert_eq!(registry.adopt(&root, 1).len(), 0, "depth is bounded");
+    }
+
+    #[test]
+    fn a_copied_checkout_keeps_the_stack_while_either_copy_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = StackRegistry::at(tmp.path().join("stacks"));
+        let original = tmp.path().join("original");
+        let copy = tmp.path().join("copy");
+        for dir in [&original, &copy] {
+            fs::create_dir(dir).unwrap();
+            write_lock_db(dir, true, Some("iso-cccccccc"));
+        }
+        registry
+            .register_checkout(&original, "iso-cccccccc")
+            .unwrap();
+        registry.register_checkout(&copy, "iso-cccccccc").unwrap();
+        let entry = registry.get("iso-cccccccc").unwrap();
+        assert_eq!(entry.claims().len(), 2, "{entry:?}");
+
+        fs::remove_dir_all(&copy).unwrap();
+        assert_eq!(
+            checkout_state(&registry.get("iso-cccccccc").unwrap()),
+            CheckoutState::Current,
+            "deleting the copy must not abandon the original's stack"
+        );
+        fs::remove_dir_all(&original).unwrap();
+        assert_eq!(
+            checkout_state(&registry.get("iso-cccccccc").unwrap()),
+            CheckoutState::Gone
+        );
+    }
+
+    #[test]
+    fn a_claim_whose_parent_moved_to_another_filesystem_cannot_be_judged() {
+        // An unmounted drive leaves its empty mount point behind: the
+        // directory is missing but its parent exists, now on the root
+        // filesystem instead of the drive's.
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("checkout");
+        let mut entry = StackEntry {
+            scope: "iso-dddddddd".into(),
+            kind: StackKind::Checkout,
+            workdir: gone.clone(),
+            parent_dev: parent_device(&gone),
+            also: Vec::new(),
+            fed_version: "x".into(),
+            first_seen: 0,
+            last_seen: 0,
+            pid: None,
+            uses_docker: true,
+        };
+        assert_eq!(checkout_state(&entry), CheckoutState::Gone);
+        if let Some(dev) = entry.parent_dev {
+            entry.parent_dev = Some(dev.wrapping_add(1));
+            assert!(matches!(
+                checkout_state(&entry),
+                CheckoutState::Unverifiable(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn adopt_follows_a_symlinked_checkout_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("data/proj");
+        fs::create_dir_all(&real).unwrap();
+        write_lock_db(&real, false, None);
+        let root = tmp.path().join("code");
+        fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, root.join("proj")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            find_checkouts(&root, 4),
+            vec![fs::canonicalize(&real).unwrap()]
+        );
+    }
+
+    #[test]
+    fn only_lock_files_are_read_to_find_dead_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = StackRegistry::at(tmp.path().to_path_buf());
+        let work = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            registry
+                .register_checkout(work.path(), &format!("{i:08x}"))
+                .unwrap();
+        }
+        drop(
+            registry
+                .begin_script_run(work.path(), "iso-eeeeeeee", false)
+                .unwrap(),
+        );
+        let dead = registry.dead_script_runs();
+        assert_eq!(dead.len(), 1);
+        assert!(!dead[0].uses_docker);
     }
 }

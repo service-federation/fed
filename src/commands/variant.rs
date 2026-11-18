@@ -59,8 +59,10 @@ fn set(
         &[],
     )?;
     let mut persisted = PersistedVariants::load(work_dir)?;
+    let prefer_given = !prefer.is_empty();
+    let pinned: Vec<String> = pin.keys().cloned().collect();
 
-    if !prefer.is_empty() {
+    if prefer_given {
         persisted.prefer = prefer;
     }
     for (service, variant) in pin {
@@ -73,9 +75,19 @@ fn set(
         &[],
     )?;
     persisted.save(work_dir)?;
-    // Told otherwise: whatever an earlier `fed start --variant` remembered no
-    // longer outranks what was just set.
-    PersistedVariants::default().save_session(work_dir)?;
+    // Told otherwise: what an earlier `fed start --variant` remembered must not
+    // outrank what was just set. A pin supersedes the remembered pin for that
+    // service only; a preference list speaks for every service, so it
+    // supersedes everything remembered.
+    let mut session = PersistedVariants::load_session(work_dir)?;
+    if prefer_given {
+        session = PersistedVariants::default();
+    } else {
+        for service in &pinned {
+            session.pin.remove(service);
+        }
+    }
+    session.save_session(work_dir)?;
     report(&persisted, work_dir, out);
     Ok(())
 }
@@ -111,6 +123,10 @@ fn unset(work_dir: &Path, services: &[String], out: &dyn UserOutput) -> anyhow::
     persisted.save(work_dir)?;
     session.save_session(work_dir)?;
     report(&persisted, work_dir, out);
+    out.status(
+        "A running service keeps the variant it runs as when restarted. \
+         To switch it now: fed restart <service> --variant <service>:<variant>",
+    );
     Ok(())
 }
 
@@ -166,7 +182,10 @@ async fn list(
 ) -> anyhow::Result<()> {
     let config = load_config(work_dir, config_path, offline).await?;
 
-    let selection = VariantSelection::load(cli_variants, work_dir)?;
+    // The same layers `fed start` and `fed restart` use, including the variant
+    // each running service runs as.
+    let selection = VariantSelection::load(cli_variants, work_dir)?
+        .with_running(&registered_variants(&config, work_dir).await)?;
     fed::config::variants::resolve_variants(&mut config.clone(), &selection, &[])?;
 
     let mut rows: Vec<(String, VariantListEntry)> = Vec::new();

@@ -21,6 +21,13 @@ services:
   next:
     process: sleep 302
     depends_on: [presentation]
+  analytics:
+    default_variant: image
+    variants:
+      source:
+        process: sleep 303
+      image:
+        process: sleep 304
 "#;
 
 fn run_fed(workdir: &Path, args: &[&str]) -> Output {
@@ -181,4 +188,34 @@ fn a_dry_run_remembers_nothing() {
         ],
     );
     assert!(!dir.join(".fed/variants.session.yaml").exists());
+}
+
+#[test]
+fn variant_set_overrides_only_what_it_names() {
+    let stack = Stack::new();
+    let dir = stack.path();
+    let session = dir.join(".fed/variants.session.yaml");
+
+    ok(&dir, &["start", "--variant", "presentation:source", "next"]);
+    assert!(
+        fs::read_to_string(&session)
+            .unwrap()
+            .contains("presentation: source")
+    );
+
+    // A pin for another service leaves this one's remembered choice alone.
+    ok(&dir, &["variant", "set", "analytics:source"]);
+    let after_unrelated = fs::read_to_string(&session).unwrap_or_default();
+    assert!(
+        after_unrelated.contains("presentation: source"),
+        "{after_unrelated}"
+    );
+
+    ok(&dir, &["variant", "set", "presentation:image"]);
+    assert!(
+        !session.exists(),
+        "the remembered pin it supersedes is gone, and with it the file"
+    );
+    let unset = ok(&dir, &["variant", "unset", "presentation"]);
+    assert!(unset.contains("keeps the variant it runs as"), "{unset}");
 }
