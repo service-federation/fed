@@ -1328,9 +1328,10 @@ fn restart_command(name: &str, variant_flags: &[String]) -> String {
 }
 
 /// One line for each of `services` whose variant comes from
-/// `.fed/variants.yaml`. Unlike `--variant` or `default_variant`, that file
-/// is out of sight when someone runs `fed start`, so the line says where the
-/// choice came from and how to undo it.
+/// `.fed/variants.yaml` or from an earlier `fed start --variant`. Unlike this
+/// run's `--variant` or `default_variant`, those are out of sight when someone
+/// runs `fed start`, so the line says where the choice came from and how to
+/// undo it.
 fn saved_variant_notes(config: &Config, services: &[String]) -> Vec<String> {
     use fed::config::variants::VariantSource;
 
@@ -1345,6 +1346,18 @@ fn saved_variant_notes(config: &Config, services: &[String]) -> Vec<String> {
         let undo = match service.variant_source {
             Some(VariantSource::FilePin) => format!("fed variant unset {name}"),
             Some(VariantSource::FilePrefer) => "fed variant clear".to_string(),
+            Some(VariantSource::SessionPin) => {
+                notes.push(format!(
+                    "Variant: {name} stays {variant}, as chosen by an earlier 'fed start --variant'. To undo: fed variant unset {name}"
+                ));
+                continue;
+            }
+            Some(VariantSource::SessionPrefer) => {
+                notes.push(format!(
+                    "Variant: {name} stays {variant}, as chosen by an earlier 'fed start --variant'. To undo: fed variant clear"
+                ));
+                continue;
+            }
             _ => continue,
         };
         notes.push(format!(

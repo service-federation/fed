@@ -536,12 +536,31 @@ async fn run() -> anyhow::Result<()> {
         variant_entries = commands::registered_variants(&config, &work_dir).await;
     }
     variant_entries.extend(cli.variant.iter().cloned());
+    let mut selection = fed::config::variants::VariantSelection::load(&variant_entries, &work_dir)?;
+    // A start or restart without `--variant` must not flip a service of a
+    // running stack back to `default_variant`: the variant it runs as is the
+    // layer just above the default. (Commands that only look at or stop
+    // services already pin it above.)
+    let starts_or_restarts = matches!(
+        cli.command,
+        Commands::Start { .. } | Commands::Restart { .. }
+    );
+    if starts_or_restarts {
+        selection =
+            selection.with_running(&commands::registered_variants(&config, &work_dir).await)?;
+    }
     let mut config = config;
-    fed::config::variants::resolve_variants(
-        &mut config,
-        &fed::config::variants::VariantSelection::load(&variant_entries, &work_dir)?,
-        &cli.profile,
-    )?;
+    fed::config::variants::resolve_variants(&mut config, &selection, &cli.profile)?;
+    // Remember what `--variant` chose, once it has resolved: the next
+    // `fed start web`, `fed restart` or supervisor refresh must not forget it.
+    if !cli.variant.is_empty()
+        && matches!(
+            cli.command,
+            Commands::Start { dry_run: false, .. } | Commands::Restart { .. }
+        )
+    {
+        commands::remember_session_variants(&work_dir, &cli.variant)?;
+    }
     let config = config;
 
     // Resolved before the start lock and any orchestrator, so a rejected

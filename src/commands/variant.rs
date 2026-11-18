@@ -10,7 +10,9 @@ use crate::cli::VariantCommands;
 use crate::commands::ports::resolve_work_dir;
 use crate::output::UserOutput;
 use fed::Parser as ConfigParser;
-use fed::config::variants::{PersistedVariants, VariantSelection, variants_file_path};
+use fed::config::variants::{
+    PersistedVariants, VariantSelection, session_variants_file_path, variants_file_path,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -71,27 +73,47 @@ fn set(
         &[],
     )?;
     persisted.save(work_dir)?;
+    // Told otherwise: whatever an earlier `fed start --variant` remembered no
+    // longer outranks what was just set.
+    PersistedVariants::default().save_session(work_dir)?;
     report(&persisted, work_dir, out);
+    Ok(())
+}
+
+/// Record `--variant` entries as the checkout's session selection, so later
+/// invocations without the flag keep the choice. See
+/// [`fed::config::variants`] for where that layer sits.
+pub fn remember_session_variants(work_dir: &Path, entries: &[String]) -> anyhow::Result<()> {
+    let mut session = PersistedVariants::load_session(work_dir)?;
+    if session.merge_entries(entries)? {
+        session.save_session(work_dir)?;
+    }
     Ok(())
 }
 
 fn unset(work_dir: &Path, services: &[String], out: &dyn UserOutput) -> anyhow::Result<()> {
     let mut persisted = PersistedVariants::load(work_dir)?;
+    let mut session = PersistedVariants::load_session(work_dir)?;
     for service in services {
-        if persisted.pin.remove(service).is_none() {
+        let in_file = persisted.pin.remove(service).is_some();
+        let in_session = session.pin.remove(service).is_some();
+        if !in_file && !in_session {
             out.status(&format!("No variant pinned for '{service}'."));
         }
     }
     persisted.save(work_dir)?;
+    session.save_session(work_dir)?;
     report(&persisted, work_dir, out);
     Ok(())
 }
 
 fn clear(work_dir: &Path, out: &dyn UserOutput) -> anyhow::Result<()> {
     PersistedVariants::default().save(work_dir)?;
+    PersistedVariants::default().save_session(work_dir)?;
     out.success(&format!(
-        "Cleared {}",
-        variants_file_path(work_dir).display()
+        "Cleared {} and {}",
+        variants_file_path(work_dir).display(),
+        session_variants_file_path(work_dir).display()
     ));
     Ok(())
 }

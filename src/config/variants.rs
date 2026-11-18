@@ -17,12 +17,19 @@
 //!
 //! 1. CLI pin — `--variant catalog:java`
 //! 2. CLI preference list — `--variant go,ts,rust`
-//! 3. Persisted selection — `.fed/variants.yaml`, written by `fed variant set`
-//! 4. The service's own `default_variant`
+//! 3. The checkout's session selection — `.fed/variants.session.yaml`, written
+//!    by every `fed start`/`fed restart` that is given `--variant`
+//! 4. Persisted selection — `.fed/variants.yaml`, written by `fed variant set`
+//! 5. The variant a service is currently running as, from the state database
+//!    (`fed start` and `fed restart` only; the other commands already pin it)
+//! 6. The service's own `default_variant`
 //!
-//! The persisted layer exists so a later `fed restart catalog`, `fed status`,
-//! the TUI and the background supervisor all agree on what is running without
-//! the user repeating the flag on every invocation.
+//! The persisted layers exist so a later `fed start web`, `fed restart
+//! catalog`, `fed status`, the TUI and the background supervisor all agree on
+//! what is running without the user repeating the flag on every invocation.
+//! The session layer is what makes `fed start --variant catalog:java` stick:
+//! it is remembered for the checkout until a later `--variant` replaces it or
+//! `fed variant set`, `unset` or `clear` says otherwise.
 
 use super::{Config, Service};
 use crate::error::{Error, Result};
@@ -36,6 +43,11 @@ pub const VARIANTS_FILE_REL: &str = ".fed/variants.yaml";
 /// Absolute path of the persisted selection file for a work dir.
 pub fn variants_file_path(work_dir: &Path) -> PathBuf {
     crate::fed_dir::fed_dir(work_dir).join("variants.yaml")
+}
+
+/// Absolute path of the session selection file for a work dir.
+pub fn session_variants_file_path(work_dir: &Path) -> PathBuf {
+    crate::fed_dir::fed_dir(work_dir).join("variants.session.yaml")
 }
 
 /// On-disk shape of `.fed/variants.yaml`.
@@ -53,8 +65,16 @@ pub struct PersistedVariants {
 impl PersistedVariants {
     /// Read the file, or return an empty selection when it does not exist.
     pub fn load(work_dir: &Path) -> Result<Self> {
-        let path = variants_file_path(work_dir);
-        let content = match std::fs::read_to_string(&path) {
+        Self::load_from(&variants_file_path(work_dir))
+    }
+
+    /// Read the session file written by `fed start --variant`.
+    pub fn load_session(work_dir: &Path) -> Result<Self> {
+        Self::load_from(&session_variants_file_path(work_dir))
+    }
+
+    fn load_from(path: &Path) -> Result<Self> {
+        let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => {
@@ -77,7 +97,28 @@ impl PersistedVariants {
     /// Write the file, creating `.fed/` if needed. An empty selection removes
     /// the file rather than leaving an empty document behind.
     pub fn save(&self, work_dir: &Path) -> Result<()> {
-        let path = variants_file_path(work_dir);
+        self.save_to(work_dir, variants_file_path(work_dir))
+    }
+
+    /// Write the session file; an empty selection removes it.
+    pub fn save_session(&self, work_dir: &Path) -> Result<()> {
+        self.save_to(work_dir, session_variants_file_path(work_dir))
+    }
+
+    /// Layer `--variant` entries over this selection: a pin replaces the pin
+    /// for the same service, and a preference list replaces the stored list (an
+    /// ordering has no sensible merge). Returns whether anything changed.
+    pub fn merge_entries(&mut self, entries: &[String]) -> Result<bool> {
+        let (prefer, pin) = split_entries(entries)?;
+        let before = (self.prefer.clone(), self.pin.clone());
+        if !prefer.is_empty() {
+            self.prefer = prefer;
+        }
+        self.pin.extend(pin);
+        Ok(before != (self.prefer.clone(), self.pin.clone()))
+    }
+
+    fn save_to(&self, work_dir: &Path, path: PathBuf) -> Result<()> {
         if self.prefer.is_empty() && self.pin.is_empty() {
             match std::fs::remove_file(&path) {
                 Ok(()) => return Ok(()),
@@ -123,10 +164,16 @@ pub enum VariantSource {
     CliPin,
     /// The `--variant a,b,c` preference list.
     CliPrefer,
+    /// A pin remembered from an earlier `fed start --variant` on this checkout.
+    SessionPin,
+    /// The preference list remembered from an earlier `fed start --variant`.
+    SessionPrefer,
     /// A pin in `.fed/variants.yaml`.
     FilePin,
     /// The preference list in `.fed/variants.yaml`.
     FilePrefer,
+    /// The variant the service is currently running as.
+    Running,
     /// The service's own `default_variant`.
     Default,
     /// The service's sole variant, with no `default_variant` needed.
@@ -138,8 +185,11 @@ impl std::fmt::Display for VariantSource {
         let s = match self {
             Self::CliPin => "--variant pin",
             Self::CliPrefer => "--variant preference list",
+            Self::SessionPin => "pinned by an earlier `fed start --variant`",
+            Self::SessionPrefer => "preferred by an earlier `fed start --variant`",
             Self::FilePin => "pinned in .fed/variants.yaml",
             Self::FilePrefer => "preferred in .fed/variants.yaml",
+            Self::Running => "what the service is running as",
             Self::Default => "default_variant",
             Self::OnlyVariant => "only variant",
         };
@@ -147,7 +197,7 @@ impl std::fmt::Display for VariantSource {
     }
 }
 
-/// The four precedence layers, resolved together.
+/// The precedence layers, resolved together.
 ///
 /// CLI and file layers are kept apart rather than merged at load time
 /// because a CLI *preference list* outranks a *file pin* — flattening them
@@ -156,8 +206,11 @@ impl std::fmt::Display for VariantSource {
 pub struct VariantSelection {
     cli_prefer: Vec<String>,
     cli_pin: HashMap<String, String>,
+    session_prefer: Vec<String>,
+    session_pin: HashMap<String, String>,
     file_prefer: Vec<String>,
     file_pin: HashMap<String, String>,
+    running_pin: HashMap<String, String>,
 }
 
 impl VariantSelection {
@@ -166,12 +219,25 @@ impl VariantSelection {
     pub fn load(cli: &[String], work_dir: &Path) -> Result<Self> {
         let (cli_prefer, cli_pin) = split_entries(cli)?;
         let persisted = PersistedVariants::load(work_dir)?;
+        let session = PersistedVariants::load_session(work_dir)?;
         Ok(Self {
             cli_prefer,
             cli_pin,
+            session_prefer: session.prefer,
+            session_pin: session.pin,
             file_prefer: persisted.prefer,
             file_pin: persisted.pin,
+            running_pin: HashMap::new(),
         })
+    }
+
+    /// Add the variants services are running as (`service:variant` entries) as
+    /// the layer just above `default_variant`, so restarting or starting a
+    /// service of a running stack does not flip it back to the default.
+    pub fn with_running(mut self, entries: &[String]) -> Result<Self> {
+        let (_, pins) = split_entries(entries)?;
+        self.running_pin = pins;
+        Ok(self)
     }
 
     /// Validate a proposed persisted selection before writing it.
@@ -209,7 +275,10 @@ impl VariantSelection {
 
     /// Every variant name mentioned in either preference list.
     fn preferred_names(&self) -> impl Iterator<Item = &String> {
-        self.cli_prefer.iter().chain(self.file_prefer.iter())
+        self.cli_prefer
+            .iter()
+            .chain(self.session_prefer.iter())
+            .chain(self.file_prefer.iter())
     }
 
     /// Choose a variant for `service`, and report which layer decided it.
@@ -232,6 +301,20 @@ impl VariantSelection {
             return Ok((hit, VariantSource::CliPrefer));
         }
 
+        if let Some(pinned) = self.session_pin.get(name) {
+            match resolve_pin(name, service, pinned) {
+                Ok(variant) => return Ok((variant, VariantSource::SessionPin)),
+                // The variant was removed from fed.yaml after it was remembered.
+                Err(e) => tracing::warn!(
+                    "{e} Ignoring the variant an earlier `fed start --variant` remembered for '{name}'. Forget it with `fed variant unset {name}`."
+                ),
+            }
+        }
+
+        if let Some(hit) = first_match(&self.session_prefer, service) {
+            return Ok((hit, VariantSource::SessionPrefer));
+        }
+
         if let Some(pinned) = self.file_pin.get(name) {
             match resolve_pin(name, service, pinned) {
                 Ok(variant) => return Ok((variant, VariantSource::FilePin)),
@@ -244,6 +327,12 @@ impl VariantSelection {
 
         if let Some(hit) = first_match(&self.file_prefer, service) {
             return Ok((hit, VariantSource::FilePrefer));
+        }
+
+        if let Some(running) = self.running_pin.get(name)
+            && let Ok(variant) = resolve_pin(name, service, running)
+        {
+            return Ok((variant, VariantSource::Running));
         }
 
         if let Some(default) = &service.default_variant {
