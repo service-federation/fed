@@ -740,7 +740,7 @@ where
     guard_with_termination(exec, next_interrupt, None, || {}, Duration::ZERO, aborted).await
 }
 
-/// [`guard_against_interrupt`] plus termination requests (SIGTERM/SIGHUP),
+/// `guard_against_interrupt` plus termination requests (SIGTERM/SIGHUP),
 /// delivered as messages on `terminations`.
 ///
 /// The first one calls `forward_terminate` (which asks the script to exit) and
