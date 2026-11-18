@@ -240,6 +240,9 @@ pub enum Commands {
         /// Also remove stacks with no owner on record that no --adopt directory uses
         #[arg(long, requires = "adopt")]
         unowned: bool,
+        /// With --unowned: only stacks whose newest container or volume is at least this many days old
+        #[arg(long, value_name = "DAYS", default_value_t = 7, requires = "unowned")]
+        unowned_min_age_days: u32,
     },
     /// Show resource usage for all services
     Top {
@@ -711,6 +714,37 @@ mod tests {
                 "{:?} must be rejected",
                 conflicting
             );
+        }
+    }
+
+    /// Removing stacks nobody owns on record is a statement about which
+    /// directories hold the user's checkouts, so it cannot be asked for alone.
+    #[test]
+    fn prune_unowned_needs_the_directories_it_is_judged_against() {
+        assert!(Cli::try_parse_from(["fed", "prune", "--unowned"]).is_err());
+        assert!(Cli::try_parse_from(["fed", "prune", "--unowned-min-age-days", "1"]).is_err());
+        let cli = Cli::try_parse_from([
+            "fed",
+            "prune",
+            "--adopt",
+            "/a",
+            "--adopt",
+            "/b",
+            "--unowned",
+        ])
+        .expect("adopt + unowned must parse");
+        match cli.command {
+            Commands::Prune {
+                force,
+                adopt,
+                unowned,
+                unowned_min_age_days,
+            } => {
+                assert!(!force && unowned);
+                assert_eq!(adopt.len(), 2);
+                assert_eq!(unowned_min_age_days, 7);
+            }
+            _ => panic!("not a prune"),
         }
     }
 }

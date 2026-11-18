@@ -334,12 +334,14 @@ async fn run() -> anyhow::Result<()> {
             force,
             adopt,
             unowned,
+            unowned_min_age_days,
         } => {
             return commands::run_prune(
                 commands::PruneOptions {
                     force: *force,
                     adopt: adopt.clone(),
                     unowned: *unowned,
+                    unowned_min_age_days: *unowned_min_age_days,
                 },
                 &out,
             )

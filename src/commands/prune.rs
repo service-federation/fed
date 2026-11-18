@@ -17,7 +17,9 @@
 //! and are left alone. `--adopt <dir>` registers every checkout under a
 //! directory, and `--unowned` (which requires `--adopt`) then also removes the
 //! stacks none of those checkouts claims: the user, not fed, vouches that the
-//! adopted directories hold all their checkouts.
+//! adopted directories hold all their checkouts. That removal still spares any
+//! stack with something running and any touched within `--unowned-min-age-days`
+//! (default 7), so a forgotten directory costs a stale stack, not a live one.
 //!
 //! Safety model: dry-run + confirm. In an interactive terminal it lists what it
 //! would remove, grouped by reason, and prompts. In a non-interactive context
@@ -40,6 +42,8 @@ pub struct PruneOptions {
     pub force: bool,
     pub adopt: Vec<PathBuf>,
     pub unowned: bool,
+    /// Minimum age, in days, of a stack removed under `unowned`.
+    pub unowned_min_age_days: u32,
 }
 
 pub async fn run_prune(opts: PruneOptions, out: &dyn UserOutput) -> anyhow::Result<()> {
@@ -74,7 +78,10 @@ pub async fn run_prune(opts: PruneOptions, out: &dyn UserOutput) -> anyhow::Resu
             Some(registry) => stack_cleanup::owner_of(registry, scope),
             None => Owner::Unknown,
         },
-        opts.unowned,
+        opts.unowned.then(|| stack_cleanup::UnownedPolicy {
+            min_age: chrono::Duration::days(i64::from(opts.unowned_min_age_days)),
+            now: Utc::now(),
+        }),
     );
 
     print_plan(&plan, total, opts.unowned, !opts.adopt.is_empty(), out);
@@ -208,11 +215,11 @@ fn print_plan(
             out.status(
                 "  To clean them up, name the directories that hold all your checkouts:\n    \
                  fed prune --adopt <dir> [--adopt <dir>...]   (registers the checkouts it finds there)\n    \
-                 fed prune --adopt <dir> --unowned            (also removes stacks none of them uses)",
+                 fed prune --adopt <dir> --unowned            (also removes stacks none of them uses, if untouched for 7+ days)",
             );
         } else if !unowned_requested {
             out.status(
-                "  None of the adopted checkouts uses them. To remove them, add --unowned \
+                "  None of the adopted checkouts uses them. To remove those untouched for a week, add --unowned \
                  (you are vouching that the --adopt directories hold every checkout you still use).",
             );
         }

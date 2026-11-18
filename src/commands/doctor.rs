@@ -115,7 +115,7 @@ pub async fn run_doctor(out: &dyn UserOutput) -> anyhow::Result<()> {
                         Some(registry) => fed::stack_cleanup::owner_of(registry, scope),
                         None => fed::stack_cleanup::Owner::Unknown,
                     },
-                    false,
+                    None,
                 );
                 let unknown = plan
                     .keep

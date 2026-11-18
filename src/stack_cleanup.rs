@@ -17,9 +17,12 @@
 //! | checkout, cannot be verified | keep |
 //! | no registry entry | keep, unless `include_unowned` |
 //!
-//! `include_unowned` is only offered together with `--adopt`, where the user
+//! Unowned removal is only offered together with `--adopt`, where the user
 //! names the directories holding their checkouts: a scope no adopted checkout
-//! claims is then the user's statement, not fed's guess.
+//! claims is then the user's statement, not fed's guess. Even then it only takes
+//! stacks whose newest resource is older than a minimum age, and never one with
+//! something running: a directory missing from `--adopt` should cost a stack
+//! somebody has not touched for a week, not one they are using.
 
 use crate::docker::DockerClient;
 use crate::docker::client::{FedContainer, FedVolume};
@@ -229,8 +232,16 @@ impl Plan {
     }
 }
 
+/// Whether, and how aggressively, stacks with no owner on record are removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnownedPolicy {
+    /// Only stacks whose newest container or volume is at least this old.
+    pub min_age: chrono::Duration,
+    pub now: DateTime<Utc>,
+}
+
 /// The verdict for one scope.
-pub fn decide(group: &Group, owner: &Owner, include_unowned: bool) -> Verdict {
+pub fn decide(group: &Group, owner: &Owner, unowned: Option<UnownedPolicy>) -> Verdict {
     match owner {
         Owner::Script { alive: true, .. } => Verdict::Keep(Keep::ScriptRunActive),
         Owner::Script { alive: false, .. } => Verdict::Remove(Remove::ScriptRunDead),
@@ -246,15 +257,26 @@ pub fn decide(group: &Group, owner: &Owner, include_unowned: bool) -> Verdict {
             CheckoutState::Superseded { .. } => Verdict::Remove(Remove::Superseded),
             CheckoutState::Unverifiable(why) => Verdict::Keep(Keep::Unverifiable(why.clone())),
         },
-        Owner::Unknown if include_unowned && !group.any_running() => {
-            Verdict::Remove(Remove::Unowned)
-        }
-        Owner::Unknown => Verdict::Keep(Keep::UnknownOwner),
+        Owner::Unknown => match unowned {
+            Some(policy)
+                if !group.any_running()
+                    && group
+                        .newest()
+                        .is_some_and(|at| policy.now - at >= policy.min_age) =>
+            {
+                Verdict::Remove(Remove::Unowned)
+            }
+            _ => Verdict::Keep(Keep::UnknownOwner),
+        },
     }
 }
 
 /// Decide every scope in `inventory`.
-pub fn plan(inventory: Inventory, owner_of: &dyn Fn(&str) -> Owner, include_unowned: bool) -> Plan {
+pub fn plan(
+    inventory: Inventory,
+    owner_of: &dyn Fn(&str) -> Owner,
+    unowned: Option<UnownedPolicy>,
+) -> Plan {
     let mut plan = Plan {
         unscoped_containers: inventory.unscoped_containers,
         unscoped_volumes: inventory.unscoped_volumes,
@@ -262,7 +284,7 @@ pub fn plan(inventory: Inventory, owner_of: &dyn Fn(&str) -> Owner, include_unow
     };
     for (scope, group) in inventory.groups {
         let owner = owner_of(&scope);
-        let verdict = decide(&group, &owner, include_unowned);
+        let verdict = decide(&group, &owner, unowned);
         let decision = Decision {
             group,
             owner,
@@ -415,14 +437,21 @@ mod tests {
             id: format!("id-{name}"),
             name: name.to_string(),
             state: state.to_string(),
-            created: None,
+            created: Some(Utc::now() - chrono::Duration::days(30)),
         }
+    }
+
+    fn policy(min_age_days: i64) -> Option<UnownedPolicy> {
+        Some(UnownedPolicy {
+            min_age: chrono::Duration::days(min_age_days),
+            now: Utc::now(),
+        })
     }
 
     fn volume(name: &str) -> FedVolume {
         FedVolume {
             name: name.to_string(),
-            created: None,
+            created: Some(Utc::now() - chrono::Duration::days(30)),
             dangling: true,
         }
     }
@@ -448,7 +477,7 @@ mod tests {
         // stack that is merely stopped was listed as an orphan.
         let group = one_scope(&[], &["fed-iso-aaaaaaaa-pgdata"]);
         assert_eq!(
-            decide(&group, &checkout(CheckoutState::Current), false),
+            decide(&group, &checkout(CheckoutState::Current), None),
             Verdict::Keep(Keep::Stopped)
         );
         // Even with the exited container still around.
@@ -457,7 +486,7 @@ mod tests {
             &["fed-iso-aaaaaaaa-pgdata"],
         );
         assert_eq!(
-            decide(&group, &checkout(CheckoutState::Current), true),
+            decide(&group, &checkout(CheckoutState::Current), policy(7)),
             Verdict::Keep(Keep::Stopped)
         );
     }
@@ -466,7 +495,7 @@ mod tests {
     fn a_running_stack_in_an_existing_checkout_is_kept() {
         let group = one_scope(&[("fed-iso-aaaaaaaa-pg", "running")], &[]);
         assert_eq!(
-            decide(&group, &checkout(CheckoutState::Current), false),
+            decide(&group, &checkout(CheckoutState::Current), None),
             Verdict::Keep(Keep::Running)
         );
     }
@@ -480,7 +509,7 @@ mod tests {
         ] {
             let group = one_scope(&containers, &["fed-iso-aaaaaaaa-pgdata"]);
             assert_eq!(
-                decide(&group, &checkout(CheckoutState::Gone), false),
+                decide(&group, &checkout(CheckoutState::Gone), None),
                 Verdict::Remove(Remove::CheckoutGone)
             );
         }
@@ -495,16 +524,12 @@ mod tests {
             decide(
                 &one_scope(&[("c", "exited")], &["v"]),
                 &checkout(state.clone()),
-                false
+                None
             ),
             Verdict::Remove(Remove::Superseded)
         );
         assert_eq!(
-            decide(
-                &one_scope(&[("c", "running")], &[]),
-                &checkout(state),
-                false
-            ),
+            decide(&one_scope(&[("c", "running")], &[]), &checkout(state), None),
             Verdict::Keep(Keep::SupersededButRunning)
         );
     }
@@ -516,7 +541,7 @@ mod tests {
             decide(
                 &one_scope(&[("c", "exited")], &["v"]),
                 &checkout(state),
-                true
+                policy(7)
             ),
             Verdict::Keep(Keep::Unverifiable("no lock.db".into()))
         );
@@ -533,12 +558,12 @@ mod tests {
             &["fed-iso-aaaaaaaa-pgdata"],
         );
         assert_eq!(
-            decide(&group, &script(false), false),
+            decide(&group, &script(false), None),
             Verdict::Remove(Remove::ScriptRunDead),
             "the two postgres/redis pairs that ran for 22 hours"
         );
         assert_eq!(
-            decide(&group, &script(true), true),
+            decide(&group, &script(true), policy(0)),
             Verdict::Keep(Keep::ScriptRunActive)
         );
     }
@@ -550,18 +575,31 @@ mod tests {
             &["fed-iso-aaaaaaaa-pgdata"],
         );
         assert_eq!(
-            decide(&group, &Owner::Unknown, false),
+            decide(&group, &Owner::Unknown, None),
             Verdict::Keep(Keep::UnknownOwner)
         );
         assert_eq!(
-            decide(&group, &Owner::Unknown, true),
+            decide(&group, &Owner::Unknown, policy(7)),
             Verdict::Remove(Remove::Unowned)
+        );
+        assert_eq!(
+            decide(&group, &Owner::Unknown, policy(60)),
+            Verdict::Keep(Keep::UnknownOwner),
+            "a stack touched within the minimum age is not removed on a directory list"
         );
         let running = one_scope(&[("fed-iso-aaaaaaaa-pg", "running")], &[]);
         assert_eq!(
-            decide(&running, &Owner::Unknown, true),
+            decide(&running, &Owner::Unknown, policy(0)),
             Verdict::Keep(Keep::UnknownOwner),
             "even a vouched-for scope is not removed while something runs in it"
+        );
+        let mut undated = group.clone();
+        undated.containers[0].created = None;
+        undated.volumes[0].created = None;
+        assert_eq!(
+            decide(&undated, &Owner::Unknown, policy(0)),
+            Verdict::Keep(Keep::UnknownOwner),
+            "a stack whose age is unknown cannot be shown to be old"
         );
     }
 
@@ -593,7 +631,7 @@ mod tests {
                     checkout(CheckoutState::Current)
                 }
             },
-            false,
+            None,
         );
         assert_eq!(plan.remove.len(), 1);
         assert_eq!(plan.remove[0].group.scope, "iso-aaaaaaaa");
