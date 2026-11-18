@@ -1365,3 +1365,159 @@ fn fed_start_shows_the_running_variant_when_it_differs() {
         "{output}"
     );
 }
+
+// ── Stickiness: what `fed start --variant` leaves behind ──────────────────
+
+const PRESENTATION: &str = r#"
+services:
+  presentation:
+    default_variant: image
+    variants:
+      source:
+        process: sleep 300
+      image:
+        process: sleep 301
+"#;
+
+fn pick_presentation(work_dir: &std::path::Path, cli: &[&str]) -> (String, VariantSource) {
+    let config = parse(PRESENTATION);
+    let entries: Vec<String> = cli.iter().map(|s| s.to_string()).collect();
+    let selection = VariantSelection::load(&entries, work_dir).unwrap();
+    let (variant, source) = selection
+        .pick_with_source("presentation", &config.services["presentation"])
+        .unwrap();
+    (variant.to_string(), source)
+}
+
+#[test]
+fn a_remembered_start_choice_outranks_the_file_and_the_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work_dir = tmp.path();
+    assert_eq!(
+        pick_presentation(work_dir, &[]),
+        ("image".to_string(), VariantSource::Default)
+    );
+
+    let mut session = PersistedVariants::load_session(work_dir).unwrap();
+    assert!(
+        session
+            .merge_entries(&["presentation:source".to_string()])
+            .unwrap()
+    );
+    session.save_session(work_dir).unwrap();
+
+    assert_eq!(
+        pick_presentation(work_dir, &[]),
+        ("source".to_string(), VariantSource::SessionPin),
+        "a later `fed start next` with no flag must keep the variant"
+    );
+
+    PersistedVariants {
+        prefer: vec![],
+        pin: HashMap::from([("presentation".to_string(), "image".to_string())]),
+    }
+    .save(work_dir)
+    .unwrap();
+    assert_eq!(
+        pick_presentation(work_dir, &[]).1,
+        VariantSource::SessionPin,
+        "the session choice is the more recent decision than the standing file"
+    );
+    assert_eq!(
+        pick_presentation(work_dir, &["presentation:image"]),
+        ("image".to_string(), VariantSource::CliPin),
+        "a new --variant overrides what was remembered"
+    );
+}
+
+#[test]
+fn merging_start_choices_replaces_the_pin_and_keeps_the_others() {
+    let mut session = PersistedVariants::default();
+    assert!(
+        session
+            .merge_entries(&["presentation:source".into(), "go".into()])
+            .unwrap()
+    );
+    assert!(session.merge_entries(&["analytics:source".into()]).unwrap());
+    assert_eq!(
+        session.pin.len(),
+        2,
+        "a second flag must not drop the first"
+    );
+    assert_eq!(session.prefer, vec!["go"], "a pin leaves the list alone");
+    assert!(
+        !session.merge_entries(&["analytics:source".into()]).unwrap(),
+        "repeating the same choice changes nothing, so nothing is rewritten"
+    );
+    session
+        .merge_entries(&["presentation:image".into()])
+        .unwrap();
+    assert_eq!(session.pin["presentation"], "image");
+    session.merge_entries(&["ts,rust".into()]).unwrap();
+    assert_eq!(
+        session.prefer,
+        vec!["ts", "rust"],
+        "a new list replaces the old"
+    );
+    assert!(
+        session.pin.is_empty(),
+        "a new list also replaces remembered pins, which would otherwise outrank it next time"
+    );
+    session
+        .merge_entries(&["go".into(), "catalog:java".into()])
+        .unwrap();
+    assert_eq!(
+        session.pin["catalog"], "java",
+        "pins given with the list stay"
+    );
+}
+
+#[test]
+fn the_running_variant_is_the_floor_above_the_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = parse(PRESENTATION);
+    let selection = VariantSelection::load(&[], tmp.path())
+        .unwrap()
+        .with_running(&["presentation:source".to_string()])
+        .unwrap();
+    assert_eq!(
+        selection
+            .pick_with_source("presentation", &config.services["presentation"])
+            .unwrap(),
+        ("source", VariantSource::Running),
+        "`fed restart presentation` must not flip a running service to image"
+    );
+
+    PersistedVariants {
+        prefer: vec![],
+        pin: HashMap::from([("presentation".to_string(), "image".to_string())]),
+    }
+    .save(tmp.path())
+    .unwrap();
+    let selection = VariantSelection::load(&[], tmp.path())
+        .unwrap()
+        .with_running(&["presentation:source".to_string()])
+        .unwrap();
+    assert_eq!(
+        selection
+            .pick("presentation", &config.services["presentation"])
+            .unwrap(),
+        "image",
+        "an explicit `fed variant set` still wins over what happens to be running"
+    );
+}
+
+#[test]
+fn a_remembered_variant_that_fed_yaml_dropped_falls_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    PersistedVariants {
+        prefer: vec![],
+        pin: HashMap::from([("presentation".to_string(), "gone".to_string())]),
+    }
+    .save_session(tmp.path())
+    .unwrap();
+    assert_eq!(
+        pick_presentation(tmp.path(), &[]),
+        ("image".to_string(), VariantSource::Default)
+    );
+}

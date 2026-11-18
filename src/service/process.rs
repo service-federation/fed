@@ -16,12 +16,11 @@ const HEALTH_CACHE_TTL: Duration = Duration::from_millis(500);
 
 fn log_writer_executable() -> std::io::Result<std::path::PathBuf> {
     let current = std::env::current_exe()?;
-    // Unit and integration test harnesses live under target/.../deps. Their
-    // own executable cannot dispatch the internal log-writer subcommand.
-    if let Some(deps) = current.parent()
-        && deps.file_name().is_some_and(|name| name == "deps")
-    {
-        let binary = deps.parent().unwrap().join("fed");
+    // A test harness cannot dispatch the internal log-writer subcommand: it
+    // reads `log-writer` as a test filter, runs nothing and exits, and the
+    // service's output goes nowhere. Use the `fed` binary Cargo built next to it.
+    if let Some(artifacts) = test_harness_artifact_dir(&current) {
+        let binary = artifacts.join(format!("fed{}", std::env::consts::EXE_SUFFIX));
         if binary.is_file() {
             return Ok(binary);
         }
@@ -34,6 +33,30 @@ fn log_writer_executable() -> std::io::Result<std::path::PathBuf> {
         ));
     }
     Ok(current)
+}
+
+/// The `target/<profile>` directory of a Cargo test harness, or `None` for
+/// anything else (an installed `fed`, wherever it lives).
+///
+/// Cargo has two layouts. Before its build-dir change a harness sits at
+/// `target/<profile>/deps/<name>-<hash>`. After it, at
+/// `target/<profile>/build/<package>/<hash>/out/<name>-<hash>`, while the
+/// `fed` binary stays at `target/<profile>/fed`. Recognising only the first
+/// made every unit test that reads a service log fail on current stable Rust.
+fn test_harness_artifact_dir(exe: &std::path::Path) -> Option<&std::path::Path> {
+    let parent = exe.parent()?;
+    match parent.file_name()?.to_str()? {
+        "deps" => parent.parent(),
+        "out" => {
+            let build = parent.parent()?.parent()?.parent()?;
+            if build.file_name()? == "build" {
+                build.parent()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Synchronous mutex for fields that are never held across await points.
@@ -2035,6 +2058,28 @@ mod tests {
     // shape called out in the fix's design doc as needing to keep working
     // (or start working) exactly as the user wrote it.
     // ========================================================================
+
+    #[test]
+    fn test_harnesses_are_recognised_in_both_cargo_layouts() {
+        use std::path::Path;
+        assert_eq!(
+            test_harness_artifact_dir(Path::new("/w/target/debug/deps/fed-0123abcd")),
+            Some(Path::new("/w/target/debug"))
+        );
+        assert_eq!(
+            test_harness_artifact_dir(Path::new(
+                "/w/target/debug/build/fed/9a52726f81f54797/out/fed-9a52726f81f54797"
+            )),
+            Some(Path::new("/w/target/debug"))
+        );
+        // An installed binary is its own log writer.
+        assert_eq!(
+            test_harness_artifact_dir(Path::new("/usr/local/bin/fed")),
+            None
+        );
+        assert_eq!(test_harness_artifact_dir(Path::new("/opt/x/out/fed")), None);
+        assert_eq!(test_harness_artifact_dir(Path::new("fed")), None);
+    }
 
     /// Builds a `ProcessService` in `OutputMode::File` with a log file under
     /// `log_dir`, for tests that need to read back captured stdout/stderr.

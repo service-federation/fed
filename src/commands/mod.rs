@@ -54,7 +54,7 @@ pub use link::run_link;
 pub use logs::run_logs;
 pub use package::run_package;
 pub use ports::run_ports;
-pub use prune::run_prune;
+pub use prune::{PruneOptions, run_prune};
 #[cfg(feature = "remote-beta")]
 pub use remote::run_remote;
 pub use restart::run_restart;
@@ -69,7 +69,9 @@ pub(crate) use supervise::{any_needs_supervision, spawn_if_needed as spawn_super
 pub use top::run_top;
 pub use tui::run_tui;
 pub use validate::run_validate;
-pub use variant::{registered_variants, run_variant};
+pub use variant::{
+    forget_session_variants, registered_variants, remember_session_variants, run_variant,
+};
 pub use workspace::run_workspace;
 
 /// Emit non-breaking warnings for unknown (typo'd) config keys — used by `fed validate`

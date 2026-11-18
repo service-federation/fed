@@ -10,7 +10,9 @@ use crate::cli::VariantCommands;
 use crate::commands::ports::resolve_work_dir;
 use crate::output::UserOutput;
 use fed::Parser as ConfigParser;
-use fed::config::variants::{PersistedVariants, VariantSelection, variants_file_path};
+use fed::config::variants::{
+    PersistedVariants, VariantSelection, session_variants_file_path, variants_file_path,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -57,8 +59,10 @@ fn set(
         &[],
     )?;
     let mut persisted = PersistedVariants::load(work_dir)?;
+    let prefer_given = !prefer.is_empty();
+    let pinned: Vec<String> = pin.keys().cloned().collect();
 
-    if !prefer.is_empty() {
+    if prefer_given {
         persisted.prefer = prefer;
     }
     for (service, variant) in pin {
@@ -71,27 +75,68 @@ fn set(
         &[],
     )?;
     persisted.save(work_dir)?;
+    // Told otherwise: what an earlier `fed start --variant` remembered must not
+    // outrank what was just set. A pin supersedes the remembered pin for that
+    // service only; a preference list speaks for every service, so it
+    // supersedes everything remembered.
+    let mut session = PersistedVariants::load_session(work_dir)?;
+    if prefer_given {
+        session = PersistedVariants::default();
+    } else {
+        for service in &pinned {
+            session.pin.remove(service);
+        }
+    }
+    session.save_session(work_dir)?;
     report(&persisted, work_dir, out);
     Ok(())
 }
 
+/// Record `--variant` entries as the checkout's session selection, so later
+/// invocations without the flag keep the choice. See
+/// [`fed::config::variants`] for where that layer sits.
+pub fn remember_session_variants(work_dir: &Path, entries: &[String]) -> anyhow::Result<()> {
+    let mut session = PersistedVariants::load_session(work_dir)?;
+    if session.merge_entries(entries)? {
+        session.save_session(work_dir)?;
+    }
+    Ok(())
+}
+
+/// A whole-stack `fed stop` ends the stack, so the variants it was started with
+/// are forgotten: the next `fed start` is a new start and resolves from the
+/// flags, `fed variant set` and `default_variant` again.
+pub fn forget_session_variants(work_dir: &Path) {
+    let _ = PersistedVariants::default().save_session(work_dir);
+}
+
 fn unset(work_dir: &Path, services: &[String], out: &dyn UserOutput) -> anyhow::Result<()> {
     let mut persisted = PersistedVariants::load(work_dir)?;
+    let mut session = PersistedVariants::load_session(work_dir)?;
     for service in services {
-        if persisted.pin.remove(service).is_none() {
+        let in_file = persisted.pin.remove(service).is_some();
+        let in_session = session.pin.remove(service).is_some();
+        if !in_file && !in_session {
             out.status(&format!("No variant pinned for '{service}'."));
         }
     }
     persisted.save(work_dir)?;
+    session.save_session(work_dir)?;
     report(&persisted, work_dir, out);
+    out.status(
+        "A running service keeps the variant it runs as when restarted. \
+         To switch it now: fed restart <service> --variant <service>:<variant>",
+    );
     Ok(())
 }
 
 fn clear(work_dir: &Path, out: &dyn UserOutput) -> anyhow::Result<()> {
     PersistedVariants::default().save(work_dir)?;
+    PersistedVariants::default().save_session(work_dir)?;
     out.success(&format!(
-        "Cleared {}",
-        variants_file_path(work_dir).display()
+        "Cleared {} and {}",
+        variants_file_path(work_dir).display(),
+        session_variants_file_path(work_dir).display()
     ));
     Ok(())
 }
@@ -137,7 +182,10 @@ async fn list(
 ) -> anyhow::Result<()> {
     let config = load_config(work_dir, config_path, offline).await?;
 
-    let selection = VariantSelection::load(cli_variants, work_dir)?;
+    // The same layers `fed start` and `fed restart` use, including the variant
+    // each running service runs as.
+    let selection = VariantSelection::load(cli_variants, work_dir)?
+        .with_running(&registered_variants(&config, work_dir).await)?;
     fed::config::variants::resolve_variants(&mut config.clone(), &selection, &[])?;
 
     let mut rows: Vec<(String, VariantListEntry)> = Vec::new();
