@@ -920,6 +920,11 @@ impl DockerClient {
                     .await
                 {
                     Ok(o) if o.status.success() => {}
+                    // The batch may already have removed it before failing on another.
+                    Ok(o)
+                        if stderr_indicates_missing_container(&String::from_utf8_lossy(
+                            &o.stderr,
+                        )) => {}
                     Ok(o) => failed.push((
                         id.clone(),
                         String::from_utf8_lossy(&o.stderr).trim().to_string(),
@@ -931,14 +936,18 @@ impl DockerClient {
         failed
     }
 
-    /// True only when Docker confirms no container and no fed volume of `scope`
-    /// remains. A daemon that cannot answer is "not clean": the caller keeps
-    /// the record that the stack may still be there.
+    /// True when Docker confirms no container and no fed volume of `scope`
+    /// remains, or when there is no container runtime to run at all (then
+    /// nothing of the scope can be in it). A daemon that is installed but
+    /// cannot answer is "not clean": the caller keeps the record that the
+    /// stack may still be there.
     pub async fn scope_is_clean(&self, scope: &str) -> bool {
         let prefix = format!("fed-{scope}-");
         let name_filter = format!("name={prefix}");
-        let Ok(containers) = self.ps_names(&name_filter, Duration::from_secs(20)).await else {
-            return false;
+        let containers = match self.ps_names(&name_filter, Duration::from_secs(20)).await {
+            Ok(containers) => containers,
+            Err(DockerError::ExecFailed { .. }) => return true,
+            Err(_) => return false,
         };
         if containers.iter().any(|n| n.starts_with(&prefix)) {
             return false;

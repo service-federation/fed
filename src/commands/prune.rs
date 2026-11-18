@@ -18,8 +18,10 @@
 //! directory, and `--unowned` (which requires `--adopt`) then also removes the
 //! stacks none of those checkouts claims: the user, not fed, vouches that the
 //! adopted directories hold all their checkouts. That removal still spares any
-//! stack with something running and any touched within `--unowned-min-age-days`
-//! (default 7), so a forgotten directory costs a stale stack, not a live one.
+//! stack with something running and any whose newest container or volume was
+//! created within `--unowned-min-age-days` (default 7). Docker records when a
+//! resource was created, not when it was last used: a stack stopped yesterday
+//! whose volumes are a month old counts as a month old.
 //!
 //! Safety model: dry-run + confirm. In an interactive terminal it lists what it
 //! would remove, grouped by reason, and prompts. In a non-interactive context
@@ -215,11 +217,11 @@ fn print_plan(
             out.status(
                 "  To clean them up, name the directories that hold all your checkouts:\n    \
                  fed prune --adopt <dir> [--adopt <dir>...]   (registers the checkouts it finds there)\n    \
-                 fed prune --adopt <dir> --unowned            (also removes stacks none of them uses, if untouched for 7+ days)",
+                 fed prune --adopt <dir> --unowned            (also removes stacks none of them uses, created 7+ days ago)",
             );
         } else if !unowned_requested {
             out.status(
-                "  None of the adopted checkouts uses them. To remove those untouched for a week, add --unowned \
+                "  None of the adopted checkouts uses them. To remove those created over a week ago, add --unowned \
                  (you are vouching that the --adopt directories hold every checkout you still use).",
             );
         }

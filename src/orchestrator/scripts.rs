@@ -620,12 +620,15 @@ fn descendants_from_ps(ps: &str, root: i32) -> Vec<i32> {
 /// A script is a shell running a test runner that spawns workers. Signalling only
 /// the shell would end it and leave the runner and its workers running against
 /// a stack that is about to be removed.
+///
+/// Returns false when no script process is running yet (fed is still bringing
+/// up the isolated stack): there is then nothing worth waiting for.
 #[cfg(unix)]
-fn terminate_script_child() {
+fn terminate_script_child() -> bool {
     use nix::sys::signal::{Signal, kill};
     let root = SCRIPT_CHILD_PID.load(std::sync::atomic::Ordering::SeqCst) as i32;
     if root == 0 {
-        return;
+        return false;
     }
     let ps = std::process::Command::new("ps")
         .args(["-A", "-o", "pid=", "-o", "ppid="])
@@ -638,6 +641,7 @@ fn terminate_script_child() {
         let _ = kill(nix::unistd::Pid::from_raw(*pid), Signal::SIGTERM);
     }
     *SCRIPT_TREE.lock().unwrap_or_else(|e| e.into_inner()) = tree;
+    true
 }
 
 /// The script ignored the request: kill what is left of its tree.
@@ -651,7 +655,9 @@ fn kill_script_tree() {
 }
 
 #[cfg(not(unix))]
-fn terminate_script_child() {}
+fn terminate_script_child() -> bool {
+    false
+}
 
 #[cfg(not(unix))]
 fn kill_script_tree() {}
@@ -737,22 +743,33 @@ where
     S: FnMut() -> SF,
     SF: std::future::Future<Output = std::io::Result<()>>,
 {
-    guard_with_termination(exec, next_interrupt, None, || {}, Duration::ZERO, aborted).await
+    guard_with_termination(
+        exec,
+        next_interrupt,
+        None,
+        || false,
+        Duration::ZERO,
+        aborted,
+    )
+    .await
 }
 
 /// `guard_against_interrupt` plus termination requests (SIGTERM/SIGHUP),
 /// delivered as messages on `terminations`.
 ///
-/// The first one calls `forward_terminate` (which asks the script to exit) and
-/// starts a `grace` period; the script exiting inside it lets cleanup run
-/// normally. A second request, or the grace running out, abandons `exec` like a
+/// The first one calls `forward_terminate`, which asks the script to exit and
+/// says whether there was a script to ask. If there was, a `grace` period
+/// starts and the script exiting inside it lets cleanup run normally. If not
+/// (the request came while the isolated stack was still starting), `exec` is
+/// abandoned at once rather than left to start the script after fed was told
+/// to stop. A second request, or the grace running out, abandons `exec` like a
 /// second Ctrl+C does. A script that cannot be killed gently must not keep the
 /// stack's containers alive: the abandon path is what guarantees cleanup runs.
 async fn guard_with_termination<T, F, S, SF>(
     exec: F,
     mut next_interrupt: S,
     mut terminations: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
-    mut forward_terminate: impl FnMut(),
+    mut forward_terminate: impl FnMut() -> bool,
     grace: Duration,
     aborted: impl FnOnce() -> T,
 ) -> T
@@ -798,7 +815,9 @@ where
             requested = termination => match requested {
                 Some(()) if deadline.is_some() => return aborted(),
                 Some(()) => {
-                    forward_terminate();
+                    if !forward_terminate() {
+                        return aborted();
+                    }
                     deadline = Some(tokio::time::Instant::now() + grace);
                 }
                 // The listener is gone; stop polling it.
@@ -1077,7 +1096,10 @@ mod tests {
             },
             no_interrupts,
             Some(terminations(1)),
-            || forwarded.set(forwarded.get() + 1),
+            || {
+                forwarded.set(forwarded.get() + 1);
+                true
+            },
             Duration::from_secs(30),
             || -1,
         )
@@ -1093,7 +1115,10 @@ mod tests {
             std::future::pending::<i32>(),
             no_interrupts,
             Some(terminations(1)),
-            || forwarded.set(forwarded.get() + 1),
+            || {
+                forwarded.set(forwarded.get() + 1);
+                true
+            },
             Duration::from_millis(50),
             || -1,
         )
@@ -1103,12 +1128,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn termination_before_the_script_started_abandons_the_run_at_once() {
+        // Still bringing up the isolated stack: no script to wait for, and
+        // starting one after being told to stop would be wrong.
+        let out = guard_with_termination(
+            std::future::pending::<i32>(),
+            no_interrupts,
+            Some(terminations(1)),
+            || false,
+            Duration::from_secs(3600),
+            || -1,
+        )
+        .await;
+        assert_eq!(out, -1);
+    }
+
+    #[tokio::test]
     async fn a_second_termination_abandons_the_script_at_once() {
         let out = guard_with_termination(
             std::future::pending::<i32>(),
             no_interrupts,
             Some(terminations(2)),
-            || {},
+            || true,
             Duration::from_secs(3600),
             || -1,
         )
@@ -1127,7 +1168,7 @@ mod tests {
             },
             no_interrupts,
             Some(rx),
-            || {},
+            || true,
             Duration::ZERO,
             || -1,
         )

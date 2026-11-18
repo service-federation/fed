@@ -205,6 +205,63 @@ fn a_sigkilled_script_run_is_recognisable_afterwards() {
 }
 
 #[test]
+fn a_run_on_a_machine_without_docker_leaves_no_record() {
+    // Process-only projects need no container runtime. A run there cannot have
+    // left anything in Docker, so neither a clean exit nor a later sweep may
+    // keep a record that makes every following command look for Docker again.
+    let project = Project::new(47_140);
+    let mut run = fed(project.dir.path(), project.registry.path())
+        .arg("slow")
+        .env("FED_CONTAINER_RUNTIME", "/nonexistent/docker")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until(
+        "the isolated script to run",
+        Duration::from_secs(60),
+        || !pids_running(&format!("sleep {}", project.marker)).is_empty(),
+    );
+    signal(&run, nix::sys::signal::Signal::SIGTERM);
+    run.wait().unwrap();
+    assert!(
+        project.script_runs().is_empty(),
+        "{:?}",
+        project.script_runs()
+    );
+
+    // A SIGKILLed run is swept by the next command instead.
+    let mut run = fed(project.dir.path(), project.registry.path())
+        .arg("slow")
+        .env("FED_CONTAINER_RUNTIME", "/nonexistent/docker")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("the run to register", Duration::from_secs(60), || {
+        !project.script_runs().is_empty()
+    });
+    signal(&run, nix::sys::signal::Signal::SIGKILL);
+    run.wait().unwrap();
+    assert_eq!(project.registry().dead_script_runs().len(), 1);
+    let stopped = fed(project.dir.path(), project.registry.path())
+        .arg("stop")
+        .env("FED_CONTAINER_RUNTIME", "/nonexistent/docker")
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(
+        project.script_runs().is_empty(),
+        "{:?}",
+        project.script_runs()
+    );
+}
+
+#[test]
 fn two_runs_of_the_same_script_do_not_share_a_scope() {
     let project = Project::new(47_130);
     let mut first = project.run_script();

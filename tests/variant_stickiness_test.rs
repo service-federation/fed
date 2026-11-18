@@ -51,14 +51,16 @@ fn ok(workdir: &Path, args: &[&str]) -> String {
 }
 
 fn variant_of(workdir: &Path, service: &str) -> Option<String> {
-    let status: serde_json::Value =
-        serde_json::from_str(&ok(workdir, &["status", "--json"])).expect("status json");
-    let entry = status["services"]
-        .as_array()
-        .map(|rows| rows.iter().find(|row| row["name"] == service).cloned())
-        .or_else(|| Some(status.get(service).cloned()))
-        .flatten()?;
-    entry["variant"].as_str().map(String::from)
+    // stdout only: anything fed logs to stderr (a warning, an INFO line) must
+    // not end up inside the JSON document.
+    let output = run_fed(workdir, &["status", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status json");
+    status[service]["variant"].as_str().map(String::from)
 }
 
 struct Stack {

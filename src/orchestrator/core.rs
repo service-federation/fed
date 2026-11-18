@@ -286,8 +286,9 @@ impl Orchestrator {
     /// cleanup of any `isolated: true` script run that died without it.
     ///
     /// Best effort and quiet: neither may ever stop a command from running.
-    /// Registering here, on every command that builds a full orchestrator
-    /// (start, stop, restart, status of a running stack, scripts), is what lets
+    /// Registering here, on every command that builds a fully initialised
+    /// orchestrator (start, stop, restart, scripts; not the read-only ones such
+    /// as status and logs), is what lets
     /// `fed prune` tell a stopped stack in a live checkout from an abandoned
     /// one, including for volumes that were created before the registry.
     async fn record_stack_ownership(&self) {

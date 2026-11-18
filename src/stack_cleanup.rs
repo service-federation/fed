@@ -20,9 +20,10 @@
 //! Unowned removal is only offered together with `--adopt`, where the user
 //! names the directories holding their checkouts: a scope no adopted checkout
 //! claims is then the user's statement, not fed's guess. Even then it only takes
-//! stacks whose newest resource is older than a minimum age, and never one with
-//! something running: a directory missing from `--adopt` should cost a stack
-//! somebody has not touched for a week, not one they are using.
+//! stacks whose newest resource was created longer ago than a minimum age, and
+//! never one with something running. That age is creation, not last use (Docker
+//! records nothing else): containers are recreated on every start, but a
+//! stopped stack is only its volumes, dated when they were first made.
 
 use crate::docker::DockerClient;
 use crate::docker::client::{FedContainer, FedVolume};
@@ -394,10 +395,20 @@ pub async fn sweep_dead_script_runs(registry: &StackRegistry) -> usize {
         return 0;
     }
     let docker = DockerClient::new();
-    let Ok(inventory) = Inventory::load(&docker).await else {
-        return 0;
+    let mut inventory = match Inventory::load(&docker).await {
+        Ok(inventory) => inventory,
+        // No container runtime on this machine: the dead runs cannot have
+        // left anything in it, so there is nothing to finish. Keeping their
+        // records would make every later command look for Docker again.
+        Err(crate::docker::DockerError::ExecFailed { .. }) => {
+            for entry in &dead {
+                registry.remove(&entry.scope);
+            }
+            return dead.len();
+        }
+        // Installed but not answering: try again next time.
+        Err(_) => return 0,
     };
-    let mut inventory = inventory;
     let decisions: Vec<Decision> = dead
         .iter()
         .map(|entry| Decision {
@@ -585,7 +596,7 @@ mod tests {
         assert_eq!(
             decide(&group, &Owner::Unknown, policy(60)),
             Verdict::Keep(Keep::UnknownOwner),
-            "a stack touched within the minimum age is not removed on a directory list"
+            "a stack created within the minimum age is not removed on a directory list"
         );
         let running = one_scope(&[("fed-iso-aaaaaaaa-pg", "running")], &[]);
         assert_eq!(
