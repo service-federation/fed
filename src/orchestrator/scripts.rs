@@ -354,6 +354,25 @@ impl<'a> ScriptRunner<'a> {
         let isolation_id = format!("iso-{:08x}", rand::random::<u32>());
         child_orchestrator.set_isolation_id(isolation_id.clone());
 
+        // Claim the scope before the first container exists. The run holds a
+        // lock for as long as this process lives, which is how `fed prune` and
+        // the next fed command recognise a run that was SIGKILLed (nothing can
+        // catch that, so nothing can clean up): its lock is free but its
+        // containers are still there. Without a home directory there is no
+        // registry, and the run proceeds unclaimed.
+        let script_run =
+            crate::stack_registry::StackRegistry::default_location().and_then(|registry| {
+                match registry.begin_script_run(&self.orchestrator.work_dir, &isolation_id) {
+                    Ok(run) => Some(run),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Could not register isolated script run {isolation_id}: {e}"
+                        );
+                        None
+                    }
+                }
+            });
+
         // Enable randomize mode for port isolation — NoopPortStore forces fresh allocation
         child_orchestrator.set_randomize_ports(true);
 
@@ -464,9 +483,22 @@ impl<'a> ScriptRunner<'a> {
         // directory per run.
         let child_markers = crate::markers::LifecycleMarkers::new(
             self.orchestrator.work_dir.to_path_buf(),
-            Some(isolation_id),
+            Some(isolation_id.clone()),
         );
         let _ = child_markers.clear_all_installed();
+
+        // Forget the run only once Docker confirms nothing of it is left. A run
+        // that could not finish its cleanup (a stuck container, a daemon
+        // hiccup) keeps its entry with the lock released, so the next fed
+        // command or `fed prune` finishes the job instead of nobody knowing the
+        // stack is there.
+        if let Some(run) = script_run
+            && crate::docker::DockerClient::new()
+                .scope_is_clean(&isolation_id)
+                .await
+        {
+            run.finish_clean();
+        }
 
         result
     }
@@ -529,7 +561,87 @@ async fn run_with_interrupt_guard<F>(exec: F) -> Result<std::process::ExitStatus
 where
     F: std::future::Future<Output = Result<std::process::ExitStatus>>,
 {
-    guard_against_interrupt(exec, tokio::signal::ctrl_c, || Err(Error::Aborted)).await
+    // SIGTERM and SIGHUP are how an agent's command timeout, `kill`, a closed
+    // terminal or a service manager ask fed to go away. Without a handler the
+    // default action ends fed on the spot, before the cleanup that follows this
+    // guard, and the script's Docker stack is left running.
+    let (receiver, _listener) = TerminationListener::listen();
+    guard_with_termination(
+        exec,
+        tokio::signal::ctrl_c,
+        receiver,
+        terminate_script_child,
+        TERMINATION_GRACE,
+        || Err(Error::Aborted),
+    )
+    .await
+}
+
+/// How long a script gets to exit after SIGTERM/SIGHUP before fed abandons it
+/// (which kills it) and moves on to cleanup.
+const TERMINATION_GRACE: Duration = Duration::from_secs(15);
+
+/// Pid of the script process currently running, 0 when none. The termination
+/// handler forwards the signal to it: the script is not necessarily in fed's
+/// process group, so signalling fed's group would not reach it.
+static SCRIPT_CHILD_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(unix)]
+fn terminate_script_child() {
+    use nix::sys::signal::{Signal, kill};
+    let pid = SCRIPT_CHILD_PID.load(std::sync::atomic::Ordering::SeqCst);
+    if pid != 0 {
+        let _ = kill(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGTERM);
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_script_child() {}
+
+/// The task that turns SIGTERM and SIGHUP into messages; stopped on drop.
+struct TerminationListener(Option<tokio::task::JoinHandle<()>>);
+
+type Terminations = Option<tokio::sync::mpsc::UnboundedReceiver<()>>;
+
+impl TerminationListener {
+    #[cfg(unix)]
+    fn listen() -> (Terminations, Self) {
+        use tokio::signal::unix::{SignalKind, signal};
+        // Installed here, before the guarded future first runs, so a signal
+        // that arrives while the isolated stack is still coming up is caught.
+        let (Ok(mut term), Ok(mut hup)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            return (None, Self(None));
+        };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = hup.recv() => {}
+                }
+                if tx.send(()).is_err() {
+                    return;
+                }
+            }
+        });
+        (Some(rx), Self(Some(task)))
+    }
+
+    #[cfg(not(unix))]
+    fn listen() -> (Terminations, Self) {
+        (None, Self(None))
+    }
+}
+
+impl Drop for TerminationListener {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
 }
 
 /// Run a script's setup+execution future, guarding it against Ctrl+C only when
@@ -556,9 +668,34 @@ where
 /// `next_interrupt` is called once per wait to obtain a future that resolves on
 /// the next interrupt. If it ever yields an error (no signal handler could be
 /// installed), the guard stops watching and simply awaits `exec`.
+#[cfg(test)]
 async fn guard_against_interrupt<T, F, S, SF>(
     exec: F,
+    next_interrupt: S,
+    aborted: impl FnOnce() -> T,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+    S: FnMut() -> SF,
+    SF: std::future::Future<Output = std::io::Result<()>>,
+{
+    guard_with_termination(exec, next_interrupt, None, || {}, Duration::ZERO, aborted).await
+}
+
+/// [`guard_against_interrupt`] plus termination requests (SIGTERM/SIGHUP),
+/// delivered as messages on `terminations`.
+///
+/// The first one calls `forward_terminate` (which asks the script to exit) and
+/// starts a `grace` period; the script exiting inside it lets cleanup run
+/// normally. A second request, or the grace running out, abandons `exec` like a
+/// second Ctrl+C does. A script that cannot be killed gently must not keep the
+/// stack's containers alive: the abandon path is what guarantees cleanup runs.
+async fn guard_with_termination<T, F, S, SF>(
+    exec: F,
     mut next_interrupt: S,
+    mut terminations: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    mut forward_terminate: impl FnMut(),
+    grace: Duration,
     aborted: impl FnOnce() -> T,
 ) -> T
 where
@@ -568,7 +705,20 @@ where
 {
     tokio::pin!(exec);
     let mut interrupts = 0u32;
+    let mut deadline: Option<tokio::time::Instant> = None;
     loop {
+        let termination = async {
+            match terminations.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        let grace_over = async {
+            match deadline {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             // Poll exec first: if it is already done, return it rather than
             // spuriously treating a co-arriving interrupt as a force-quit.
@@ -587,6 +737,16 @@ where
                 // First interrupt: the child got it too and is winding down.
                 // Loop and keep waiting so its exit drives normal cleanup.
             }
+            requested = termination => match requested {
+                Some(()) if deadline.is_some() => return aborted(),
+                Some(()) => {
+                    forward_terminate();
+                    deadline = Some(tokio::time::Instant::now() + grace);
+                }
+                // The listener is gone; stop polling it.
+                None => terminations = None,
+            },
+            () = grace_over => return aborted(),
         }
     }
 }
@@ -686,12 +846,12 @@ pub(super) async fn execute_script_command(
         .spawn()
         .map_err(|e| Error::Process(format!("Failed to spawn script: {}", e)))?;
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| Error::Process(format!("Failed to wait for script: {}", e)))?;
+    // So a SIGTERM/SIGHUP aimed at fed can be passed on to the script.
+    SCRIPT_CHILD_PID.store(child.id().unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
+    let status = child.wait().await;
+    SCRIPT_CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
 
-    Ok(status)
+    status.map_err(|e| Error::Process(format!("Failed to wait for script: {}", e)))
 }
 
 /// Check if a script uses positional parameters ($@, $*, $1, $2, etc.)
@@ -820,6 +980,91 @@ mod tests {
             };
         let out = guard_against_interrupt(async { 5 }, signal_err, || -1).await;
         assert_eq!(out, 5);
+    }
+
+    /// A termination source that delivers `n` requests, then stays open and idle.
+    fn terminations(n: usize) -> tokio::sync::mpsc::UnboundedReceiver<()> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..n {
+            tx.send(()).unwrap();
+        }
+        std::mem::forget(tx);
+        rx
+    }
+
+    fn no_interrupts() -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>>>>
+    {
+        Box::pin(std::future::pending())
+    }
+
+    #[tokio::test]
+    async fn termination_is_forwarded_and_the_script_gets_its_grace_period() {
+        // The script exits a moment after being asked to: its own result wins,
+        // so the cleanup after the guard runs on the normal path.
+        let forwarded = Cell::new(0);
+        let out = guard_with_termination(
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                11
+            },
+            no_interrupts,
+            Some(terminations(1)),
+            || forwarded.set(forwarded.get() + 1),
+            Duration::from_secs(30),
+            || -1,
+        )
+        .await;
+        assert_eq!(out, 11);
+        assert_eq!(forwarded.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_script_that_ignores_termination_is_abandoned_after_the_grace_period() {
+        let forwarded = Cell::new(0);
+        let out = guard_with_termination(
+            std::future::pending::<i32>(),
+            no_interrupts,
+            Some(terminations(1)),
+            || forwarded.set(forwarded.get() + 1),
+            Duration::from_millis(50),
+            || -1,
+        )
+        .await;
+        assert_eq!(out, -1, "cleanup must still get its turn");
+        assert_eq!(forwarded.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_termination_abandons_the_script_at_once() {
+        let out = guard_with_termination(
+            std::future::pending::<i32>(),
+            no_interrupts,
+            Some(terminations(2)),
+            || {},
+            Duration::from_secs(3600),
+            || -1,
+        )
+        .await;
+        assert_eq!(out, -1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_termination_listener_does_not_spin_or_abort() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(tx);
+        let out = guard_with_termination(
+            async {
+                tokio::task::yield_now().await;
+                3
+            },
+            no_interrupts,
+            Some(rx),
+            || {},
+            Duration::ZERO,
+            || -1,
+        )
+        .await;
+        assert_eq!(out, 3);
     }
 
     #[tokio::test]

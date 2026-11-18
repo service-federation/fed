@@ -330,8 +330,20 @@ async fn run() -> anyhow::Result<()> {
         Commands::Doctor => {
             return commands::run_doctor(&out).await;
         }
-        Commands::Prune { force } => {
-            return commands::run_prune(*force, &out).await;
+        Commands::Prune {
+            force,
+            adopt,
+            unowned,
+        } => {
+            return commands::run_prune(
+                commands::PruneOptions {
+                    force: *force,
+                    adopt: adopt.clone(),
+                    unowned: *unowned,
+                },
+                &out,
+            )
+            .await;
         }
         Commands::Package(package_cmd) => {
             return commands::run_package(package_cmd, &out).await;

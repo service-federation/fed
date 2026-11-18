@@ -729,18 +729,21 @@ async fn prune_reaps_only_labeled_fed_volumes() {
     ]);
     docker(&["volume", "create", unlabeled]);
 
-    let orphans = DockerClient::new()
-        .orphaned_fed_volumes()
+    let volumes: Vec<String> = DockerClient::new()
+        .list_fed_volumes()
         .await
-        .expect("list orphaned fed volumes");
+        .expect("list fed volumes")
+        .into_iter()
+        .map(|v| v.name)
+        .collect();
 
     assert!(
-        orphans.iter().any(|v| v == labeled),
-        "a labeled, dangling fed volume should be reapable"
+        volumes.iter().any(|v| v == labeled),
+        "a labeled fed volume belongs to prune's inventory"
     );
     assert!(
-        !orphans.iter().any(|v| v == unlabeled),
-        "an UNLABELED fed-* volume must never be reapable (it may be the user's)"
+        !volumes.iter().any(|v| v == unlabeled),
+        "an UNLABELED fed-* volume must never be in prune's inventory (it may be the user's)"
     );
 
     docker(&["volume", "rm", "-f", labeled, unlabeled]);

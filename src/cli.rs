@@ -228,11 +228,18 @@ pub enum Commands {
     },
     /// Check system requirements (Docker, etc.)
     Doctor,
-    /// Remove orphaned fed-managed Docker volumes (dangling only; dry-run + confirm, --force to delete)
+    /// Remove Docker stacks whose checkout is gone or whose script run died (dry-run + confirm, --force to delete)
     Prune {
         /// Skip the confirmation prompt; required to delete in a non-interactive context
         #[arg(short, long)]
         force: bool,
+        /// Register the checkouts found under this directory (repeatable), so stacks made
+        /// by an older fed in them are recognised as in use
+        #[arg(long, value_name = "DIR")]
+        adopt: Vec<std::path::PathBuf>,
+        /// Also remove stacks with no owner on record that no --adopt directory uses
+        #[arg(long, requires = "adopt")]
+        unowned: bool,
     },
     /// Show resource usage for all services
     Top {

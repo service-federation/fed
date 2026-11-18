@@ -127,6 +127,9 @@ pub struct Orchestrator {
     /// Used by isolated script execution to give child orchestrators their own
     /// container namespace, preventing collisions with parent containers.
     pub(super) isolation_id: Option<String>,
+    /// Built by [`Orchestrator::new_ephemeral`]: an in-memory state tracker that
+    /// owns no checkout stack, so `initialize` must not register one.
+    ephemeral: bool,
     /// Names of services whose start THIS orchestrator instance owns: it won
     /// the cross-process registration race (or ran a oneshot's hooks). The
     /// failure-path [`Orchestrator::cleanup`] scopes its teardown to this set
@@ -195,6 +198,7 @@ impl Orchestrator {
             monitoring_stop_started: AtomicBool::new(false),
             randomize_ports: false,
             isolation_id: None,
+            ephemeral: false,
             owned_services: std::sync::Mutex::new(std::collections::HashSet::new()),
             foreground: None,
         })
@@ -232,6 +236,7 @@ impl Orchestrator {
             monitoring_stop_started: AtomicBool::new(false),
             randomize_ports: false,
             isolation_id: None,
+            ephemeral: true,
             owned_services: std::sync::Mutex::new(std::collections::HashSet::new()),
             foreground: None,
         })
@@ -271,9 +276,35 @@ impl Orchestrator {
             monitoring_stop_started: AtomicBool::new(false),
             randomize_ports: false,
             isolation_id: None,
+            ephemeral: false,
             owned_services: std::sync::Mutex::new(std::collections::HashSet::new()),
             foreground: None,
         })
+    }
+
+    /// Tell the stack registry which checkout owns this scope, and finish the
+    /// cleanup of any `isolated: true` script run that died without it.
+    ///
+    /// Best effort and quiet: neither may ever stop a command from running.
+    /// Registering here, on every command that builds a full orchestrator
+    /// (start, stop, restart, status of a running stack, scripts), is what lets
+    /// `fed prune` tell a stopped stack in a live checkout from an abandoned
+    /// one, including for volumes that were created before the registry.
+    async fn record_stack_ownership(&self) {
+        if self.ephemeral {
+            return;
+        }
+        let Some(registry) = crate::stack_registry::StackRegistry::default_location() else {
+            return;
+        };
+        let scope = self
+            .isolation_id
+            .clone()
+            .unwrap_or_else(|| crate::service::hash_work_dir(&self.work_dir));
+        if let Err(e) = registry.register_checkout(&self.work_dir, &scope) {
+            tracing::debug!("Could not record the owner of stack {scope}: {e}");
+        }
+        crate::stack_cleanup::sweep_dead_script_runs(&registry).await;
     }
 
     /// Get the working directory for services
@@ -969,6 +1000,8 @@ impl Orchestrator {
                 self.isolation_id = Some(id);
             }
         }
+
+        self.record_stack_ownership().await;
 
         // Collect ports owned by running managed services.
         // Safe to call after initialize because dead services are marked stale
