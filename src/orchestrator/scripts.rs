@@ -572,7 +572,10 @@ where
         receiver,
         terminate_script_child,
         TERMINATION_GRACE,
-        || Err(Error::Aborted),
+        || {
+            kill_script_tree();
+            Err(Error::Aborted)
+        },
     )
     .await
 }
@@ -586,17 +589,72 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(15);
 /// process group, so signalling fed's group would not reach it.
 static SCRIPT_CHILD_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Every process of the script's tree, recorded when termination is first
+/// requested so that the abandon path can still reach what survives.
+static SCRIPT_TREE: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+/// The descendants of `root` in `ps -A -o pid=,ppid=` output.
+fn descendants_from_ps(ps: &str, root: i32) -> Vec<i32> {
+    let mut children: std::collections::HashMap<i32, Vec<i32>> = std::collections::HashMap::new();
+    for line in ps.lines() {
+        let mut fields = line.split_whitespace().map(str::parse::<i32>);
+        if let (Some(Ok(pid)), Some(Ok(parent))) = (fields.next(), fields.next()) {
+            children.entry(parent).or_default().push(pid);
+        }
+    }
+    let mut found = Vec::new();
+    let mut queue = vec![root];
+    while let Some(pid) = queue.pop() {
+        for child in children.get(&pid).into_iter().flatten() {
+            if !found.contains(child) {
+                found.push(*child);
+                queue.push(*child);
+            }
+        }
+    }
+    found
+}
+
+/// Ask the script, and everything it started, to exit.
+///
+/// A script is a shell running a test runner that spawns workers. Signalling only
+/// the shell would end it and leave the runner and its workers running against
+/// a stack that is about to be removed.
 #[cfg(unix)]
 fn terminate_script_child() {
     use nix::sys::signal::{Signal, kill};
-    let pid = SCRIPT_CHILD_PID.load(std::sync::atomic::Ordering::SeqCst);
-    if pid != 0 {
-        let _ = kill(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGTERM);
+    let root = SCRIPT_CHILD_PID.load(std::sync::atomic::Ordering::SeqCst) as i32;
+    if root == 0 {
+        return;
+    }
+    let ps = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=", "-o", "ppid="])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let mut tree = descendants_from_ps(&ps, root);
+    tree.push(root);
+    for pid in &tree {
+        let _ = kill(nix::unistd::Pid::from_raw(*pid), Signal::SIGTERM);
+    }
+    *SCRIPT_TREE.lock().unwrap_or_else(|e| e.into_inner()) = tree;
+}
+
+/// The script ignored the request: kill what is left of its tree.
+#[cfg(unix)]
+fn kill_script_tree() {
+    use nix::sys::signal::{Signal, kill};
+    let tree = std::mem::take(&mut *SCRIPT_TREE.lock().unwrap_or_else(|e| e.into_inner()));
+    for pid in tree {
+        let _ = kill(nix::unistd::Pid::from_raw(pid), Signal::SIGKILL);
     }
 }
 
 #[cfg(not(unix))]
 fn terminate_script_child() {}
+
+#[cfg(not(unix))]
+fn kill_script_tree() {}
 
 /// The task that turns SIGTERM and SIGHUP into messages; stopped on drop.
 struct TerminationListener(Option<tokio::task::JoinHandle<()>>);
@@ -995,6 +1053,16 @@ mod tests {
     fn no_interrupts() -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>>>>
     {
         Box::pin(std::future::pending())
+    }
+
+    #[test]
+    fn the_whole_process_tree_of_a_script_is_found() {
+        let ps = "  1     0\n 10     1\n 20    10\n 21    10\n 30    20\n 40     1\n garbage\n";
+        let mut tree = descendants_from_ps(ps, 10);
+        tree.sort();
+        assert_eq!(tree, vec![20, 21, 30]);
+        assert!(descendants_from_ps(ps, 40).is_empty());
+        assert!(descendants_from_ps("", 10).is_empty());
     }
 
     #[tokio::test]

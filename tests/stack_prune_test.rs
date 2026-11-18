@@ -53,6 +53,8 @@ struct Project {
 impl Project {
     /// A project whose isolated script runs `sleep <marker>` against a worker
     /// that runs `sleep <marker + 1>`, so each test finds only its own processes.
+    /// The script backgrounds its `sleep` under the shell, so ending the shell
+    /// alone would leave it running.
     fn new(marker: u32) -> Self {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -66,7 +68,10 @@ scripts:
   slow:
     isolated: true
     depends_on: [worker]
-    script: sleep {marker}
+    # Like a test runner: the shell is not the process that does the work.
+    script: |
+      sleep {marker} &
+      wait
 "#,
                 worker = marker + 1
             ),
