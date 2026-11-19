@@ -58,12 +58,21 @@ impl PortAllocator {
     ///
     /// Thread-safe: Uses interior mutability to allow concurrent allocation.
     pub fn allocate_port_with_default(&mut self, default_port: u16) -> Result<u16> {
+        self.allocate_with_preference(default_port, Self::try_allocate_port)
+    }
+
+    /// Keep preference policy independent of the atomic reservation operation.
+    fn allocate_with_preference(
+        &mut self,
+        default_port: u16,
+        reserve: impl FnOnce(&mut Self, u16) -> Result<u16>,
+    ) -> Result<u16> {
         // Binding port 0 always succeeds (the OS picks an ephemeral port), so it
         // can never be honored as a literal default.
         if default_port == 0 {
             return self.allocate_random_port();
         }
-        match self.try_allocate_port(default_port) {
+        match reserve(self, default_port) {
             Ok(port) => Ok(port),
             Err(_) => self.allocate_random_port(),
         }
@@ -222,6 +231,21 @@ impl Drop for PortAllocator {
 mod tests {
     use super::*;
 
+    /// Exercise successful preference selection while retaining ownership of
+    /// the socket. Discovering a free port and dropping it before the claim
+    /// lets parallel tests legitimately take it between those two operations.
+    fn allocate_owned_default(allocator: &mut PortAllocator) -> (u16, u16) {
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let preferred = listener.local_addr().unwrap().port();
+        let actual = allocator
+            .allocate_with_preference(preferred, |allocator, requested| {
+                assert_eq!(requested, preferred);
+                allocator.reserve_bound_wildcard(listener)
+            })
+            .unwrap();
+        (preferred, actual)
+    }
+
     /// Regression test: a node/Next.js dev server binds the IPv6 dual-stack
     /// wildcard ([::]). With SO_REUSEADDR a loopback bind still succeeds
     /// alongside it on macOS, so only the (previously swallowed) wildcard
@@ -309,15 +333,8 @@ mod tests {
     fn test_allocate_port_with_default_available() {
         let mut allocator = PortAllocator::new();
 
-        // Use a high port that's likely available.
-        // We can't assert we get exactly this port due to TOCTOU -
-        // another process could grab it between our check and bind.
-        // The allocator correctly falls back to a random port if needed.
-        let preferred_port = 59123;
-
-        let port = allocator
-            .allocate_port_with_default(preferred_port)
-            .unwrap();
+        let (preferred_port, port) = allocate_owned_default(&mut allocator);
+        assert_eq!(port, preferred_port);
 
         // Verify we got a valid port and it's properly tracked
         assert!(port > 0);
@@ -353,11 +370,7 @@ mod tests {
         let mut allocator = PortAllocator::new();
 
         // Allocate first port with default
-        let listener1 = TcpListener::bind("127.0.0.1:0").unwrap();
-        let default1 = listener1.local_addr().unwrap().port();
-        drop(listener1);
-
-        let port1 = allocator.allocate_port_with_default(default1).unwrap();
+        let (default1, port1) = allocate_owned_default(&mut allocator);
         assert_eq!(port1, default1);
 
         // Try to allocate the same default port again (should fail and get random)
@@ -386,13 +399,8 @@ mod tests {
         assert!(allocator.allocated_ports().contains(&fallback));
         drop(held);
 
-        // Case 2: default is free — bind an ephemeral port to discover a free
-        // one, release it, and allocate immediately. The race window here is
-        // microseconds against the ephemeral range, not a well-known port.
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let free_port = probe.local_addr().unwrap().port();
-        drop(probe);
-        let got = allocator.allocate_port_with_default(free_port).unwrap();
+        // Case 2: the successful claim keeps its socket held throughout.
+        let (free_port, got) = allocate_owned_default(&mut allocator);
         assert_eq!(got, free_port);
         assert!(allocator.allocated_ports().contains(&got));
 

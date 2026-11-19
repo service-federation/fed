@@ -212,8 +212,11 @@ pub fn encode_env_value(value: &str) -> String {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
+            '$' => out.push_str("\\$"),
             '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
+            // dotenvy supports \\n but not \\r. A literal CR inside the quotes
+            // survives parsing (including trailing CR and CRLF values).
+            '\r' => out.push('\r'),
             _ => out.push(c),
         }
     }
@@ -996,6 +999,15 @@ mod env_encoding_tests {
             "-----BEGIN KEY-----\nline2\nline3\n-----END KEY-----",
             "quote\"inside",
             "back\\slash",
+            "$K0",
+            "${K0}",
+            "$(not-a-command)",
+            "trailing$",
+            "backslash\\$K0",
+            "line1\r\nline2\r\n",
+            "trailing\r",
+            "\r",
+            "mixed\r\n\"quotes\"\\$K0\tend",
             "",
         ];
         let dir = tempfile::tempdir().unwrap();
@@ -1014,6 +1026,31 @@ mod env_encoding_tests {
                 Some(v.as_str()),
                 "key {k}"
             );
+        }
+
+        // Rewriting another key must preserve already encoded secrets, and
+        // vault caches use the same encoding through their actual read path.
+        write_env_file(&path, &[("OTHER".to_string(), "updated".to_string())]).unwrap();
+        let loaded = load_existing_env(&path);
+        let entries = pairs
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    CacheEntry {
+                        value: value.clone(),
+                        fetched_at: Some(42),
+                    },
+                )
+            })
+            .collect();
+        let cache = dir.path().join("secrets.cache.env");
+        write_cache_file(&cache, &entries).unwrap();
+        let (cached_values, stamps) = load_cache_values_and_stamps(&cache);
+        for (key, value) in &pairs {
+            assert_eq!(loaded.get(key), Some(value), "rewritten env {key}");
+            assert_eq!(cached_values.get(key), Some(value), "cache {key}");
+            assert_eq!(stamps.get(key), Some(&42));
         }
     }
 }

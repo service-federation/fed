@@ -13,7 +13,7 @@
 //! 5. Import the target service and its dependencies with namespacing
 //! 6. Adjust paths and dependencies for the imported services
 
-use crate::config::{Config, DependsOn, HealthCheck, Parser, Service};
+use crate::config::{Config, DependsOn, Parser, Service};
 use crate::dependency::GitOperations;
 use crate::error::{Error, Result};
 use crate::parameter::Resolver;
@@ -160,7 +160,7 @@ impl<'a> ExternalServiceExpander<'a> {
                     service_name,
                     &target_path,
                     &parameter_mapping,
-                )?;
+                );
 
                 config.services.insert(namespaced_name, adjusted_service);
             }
@@ -236,7 +236,7 @@ impl<'a> ExternalServiceExpander<'a> {
         parent_service_name: &str,
         target_path: &Path,
         parameter_mapping: &HashMap<String, String>,
-    ) -> Result<Service> {
+    ) -> Service {
         let mut adjusted = import_service.clone();
 
         // Adjust CWD to be relative to external repo
@@ -246,36 +246,11 @@ impl<'a> ExternalServiceExpander<'a> {
             target_path.to_string_lossy().to_string()
         });
 
-        // Resolve templates in various fields
-        if let Some(ref process) = adjusted.process {
-            adjusted.process = Some(self.resolver.resolve_template(process, parameter_mapping)?);
-        }
-
-        if let Some(ref install) = adjusted.install {
-            adjusted.install = Some(self.resolver.resolve_template(install, parameter_mapping)?);
-        }
-
-        // Resolve environment variables
-        let mut resolved_env = HashMap::new();
-        for (key, value) in &adjusted.environment {
-            resolved_env.insert(
-                key.clone(),
-                self.resolver.resolve_template(value, parameter_mapping)?,
-            );
-        }
-        adjusted.environment = resolved_env;
-
-        // Resolve ports
-        let mut resolved_ports = Vec::new();
-        for port in &adjusted.ports {
-            resolved_ports.push(self.resolver.resolve_template(port, parameter_mapping)?);
-        }
-        adjusted.ports = resolved_ports;
-
-        // Resolve healthcheck
-        if let Some(ref healthcheck) = adjusted.healthcheck {
-            adjusted.healthcheck = Some(self.resolve_healthcheck(healthcheck, parameter_mapping)?);
-        }
+        // Keep templates intact until the normal resolver renders all fields.
+        // Eager rendering here followed by parent resolution would scan mapped
+        // values a second time, allowing literal {{OTHER}} data to become a
+        // parent-parameter reference (and bypassing shell quoting).
+        adjusted.template_parameters = Some(parameter_mapping.clone());
 
         // Adjust dependencies to use namespaced names
         adjusted.depends_on = adjusted
@@ -284,30 +259,7 @@ impl<'a> ExternalServiceExpander<'a> {
             .map(|dep| DependsOn::Simple(format!("{}:{}", parent_service_name, dep.service_name())))
             .collect();
 
-        Ok(adjusted)
-    }
-
-    /// Resolve templates in a healthcheck
-    fn resolve_healthcheck(
-        &self,
-        healthcheck: &HealthCheck,
-        parameter_mapping: &HashMap<String, String>,
-    ) -> Result<HealthCheck> {
-        Ok(match healthcheck {
-            HealthCheck::HttpGet { http_get, timing } => HealthCheck::HttpGet {
-                http_get: self
-                    .resolver
-                    .resolve_template(http_get, parameter_mapping)?,
-                timing: timing.clone(),
-            },
-            HealthCheck::CommandMap { command, timing } => HealthCheck::CommandMap {
-                command: self.resolver.resolve_template(command, parameter_mapping)?,
-                timing: timing.clone(),
-            },
-            HealthCheck::Command(cmd) => {
-                HealthCheck::Command(self.resolver.resolve_template(cmd, parameter_mapping)?)
-            }
-        })
+        adjusted
     }
 }
 
@@ -351,6 +303,176 @@ fn collect_deps_recursive(
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+    use crate::config::HealthCheck;
+
+    #[test]
+    fn imported_shell_commands_escape_mapped_parameter_values() {
+        let config = Config::default();
+        let resolver = Resolver::new();
+        let dir = tempfile::tempdir().unwrap();
+        let expander = ExternalServiceExpander::new(&config, &resolver, dir.path().to_path_buf());
+        let marker = dir.path().join("injected");
+        let payload = format!(
+            "literal {{{{OTHER}}}}; printf injected > {}; #",
+            marker.display()
+        );
+        let mapping = HashMap::from([("MESSAGE".to_string(), payload.clone())]);
+        let command = "printf '%s' {{MESSAGE}}".to_string();
+
+        for healthcheck in [
+            HealthCheck::Command(command.clone()),
+            HealthCheck::CommandMap {
+                command: command.clone(),
+                timing: crate::config::HealthCheckTiming {
+                    timeout: Some("2s".to_string()),
+                    ..Default::default()
+                },
+            },
+        ] {
+            let imported = Service {
+                process: Some(command.clone()),
+                install: Some(command.clone()),
+                migrate: Some(command.clone()),
+                environment: HashMap::from([(
+                    "RAW_MESSAGE".to_string(),
+                    "{{MESSAGE}}".to_string(),
+                )]),
+                healthcheck: Some(healthcheck),
+                ..Default::default()
+            };
+            let adjusted =
+                expander.adjust_imported_service(&imported, "parent", dir.path(), &mapping);
+            let mut expanded = Config::default();
+            expanded.services.insert("imported".to_string(), adjusted);
+            expanded.parameters.insert(
+                "OTHER".to_string(),
+                crate::config::Parameter {
+                    value: Some("parent-only-secret".to_string()),
+                    ..Default::default()
+                },
+            );
+            let staged = expanded.clone();
+            let resolved = Resolver::new().resolve_config(&staged).unwrap();
+            assert!(resolved.services["imported"].template_parameters.is_none());
+            // Consumers use resolved fields, including after a clone or Serde
+            // round-trip; no hidden import scope is needed downstream.
+            let yaml = serde_yaml::to_string(&resolved).unwrap();
+            let reloaded: Config = serde_yaml::from_str(&yaml).unwrap();
+            let adjusted = &reloaded.services["imported"];
+            for command in [
+                adjusted.process.as_deref().unwrap(),
+                adjusted.install.as_deref().unwrap(),
+                adjusted.migrate.as_deref().unwrap(),
+                adjusted
+                    .healthcheck
+                    .as_ref()
+                    .unwrap()
+                    .get_command()
+                    .unwrap(),
+            ] {
+                let output = std::process::Command::new("bash")
+                    .args(["-c", command])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                assert_eq!(String::from_utf8(output.stdout).unwrap(), payload);
+                assert!(
+                    !marker.exists(),
+                    "imported command executed parameter contents"
+                );
+            }
+            assert_eq!(adjusted.environment.get("RAW_MESSAGE"), Some(&payload));
+        }
+    }
+
+    #[test]
+    fn imported_templates_cannot_read_unmapped_parent_parameters() {
+        let mut config = Config::default();
+        config.parameters.insert(
+            "PRIVATE".to_string(),
+            crate::config::Parameter {
+                value: Some("parent-only-secret".to_string()),
+                ..Default::default()
+            },
+        );
+        let resolver = Resolver::new();
+        let dir = tempfile::tempdir().unwrap();
+        let expander = ExternalServiceExpander::new(&config, &resolver, dir.path().to_path_buf());
+        let imported = Service {
+            process: Some("printf '%s' {{PRIVATE}}".to_string()),
+            ..Default::default()
+        };
+        let adjusted =
+            expander.adjust_imported_service(&imported, "parent", dir.path(), &HashMap::new());
+        let yaml = serde_yaml::to_string(&adjusted).unwrap();
+        assert!(!yaml.contains("template_parameters"));
+        config.services.insert("imported".to_string(), adjusted);
+        let error = Resolver::new()
+            .resolve_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("PRIVATE"));
+        assert!(!error.contains("parent-only-secret"));
+    }
+
+    #[tokio::test]
+    async fn imported_scope_is_rebuilt_from_source_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("external");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("fed.yaml"),
+            r#"
+services:
+  target:
+    expose: true
+    process: printf '%s' "{{MESSAGE}}"
+"#,
+        )
+        .unwrap();
+        let payload = "literal {{PARENT_ONLY}} $(not-a-command) 'quotes'";
+        let mut source = make_importer_config("external");
+        source
+            .parameters
+            .insert("VALUE".to_string(), crate::config::Parameter::default());
+        source.env_file = vec![".env".to_string()];
+        crate::parameter::secret::write_env_file(
+            &dir.path().join(".env"),
+            &[("VALUE".to_string(), payload.to_string())],
+        )
+        .unwrap();
+        source
+            .services
+            .get_mut("imported")
+            .unwrap()
+            .parameters
+            .insert("MESSAGE".to_string(), "{{VALUE}}".to_string());
+        let path = dir.path().join("fed.yaml");
+        std::fs::write(&path, serde_yaml::to_string(&source).unwrap()).unwrap();
+
+        for _ in 0..2 {
+            // CLI start/restart and the supervisor load the source config again;
+            // they do not cache an intermediate expanded config via Serde.
+            let mut loaded = Parser::new().load_config(&path).unwrap();
+            let mut resolver = Resolver::new();
+            resolver.set_work_dir(dir.path());
+            resolver.resolve_parameters(&mut loaded).unwrap();
+            let expanded =
+                ExternalServiceExpander::new(&loaded, &resolver, dir.path().to_path_buf())
+                    .expand()
+                    .await
+                    .unwrap();
+            let resolved = resolver.resolve_config(&expanded).unwrap();
+            let command = resolved.services["imported"].process.as_ref().unwrap();
+            let output = std::process::Command::new("bash")
+                .args(["-c", command])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), payload);
+            assert!(resolved.services["imported"].template_parameters.is_none());
+        }
+    }
 
     fn create_test_config() -> Config {
         let mut config = Config::default();
