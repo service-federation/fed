@@ -171,6 +171,62 @@ fn platform_matches(wanted: &str, found: &str) -> bool {
 /// for this machine and the service sets no `platform:`.
 const NO_MATCHING_PLATFORM_HINT: &str = "This image has no build for this machine. If it has one for another platform, set `platform:` on the service, for example `platform: linux/amd64`.";
 
+/// Runs `binary` with `args` and returns its output, or `None` when it runs
+/// longer than `timeout`.
+///
+/// The command gets a process group of its own, and a timeout kills the
+/// whole group. `docker` starts helper processes, such as one per CLI plugin
+/// for `docker info`. Killing only `docker` leaves a helper that hangs
+/// against a stuck daemon running forever, and a supervisor that polls the
+/// daemon then fills the process table.
+async fn output_within(
+    binary: &str,
+    args: &[&str],
+    env: &[(String, String)],
+    timeout: Duration,
+) -> Option<std::io::Result<Output>> {
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .args(args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => return Some(Err(e)),
+    };
+    let group = child.id();
+    let output = child.wait_with_output();
+    tokio::pin!(output);
+    tokio::select! {
+        result = &mut output => Some(result),
+        () = tokio::time::sleep(timeout) => {
+            #[cfg(unix)]
+            if let Some(group) = group.and_then(|id| i32::try_from(id).ok()) {
+                let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), nix::sys::signal::Signal::SIGKILL);
+            }
+            None
+        }
+    }
+}
+
+/// The arguments that ask the daemon for its version. A daemon that does not
+/// answer makes the command fail.
+///
+/// Docker is asked with `version`, which starts no CLI plugins. `info` starts
+/// every plugin on each call, which is costly for a check that runs often.
+/// Other runtimes keep `info`.
+fn daemon_version_args(binary: &str) -> [&'static str; 3] {
+    match RuntimeFlavor::of_binary(binary) {
+        RuntimeFlavor::Docker => ["version", "--format", "{{.Server.Version}}"],
+        RuntimeFlavor::Podman => ["info", "--format", "{{.ServerVersion}}"],
+    }
+}
+
 impl DockerClient {
     pub fn new() -> Self {
         DockerClient
@@ -198,25 +254,11 @@ impl DockerClient {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<Output, DockerError> {
-        // kill_on_drop: when the timeout wins the race and drops the output
-        // future, the docker process must die with it — otherwise every
-        // timeout against a hung daemon leaks a subprocess.
-        let result = tokio::time::timeout(
-            timeout,
-            tokio::process::Command::new(runtime::binary())
-                .args(args)
-                .envs(env.iter().map(|(k, v)| (k, v)))
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await;
-
         let cmd_str = Self::cmd_str(args);
-
-        match result {
-            Ok(Ok(output)) => Ok(output),
-            Ok(Err(e)) => Err(DockerError::exec_failed(cmd_str, e)),
-            Err(_) => Err(DockerError::timeout(cmd_str, timeout)),
+        match output_within(runtime::binary(), args, env, timeout).await {
+            Some(Ok(output)) => Ok(output),
+            Some(Err(e)) => Err(DockerError::exec_failed(cmd_str, e)),
+            None => Err(DockerError::timeout(cmd_str, timeout)),
         }
     }
 
@@ -968,7 +1010,7 @@ impl DockerClient {
     /// Check if the Docker daemon is healthy (async).
     pub async fn daemon_healthy(&self, timeout: Duration) -> bool {
         match self
-            .run(&["info", "--format", "{{.ServerVersion}}"], timeout)
+            .run(&daemon_version_args(runtime::binary()), timeout)
             .await
         {
             Ok(o) => o.status.success(),
@@ -978,7 +1020,7 @@ impl DockerClient {
 
     /// Check if the Docker daemon is healthy (synchronous).
     pub fn daemon_healthy_sync(&self) -> bool {
-        match self.run_sync(&["info", "--format", "{{.ServerVersion}}"]) {
+        match self.run_sync(&daemon_version_args(runtime::binary())) {
             Ok(o) => o.status.success(),
             Err(_) => false,
         }
@@ -1142,5 +1184,75 @@ mod inventory_tests {
         assert!(c.created.is_none());
         assert!(c.is_running());
         assert!(parse_container_line("").is_none());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod timeout_tests {
+    use super::{daemon_version_args, output_within};
+    use std::time::Duration;
+
+    /// True while a process with this id exists.
+    fn alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_timeout_also_stops_the_helpers_the_command_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("helper.pid");
+        // The command starts a helper that outlives it, as `docker info`
+        // starts its CLI plugins, and then hangs.
+        let script = format!("sleep 300 & echo $! > {}; wait", pid_file.display());
+
+        let output = output_within("sh", &["-c", &script], &[], Duration::from_millis(500)).await;
+        assert!(output.is_none(), "the command runs past its timeout");
+
+        let helper: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the command wrote its helper's id")
+            .trim()
+            .parse()
+            .unwrap();
+        for _ in 0..40 {
+            if !alive(helper) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(helper),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        panic!("the helper {helper} still runs after the timeout");
+    }
+
+    #[tokio::test]
+    async fn a_command_that_ends_in_time_gives_its_output() {
+        let output = output_within("sh", &["-c", "printf hello"], &[], Duration::from_secs(5))
+            .await
+            .expect("the command ends in time")
+            .expect("sh starts");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"hello");
+    }
+
+    #[test]
+    fn docker_is_asked_for_its_version_without_starting_plugins() {
+        assert_eq!(
+            daemon_version_args("docker"),
+            ["version", "--format", "{{.Server.Version}}"]
+        );
+        assert_eq!(
+            daemon_version_args("/opt/homebrew/bin/docker"),
+            ["version", "--format", "{{.Server.Version}}"]
+        );
+    }
+
+    #[test]
+    fn another_runtime_keeps_its_info_call() {
+        assert_eq!(
+            daemon_version_args("podman"),
+            ["info", "--format", "{{.ServerVersion}}"]
+        );
     }
 }
