@@ -4,7 +4,9 @@
 [![CI](https://github.com/service-federation/fed/actions/workflows/ci.yml/badge.svg)](https://github.com/service-federation/fed/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/github/license/service-federation/fed)](./LICENSE)
 
-Run your app natively and its dependencies in Docker from one config file. Think `docker compose up`, except the app isn't in a container and every Git worktree can run its own isolated copy of the stack.
+**Git isolates files. `fed` isolates the stack.**
+
+Run your app natively and its dependencies in Docker from one `fed.yaml`. Give every Git worktree and coding agent its own ports, containers, and volumes — and stop copy-pasting `.env` files across checkouts and teammates.
 
 ```console
 $ fed start
@@ -17,58 +19,61 @@ Starting: api (with deps: database, schema)
 API ready: http://localhost:8080
 ```
 
-fed handles the parts of local development that shell scripts and Compose override files usually leave to people:
-
-- Starts native processes, Docker containers, and Compose services in dependency order.
-- Polls configured health checks and reports the result for each service.
-- Allocates stable ports and scopes containers, volumes, and state to each checkout.
-- Runs project commands with the ports and credentials allocated to that checkout.
-- Starts and cleans up throwaway native and image-backed stacks for integration tests.
-
-Rather than replacing Docker or Compose, fed drives them alongside the processes you keep on the host.
-
 ![fed demo: starting a mixed native and Docker stack, then running an isolated copy from a Git worktree](docs/fed-demo.gif)
 
 ## Install
 
 ```bash
+# macOS / Linux (Homebrew)
 brew install service-federation/tap/fed
+
+# macOS / Linux (installer script)
+curl -LsSf https://github.com/service-federation/fed/releases/latest/download/fed-installer.sh | sh
 ```
 
-macOS and Linux binaries are also available from [GitHub Releases](https://github.com/service-federation/fed/releases/latest). To build the current main branch from source:
+Prebuilt binaries are on [GitHub Releases](https://github.com/service-federation/fed/releases/latest), or build from source with `cargo install --git https://github.com/service-federation/fed --locked`. Run `fed doctor` to verify Docker and Git.
+
+## One stack per Git worktree
+
+Git isolates files. `fed` isolates the runtime state that still collides: declared ports, Docker container names, named volumes, generated secrets, and `.fed/` state.
+
+```console
+~/app          $ fed start
+
+~/app-task-1   $ fed isolate enable
+~/app-task-1   $ fed start
+
+~/app-task-2   $ fed isolate enable
+~/app-task-2   $ fed start
+```
+
+Your primary checkout stays untouched. For coding agents, add this to `AGENTS.md` or `CLAUDE.md`:
+
+```markdown
+Run `fed isolate enable` before any other fed command in a new worktree.
+Run project tasks through fed so they receive this worktree's ports and credentials.
+Run `fed clean` before removing the worktree.
+```
+
+No editor plugin or agent wrapper is required — the isolation boundary is the checkout directory. Deleted a worktree without stopping it first? `fed prune` finds and cleans up orphaned containers and volumes ([details](docs/advanced.md#cleaning-up-after-deleted-worktrees)). See [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/).
+
+## Stop copy-pasting `.env` files
+
+- **Local generated secrets (free, offline):** `type: secret` generates a stable per-checkout value in a mode-`0600`, Git-ignored file under `.fed/`, with no account or network access.
+- **Optional team dev vault:** For shared dev API keys (Google Maps, Stripe, OAuth, private image pull tokens), link the repo once with `fed link org/project`. Teammates sign in with GitHub (`fed login`), and `fed start` injects the values into every checkout and worktree.
 
 ```bash
-cargo install --git https://github.com/service-federation/fed --locked
+fed secrets set GOOGLE_MAPS_API_KEY               # hidden prompt in a terminal
+printf '%s' "$KEY" | fed secrets set STRIPE_KEY   # or from stdin
 ```
 
-Run `fed doctor` after installation to check Docker, Compose, and Git.
+**Pricing:** Free for up to 3 people, then €8/seat/month. Billing only gates adding new members — it never blocks `fed start`.
 
-### What it touches
+> Built for development credentials, not production secrets. The MIT CLI and local secret generation work completely offline without an account. See [Team secrets](https://www.service-federation.com/docs/secrets/) for the security model, cache modes, and rotation guidance.
 
-fed shells out to the `docker` and `docker compose` CLIs, so it has the same Docker access your own shell has. It runs for the duration of a command and exits.
+## Quick start (`fed.yaml`)
 
-Everything it tracks for a project lives in `.fed/` inside that checkout: state, logs, port allocations, and generated secrets. It manages `.fed/.gitignore` for you. `fed stop` stops and removes the containers it started, and `fed clean` additionally runs the clean commands you declare.
-
-It opens network connections to two places: the healthcheck URLs you configure, and the hosted vault once you have run `fed login` and `fed link`.
-
-## Try a real stack
-
-The repository includes a small Python and PostgreSQL project. It has a native API, a Docker database, a schema migration, and health checks.
-
-```bash
-git clone https://github.com/service-federation/fed.git
-cd fed/docs/demo
-fed start
-curl http://localhost:18480/health
-fed stop
-fed clean
-```
-
-If that works, your machine is set up. Then write a config for your own project.
-
-## Add fed to a project
-
-Create `fed.yaml` in the project root. This example runs PostgreSQL in Docker and a Node API on the host:
+Create `fed.yaml` (or run `fed init`) in your project root:
 
 ```yaml
 parameters:
@@ -80,6 +85,7 @@ services:
   database:
     image: postgres:16-alpine
     ports: ["{{DB_PORT}}:5432"]
+    volumes: ["app-data:/var/lib/postgresql/data"]
     environment:
       POSTGRES_PASSWORD: "{{DB_PASSWORD}}"
       POSTGRES_DB: app
@@ -99,8 +105,6 @@ services:
 entrypoint: api
 ```
 
-Then run:
-
 ```bash
 fed validate
 fed start
@@ -109,110 +113,19 @@ fed logs api
 fed stop
 ```
 
-`fed init` can create a starter file. The [configuration reference](https://www.service-federation.com/docs/configuration/) covers all service types and fields.
-
-### Startup health semantics
-
-`fed start` waits for each service's healthcheck before starting its dependents.
-
-- A healthcheck that passes before startup returns marks the service `healthy`. The `timeout` is evaluated between polling attempts, so a check already in flight at the deadline may still count.
-- A healthcheck that does not pass within its `timeout` (default 5s) is a warning, not an error: the process keeps running, dependents still start, and the run ends with `Services started with N health warning(s)` instead of the success line. The exit code stays 0.
-- A process that dies before its healthcheck passes fails the start with a non-zero exit code.
-
-In `fed status`, `running` means the process is up but no healthcheck has confirmed it; only `healthy` means verified. `fed status --json` reports the same distinction as `"status": "running"` with `"health": "unknown"`.
-
-### Services run in the background
-
-`fed start` detaches every process service: it gets no stdin, and its output goes to `.fed/logs/<service>.log`. Follow it with `fed logs -f <service>` or watch everything in `fed tui`. A program that waits for terminal input, such as a shell or a REPL, exits as soon as it starts, because there is nothing to read.
-
-To keep such a program running in the background, give it `tty: true` in `fed.yaml`. fed then runs it under a terminal of its own, so a shell or a REPL stays up with nothing to read from. Everything the program shows on that terminal goes to the log file, including the input it echoes back. Process services only, and not on Windows.
-
-To run one such service in your terminal instead, start it with `-i`:
-
-```console
-$ fed start -i shell
-```
-
-fed starts that service's dependencies in the background as usual, hands it your terminal, and waits for it. Ctrl+C goes to the service, not to fed. When it exits, fed exits with the same code and leaves the dependencies running for `fed stop`. One service at a time, process services only.
-
-When `fed start -i` doesn't receive a service, it uses the entrypoint. Just like `fed start`. That works when the entrypoint is itself a process service. An entrypoint that only groups other services (a `depends_on:` list with no `process:`) has nothing to hand the terminal to, so fed asks you to pass one of them.
-
-### Log retention
-
-Service logs rotate at 10 MiB and retain three files by default, including the active log. Set `logs.max_size` and `logs.max_files` in `fed.yaml` to change either limit for the project, or put the same `logs:` block in `$XDG_CONFIG_HOME/fed/config.yaml` (normally `~/.config/fed/config.yaml`) for all projects. Each project setting overrides the corresponding global setting. For example:
-
-```yaml
-logs:
-  max_size: 20MiB
-  max_files: 5
-```
-
-`max_size` accepts `B`, `KiB`, `MiB`, `GiB`, and `TiB` suffixes. The limits are 1 byte to 1 TiB and 1 to 1000 files.
-
-Changes to `logs:` apply when a service restarts. At startup, fed trims oversized existing log files and removes backups beyond the new limit; `fed logs` reads the retained files in order, including archives. The same global limits bound supervisor, host, and TUI diagnostics. Docker logs remain managed by Docker.
-
-If `XDG_CONFIG_HOME` is unset, empty, or relative, fed uses `~/.config`. Reading an absent global config does not create a directory or file.
-
-### Attach to a running service
-
-Give a process service `tty: true`, then run `fed start <service>` and
-`fed attach <service>`. Your input goes to the service and its output appears
-in your terminal. Press Ctrl+P, then Ctrl+Q to detach; the service keeps running.
-Use `--detach-keys ctrl-a,ctrl-d` to choose another pair.
-
-`fed attach <service> --no-stdin` follows output without forwarding input.
-Ctrl+C ends that client. Multiple clients can attach to the same service.
-An attached client exits with the service's exit code when the service stops.
-
-Terminal output, including typed input the program echoes, is saved in
-`.fed/logs/<service>.log` and available through `fed logs <service>`.
-
-## One stack per worktree
-
-Git isolates files. fed isolates the runtime state that usually still collides.
-
-One worktree per branch or agent, one full stack per worktree, zero shared ports.
-
-```console
-~/app         $ fed start
-
-~/app-task-1 $ fed isolate enable
-~/app-task-1 $ fed start
-
-~/app-task-2 $ fed isolate enable
-~/app-task-2 $ fed start
-```
-
-Each isolated checkout gets its own values for declared `type: port` parameters, direct Docker container names, named volumes, generated secrets, and fed state.
-
-Caveat: fed cannot remap a port hardcoded inside a command, URL, or Compose file. Declare it as a `type: port` parameter and it can, one port at a time, as you hit the ones that actually collide. See [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/) for Compose behavior, bind mounts, cookies, cleanup, and the full isolation model.
-
-For coding agents, put this in `AGENTS.md` or `CLAUDE.md`:
-
-```markdown
-Run `fed isolate enable` before any other fed command in a new worktree.
-Run project tasks through fed so they receive this worktree's ports and credentials.
-Run `fed clean` before removing the worktree.
-```
-
-No editor plugin or agent integration is required. The boundary is the checkout directory.
-
-### Cleaning up after deleted worktrees
-
-`fed stop` removes a stack's containers but keeps its named volumes, so a stopped stack still has its database when you start it again. A worktree deleted without `fed stop` leaves its containers and volumes behind. `fed prune` finds those:
+Want to verify your machine against a runnable Python + PostgreSQL project first?
 
 ```bash
-fed prune          # list what it would remove, grouped by reason, with the checkout path and age
-fed prune --force  # remove it (without --force it asks, or in a script only lists)
+git clone https://github.com/service-federation/fed.git
+cd fed/docs/demo
+fed start
+curl http://localhost:18480/health
+fed stop && fed clean
 ```
 
-Every fed command that starts, stops or restarts services or runs a script in a checkout records which directory owns its stack in `~/.fed/stacks/`. `fed prune` removes a stack only when it can show that its directory no longer exists, that the checkout has moved to another isolation id (`fed isolate rotate` or `disable`), or that it belonged to an `isolated: true` script run whose process is dead. A stopped stack in a checkout that still exists is kept. So is any stack created by fed 8.3.2 or earlier until a fed command runs in its checkout. If you move or rename a checkout, run any fed command in it before `fed prune`: until then the registry still points at the old path, which no longer exists. `fed prune --adopt ~/worktrees` registers the checkouts it finds below a directory so those stacks are recognised; adding `--unowned` also removes the stacks none of them claims, if nothing in them is running and their newest container or volume was created at least a week ago (`--unowned-min-age-days`; Docker records creation, not last use, so a stopped stack is as old as its volumes). That is you vouching that the `--adopt` directories hold every checkout you still use.
+## Project scripts & isolated integration tests
 
-An `isolated: true` script run removes its throwaway stack on Ctrl+C, SIGTERM and SIGHUP too. SIGKILL cannot be caught, so a killed run leaves its stack; the next fed command in any checkout notices that the run's process is gone and removes it, and `fed prune` lists it. `fed doctor` reports how many stacks are reclaimable.
-
-## Project commands and integration tests
-
-Scripts declared in `fed.yaml` know which services they need:
+Declare database tools, seeds, and integration tests under `scripts:`. `fed` starts missing dependencies in health-checked order, injects the checkout's resolved ports and secrets, and stops what it started.
 
 ```yaml
 scripts:
@@ -228,258 +141,29 @@ scripts:
 fed test:integration
 ```
 
-fed starts missing dependencies, polls their configured health checks, runs the command with resolved values, and cleans up the services it started. For native and direct image-backed services, an isolated script gets a throwaway stack and leaves your development stack alone. Compose-backed dependencies have the limits described in the guide below.
+With `isolated: true`, the test gets a throwaway stack and leaves your development database untouched. See [Scripts and tests](https://www.service-federation.com/docs/scripts/).
 
-See [Scripts and tests](https://www.service-federation.com/docs/scripts/) for lifecycle rules, argument passing, output modes, and isolation limits.
+## More features & reference
 
-## One service, several implementations
+- **Interactive shells, TTY, & `fed attach`** — run foreground processes (`fed start -i`), keep REPLs alive with `tty: true`, and attach/detach live terminals ([`docs/advanced.md`](docs/advanced.md#services-run-in-the-background)).
+- **Service variants & shared defaults** — swap implementations behind one service contract (`variants:`) and share config via `defaults:` / `templates:` ([`docs/advanced.md`](docs/advanced.md#one-service-several-implementations)).
+- **Healthcheck timing & startup semantics** — tune `start_period`, `interval`, `probe_timeout`, and `retries` ([`docs/advanced.md`](docs/advanced.md#healthcheck-timing)).
+- **Log retention, private registries, & host networking** — configure log rotation (`logs:`), pull private images via `registry_auth`, pin `platform: linux/amd64`, and reach host services via `host.docker.internal` ([`docs/advanced.md`](docs/advanced.md#log-retention)).
+- **Existing Docker Compose files** — import basic Compose stacks alongside native processes ([`docs/advanced.md`](docs/advanced.md#existing-docker-compose-projects), [Compose docs](https://www.service-federation.com/docs/compose/)).
 
-A rewrite keeps the old and the new implementation side by side for months. Both listen on the same port, both satisfy the same dependants, and only one may run at a time. Profiles can't express that — they add services, they never replace one.
+### What `fed` touches
 
-`variants:` keeps one service name and one contract, and moves only the implementation:
+`fed` shells out to `docker` and `docker compose` with your user's existing Docker access. Per-checkout state, logs, port allocations, and generated secrets live inside `.fed/` (with `.fed/.gitignore` managed automatically). It only opens network connections to configured healthcheck URLs and, if you explicitly run `fed login` and `fed link`, the optional team vault.
 
-```yaml
-services:
-  catalog:
-    depends_on: [storage]
-    healthcheck: { http_get: 'http://localhost:{{CATALOG_PORT}}/health' }
-    default_variant: java
-    variants:
-      java:
-        gradle_task: ':catalog:run'
-      go:
-        process: go run ./cmd/catalog
-        cwd: services/catalog-go
-```
+## Documentation & examples
 
-The outer service holds the shared contract — ports, healthcheck, `depends_on`, tags — and carries no type-defining field of its own. Each variant supplies exactly one, plus whatever else differs. The chosen variant is merged over the outer service before anything else runs, so dependants, `fed status` and the dependency graph see an ordinary service; `frontend`'s `depends_on: [catalog]` holds whichever implementation is live.
+- [Quickstart](https://www.service-federation.com/docs/) · [Worktrees & coding agents](https://www.service-federation.com/docs/isolation/) · [Team secrets](https://www.service-federation.com/docs/secrets/) · [Configuration reference](https://www.service-federation.com/docs/configuration/) · [Command reference](https://www.service-federation.com/docs/commands/)
+- Examples: [Rails + Sidekiq](./examples/rails-sidekiq.yaml), [FastAPI + Celery](./examples/python-fastapi.yaml), [Go microservices](./examples/go-microservices.yaml), [Node microservices](./examples/nodejs-microservices.yaml), [Service variants](./examples/variants-example.yaml)
 
-Variant names are a vocabulary shared across services, so the main control is an ordered preference list rather than a per-service flag:
+`fed --help` is the command-line source of truth for your installed version.
 
-```bash
-fed start --variant go,ts,rust    # first name each service actually has
-fed start --variant catalog:java  # pin the odd one out
-fed variant set go,ts,rust        # persist it; fed variant list shows the result
-```
+## Support & License
 
-For each service, the first name in the list it offers wins; otherwise its `default_variant`. A name no service has produces a warning, so one list can serve several checkouts. Precedence, highest first: a `--variant` pin, the `--variant` list, the choice remembered from an earlier `fed start --variant` or `fed restart --variant` (`.fed/variants.session.yaml`), `.fed/variants.yaml` (written by `fed variant set`), the variant a service is running as right now, then `default_variant`. Persisting matters because `fed start web`, `fed restart`, `fed status`, the TUI and the background supervisor all have to agree without the flag being repeated: after `fed start --variant catalog:java` the checkout keeps `java` for `fed start web`, `fed restart` and a stopped-and-restarted `catalog` until a later `--variant` replaces it, `fed variant set`, `unset` or `clear` says otherwise, or a whole-stack `fed stop` ends the stack.
-
-To show which implementation runs, `fed start` and `fed status` print the variant next to the service name, as in `catalog (go)`. When the choice comes from `.fed/variants.yaml` or an earlier `--variant`, `fed start` says so and prints the command that undoes it.
-
-Switching variant while the service runs is a `fed stop` and a `fed start` — the ports and container names are the same, so the two implementations can't coexist. A variant that needs a *different* port is a different service, not a variant: the contract lives on the outer service by design.
-
-See [`examples/variants-example.yaml`](./examples/variants-example.yaml) for a minimal version, or the [variant stack walkthrough](./examples/variant-stack/) for real HTTP services, a browser page, health failure/recovery, and an attachable console.
-
-### Shared defaults and whole-stack startup
-
-Use `defaults:` for common service fields. A service or template's own values
-win; collections are combined. An explicit `depends_on: []` opts out of
-inherited dependencies, including through a template or variant. Services
-named in `defaults.depends_on` are excluded from all defaults to avoid cycles;
-`fed validate` reports that exclusion once.
-
-```yaml
-defaults:
-  depends_on: [storage]
-  healthcheck_timeout: 30s
-  startup_timeout: 1m
-
-templates:
-  go-worker:
-    process: go run ./cmd/worker
-
-services:
-  storage: { process: sleep 300 }
-  catalog:
-    variants:
-      java: { process: sleep 300 }
-      go: { extends: go-worker, cwd: workers/catalog }
-    default_variant: java
-  standalone: { process: sleep 300, depends_on: [] }
-
-entrypoint: '*'
-```
-
-Variants can extend local templates or exposed package services, using the
-same `extends:` rules as ordinary services. Templates cannot extend templates.
-Defaults fill fields left unset after extension resolution; the chosen variant
-then overrides the outer service. `healthcheck_timeout` (also accepted as
-`healthcheck_start_period`) supplies a startup health wait without defining a
-probe. An explicit `healthcheck.start_period` or legacy `timeout` wins over it.
-
-`fed start --all` starts every service enabled by the active profiles.
-`entrypoint: '*'` makes that the default for plain `fed start`.
-`fed restart --all` explicitly requests the existing restart-everything behavior.
-A service with only `depends_on` is a grouping node: it completes after its
-dependencies start. Interactive startup still requires a single process service;
-use `fed start -i <service>` with a wildcard or grouping entrypoint.
-
-See [examples/whole-stack.yaml](./examples/whole-stack.yaml) for a runnable
-example with defaults, variant templates, grouping, and optional profiles.
-
-### Healthcheck timing
-
-start_period is how long fed waits for the first pass. It is separate from the
-time limit for an individual probe.
-
-| Field | Meaning | Default |
-| --- | --- | --- |
-| `start_period` | Startup wait for the first successful probe | 5s |
-| `interval` | Delay between probes | 500ms |
-| `probe_timeout` | Time limit for one probe | The effective start period, preserving legacy behavior |
-| `retries` | Consecutive failed probes before unhealthy | 3 |
-
-These fields work alongside either `http_get` or `command`. A bare command
-string uses the defaults. `timeout` remains the legacy alias for `start_period`;
-setting both is an error. `interval` must be positive and `retries` at least 1.
-`startup_timeout` still caps the entire start attempt; validation warns when
-it is shorter than the health wait.
-
-A probe timeout counts as one failed probe. Startup continues polling until the
-start period expires; expiry while the process is alive produces a health
-warning, not a failed start. A probe already in flight at the deadline may
-finish. After startup, the supervisor (or watch/TUI monitor) runs the configured
-probes, preserves health through fewer than `retries` failures, and records
-unhealthy at the threshold. A success resets the streak and restores healthy
-status. Process death bypasses probe retries. Healthchecks alone enable
-supervision; restarting still requires a restart policy.
-
-
-## Existing Docker Compose projects
-
-You do not need to translate every container into fed. Include the Compose file once and fed expands its services and dependency edges into the same graph as native services:
-
-```yaml
-compose:
-  - ./compose.yaml
-
-services:
-  api:
-    process: npm run dev
-    depends_on: [postgres]
-```
-
-Use a namespace when names could collide, and pass Fed parameters to Compose interpolation once for the whole project:
-
-```yaml
-parameters:
-  DATABASE_PORT:
-    type: port
-
-compose:
-  - file: ./compose.yaml
-    namespace: infrastructure
-    environment:
-      DATABASE_PORT: "{{DATABASE_PORT}}"
-```
-
-That exposes names such as `infrastructure/postgres` and `infrastructure/redis`. The Compose file consumes values with its normal `${DATABASE_PORT}` syntax. Its own `.env`, `env_file`, and container `environment` behavior remain Compose-owned.
-
-The older per-service `compose_file` + `compose_service` form is still accepted for compatibility but is deprecated; use a top-level import for new configurations.
-
-Compose files with hardcoded host ports work as they are. One checkout starts exactly as it does today. You only need `${VAR}` substitution on a port when you want *two* checkouts of that service running at the same time, because fed exports the allocated value and Compose's own substitution picks it up. Leave a port hardcoded and the second checkout stops on the bind rather than quietly sharing the first one's container. So you can retrofit ports when you actually hit a collision.
-
-[`examples/compose-siblings/`](examples/compose-siblings/) is a runnable Postgres and Redis project exercised against a real Docker daemon by the integration suite.
-
-## Secrets
-
-`type: secret` generates a stable local development value and keeps it in a mode-0600, Git-ignored file, with no account or network access involved.
-
-If your team needs to share development credentials, an optional hosted vault can fill `source: manual` values during `fed start`. Everything above this line works without it. It handles development credentials, not production secrets, and removing someone's access does not erase values already cached on their machine, so rotate after offboarding. [Team secrets](https://www.service-federation.com/docs/secrets/) covers how it works, what it costs, and how to turn the local cache off. For the local-only path, see [Generated secrets](https://www.service-federation.com/docs/generated-secrets/).
-
-To change a value, org admins can use the dashboard or the CLI in a linked checkout:
-
-```bash
-fed secrets set STRIPE_SECRET_KEY                 # hidden prompt in a terminal
-printf '%s' "$KEY" | fed secrets set STRIPE_SECRET_KEY   # or from stdin
-fed secrets rm STRIPE_SECRET_KEY
-```
-
-The value is never accepted as an argument, because arguments show up in `ps` and shell history. Other checkouts keep a cached value until their next vault request, at most `FED_VAULT_TTL` later.
-
-The vault URL must use HTTPS. An explicitly configured loopback HTTP URL is supported for local development. Vault requests never follow redirects. When file caching is enabled, an online run may use individual cached values during a transient outage only while each value is newer than `FED_VAULT_MAX_AGE` (24 hours by default). Rejected access and incompatible responses stop the run instead of using cached values. `--offline` explicitly skips the vault and can use older cached values; it cannot verify current access or revocation. A cache within `FED_VAULT_TTL` (five minutes by default) skips the request entirely, and a slow request can be bypassed after `FED_VAULT_GRACE` when the cache is fresh, so access changes may take effect after those windows. Rotate downstream credentials after offboarding.
-
-### Private registry images
-
-When your `image:` services come from a private registry, the team can share one pull token through the vault instead of everyone running `docker login`:
-
-```yaml
-parameters:
-  REGISTRY_TOKEN:
-    type: secret
-    source: manual
-    optional: true
-    description: Read-only token for pulling team images from ghcr.io
-registry_auth:
-  ghcr.io:
-    username: acme-bot          # literal or a {{PARAM}} template
-    password: '{{REGISTRY_TOKEN}}'
-```
-
-Each key is a registry host. An image without a host, such as `postgres:16`, comes from `docker.io`. The password must reference a `type: secret` parameter, so `fed validate` rejects a literal password.
-
-When `REGISTRY_TOKEN` has a value, fed pulls that registry's images with a temporary Docker config that holds this one login. The config is private to your user and is deleted after the pull. fed never runs `docker login` and never writes to `~/.docker`. When the token has no value, fed pulls with your own Docker credentials, as it does without `registry_auth`. If the registry refuses the token, fed prints one warning and retries with your own credentials.
-
-Before you add a token:
-
-- **Use a read-only, pull-only bot token.** Everyone with access to the project can read it.
-- **ECR passwords expire after 12 hours.** For ECR, keep using `aws ecr get-login-password | docker login`.
-
-`registry_auth` covers `image:` services and the image pull before `fed start`. Compose services and the base images of Dockerfile `build:` services still pull with your own Docker credentials.
-
-### Images for another architecture
-
-When an image is published only for `linux/amd64`, the pull fails on an Apple Silicon Mac with `no matching manifest for linux/arm64/v8`. Set `platform:` on the service:
-
-```yaml
-services:
-  presentation:
-    image: example/presentation:latest
-    platform: linux/amd64
-```
-
-fed passes `--platform` to the pull and to `docker run`. Docker Desktop runs the container under emulation (Rosetta), which is slower than a native build. A local copy of the image for another platform does not count, so fed pulls the one you asked for.
-
-`platform:` is valid only next to `image:`. In a service with variants, put it in the variant that sets the image. It does not change Dockerfile `build:` services or Compose services.
-
-### Reaching the host from a container
-
-A container reaches services on your machine, native processes and other services' published ports, at `host.docker.internal`:
-
-```yaml
-services:
-  worker:
-    image: example/worker:latest
-    environment:
-      DATABASE_URL: 'postgresql://app:secret@host.docker.internal:5432/app'
-```
-
-Docker Desktop and Podman define that name in every container. Docker Engine on Linux does not, so on Linux fed starts each container with `--add-host host.docker.internal:host-gateway`, which needs Docker Engine 20.10 or later.
-
-On Linux the traffic arrives on the Docker bridge (`docker0`), and a host firewall that denies incoming traffic drops it: the name resolves, but connections time out. With ufw, allow the bridge:
-
-```bash
-sudo ufw allow in on docker0
-```
-
-## Documentation and examples
-
-- [Quickstart](https://www.service-federation.com/docs/)
-- [Worktrees and coding agents](https://www.service-federation.com/docs/isolation/)
-- [Configuration reference](https://www.service-federation.com/docs/configuration/)
-- [Scripts and tests](https://www.service-federation.com/docs/scripts/)
-- [Command reference](https://www.service-federation.com/docs/commands/)
-
-Example configs include [Rails with Sidekiq](./examples/rails-sidekiq.yaml), [FastAPI with Celery](./examples/python-fastapi.yaml), [Go microservices](./examples/go-microservices.yaml), [Node services](./examples/nodejs-microservices.yaml), [service variants](./examples/variants-example.yaml), and [an existing Docker Compose project](./examples/docker-compose-example/).
-
-`fed --help` is the command-line source of truth for the installed version.
-
-## Support and contributing
-
-[Open an issue](https://github.com/service-federation/fed/issues) for bugs, questions, or feature requests. Include `fed doctor` output when the problem depends on the local environment.
-
-Contributions are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md).
-
-## License
+[Open an issue](https://github.com/service-federation/fed/issues) with `fed doctor` output for bugs or questions. Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 MIT
